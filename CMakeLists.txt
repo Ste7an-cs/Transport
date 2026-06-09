@@ -34,6 +34,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/result_test.cpp
     tests/interfaces_test.cpp
     tests/framing/length_field_framer_test.cpp
+    tests/framing/frame_assembler_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   gtest_discover_tests(transport_tests)
