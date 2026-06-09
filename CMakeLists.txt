@@ -11,6 +11,7 @@ add_library(transport STATIC
   src/core/version.cpp
   src/core/ReceiveQueue.cpp
   src/framing/LengthFieldFramer.cpp
+  src/tcp/TcpConnection.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -57,6 +58,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/core/transport_base_test.cpp
     tests/tcp/asio_smoke_test.cpp
     tests/tcp/tcp_interfaces_test.cpp
+    tests/tcp/tcp_connection_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)
