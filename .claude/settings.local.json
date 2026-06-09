@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"---exit:$?\")",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git -c user.name='David' -c user.email='david@local' commit -q -m \"docs: 通信中间件框架设计规格文档（含发送指定目的地/DDS单实例多topic/流式分帧增补）\")"
+    ]
+  }
+}
