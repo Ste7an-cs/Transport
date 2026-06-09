@@ -56,6 +56,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/core/receive_queue_test.cpp
     tests/core/transport_base_test.cpp
     tests/tcp/asio_smoke_test.cpp
+    tests/tcp/tcp_interfaces_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)
