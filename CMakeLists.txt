@@ -37,6 +37,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/framing/length_field_framer_test.cpp
     tests/framing/frame_assembler_test.cpp
     tests/core/receive_queue_test.cpp
+    tests/core/transport_base_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)
