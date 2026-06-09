@@ -9,6 +9,7 @@ option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
 
 add_library(transport STATIC
   src/core/version.cpp
+  src/core/ReceiveQueue.cpp
   src/framing/LengthFieldFramer.cpp
 )
 target_include_directories(transport PUBLIC
@@ -35,7 +36,10 @@ if(TRANSPORT_BUILD_TESTS)
     tests/interfaces_test.cpp
     tests/framing/length_field_framer_test.cpp
     tests/framing/frame_assembler_test.cpp
+    tests/core/receive_queue_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
+  find_package(Threads REQUIRED)
+  target_link_libraries(transport PUBLIC Threads::Threads)
   gtest_discover_tests(transport_tests)
 endif()
