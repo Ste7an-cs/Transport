@@ -1,0 +1,26 @@
+#pragma once
+
+#include <string>
+#include <utility>
+#include <variant>
+
+namespace transport {
+
+// 所有可能失败的操作返回 Result<T>；框架不抛异常。
+// 错误字符串前缀分类：timeout: / conn: / codec: / frame: / io: / config:
+// 约束：T 必须可默认构造（Fail 时以 T{} 初始化 value）。
+template <typename T>
+struct Result {
+  T value{};
+  bool ok = false;
+  std::string error;
+
+  explicit operator bool() const { return ok; }
+
+  static Result<T> Success(T v) { return {std::move(v), true, ""}; }
+  static Result<T> Fail(std::string msg) { return {T{}, false, std::move(msg)}; }
+};
+
+using Status = Result<std::monostate>;
+
+}  // namespace transport

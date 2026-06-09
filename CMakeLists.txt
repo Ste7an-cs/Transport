@@ -30,6 +30,7 @@ if(TRANSPORT_BUILD_TESTS)
 
   add_executable(transport_tests
     tests/version_test.cpp
+    tests/result_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   gtest_discover_tests(transport_tests)
