@@ -4,7 +4,7 @@
 **状态：** 已确认  
 **修订：**
 - 2026-06-09 增补 —— 发送时指定目的地（UDP 目的 ip:port、DDS topic）、DDS 实例内部多 topic 路由、接收侧流式分帧层、`ICodec` 可报错、所有发送接口去除 `len` 参数改用 `std::vector<uint8_t>`、移除 `DdsTransportManager`、DDS req-resp 仅客户端发请求。
-- 2026-06-09 二次增补 —— DDS 统一字节流类型：pub-sub 用 `RawMessage{payload}`、req-resp 用 `RawRequest`/`RawReply`（框架自动关联 `request_id`+`reply_topic`、自动超时），移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
+- 2026-06-09 二次增补 —— DDS 统一字节流承载：单个 `RawMessage` C++ 类（`request_id`/`reply_topic`/`payload`）+ 自定义 `TopicDataType`，绕过 IDL/Fast DDS-Gen/Fast CDR 直发原始字节；req-resp 框架自动关联（`request_id`+`reply_topic`）、自动超时，移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
 
 ---
 
@@ -102,12 +102,11 @@ transport/
 │   │   ├── UdpTransport.hpp
 │   │   └── UdpTransport.cpp
 │   ├── dds/
-│   │   ├── idl/                        // 统一字节流类型；跨系统互通需共用
-│   │   │   ├── RawMessage.idl          // pub-sub：{ sequence<octet> payload }
-│   │   │   ├── RawRequest.idl          // req-resp 请求：{ request_id, reply_topic, payload }
-│   │   │   └── RawReply.idl            // req-resp 响应：{ request_id, payload }
+│   │   ├── RawMessage.hpp              // DDS 承载类（普通 C++ 类）：{ request_id, reply_topic, payload }，provider 无关
 │   │   ├── DdsTransport.hpp            // req-resp 关联/超时/id 配对在此层完成
 │   │   ├── DdsTransport.cpp
+│   │   ├── FastDdsRawType.hpp          // 自定义 TopicDataType：绕过 IDL/Fast DDS-Gen/Fast CDR，手写原始字节序列化
+│   │   ├── FastDdsRawType.cpp
 │   │   ├── FastDdsProvider.hpp
 │   │   └── FastDdsProvider.cpp
 │   ├── serial/
@@ -383,29 +382,46 @@ struct DdsConfig {
 };
 ```
 
-> **已移除 `type_name`：** DDS 承载的统一是不透明字节流，类型固定为 §7.2 的内置 IDL 类型，无需用户指定。
+> **已移除 `type_name`：** DDS 承载的统一是不透明字节流，类型固定为 §7.2 的内置 `RawMessage` 承载类，无需用户指定。
 
-### 7.2 DDS 字节流类型与互通约定
+### 7.2 DDS 承载类 `RawMessage` 与自定义 `TopicDataType`
 
-DDS 是强类型的（需要 IDL type），而本框架传输不透明字节流。因此框架预定义固定 IDL 类型来承载 `ICodec.Encode` 输出的二进制。**TCP/UDP/串口直接发送 `std::vector<uint8_t>`，仅 DDS 需要这层薄包装。**
+Fast DDS **不强制使用 IDL 或 CDR**——它只要求实现 `TopicDataType` 的序列化/反序列化接口。框架据此采用 Fast DDS 3.6 推荐的高级用法：**自定义 `TopicDataType`，完全绕过 IDL、Fast DDS-Gen 与 Fast CDR，直接收发原始字节流。** TCP/UDP/串口本就直接发送 `std::vector<uint8_t>`，仅 DDS 需要这层承载类把字节装进 sample。
 
-```idl
-// transport/dds/idl/  —— 跨系统经 DDS 与本框架互通时，必须共用这三份定义
+承载类是一个**普通 C++ 类（非 IDL）**，provider 无关，pub-sub 与 req-resp 共用一个类型：
 
-// pub-sub：极简，仅承载字节流
-struct RawMessage  { sequence<octet> payload; };
-
-// req-resp 请求：框架级关联元数据，独立于用户 payload
-struct RawRequest  { string request_id; string reply_topic; sequence<octet> payload; };
-
-// req-resp 响应：仅回带关联 id
-struct RawReply    { string request_id; sequence<octet> payload; };
+```cpp
+// transport/dds/RawMessage.hpp
+class RawMessage {
+ public:
+  std::string          request_id;   // req-resp 关联 id；pub-sub 为空
+  std::string          reply_topic;  // req-resp 回包 topic；pub-sub 为空
+  std::vector<uint8_t> payload;      // ICodec.Encode 输出的原始字节
+};
 ```
 
+Fast DDS 端实现 `FastDdsRawType : public eprosima::fastdds::dds::TopicDataType`，**手写紧凑序列化，不经 CDR**：
+
+- `serialize`：依次写入 `request_id`（uint16 长度前缀 + 字节）、`reply_topic`（同）、`payload`（其余全部，无需长度前缀）。
+- `deserialize`：按相同布局逆向解析。
+- `calculate_serialized_size` / `create_data` / `delete_data`：依此布局实现。
+
+pub-sub 时 `request_id`/`reply_topic` 为空串（各占 2 字节长度前缀 = 0），开销可忽略。
+
 - `payload` = `ICodec.Encode` 输出（用户 header + body）。框架不解析 payload；用户自有的 id/topic 等元数据若存在，都在 payload 内部，由用户 codec 处理。
-- `request_id` / `reply_topic` 是**框架级**关联信息，与用户 payload 完全分离，由框架在 req-resp 模式下自动填充/读取，对用户不可见。
-- provider 在 `Init()` 时一次性注册这三个类型的 `TypeSupport`。所有 topic 共用同一组类型，topic 路由由 DDS Topic 名负责。
+- `request_id` / `reply_topic` 是**框架级**关联信息，与用户 payload 分离，由框架在 req-resp 模式下自动填充/读取，对用户不可见。
+- provider 在 `Init()` 时一次性注册 `RawMessage` 的自定义 `TopicDataType`（默认 type 名 `"RawMessage"`）。所有 topic（含 req-resp 的 `_Request`/`_Reply`）共用此类型，topic 路由由 DDS Topic 名负责。
 - 接收侧 `Message.topic` 由 DDS Topic 名填充。
+
+**互通约定（wire layout）：** 跨系统经 DDS 与本框架互通时，对端须注册同名 type（`"RawMessage"`）并按此布局收发：
+
+```
+[uint16 LE: id_len][id_len 字节 request_id]
+[uint16 LE: reply_len][reply_len 字节 reply_topic]
+[payload 字节 ... 到 sample 末尾]
+```
+
+接入其它 DDS 实现时，等价地实现各自的「原始字节 TopicDataType / 自定义序列化」并遵循同一 wire layout 即可。
 
 ### 7.3 `IDdsTransport`（实例内部多 topic + req-resp）
 
@@ -450,16 +466,16 @@ class IDdsTransport : public ITransport {
 
 req-resp 完全建在 pub-sub 之上，**provider 无关**，其它 DDS 实现照搬即可。
 
-- **topic 命名约定：** 逻辑 topic `foo` → 请求走 `foo_Request`（类型 `RawRequest`），响应走 `foo_Reply`（类型 `RawReply`）。
+- **topic 命名约定：** 逻辑 topic `foo` → 请求走 `foo_Request`，响应走 `foo_Reply`；两者均承载同一个 `RawMessage` 类型。
 - **客户端 `SendRequest`：**
   1. 生成唯一 `request_id`；确保已订阅 `foo_Reply`；
-  2. 发布 `RawRequest{request_id, reply_topic="foo_Reply", payload=Encode(data)}` 到 `foo_Request`；
+  2. 发布 `RawMessage{request_id, reply_topic="foo_Reply", payload=Encode(data)}` 到 `foo_Request`；
   3. 内部维护 `map<request_id, {on_reply, deadline}>`，由 I/O 线程上的定时检查驱动超时；
-  4. 收到匹配 `request_id` 的 `RawReply` → `Decode` 后 `on_reply(Success(msg))` 并清理该条目；到期未收到 → `on_reply(Fail("timeout: ..."))` 并清理。
+  4. 收到匹配 `request_id` 的 `RawMessage` → `Decode` 后 `on_reply(Success(msg))` 并清理该条目；到期未收到 → `on_reply(Fail("timeout: ..."))` 并清理。
 - **响应端 `OnRequest`：**
   1. 订阅 `foo_Request`；
-  2. 每条 `RawRequest` → 构造 `Message`（payload 经 `Decode`）+ 一个绑定了该请求 `request_id`/`reply_topic` 的 `ReplyFn`；
-  3. 调用用户 handler；handler 调用 `reply(bytes)` 时，发布 `RawReply{request_id, payload=Encode(bytes)}` 到该请求携带的 `reply_topic`。
+  2. 每条 `RawMessage`（带 `request_id`）→ 构造 `Message`（payload 经 `Decode`）+ 一个绑定了该请求 `request_id`/`reply_topic` 的 `ReplyFn`；
+  3. 调用用户 handler；handler 调用 `reply(bytes)` 时，发布 `RawMessage{request_id, reply_topic 留空, payload=Encode(bytes)}` 到该请求携带的 `reply_topic`。
 - 同一 `foo_Reply` 上若有多个客户端，各自按 `request_id` 过滤；框架以唯一 id 保证只兑现自己发出的请求。
 
 ### 7.5 `IDdsProvider`
@@ -471,7 +487,7 @@ class IDdsProvider {
  public:
   virtual ~IDdsProvider() = default;
 
-  // 注册 RawMessage / RawRequest / RawReply 三个 TypeSupport，建立 participant
+  // 注册 RawMessage 的自定义 TopicDataType（如 FastDdsRawType），建立 participant
   virtual Status Init(const DdsConfig& config) = 0;
 
   // ---- pub-sub（RawMessage）----
@@ -481,26 +497,26 @@ class IDdsProvider {
                            ITransport::ReceiveCallback cb)   = 0;
   virtual Status Unsubscribe(const std::string& topic)       = 0;
 
-  // ---- req-resp 客户端：发布 RawRequest 到 <topic>_Request ----
+  // ---- req-resp 客户端：发布 RawMessage(带 request_id/reply_topic) 到 <topic>_Request ----
   virtual Status SendRequest(const std::string& request_topic,
                              const std::string& request_id,
                              const std::string& reply_topic,
                              const std::vector<uint8_t>& data) = 0;
 
-  // ---- req-resp 客户端：订阅 reply_topic，对每条 RawReply 回调（懒加载，幂等）----
+  // ---- req-resp 客户端：订阅 reply_topic，对每条回复 RawMessage 回调（懒加载，幂等）----
   using ReplySink = std::function<void(const std::string& request_id,
                                        const std::vector<uint8_t>& payload)>;
   virtual Status SubscribeReplies(const std::string& reply_topic,
                                   ReplySink sink)             = 0;
 
-  // ---- req-resp 响应端：订阅 <request_topic>，对每条 RawRequest 回调 ----
+  // ---- req-resp 响应端：订阅 <request_topic>，对每条请求 RawMessage 回调 ----
   using RequestSink = std::function<void(const std::vector<uint8_t>& payload,
                                          const std::string& request_id,
                                          const std::string& reply_topic)>;
   virtual Status ServeRequests(const std::string& request_topic,
                                RequestSink sink)              = 0;
 
-  // ---- req-resp 响应端：发布 RawReply 到 reply_topic ----
+  // ---- req-resp 响应端：发布回复 RawMessage 到 reply_topic ----
   virtual Status Reply(const std::string& reply_topic,
                        const std::string& request_id,
                        const std::vector<uint8_t>& data)      = 0;
@@ -654,7 +670,7 @@ Send(data) ─▶ [若已设 ICodec: data = Encode(data)] ─▶ 传输特定写
 
 - **发送侧不分帧、不加任何前缀**——`Encode` 输出的字节流（帧长已在用户 header 内）原样写出。
 - TCP/UDP/串口：直接写 `std::vector<uint8_t>`。
-- DDS：`payload = Encode(data)` 装入 `RawMessage`（pub-sub）/ `RawRequest`（req-resp）后由 writer 发布。
+- DDS：`payload = Encode(data)` 装入 `RawMessage`（req-resp 时附带 `request_id`/`reply_topic`）后由 writer 发布。
 - 返回的 `Status` 表示「入队/写出成功」，不代表对端已收（见 §10）。
 
 ### 14.2 接收路径 — 流式（TCP / 串口）
@@ -675,7 +691,7 @@ I/O线程 read 字节
 ### 14.3 接收路径 — 报文式（UDP / DDS）
 
 ```
-I/O线程 收到一个 datagram（UDP）/ 一条 RawMessage|RawRequest|RawReply（DDS）
+I/O线程 收到一个 datagram（UDP）/ 一条 RawMessage（DDS）
   └▶ [若已设 ICodec: payload = Decode(payload)]
        └▶ 组装 Message ─▶ 投递
 ```
