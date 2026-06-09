@@ -2,7 +2,9 @@
 
 **日期：** 2026-06-09  
 **状态：** 已确认  
-**修订：** 2026-06-09 增补 —— 发送时指定目的地（UDP 目的 ip:port、DDS topic）、DDS 实例内部多 topic 路由、接收侧流式分帧层、`ICodec` 可报错、所有发送接口去除 `len` 参数改用 `std::vector<uint8_t>`、移除 `DdsTransportManager`、DDS req-resp 仅客户端发请求。
+**修订：**
+- 2026-06-09 增补 —— 发送时指定目的地（UDP 目的 ip:port、DDS topic）、DDS 实例内部多 topic 路由、接收侧流式分帧层、`ICodec` 可报错、所有发送接口去除 `len` 参数改用 `std::vector<uint8_t>`、移除 `DdsTransportManager`、DDS req-resp 仅客户端发请求。
+- 2026-06-09 二次增补 —— DDS 统一字节流类型：pub-sub 用 `RawMessage{payload}`、req-resp 用 `RawRequest`/`RawReply`（框架自动关联 `request_id`+`reply_topic`、自动超时），移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
 
 ---
 
@@ -100,7 +102,11 @@ transport/
 │   │   ├── UdpTransport.hpp
 │   │   └── UdpTransport.cpp
 │   ├── dds/
-│   │   ├── DdsTransport.hpp
+│   │   ├── idl/                        // 统一字节流类型；跨系统互通需共用
+│   │   │   ├── RawMessage.idl          // pub-sub：{ sequence<octet> payload }
+│   │   │   ├── RawRequest.idl          // req-resp 请求：{ request_id, reply_topic, payload }
+│   │   │   └── RawReply.idl            // req-resp 响应：{ request_id, payload }
+│   │   ├── DdsTransport.hpp            // req-resp 关联/超时/id 配对在此层完成
 │   │   ├── DdsTransport.cpp
 │   │   ├── FastDdsProvider.hpp
 │   │   └── FastDdsProvider.cpp
@@ -369,69 +375,144 @@ class IUdpTransport : public ITransport {
 enum class DdsMode { kPubSub, kReqResp };
 
 struct DdsConfig {
-  DdsMode     mode        = DdsMode::kPubSub;
-  std::string topic;             // Send(data) 与 SendRequest 的默认 topic
-  std::string type_name;
-  int         domain_id   = 0;   // 一个实例 = 一个 DomainParticipant（绑定 domain_id）
-  std::string qos_profile;       // 为空时使用默认 QoS
-  std::string provider    = "FastDDS";  // 选择已注册的 IDdsProvider
+  DdsMode                  mode      = DdsMode::kPubSub;
+  std::vector<std::string> topics;          // 实例关注的 topic 列表；topics[0] 为默认 topic
+  int                      domain_id = 0;    // 一个实例 = 一个 DomainParticipant（绑定 domain_id）
+  std::string              qos_profile;      // 为空时使用默认 QoS
+  std::string              provider  = "FastDDS";  // 选择已注册的 IDdsProvider
 };
 ```
 
-### 7.2 `IDdsTransport`（实例内部多 topic）
+> **已移除 `type_name`：** DDS 承载的统一是不透明字节流，类型固定为 §7.2 的内置 IDL 类型，无需用户指定。
+
+### 7.2 DDS 字节流类型与互通约定
+
+DDS 是强类型的（需要 IDL type），而本框架传输不透明字节流。因此框架预定义固定 IDL 类型来承载 `ICodec.Encode` 输出的二进制。**TCP/UDP/串口直接发送 `std::vector<uint8_t>`，仅 DDS 需要这层薄包装。**
+
+```idl
+// transport/dds/idl/  —— 跨系统经 DDS 与本框架互通时，必须共用这三份定义
+
+// pub-sub：极简，仅承载字节流
+struct RawMessage  { sequence<octet> payload; };
+
+// req-resp 请求：框架级关联元数据，独立于用户 payload
+struct RawRequest  { string request_id; string reply_topic; sequence<octet> payload; };
+
+// req-resp 响应：仅回带关联 id
+struct RawReply    { string request_id; sequence<octet> payload; };
+```
+
+- `payload` = `ICodec.Encode` 输出（用户 header + body）。框架不解析 payload；用户自有的 id/topic 等元数据若存在，都在 payload 内部，由用户 codec 处理。
+- `request_id` / `reply_topic` 是**框架级**关联信息，与用户 payload 完全分离，由框架在 req-resp 模式下自动填充/读取，对用户不可见。
+- provider 在 `Init()` 时一次性注册这三个类型的 `TypeSupport`。所有 topic 共用同一组类型，topic 路由由 DDS Topic 名负责。
+- 接收侧 `Message.topic` 由 DDS Topic 名填充。
+
+### 7.3 `IDdsTransport`（实例内部多 topic + req-resp）
 
 一个 `IDdsTransport` 实例对应一个 `DomainParticipant`，内部以 `map<topic, writer/reader>` 懒加载维护多个 topic：`Send(data, topic)` 自动创建/复用该 topic 的 DataWriter，`Subscribe(topic)` 自动创建该 topic 的 DataReader。因此「同一用户用 map 维护多个 topic」由实例内部完成，无需外部管理器。
 
 ```cpp
 class IDdsTransport : public ITransport {
  public:
-  // pub-sub：向运行期指定 topic 发布（topic 不存在则建 writer，存在则复用）
+  // ---- pub-sub ----
+  // 向运行期指定 topic 发布（topic 不存在则建 writer，存在则复用）
   virtual Status Send(const std::vector<uint8_t>& data,
                       const std::string& topic) = 0;
-
   // 动态订阅/退订；收到的消息经 OnReceive/Receive/AsyncReceive 交付，
   // Message.topic 标识来源 topic
   virtual Status Subscribe(const std::string& topic)   = 0;
   virtual Status Unsubscribe(const std::string& topic) = 0;
 
-  // req-resp：仅客户端发请求侧。on_reply 在收到响应时被调用一次
+  // ---- req-resp 客户端：发请求 ----
+  // 框架生成 request_id、订阅对应 reply topic、自动配对响应或超时。
+  // 收到响应时 on_reply(Success(msg)) 调用一次；超时则 on_reply(Fail("timeout:..."))。
   virtual Status SendRequest(const std::vector<uint8_t>& data,
                              const std::string& topic,
-                             std::function<void(Result<Message>)> on_reply) = 0;
+                             std::function<void(Result<Message>)> on_reply,
+                             uint32_t timeout_ms = 5000) = 0;
+
+  // ---- req-resp 响应端：处理请求 ----
+  using ReplyFn        = std::function<Status(const std::vector<uint8_t>&)>;
+  using RequestHandler = std::function<void(const Message& request, ReplyFn reply)>;
+  // 注册某 topic 的请求处理器；handler 内（或稍后异步）调用 reply 回包
+  virtual Status OnRequest(const std::string& topic, RequestHandler handler) = 0;
 
   virtual DdsMode     Mode()     const = 0;
   virtual std::string Provider() const = 0;
 };
 ```
 
-- 基类 `Send(data)`：发往 config 的默认 `topic`。
-- 基类 `Receive()`/`OnReceive()`/`AsyncReceive()`：交付所有已 `Subscribe` topic 收到的消息。
-- req-resp 仅实现客户端发请求 + 接收响应；不提供服务端请求处理接口。
+- 基类 `Send(data)`：发往 config `topics` 的默认 topic（`topics[0]`）。
+- 基类 `Receive()`/`OnReceive()`/`AsyncReceive()`：交付所有已 `Subscribe` topic 收到的消息，`Message.topic` 标识来源。
+- `ReplyFn` 可在 handler 内同步调用，也可存起来稍后异步调用 → 支持耗时处理。
 
-### 7.3 `IDdsProvider`
+### 7.4 req-resp 机制（基于 pub-sub + 关联 ID）
 
-抽象底层 DDS 库。实现此接口可接入新的 DDS 实现。按 topic 操作以支持单实例多 topic。
+req-resp 完全建在 pub-sub 之上，**provider 无关**，其它 DDS 实现照搬即可。
+
+- **topic 命名约定：** 逻辑 topic `foo` → 请求走 `foo_Request`（类型 `RawRequest`），响应走 `foo_Reply`（类型 `RawReply`）。
+- **客户端 `SendRequest`：**
+  1. 生成唯一 `request_id`；确保已订阅 `foo_Reply`；
+  2. 发布 `RawRequest{request_id, reply_topic="foo_Reply", payload=Encode(data)}` 到 `foo_Request`；
+  3. 内部维护 `map<request_id, {on_reply, deadline}>`，由 I/O 线程上的定时检查驱动超时；
+  4. 收到匹配 `request_id` 的 `RawReply` → `Decode` 后 `on_reply(Success(msg))` 并清理该条目；到期未收到 → `on_reply(Fail("timeout: ..."))` 并清理。
+- **响应端 `OnRequest`：**
+  1. 订阅 `foo_Request`；
+  2. 每条 `RawRequest` → 构造 `Message`（payload 经 `Decode`）+ 一个绑定了该请求 `request_id`/`reply_topic` 的 `ReplyFn`；
+  3. 调用用户 handler；handler 调用 `reply(bytes)` 时，发布 `RawReply{request_id, payload=Encode(bytes)}` 到该请求携带的 `reply_topic`。
+- 同一 `foo_Reply` 上若有多个客户端，各自按 `request_id` 过滤；框架以唯一 id 保证只兑现自己发出的请求。
+
+### 7.5 `IDdsProvider`
+
+抽象底层 DDS 库。实现此接口可接入新的 DDS 实现。关联/超时、`request_id` 生成与配对都在 `DdsTransport` 层完成；provider 只负责「按类型在指定 topic 上收发字节」，因此其它 DDS 实现无需理解 req-resp 语义。
 
 ```cpp
 class IDdsProvider {
  public:
   virtual ~IDdsProvider() = default;
 
-  virtual Status Init(const DdsConfig& config)                              = 0;
+  // 注册 RawMessage / RawRequest / RawReply 三个 TypeSupport，建立 participant
+  virtual Status Init(const DdsConfig& config) = 0;
+
+  // ---- pub-sub（RawMessage）----
   virtual Status Publish(const std::string& topic,
-                         const std::vector<uint8_t>& data)                  = 0;
+                         const std::vector<uint8_t>& data)  = 0;
   virtual Status Subscribe(const std::string& topic,
-                           ITransport::ReceiveCallback cb)                  = 0;
-  virtual Status Unsubscribe(const std::string& topic)                     = 0;
-  virtual Status SendRequest(const std::string& topic,
-                             const std::vector<uint8_t>& data,
-                             std::function<void(Result<Message>)> on_reply) = 0;
-  virtual void   Shutdown()                                                 = 0;
-  virtual std::string ProviderName() const                                 = 0;
+                           ITransport::ReceiveCallback cb)   = 0;
+  virtual Status Unsubscribe(const std::string& topic)       = 0;
+
+  // ---- req-resp 客户端：发布 RawRequest 到 <topic>_Request ----
+  virtual Status SendRequest(const std::string& request_topic,
+                             const std::string& request_id,
+                             const std::string& reply_topic,
+                             const std::vector<uint8_t>& data) = 0;
+
+  // ---- req-resp 客户端：订阅 reply_topic，对每条 RawReply 回调（懒加载，幂等）----
+  using ReplySink = std::function<void(const std::string& request_id,
+                                       const std::vector<uint8_t>& payload)>;
+  virtual Status SubscribeReplies(const std::string& reply_topic,
+                                  ReplySink sink)             = 0;
+
+  // ---- req-resp 响应端：订阅 <request_topic>，对每条 RawRequest 回调 ----
+  using RequestSink = std::function<void(const std::vector<uint8_t>& payload,
+                                         const std::string& request_id,
+                                         const std::string& reply_topic)>;
+  virtual Status ServeRequests(const std::string& request_topic,
+                               RequestSink sink)              = 0;
+
+  // ---- req-resp 响应端：发布 RawReply 到 reply_topic ----
+  virtual Status Reply(const std::string& reply_topic,
+                       const std::string& request_id,
+                       const std::vector<uint8_t>& data)      = 0;
+
+  virtual void   Shutdown()                = 0;
+  virtual std::string ProviderName() const = 0;
 };
 ```
 
-### 7.4 `DdsProviderRegistry`
+> **codec 边界：** provider 收发的 `payload`/`data` 都是 **`ICodec` 处理前/后的原始字节**——`Encode`/`Decode` 由 `DdsTransport` 层在调用 provider 之前/之后完成，provider 不感知 codec。`Subscribe` 的 `cb` 中 `Message.payload` 即为待 `Decode` 的原始字节，`DdsTransport` 以包装回调拦截、`Decode` 后再交付用户。
+
+### 7.6 `DdsProviderRegistry`
 
 ```cpp
 class DdsProviderRegistry {
@@ -503,7 +584,7 @@ class TransportFactory {
       "framer": { "header_size": 8, "length_offset": 4, "length_size": 4, "big_endian": true } },
     { "type": "tcp_server", "bind_addr": "0.0.0.0", "port": 9001, "max_clients": 10 },
     { "type": "udp",        "mode": "multicast", "multicast_group": "239.0.0.1", "local_port": 5000 },
-    { "type": "dds",        "mode": "pubsub", "topic": "sensor_data", "domain_id": 0, "provider": "FastDDS" },
+    { "type": "dds",        "mode": "pubsub", "topics": ["sensor_data"], "domain_id": 0, "provider": "FastDDS" },
     { "type": "serial",     "device": "/dev/ttyS0", "baud_rate": 115200 }
   ]
 }
@@ -560,3 +641,146 @@ class TransportFactory {
 - 禁止非 const 全局变量
 - 单参数构造函数加 `explicit`
 - 所有权用智能指针（`unique_ptr`、`shared_ptr`）；非所有权引用才使用裸指针
+
+---
+
+## 14. 收发数据流与调用时序
+
+### 14.1 发送路径（所有传输统一）
+
+```
+Send(data) ─▶ [若已设 ICodec: data = Encode(data)] ─▶ 传输特定写出
+```
+
+- **发送侧不分帧、不加任何前缀**——`Encode` 输出的字节流（帧长已在用户 header 内）原样写出。
+- TCP/UDP/串口：直接写 `std::vector<uint8_t>`。
+- DDS：`payload = Encode(data)` 装入 `RawMessage`（pub-sub）/ `RawRequest`（req-resp）后由 writer 发布。
+- 返回的 `Status` 表示「入队/写出成功」，不代表对端已收（见 §10）。
+
+### 14.2 接收路径 — 流式（TCP / 串口）
+
+```
+I/O线程 read 字节
+  └▶ 追加滚动缓冲区
+       └▶ 循环 IFramer.TryExtract(buf, len)
+            ├─ has_frame=false ─▶ 等待更多字节
+            └─ has_frame=true  ─▶ frame = buf[0..consumed)
+                  └▶ [若已设 ICodec: frame = Decode(frame)]
+                       └▶ 组装 Message（填 source/timestamp）─▶ 投递
+```
+
+- 无 framer 时为「透传模式」：底层每次读到多少字节即作为一条 `Message` 投递。
+- `Decode` 失败 → 投递 `Result<Message>{ok=false, error="codec:..."}`；`TryExtract` 报错（帧头非法/越界）→ `error="frame:..."` 并断开。
+
+### 14.3 接收路径 — 报文式（UDP / DDS）
+
+```
+I/O线程 收到一个 datagram（UDP）/ 一条 RawMessage|RawRequest|RawReply（DDS）
+  └▶ [若已设 ICodec: payload = Decode(payload)]
+       └▶ 组装 Message ─▶ 投递
+```
+
+报文天然保边界，**不经分帧**。
+
+### 14.4 三种交付模式与 `AsyncReceive` 队列语义
+
+- 同步（`Receive`）、回调（`OnReceive`）、future（`AsyncReceive`）在同一实例上**互斥**，由 `Open()` 后首次接收调用确定，之后不可切换。
+- 实例内部维护一个 **FIFO 消息队列**，I/O 线程入队，交付侧出队：
+  - **`Receive(timeout_ms)`**：阻塞出队一条；空队列等待至超时（`0` = 永久）。
+  - **`OnReceive(cb)`**：I/O 线程每入队一条即调用 `cb`（回调必须非阻塞）。
+  - **`AsyncReceive()`**：返回 `std::future<Result<Message>>`；若队列非空则立即就绪，否则在下一条到达时就绪。多个未决 future 按**到达顺序 FIFO** 兑现。
+- 连接级错误以 `Result<Message>{ok=false}` 同样经上述队列/回调投递。
+
+---
+
+## 15. 测试策略
+
+测试框架 GoogleTest，目录映射到 `tests/{framing,tcp,udp,dds,serial,integration}/`。
+
+### 15.1 单元测试（不依赖网络/硬件）
+
+- **`LengthFieldFramer`（表驱动）**：半包、粘包、跨多次读到达的整帧、超长帧（触发 `frame:` 错误并断开）、非法帧头、大小端、`length_includes_header` 两种取值、`length_size ∈ {2,4,8}`。
+- **`Result` / `Status`**：`Success`/`Fail`、`operator bool`、错误前缀。
+- **codec 边界**：未设 codec 时透传恒等；设 codec 时发送侧调 `Encode`、接收侧调 `Decode`，且顺序正确（用 `MockCodec` 断言调用）。
+
+### 15.2 Mock 隔离
+
+- **`FakeDdsProvider`**：纯内存回环实现 `IDdsProvider`，不依赖 Fast DDS。用于测 `DdsTransport` 的 topic 懒加载路由、req-resp 的 `request_id` 配对、超时触发、并发多请求互不串扰。
+- **`MockCodec` / `MockFramer`**：验证框架在收发边界对编解码/分帧的调用次数与顺序。
+
+### 15.3 回环集成测试
+
+- **TCP**：localhost 上 server↔client，覆盖连接建立、`OnNewConnection`、每客户端独立收发、广播 `Send`、`DisconnectClient`、`auto_reconnect`。
+- **UDP**：localhost 单播、组播（loopback 加入组）、`SendTo` 动态目的地、`Message.source` 正确。
+- **串口**：用 `openpty`/`socat -d -d pty,raw pty,raw` 造虚拟串口对，覆盖分帧与透传两种模式。
+- **DDS（Fast DDS）**：同 `domain_id` 双 participant，覆盖 pub-sub 多 topic、req-resp 端到端（含响应端 `OnRequest` 同步与异步回包）、超时。
+
+### 15.4 场景测试
+
+超时、断连 + 自动重连、req-resp 并发多请求关联正确性、三种交付模式互斥约束。
+
+---
+
+## 16. 使用示例
+
+### 16.1 一个用户同时持有多类 / 多实例（需求 5）
+
+```cpp
+// 1) TCP 客户端 + length-field 分帧 + 自定义 codec
+auto tcp = TransportFactory::Create(TcpClientConfig{
+    .host = "192.168.1.10", .port = 9000,
+    .framer = LengthFieldFramerConfig{.header_size = 8, .length_offset = 4}});
+tcp->SetCodec(std::make_shared<MyCodec>());
+tcp->Open();
+tcp->OnReceive([](Result<Message> m) { /* I/O 线程，非阻塞 */ });
+tcp->Send(payload);                       // Encode 后写出
+
+// 2) UDP 组播，发送时动态指定目的地
+auto udp = TransportFactory::Create(UdpConfig{
+    .mode = UdpMode::kMulticast, .multicast_group = "239.0.0.1",
+    .local_port = 5000, .remote_port = 5000});
+udp->Open();
+udp->Send(payload);                       // 发往组播组
+udp->SendTo(payload, "10.0.0.7", 6000);   // 运行期指定单播目的地
+
+// 3) DDS pub-sub：单实例内部多 topic
+auto dds = TransportFactory::Create(DdsConfig{
+    .mode = DdsMode::kPubSub, .topics = {"cmd", "telemetry"}, .domain_id = 0});
+dds->Open();
+dds->Subscribe("telemetry");
+dds->OnReceive([](Result<Message> m) { /* m.topic 标识来源 */ });
+dds->Send(payload, "cmd");                // 向指定 topic 发布
+```
+
+### 16.2 DDS 请求响应（框架自动关联）
+
+```cpp
+// 响应端
+auto server = TransportFactory::Create(DdsConfig{
+    .mode = DdsMode::kReqResp, .topics = {"calc"}, .domain_id = 0});
+server->Open();
+server->OnRequest("calc", [](const Message& req, IDdsTransport::ReplyFn reply) {
+  auto result = Compute(req.payload);     // 处理（可同步或异步）
+  reply(result);                          // 框架自动发到 calc_Reply，并带回 request_id
+});
+
+// 客户端
+auto client = TransportFactory::Create(DdsConfig{
+    .mode = DdsMode::kReqResp, .topics = {"calc"}, .domain_id = 0});
+client->Open();
+client->SendRequest(request_bytes, "calc",
+    [](Result<Message> reply) {
+      if (!reply) { /* reply.error 形如 "timeout:..." */ return; }
+      Use(reply.value.payload);           // 框架已按 request_id 配对
+    },
+    /*timeout_ms=*/3000);
+```
+
+### 16.3 同步接收
+
+```cpp
+auto serial = TransportFactory::Create(SerialConfig{.device = "/dev/ttyS0"});
+serial->Open();
+Result<Message> m = serial->Receive(/*timeout_ms=*/1000);  // 阻塞
+if (m) Use(m.value.payload);
+```
