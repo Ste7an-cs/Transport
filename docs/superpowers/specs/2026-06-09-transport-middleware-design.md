@@ -119,6 +119,44 @@ transport/
 └── CMakeLists.txt
 ```
 
+### 3.4 接口 vs 实现 的依赖分层
+
+框架贯穿同一约定：每类传输 = **接口 `I*`（契约，纯虚，零第三方依赖）** + **实现类 `*Transport`（落地，封装 asio / Fast DDS / termios）**。应用层与 `TransportFactory` 只依赖接口；第三方库被关在实现类内部。`ITcpServer` 与 `TcpServerTransport` 即这一关系的一个实例——前者声明服务端契约，后者用 Asio 实现它。
+
+```
+记号： A ──▷ B  「A 实现/继承 B」      A ··▷ B  「A 使用/持有 B」
+状态： [✓] 已实现（Foundation + TCP）   [ ] 规划中
+
+接口层 include/transport/（零第三方依赖）
+  ITransport [✓]  ── Open/Close/Send/Receive/OnReceive/AsyncReceive/SetCodec
+    ├─▷ ITcpServer    [✓]  + OnNewConnection / GetClients / DisconnectClient
+    ├─▷ IUdpTransport [ ]  + SendTo
+    └─▷ IDdsTransport [ ]  + Send(topic) / SendRequest / OnRequest
+
+实现层 src/（各自封装底层库）
+  TcpConnection      [✓] ──▷ ITransport      （经 TransportBase）
+    └─ TcpClientTransport [✓] ──▷ TcpConnection
+  TcpServerTransport [✓] ──▷ ITcpServer      （不经 TransportBase）
+  UdpTransport       [ ] ──▷ IUdpTransport    （经 TransportBase）
+  DdsTransport       [ ] ──▷ IDdsTransport    （经 TransportBase，且 ··▷ IDdsProvider）
+  SerialTransport    [ ] ──▷ ITransport       （经 TransportBase）
+
+复用件  TransportBase [✓] ── ITransport「接收侧」通用实现
+  （ReceiveQueue 三模式交付 + codec 编解码 + Message 组装 + 断连通知）
+    ··▷ 被「会收数据」的传输复用：TcpConnection / Udp / Dds / Serial
+    ✗ TcpServerTransport 不用它（只 accept + 广播，不维护接收队列）
+
+支撑设施 [✓]：ICodec（用户实现） · IFramer ◁── LengthFieldFramer · FrameAssembler
+            · ReceiveQueue · Message · Result<T> / Status
+
+创建入口  TransportFactory [ ] ··▷ 按 config 实例化对应实现类，
+          回交 shared_ptr<ITransport / I*Transport> —— 应用层只面向接口编程。
+```
+
+> 为什么要 `I*` 接口而不止一个实现类：① `TransportFactory` 据接口返回句柄；② 消费者头文件不被 asio/Fast DDS 等依赖污染；③ 可替换 / 可用 fake 测试上层；④ 全框架一致。
+>
+> 注：`TransportBase` 当前 `: public ITransport`。UDP/DDS 阶段拟将其改为**被持有的组件 `TransportCore`**（组合替代继承，消除「与扩展接口同源 `ITransport`」的菱形）——该重构**待议**，详见 `docs/superpowers/specs/2026-06-10-udp-transport-design.md`。
+
 ---
 
 ## 4. 核心接口
