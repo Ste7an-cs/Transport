@@ -2,7 +2,7 @@
 
 > 本 spec 是主设计文档 `2026-06-09-transport-middleware-design.md` §6（UDP 传输）的**实现层细化**。主 spec 已锁定 UDP 的公共 API（`UdpMode`、`UdpConfig`、`IUdpTransport` + `SendTo`、Send 按 mode 的默认目的地语义）；本 spec 锁定实现细节：单类多模式结构、并发模型、按 mode 的 socket 配置、错误语义与测试策略，供后续 plan 直接落地。
 
-**Goal:** 在 Foundation 层（`TransportCore`〔原 `TransportBase`，本 spec 重构为组合组件〕+ `ReceiveQueue`）之上实现 UDP 单播 / 组播 / 广播传输，基于 Standalone Asio 的异步单线程 I/O 模型，单个 `UdpTransport` 类按 mode 分支配置 socket，以真实回环 socket 集成测试验证（组播/广播在不支持的环境下优雅跳过）。
+**Goal:** 在 Foundation 层（`TransportCore`〔原 `TransportBase`，本 spec 重构为组合组件〕+ `ReceiveQueue`）之上实现 UDP 单播 / 组播 / 广播传输，基于 Standalone Asio 的异步单线程 I/O 模型，单个 `UdpImpl` 类按 mode 分支配置 socket，以真实回环 socket 集成测试验证（组播/广播在不支持的环境下优雅跳过）。
 
 **Tech Stack:** C++17、Standalone Asio（已由 TCP 任务集成，`ASIO_STANDALONE`）、GoogleTest 1.14、Google C++ 风格。
 
@@ -12,15 +12,15 @@
 
 ## 1. 范围与文件布局
 
-单个 `UdpTransport` 处理全部三种模式（单播 / 组播 / 广播），满足主 spec §6.1 的单一 `IUdpTransport`。组合 Foundation 的 `TransportCore`（原 `TransportBase`，本 spec 重构为被持有组件）。
+单个 `UdpImpl` 处理全部三种模式（单播 / 组播 / 广播），满足主 spec §6.1 的单一 `IUdpTransport`。组合 Foundation 的 `TransportCore`（原 `TransportBase`，本 spec 重构为被持有组件）。
 
 ```
 include/transport/udp/
 ├── UdpConfig.hpp        # UdpMode + UdpConfig（复述自主 spec §6）
 ├── IUdpTransport.hpp    # IUdpTransport（+ SendTo，复述自主 spec §6.1）
-└── UdpTransport.hpp     # 单类多模式实现
+└── UdpImpl.hpp     # 单类多模式实现
 src/udp/
-└── UdpTransport.cpp
+└── UdpImpl.cpp
 tests/udp/
 ├── udp_interfaces_test.cpp   # 配置默认值 + IUdpTransport 抽象关系
 └── udp_transport_test.cpp    # 真实回环：单播 e2e + 组播/广播（可跳过）
@@ -53,14 +53,14 @@ struct UdpConfig {
 
 ---
 
-## 3. `UdpTransport`（单类多模式，组合 `TransportCore`）
+## 3. `UdpImpl`（单类多模式，组合 `TransportCore`）
 
 ```cpp
-class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITransport
-                     public std::enable_shared_from_this<UdpTransport> {
+class UdpImpl : public IUdpTransport,   // IUdpTransport : public ITransport
+                     public std::enable_shared_from_this<UdpImpl> {
  public:
-  explicit UdpTransport(UdpConfig config);
-  ~UdpTransport() override;
+  explicit UdpImpl(UdpConfig config);
+  ~UdpImpl() override;
 
   // 生命周期 + 发送（自有逻辑）
   Status Open() override;   // 按 mode 配置 socket，启动接收循环
@@ -99,7 +99,7 @@ class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITranspor
 };
 ```
 
-> **设计说明（组合而非继承）：** `UdpTransport` 直接实现 `IUdpTransport`（= `ITransport` + `SendTo`），并**持有**一个 `TransportCore core_` 提供接收交付与编解码机能。接收侧五个方法一行转发给 `core_`；io handler 收到 datagram 调 `core_.DeliverFrame(...)`，发送前调 `core_.EncodeForSend(...)`。这样彻底避免「`TransportBase` 与 `IUdpTransport` 同源 `ITransport`」的菱形——无需虚继承、无多继承谜题，UDP / DDS 一视同仁。
+> **设计说明（组合而非继承）：** `UdpImpl` 直接实现 `IUdpTransport`（= `ITransport` + `SendTo`），并**持有**一个 `TransportCore core_` 提供接收交付与编解码机能。接收侧五个方法一行转发给 `core_`；io handler 收到 datagram 调 `core_.DeliverFrame(...)`，发送前调 `core_.EncodeForSend(...)`。这样彻底避免「`TransportBase` 与 `IUdpTransport` 同源 `ITransport`」的菱形——无需虚继承、无多继承谜题，UDP / DDS 一视同仁。
 >
 > **这是本 spec 锁定的一处 Foundation 重构（UDP plan 的前置任务）：** 把 `TransportBase` 改造为不继承 `ITransport` 的组件 `TransportCore`（成员与方法语义不变，仅去掉 `: public ITransport` 与各 `override`，改作被持有组件；接收侧公共方法 `SetCodec/Receive/OnReceive/AsyncReceive/OnDisconnect` + 生产侧 protected 工具 `EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/Close/NowMicros` 全部保留，回调类型用 `ITransport::ReceiveCallback`/`DisconnectCallback`）。同时把现有 `TcpConnectionImpl`（及经它的 `TcpClientImpl`）从「继承 `TransportBase`」改为「持有 `TransportCore` + 五行转发」。要求 Foundation + TCP 既有 57 个测试在重构后全绿，再实现 UDP。`TcpServerImpl` 不受影响（本就未用 `TransportBase`）。
 
@@ -135,7 +135,7 @@ class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITranspor
 
 ### 3.3 生命周期
 
-- `UdpTransport` 自有 `io_context` + 1 后台 io 线程（构造时起，`Close()`/析构时停）。
+- `UdpImpl` 自有 `io_context` + 1 后台 io 线程（构造时起，`Close()`/析构时停）。
 - `Close()`：`open_=false`；在 strand 上关 socket；`core_.Close()` 唤醒接收侧；`guard_.reset()` + `ctx_.stop()` + join io 线程。幂等。
 - `LocalPort()` 返回 `local_port_`。
 
@@ -143,7 +143,7 @@ class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITranspor
 
 ## 4. 线程模型与错误语义
 
-- 并发与 TCP 一致：每个 `UdpTransport` 一个 `io_context` + 一个 io 线程；async 操作经 strand；handler 用 `shared_from_this` 保活；实例 `make_shared` 持有。
+- 并发与 TCP 一致：每个 `UdpImpl` 一个 `io_context` + 一个 io 线程；async 操作经 strand；handler 用 `shared_from_this` 保活；实例 `make_shared` 持有。
 - 接收落入线程安全的 `ReceiveQueue`，应用线程用 `Receive/OnReceive/AsyncReceive` 取。
 
 错误前缀（沿用主 spec §3）：
@@ -167,13 +167,13 @@ UDP 无连接，故不产生 `conn:`/`timeout:`/`frame:`。
 - 编译期确认 `IUdpTransport` 继承自 `ITransport`。
 
 **`udp_transport_test`（单播——必须真实 e2e）：**
-- 两个单播 `UdpTransport`（A bind 临时端口、B bind 临时端口，互设对方为 remote）；A `Send` → B `Receive` 收到，且 `Message.source` 为 A 的 `"ip:port"`；
+- 两个单播 `UdpImpl`（A bind 临时端口、B bind 临时端口，互设对方为 remote）；A `Send` → B `Receive` 收到，且 `Message.source` 为 A 的 `"ip:port"`；
 - `SendTo(data, "127.0.0.1", B_port)` 忽略默认 remote，B 收到；
 - codec（ShiftCodec）在收发两侧正确应用；无 codec 透传；
 - 向未打开的 transport `Send` 返回错误。
 
 **`udp_transport_test`（组播——支持则 e2e，否则跳过）：**
-- 一个组播 `UdpTransport`（如 group `239.255.0.1`、临时 `local_port`、`enable_loopback`）`Send` → 自身 `Receive` 收到；
+- 一个组播 `UdpImpl`（如 group `239.255.0.1`、临时 `local_port`、`enable_loopback`）`Send` → 自身 `Receive` 收到；
 - 若 `Open()` 因环境不支持 join/loopback 返回 `config:` 错误，或回环投递在超时内未达 → `GTEST_SKIP() << "multicast loopback not supported in this environment"`，不判失败。
 
 **`udp_transport_test`（广播——支持则 e2e，否则跳过）：**
@@ -189,7 +189,7 @@ UDP 无连接，故不产生 `conn:`/`timeout:`/`frame:`。
 - 组合 `TransportCore`（原 `TransportBase`：编解码、三模式接收交付、时间戳）、`ReceiveQueue`。**不**使用 `IFramer`/`FrameAssembler`（UDP 报文保边界）。
 - 满足主 spec §6 全部公共 API 与 Send/SendTo 语义。
 - 唯一对外新增便利方法 `LocalPort()`（测试/运维）。
-- 一处 Foundation 重构（UDP plan 前置任务）：`TransportBase` → 不继承 `ITransport` 的组合组件 `TransportCore`，`TcpConnectionImpl` 由继承改为持有 + 五行转发（见 §3 说明）；以「Foundation + TCP 既有 57 测试在重构后全绿」为通过门槛，再实现 UDP。`UdpTransport` 组合 `TransportCore`、直接实现 `IUdpTransport`，无菱形、无虚继承。
+- 一处 Foundation 重构（UDP plan 前置任务）：`TransportBase` → 不继承 `ITransport` 的组合组件 `TransportCore`，`TcpConnectionImpl` 由继承改为持有 + 五行转发（见 §3 说明）；以「Foundation + TCP 既有 57 测试在重构后全绿」为通过门槛，再实现 UDP。`UdpImpl` 组合 `TransportCore`、直接实现 `IUdpTransport`，无菱形、无虚继承。
 
 ## 7. 后续（不在本 spec 范围）
 
