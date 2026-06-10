@@ -11,11 +11,31 @@ add_library(transport STATIC
   src/core/version.cpp
   src/core/ReceiveQueue.cpp
   src/framing/LengthFieldFramer.cpp
+  src/tcp/TcpConnection.cpp
+  src/tcp/TcpClientTransport.cpp
+  src/tcp/TcpServerTransport.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_compile_features(transport PUBLIC cxx_std_17)
+
+include(FetchContent)
+find_package(Threads REQUIRED)
+
+FetchContent_Declare(
+  asio
+  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+  GIT_TAG asio-1-30-2
+)
+FetchContent_MakeAvailable(asio)
+
+add_library(asio_standalone INTERFACE)
+target_include_directories(asio_standalone INTERFACE ${asio_SOURCE_DIR}/asio/include)
+target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+target_link_libraries(asio_standalone INTERFACE Threads::Threads)
+
+target_link_libraries(transport PUBLIC asio_standalone)
 
 if(TRANSPORT_BUILD_TESTS)
   enable_testing()
@@ -38,6 +58,11 @@ if(TRANSPORT_BUILD_TESTS)
     tests/framing/frame_assembler_test.cpp
     tests/core/receive_queue_test.cpp
     tests/core/transport_base_test.cpp
+    tests/tcp/asio_smoke_test.cpp
+    tests/tcp/tcp_interfaces_test.cpp
+    tests/tcp/tcp_connection_test.cpp
+    tests/tcp/tcp_client_test.cpp
+    tests/tcp/tcp_server_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)
