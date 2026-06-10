@@ -60,9 +60,13 @@ Status UdpImpl::Open() {
     if (ec) return Status::Fail("config: invalid remote_addr");
     default_dest_ = asio::ip::udp::endpoint(raddr, config_.remote_port);
   }
-  // 单播/广播 remote_addr 为空：default_dest_ 留默认（仅 SendTo/接收可用）。
+  // 单播/广播 remote_addr 为空：default_dest_ 留默认（仅 SendTo/接收可用）；
+  // 此时调 Send() 会向 0.0.0.0:0 发出并经 core_.DeliverError 报 io: 错误。
 
-  local_port_ = socket_.local_endpoint().port();
+  asio::error_code lec;  // 用 error_code 重载，遵守框架不抛异常约定
+  auto le = socket_.local_endpoint(lec);
+  if (lec) return Status::Fail("config: local_endpoint: " + lec.message());
+  local_port_ = le.port();
   open_.store(true);
   auto self = shared_from_this();
   asio::post(strand_, [this, self]() { StartReceive(); });
