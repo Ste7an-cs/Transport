@@ -2,7 +2,7 @@
 
 > 本 spec 是主设计文档 `2026-06-09-transport-middleware-design.md` §5（TCP 传输）的**实现层细化**。主 spec 已锁定 TCP 的公共 API（`TcpClientConfig`/`TcpServerConfig`/`ITcpServer`、客户端与 accepted 连接共用 `ITransport`、广播 `Send`、framer 集成）；本 spec 锁定实现细节：Asio 选型、并发模型、类分解、重连、错误语义与测试策略，供后续 plan 直接落地。
 
-**Goal:** 在 Foundation 层（`TransportBase` + `FrameAssembler` + `ReceiveQueue`）之上实现 TCP 客户端与服务端，基于 Standalone Asio 的异步单线程 I/O 模型，客户端支持指数退避自动重连，全部以真实回环 socket 集成测试验证。
+**Goal:** 在 Foundation 层（`TransportCore` + `FrameAssembler` + `ReceiveQueue`）之上实现 TCP 客户端与服务端，基于 Standalone Asio 的异步单线程 I/O 模型，客户端支持指数退避自动重连，全部以真实回环 socket 集成测试验证。
 
 **Tech Stack:** C++17、Standalone Asio（FetchContent 拉取，`ASIO_STANDALONE`，header-only）、GoogleTest 1.14、Google C++ 风格。
 
@@ -62,34 +62,40 @@ struct TcpServerConfig {
 
 ## 3. 类分解
 
-### 3.1 `TcpConnectionImpl`（内部，继承 `TransportBase`）
+> 注：本 spec 初稿按「继承 `TransportBase`」描述；接收交付基座后续重构为**组合式组件 `TransportCore`**（见主 spec §3.4 / `2026-06-10-foundation-tcp-architecture.md`）。下文已对齐 as-built：`TcpConnectionImpl` **直接实现 `ITransport`** 并**持有 `TransportCore core_`**。
 
-包装一个**已连接**的 `asio::ip::tcp::socket`，实现 `ITransport` 的 `Open/Close/IsOpen/Send`。客户端连上后、服务端 accept 后都用它。
+### 3.1 `TcpConnectionImpl`（内部，实现 `ITransport`，组合 `TransportCore`）
+
+包装一个**已连接**的 `asio::ip::tcp::socket`，实现 `ITransport` 的 `Open/Close/IsOpen/Send`，接收侧方法转发给 `core_`。客户端连上后、服务端 accept 后都用它。
 
 ```cpp
-class TcpConnectionImpl : public TransportBase {
+class TcpConnectionImpl : public ITransport {   // 直接实现 ITransport
  public:
   // socket 已连接；io 由外部 io_context 驱动（client 自有 / server 共享）
   TcpConnectionImpl(asio::ip::tcp::socket socket,
                 std::shared_ptr<IFramer> framer);  // framer 可为 nullptr（透传）
 
   Status Open() override;     // 启动 async_read 循环（已连接，故仅启动读）
-  void Close() override;      // 关闭 socket + CloseQueue()
+  void Close() override;      // 关闭 socket + core_.Close()
   bool IsOpen() const override;
-  Status Send(const std::vector<uint8_t>& data) override;  // EncodeForSend → strand async_write
+  Status Send(const std::vector<uint8_t>& data) override;  // core_.EncodeForSend → strand async_write
+  // 接收侧 Receive/OnReceive/AsyncReceive/SetCodec/OnDisconnect 一行转发给 core_
 
   std::string PeerId() const;  // "ip:port"，作为 source / client_id
 
+ protected:
+  TransportCore core_;        // 接收交付 + 编解码（子类 TcpClientImpl 也用）
+
  private:
   void StartRead();           // 投递一次 async_read_some
-  void OnRead(error_code ec, size_t n);  // Feed 切帧 → DeliverFrame；ec → 断连
+  void OnRead(error_code ec, size_t n);  // Feed 切帧 → core_.DeliverFrame；ec → 断连
   // socket_, strand_, read_buffer_, assembler_(FrameAssembler), peer_id_, open_ 标志
 };
 ```
 
-- **收：** `StartRead` 投递 `async_read_some` 到内部读缓冲；`OnRead` 把读到的字节交给 `FrameAssembler.Feed`，对每个切出的帧调用 `DeliverFrame(frame, PeerId(), "")`（topic 为空，TCP 无 topic）。Feed 返回 `frame:` 错误（帧非法）时投递错误并断开。读到 eof/错误 → 进入断连流程。
-- **发：** `Send` 先 `EncodeForSend`，再 `asio::post(strand_, ...)` 经 strand 串行化 `async_write`，避免并发写交叠。返回 `Status` 表示「已入队写出」，不代表对端已收（主 spec §10）。连接已关时返回 `conn:` 错误。
-- **断连：** `OnRead` 收到 eof/error → 标记关闭、`CloseQueue()` 唤醒接收侧、`NotifyDisconnect("conn: ...")`。`TcpConnectionImpl` 自身不重连（重连是客户端职责，见 §3.2）。
+- **收：** `StartRead` 投递 `async_read_some` 到内部读缓冲；`OnRead` 把读到的字节交给 `FrameAssembler.Feed`，对每个切出的帧调用 `core_.DeliverFrame(frame, PeerId(), "")`（topic 为空，TCP 无 topic）。Feed 返回 `frame:` 错误（帧非法）时投递错误并断开。读到 eof/错误 → 进入断连流程。
+- **发：** `Send` 先 `core_.EncodeForSend`，再 `asio::post(strand_, ...)` 经 strand 串行化 `async_write`，避免并发写交叠。返回 `Status` 表示「已入队写出」，不代表对端已收（主 spec §10）。连接已关时返回 `conn:` 错误。
+- **断连：** `OnRead` 收到 eof/error → 标记关闭、`core_.Close()` 唤醒接收侧、`core_.NotifyDisconnect("conn: ...")`。`TcpConnectionImpl` 自身不重连（重连是客户端职责，见 §3.2）。
 
 ### 3.2 `TcpClientImpl`（继承 `TcpConnectionImpl`）
 
@@ -159,12 +165,12 @@ class TcpServerImpl : public ITcpServer {  // ITcpServer : public ITransport
 
 ### 4.1 接收路径
 ```
-io 线程: async_read_some → FrameAssembler.Feed(切帧) → 每帧 DeliverFrame(payload, "ip:port", "")
-                                                              ↓ (TransportBase: Decode if codec)
+io 线程: async_read_some → FrameAssembler.Feed(切帧) → 每帧 core_.DeliverFrame(payload, "ip:port", "")
+                                                              ↓ (TransportCore: Decode if codec)
                                                           ReceiveQueue.Push  (线程安全)
 应用线程: Receive(timeout) / OnReceive 回调 / AsyncReceive future  取出
 ```
-- `DeliverFrame` 内部按 `TransportBase` 既有逻辑：有 codec 先 `Decode`（失败投递 `codec:` 错误），无 codec 透传；填 `source="ip:port"`、`topic=""`、`timestamp`。
+- `core_.DeliverFrame` 内部按 `TransportCore` 既有逻辑：有 codec 先 `Decode`（失败投递 `codec:` 错误），无 codec 透传；填 `source="ip:port"`、`topic=""`、`timestamp`。
 
 ### 4.2 发送路径
 ```
@@ -225,7 +231,7 @@ TCP 实现本质是真实 I/O，采用 **127.0.0.1 + 临时端口（`port = 0` �
 
 ## 7. 与 Foundation / 主 spec 的衔接
 
-- 复用 `TransportBase`（编解码、三模式接收交付、断连通知、时间戳）、`FrameAssembler`（接收侧分帧）、`LengthFieldFramer`、`ReceiveQueue`。
+- 组合 `TransportCore`（编解码、三模式接收交付、断连通知、时间戳）、`FrameAssembler`（接收侧分帧）、`LengthFieldFramer`、`ReceiveQueue`。
 - 满足主 spec §5 全部公共 API 与行为表。
 - 不引入新的对外接口（除 `LocalPort()` 这一测试/运维便利方法）。
 
