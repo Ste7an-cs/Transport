@@ -2,7 +2,7 @@
 
 > 本 spec 是主设计文档 `2026-06-09-transport-middleware-design.md` §6（UDP 传输）的**实现层细化**。主 spec 已锁定 UDP 的公共 API（`UdpMode`、`UdpConfig`、`IUdpTransport` + `SendTo`、Send 按 mode 的默认目的地语义）；本 spec 锁定实现细节：单类多模式结构、并发模型、按 mode 的 socket 配置、错误语义与测试策略，供后续 plan 直接落地。
 
-**Goal:** 在 Foundation 层（`TransportBase` + `ReceiveQueue`）之上实现 UDP 单播 / 组播 / 广播传输，基于 Standalone Asio 的异步单线程 I/O 模型，单个 `UdpTransport` 类按 mode 分支配置 socket，以真实回环 socket 集成测试验证（组播/广播在不支持的环境下优雅跳过）。
+**Goal:** 在 Foundation 层（`TransportCore`〔原 `TransportBase`，本 spec 重构为组合组件〕+ `ReceiveQueue`）之上实现 UDP 单播 / 组播 / 广播传输，基于 Standalone Asio 的异步单线程 I/O 模型，单个 `UdpTransport` 类按 mode 分支配置 socket，以真实回环 socket 集成测试验证（组播/广播在不支持的环境下优雅跳过）。
 
 **Tech Stack:** C++17、Standalone Asio（已由 TCP 任务集成，`ASIO_STANDALONE`）、GoogleTest 1.14、Google C++ 风格。
 
@@ -12,7 +12,7 @@
 
 ## 1. 范围与文件布局
 
-单个 `UdpTransport` 处理全部三种模式（单播 / 组播 / 广播），满足主 spec §6.1 的单一 `IUdpTransport`。复用 Foundation 的 `TransportBase`。
+单个 `UdpTransport` 处理全部三种模式（单播 / 组播 / 广播），满足主 spec §6.1 的单一 `IUdpTransport`。组合 Foundation 的 `TransportCore`（原 `TransportBase`，本 spec 重构为被持有组件）。
 
 ```
 include/transport/udp/
@@ -53,23 +53,29 @@ struct UdpConfig {
 
 ---
 
-## 3. `UdpTransport`（单类多模式，经 `TransportBase`）
+## 3. `UdpTransport`（单类多模式，组合 `TransportCore`）
 
 ```cpp
-class UdpTransport : public IUdpTransport,             // IUdpTransport : public ITransport
-                     public TransportBase,
+class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITransport
                      public std::enable_shared_from_this<UdpTransport> {
  public:
   explicit UdpTransport(UdpConfig config);
   ~UdpTransport() override;
 
+  // 生命周期 + 发送（自有逻辑）
   Status Open() override;   // 按 mode 配置 socket，启动接收循环
-  void Close() override;    // 关 socket + CloseQueue() + 停 io 线程
+  void Close() override;    // 关 socket + core_.Close() + 停 io 线程
   bool IsOpen() const override;
-
   Status Send(const std::vector<uint8_t>& data) override;             // 发往默认目的地
   Status SendTo(const std::vector<uint8_t>& data,
                 const std::string& ip, uint16_t port) override;       // 发往运行期目的地
+
+  // 接收侧：一行转发给 core_（TransportCore = 原 TransportBase 的组合化版本）
+  void SetCodec(std::shared_ptr<ICodec> c) override { core_.SetCodec(std::move(c)); }
+  Result<Message> Receive(uint32_t timeout_ms) override { return core_.Receive(timeout_ms); }
+  void OnReceive(ReceiveCallback cb) override { core_.OnReceive(std::move(cb)); }
+  std::future<Result<Message>> AsyncReceive() override { return core_.AsyncReceive(); }
+  void OnDisconnect(DisconnectCallback cb) override { core_.OnDisconnect(std::move(cb)); }
 
   uint16_t LocalPort() const;  // 实际绑定端口
 
@@ -79,8 +85,10 @@ class UdpTransport : public IUdpTransport,             // IUdpTransport : public
                         const asio::ip::udp::endpoint& dest);
 
   UdpConfig config_;
+  TransportCore core_;     // 编解码 + ReceiveQueue + 交付（io handler 调 core_.DeliverFrame）
   asio::io_context ctx_;
   asio::executor_work_guard<asio::io_context::executor_type> guard_;
+  asio::strand<asio::io_context::executor_type> strand_;
   asio::ip::udp::socket socket_;
   asio::ip::udp::endpoint default_dest_;     // Open() 时按 mode 解析
   asio::ip::udp::endpoint recv_from_;        // async_receive_from 填充发送方
@@ -91,7 +99,9 @@ class UdpTransport : public IUdpTransport,             // IUdpTransport : public
 };
 ```
 
-> 说明：`UdpTransport` 多重继承 `IUdpTransport`（其本身继承 `ITransport`）与 `TransportBase`（也继承 `ITransport`）。`TransportBase` 提供 `ITransport` 的接收侧/编解码实现；`IUdpTransport` 只新增纯虚 `SendTo`。为避免 `ITransport` 菱形二义，`TransportBase` 与 `IUdpTransport` 对 `ITransport` 采用**虚继承**（`class TransportBase : public virtual ITransport`、`class IUdpTransport : public virtual ITransport`）。**这是本 spec 锁定的一处 Foundation 调整**：把 `ITransport` 在 `TransportBase` 与各 `I*Transport` 扩展接口处改为虚继承（TCP 的 `TcpConnection` 经 `TransportBase` 单链继承不受影响；`ITcpServer`/`IUdpTransport` 改为 `public virtual ITransport`）。
+> **设计说明（组合而非继承）：** `UdpTransport` 直接实现 `IUdpTransport`（= `ITransport` + `SendTo`），并**持有**一个 `TransportCore core_` 提供接收交付与编解码机能。接收侧五个方法一行转发给 `core_`；io handler 收到 datagram 调 `core_.DeliverFrame(...)`，发送前调 `core_.EncodeForSend(...)`。这样彻底避免「`TransportBase` 与 `IUdpTransport` 同源 `ITransport`」的菱形——无需虚继承、无多继承谜题，UDP / DDS 一视同仁。
+>
+> **这是本 spec 锁定的一处 Foundation 重构（UDP plan 的前置任务）：** 把 `TransportBase` 改造为不继承 `ITransport` 的组件 `TransportCore`（成员与方法语义不变，仅去掉 `: public ITransport` 与各 `override`，改作被持有组件；接收侧公共方法 `SetCodec/Receive/OnReceive/AsyncReceive/OnDisconnect` + 生产侧 protected 工具 `EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/Close/NowMicros` 全部保留，回调类型用 `ITransport::ReceiveCallback`/`DisconnectCallback`）。同时把现有 `TcpConnection`（及经它的 `TcpClientTransport`）从「继承 `TransportBase`」改为「持有 `TransportCore` + 五行转发」。要求 Foundation + TCP 既有 57 个测试在重构后全绿，再实现 UDP。`TcpServerTransport` 不受影响（本就未用 `TransportBase`）。
 
 ### 3.1 `Open()` 按 mode 配置
 
@@ -117,16 +127,16 @@ class UdpTransport : public IUdpTransport,             // IUdpTransport : public
 
 ### 3.2 接收 / 发送
 
-- **接收循环（io 线程）：** `socket_.async_receive_from(buffer(recv_buf_), recv_from_, ...)`。回调：
-  - 无错误：把 `recv_buf_[0..n)` 连同 `recv_from_`（`"ip:port"`）交给 `DeliverFrame(datagram, source, "")`（topic 为空；有 codec 则 `Decode`，无则透传），再 `StartReceive()` 继续。
-  - 错误：若 socket 已关（`operation_aborted` 或 `open_==false`）则停止；否则投递 `io:` 错误（`DeliverError`）并继续 `StartReceive()`（单个报文错误不致命，如某些平台对早前 send 的 ICMP port-unreachable 会让一次 receive 返回 `connection_refused`）。
+- **接收循环（io 线程）：** `socket_.async_receive_from(buffer(recv_buf_), recv_from_, bind_executor(strand_, ...))`。回调：
+  - 无错误：把 `recv_buf_[0..n)` 连同 `recv_from_`（`"ip:port"`）交给 `core_.DeliverFrame(datagram, source, "")`（topic 为空；core_ 有 codec 则 `Decode`，无则透传），再 `StartReceive()` 继续。
+  - 错误：若 socket 已关（`operation_aborted` 或 `open_==false`）则停止；否则 `core_.DeliverError("io: ...")` 并继续 `StartReceive()`（单个报文错误不致命，如某些平台对早前 send 的 ICMP port-unreachable 会让一次 receive 返回 `connection_refused`）。
 
-- **发送：** `Send(data)` → `SendToEndpoint(data, default_dest_)`；`SendTo(data, ip, port)` → `SendToEndpoint(data, {make_address(ip), port})`。`SendToEndpoint` 先 `EncodeForSend`（有 codec 则 Encode），再经 strand `async_send_to`（与 TCP 一致用 strand 串行化写）。返回 `Status` 表示「已入队写出」，不代表对端已收（主 spec §10）。未打开（`open_==false`）时返回 `config: socket not open` 错误。
+- **发送：** `Send(data)` → `SendToEndpoint(data, default_dest_)`；`SendTo(data, ip, port)` → `SendToEndpoint(data, {make_address(ip), port})`。`SendToEndpoint` 先 `core_.EncodeForSend`（core_ 有 codec 则 Encode），再经 `strand_` `async_send_to`（与 TCP 一致用 strand 串行化写）。返回 `Status` 表示「已入队写出」，不代表对端已收（主 spec §10）。未打开（`open_==false`）时返回 `config: socket not open` 错误。
 
 ### 3.3 生命周期
 
 - `UdpTransport` 自有 `io_context` + 1 后台 io 线程（构造时起，`Close()`/析构时停）。
-- `Close()`：`open_=false`；在 strand 上关 socket；`CloseQueue()` 唤醒接收侧；`guard_.reset()` + `ctx_.stop()` + join io 线程。幂等。
+- `Close()`：`open_=false`；在 strand 上关 socket；`core_.Close()` 唤醒接收侧；`guard_.reset()` + `ctx_.stop()` + join io 线程。幂等。
 - `LocalPort()` 返回 `local_port_`。
 
 ---
@@ -176,10 +186,10 @@ UDP 无连接，故不产生 `conn:`/`timeout:`/`frame:`。
 
 ## 6. 与 Foundation / 主 spec 的衔接
 
-- 复用 `TransportBase`（编解码、三模式接收交付、时间戳）、`ReceiveQueue`。**不**使用 `IFramer`/`FrameAssembler`（UDP 报文保边界）。
+- 组合 `TransportCore`（原 `TransportBase`：编解码、三模式接收交付、时间戳）、`ReceiveQueue`。**不**使用 `IFramer`/`FrameAssembler`（UDP 报文保边界）。
 - 满足主 spec §6 全部公共 API 与 Send/SendTo 语义。
 - 唯一对外新增便利方法 `LocalPort()`（测试/运维）。
-- 一处 Foundation 调整：`TransportBase` 与 `I*Transport` 扩展接口对 `ITransport` 改为**虚继承**，以支持 `UdpTransport` 同时继承 `IUdpTransport` 与 `TransportBase`（见 §3 说明）；需回归 Foundation 与 TCP 既有测试仍全绿。
+- 一处 Foundation 重构（UDP plan 前置任务）：`TransportBase` → 不继承 `ITransport` 的组合组件 `TransportCore`，`TcpConnection` 由继承改为持有 + 五行转发（见 §3 说明）；以「Foundation + TCP 既有 57 测试在重构后全绿」为通过门槛，再实现 UDP。`UdpTransport` 组合 `TransportCore`、直接实现 `IUdpTransport`，无菱形、无虚继承。
 
 ## 7. 后续（不在本 spec 范围）
 
