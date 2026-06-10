@@ -19,10 +19,10 @@ namespace transport {
 
 // 已连接 socket 的收发循环：客户端连上后、服务端 accept 后均用它。
 // io 由 socket 所属的 io_context 驱动（本类不拥有线程）。须以 shared_ptr 持有。
-class TcpConnection : public TransportBase,
-                      public std::enable_shared_from_this<TcpConnection> {
+class TcpConnectionImpl : public TransportBase,
+                      public std::enable_shared_from_this<TcpConnectionImpl> {
  public:
-  TcpConnection(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer);
+  TcpConnectionImpl(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer);
 
   Status Open() override;   // 启动 async_read 循环
   void Close() override;    // 关闭 socket + CloseQueue()

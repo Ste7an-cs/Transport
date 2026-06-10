@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpServerTransport.hpp"
+#include "transport/tcp/TcpServerImpl.hpp"
 
 #include <utility>
 #include <variant>
@@ -7,16 +7,16 @@
 
 namespace transport {
 
-TcpServerTransport::TcpServerTransport(TcpServerConfig config)
+TcpServerImpl::TcpServerImpl(TcpServerConfig config)
     : config_(std::move(config)),
       guard_(ctx_.get_executor()),
       acceptor_(ctx_) {
   io_thread_ = std::thread([this] { ctx_.run(); });
 }
 
-TcpServerTransport::~TcpServerTransport() { Close(); }
+TcpServerImpl::~TcpServerImpl() { Close(); }
 
-Status TcpServerTransport::Open() {
+Status TcpServerImpl::Open() {
   if (config_.framer) {  // framer 配置校验（spec：非法则 config: 错误）
     auto v = LengthFieldFramer::ValidateConfig(*config_.framer);
     if (!v) return Status::Fail(v.error);
@@ -40,9 +40,9 @@ Status TcpServerTransport::Open() {
   return Status::Success(std::monostate{});
 }
 
-bool TcpServerTransport::IsOpen() const { return open_.load(); }
+bool TcpServerImpl::IsOpen() const { return open_.load(); }
 
-void TcpServerTransport::DoAccept() {
+void TcpServerImpl::DoAccept() {
   auto self = shared_from_this();
   acceptor_.async_accept([this, self](asio::error_code ec,
                                       asio::ip::tcp::socket sock) {
@@ -55,7 +55,7 @@ void TcpServerTransport::DoAccept() {
       if (dcb) dcb("conn: acceptor: " + ec.message());
       return;
     }
-    std::shared_ptr<TcpConnection> conn;
+    std::shared_ptr<TcpConnectionImpl> conn;
     ConnectionCallback cb_copy;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -66,11 +66,11 @@ void TcpServerTransport::DoAccept() {
         std::shared_ptr<IFramer> framer;
         if (config_.framer)
           framer = std::make_shared<LengthFieldFramer>(*config_.framer);
-        conn = std::make_shared<TcpConnection>(std::move(sock), framer);
+        conn = std::make_shared<TcpConnectionImpl>(std::move(sock), framer);
         if (codec_) conn->SetCodec(codec_);
         const std::string id = conn->PeerId();
         clients_[id] = conn;
-        std::weak_ptr<TcpServerTransport> wself = self;
+        std::weak_ptr<TcpServerImpl> wself = self;
         conn->OnDisconnect([wself, id](const std::string&) {
           if (auto s = wself.lock()) s->RemoveClient(id);
         });
@@ -83,13 +83,13 @@ void TcpServerTransport::DoAccept() {
   });
 }
 
-void TcpServerTransport::RemoveClient(const std::string& id) {
+void TcpServerImpl::RemoveClient(const std::string& id) {
   std::lock_guard<std::mutex> lock(mutex_);
   clients_.erase(id);
 }
 
-Status TcpServerTransport::Send(const std::vector<uint8_t>& data) {
-  std::vector<std::shared_ptr<TcpConnection>> snapshot;
+Status TcpServerImpl::Send(const std::vector<uint8_t>& data) {
+  std::vector<std::shared_ptr<TcpConnectionImpl>> snapshot;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : clients_) snapshot.push_back(kv.second);
@@ -98,44 +98,44 @@ Status TcpServerTransport::Send(const std::vector<uint8_t>& data) {
   return Status::Success(std::monostate{});
 }
 
-Result<Message> TcpServerTransport::Receive(uint32_t) {
+Result<Message> TcpServerImpl::Receive(uint32_t) {
   return Result<Message>::Fail(
       "config: 请使用 OnNewConnection 获取的 client_transport 进行接收");
 }
 
-void TcpServerTransport::OnReceive(ReceiveCallback) {}
+void TcpServerImpl::OnReceive(ReceiveCallback) {}
 
-std::future<Result<Message>> TcpServerTransport::AsyncReceive() {
+std::future<Result<Message>> TcpServerImpl::AsyncReceive() {
   std::promise<Result<Message>> p;
   p.set_value(Result<Message>::Fail(
       "config: 请使用 OnNewConnection 获取的 client_transport 进行接收"));
   return p.get_future();
 }
 
-void TcpServerTransport::OnDisconnect(DisconnectCallback cb) {
+void TcpServerImpl::OnDisconnect(DisconnectCallback cb) {
   std::lock_guard<std::mutex> lock(mutex_);
   disconnect_cb_ = std::move(cb);
 }
 
-void TcpServerTransport::SetCodec(std::shared_ptr<ICodec> codec) {
+void TcpServerImpl::SetCodec(std::shared_ptr<ICodec> codec) {
   std::lock_guard<std::mutex> lock(mutex_);
   codec_ = std::move(codec);
 }
 
-void TcpServerTransport::OnNewConnection(ConnectionCallback cb) {
+void TcpServerImpl::OnNewConnection(ConnectionCallback cb) {
   std::lock_guard<std::mutex> lock(mutex_);
   connection_cb_ = std::move(cb);
 }
 
-std::vector<std::shared_ptr<ITransport>> TcpServerTransport::GetClients() const {
+std::vector<std::shared_ptr<ITransport>> TcpServerImpl::GetClients() const {
   std::vector<std::shared_ptr<ITransport>> out;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& kv : clients_) out.push_back(kv.second);
   return out;
 }
 
-void TcpServerTransport::DisconnectClient(const std::string& client_id) {
-  std::shared_ptr<TcpConnection> conn;
+void TcpServerImpl::DisconnectClient(const std::string& client_id) {
+  std::shared_ptr<TcpConnectionImpl> conn;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = clients_.find(client_id);
@@ -146,10 +146,10 @@ void TcpServerTransport::DisconnectClient(const std::string& client_id) {
   conn->Close();
 }
 
-void TcpServerTransport::Close() {
+void TcpServerImpl::Close() {
   if (closing_.exchange(true)) return;
   open_.store(false);
-  std::vector<std::shared_ptr<TcpConnection>> snapshot;
+  std::vector<std::shared_ptr<TcpConnectionImpl>> snapshot;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : clients_) snapshot.push_back(kv.second);

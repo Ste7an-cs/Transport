@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpServerTransport.hpp"
+#include "transport/tcp/TcpServerImpl.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -10,15 +10,15 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/tcp/TcpClientTransport.hpp"
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 using transport::ITransport;
 using transport::Result;
 using transport::TcpClientConfig;
-using transport::TcpClientTransport;
+using transport::TcpClientImpl;
 using transport::TcpServerConfig;
-using transport::TcpServerTransport;
+using transport::TcpServerImpl;
 
 namespace {
 
@@ -29,13 +29,13 @@ TcpServerConfig ServerCfg() {
   return c;
 }
 
-std::shared_ptr<TcpClientTransport> MakeClient(uint16_t port) {
+std::shared_ptr<TcpClientImpl> MakeClient(uint16_t port) {
   TcpClientConfig c;
   c.host = "127.0.0.1";
   c.port = port;
   c.connect_timeout_ms = 1000;
   c.auto_reconnect = false;
-  return std::make_shared<TcpClientTransport>(c);
+  return std::make_shared<TcpClientImpl>(c);
 }
 
 void WaitFor(std::function<bool()> pred, int ms = 1000) {
@@ -46,7 +46,7 @@ void WaitFor(std::function<bool()> pred, int ms = 1000) {
 }  // namespace
 
 TEST(TcpServer, AcceptsConnectionAndDeliversPerClient) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::atomic<int> conns{0};
   std::shared_ptr<ITransport> accepted;
   server->OnNewConnection([&](std::shared_ptr<ITransport> c) {
@@ -72,7 +72,7 @@ TEST(TcpServer, AcceptsConnectionAndDeliversPerClient) {
 }
 
 TEST(TcpServer, BroadcastSendReachesAllClients) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::atomic<int> conns{0};
   server->OnNewConnection([&](std::shared_ptr<ITransport>) { ++conns; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));
@@ -98,7 +98,7 @@ TEST(TcpServer, BroadcastSendReachesAllClients) {
 }
 
 TEST(TcpServer, GetClientsAndDisconnectClient) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::shared_ptr<ITransport> accepted;
   server->OnNewConnection([&](std::shared_ptr<ITransport> c) { accepted = c; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));
@@ -110,8 +110,8 @@ TEST(TcpServer, GetClientsAndDisconnectClient) {
   WaitFor([&] { return server->GetClients().size() >= 1 && accepted != nullptr; });
   ASSERT_EQ(server->GetClients().size(), 1u);
 
-  // accepted 实为 TcpConnection；其 PeerId() 即 server 端登记的 client_id
-  auto conn = std::dynamic_pointer_cast<transport::TcpConnection>(accepted);
+  // accepted 实为 TcpConnectionImpl；其 PeerId() 即 server 端登记的 client_id
+  auto conn = std::dynamic_pointer_cast<transport::TcpConnectionImpl>(accepted);
   ASSERT_TRUE(conn != nullptr);
   server->DisconnectClient(conn->PeerId());
 
@@ -125,7 +125,7 @@ TEST(TcpServer, GetClientsAndDisconnectClient) {
 }
 
 TEST(TcpServer, ReceiveOnServerReturnsConfigError) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   ASSERT_TRUE(static_cast<bool>(server->Open()));
   auto r = server->Receive(10);
   EXPECT_FALSE(static_cast<bool>(r));
@@ -140,7 +140,7 @@ TEST(TcpServer, ReceiveOnServerReturnsConfigError) {
 TEST(TcpServer, MaxClientsRejectsExtra) {
   auto cfg = ServerCfg();
   cfg.max_clients = 1;
-  auto server = std::make_shared<TcpServerTransport>(cfg);
+  auto server = std::make_shared<TcpServerImpl>(cfg);
   std::atomic<int> conns{0};
   server->OnNewConnection([&](std::shared_ptr<ITransport>) { ++conns; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));

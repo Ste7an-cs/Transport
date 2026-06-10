@@ -11,9 +11,9 @@ add_library(transport STATIC
   src/core/version.cpp
   src/core/ReceiveQueue.cpp
   src/framing/LengthFieldFramer.cpp
-  src/tcp/TcpConnection.cpp
-  src/tcp/TcpClientTransport.cpp
-  src/tcp/TcpServerTransport.cpp
+  src/tcp/TcpConnectionImpl.cpp
+  src/tcp/TcpClientImpl.cpp
+  src/tcp/TcpServerImpl.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpClientTransport.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
 
 #include <algorithm>
 #include <future>
@@ -9,11 +9,11 @@
 
 namespace transport {
 
-TcpClientTransport::TcpClientTransport(TcpClientConfig config,
+TcpClientImpl::TcpClientImpl(TcpClientConfig config,
                                        std::chrono::milliseconds backoff_base,
                                        std::chrono::milliseconds backoff_cap)
     : detail::IoContextHolder(),
-      TcpConnection(asio::ip::tcp::socket(ctx),
+      TcpConnectionImpl(asio::ip::tcp::socket(ctx),
                     config.framer
                         ? std::make_shared<LengthFieldFramer>(*config.framer)
                         : nullptr),
@@ -28,9 +28,9 @@ TcpClientTransport::TcpClientTransport(TcpClientConfig config,
   io_thread_ = std::thread([this] { ctx.run(); });
 }
 
-TcpClientTransport::~TcpClientTransport() { Close(); }
+TcpClientImpl::~TcpClientImpl() { Close(); }
 
-Status TcpClientTransport::Open() {
+Status TcpClientImpl::Open() {
   // framer 配置校验（spec：非法则 config: 错误）
   if (config_.framer) {
     auto v = LengthFieldFramer::ValidateConfig(*config_.framer);
@@ -38,13 +38,13 @@ Status TcpClientTransport::Open() {
   }
   auto prom = std::make_shared<std::promise<Status>>();
   auto fut = prom->get_future();
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
   asio::post(strand_, [this, self, prom]() { StartConnect(prom); });
   return fut.get();  // 阻塞等待初次连接成败/超时
 }
 
-void TcpClientTransport::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+void TcpClientImpl::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
 
   // 已知限制：resolver_.resolve 为同步阻塞 DNS 查询，不受 connect_timeout_ms 约束；
   // connect_timeout_ms 仅约束 TCP 连接阶段。host 为 IP（如 127.0.0.1）时解析瞬时返回；
@@ -95,10 +95,10 @@ void TcpClientTransport::StartConnect(std::shared_ptr<std::promise<Status>> prom
           }));
 }
 
-void TcpClientTransport::ScheduleReconnect() {
+void TcpClientImpl::ScheduleReconnect() {
   if (closing_.load() || !config_.auto_reconnect) return;
   reconnect_timer_.expires_after(backoff_cur_);
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
   reconnect_timer_.async_wait(asio::bind_executor(
       strand_, [this, self](asio::error_code ec) {
         if (ec || closing_.load()) return;
@@ -107,7 +107,7 @@ void TcpClientTransport::ScheduleReconnect() {
       }));
 }
 
-void TcpClientTransport::HandleDisconnect(const std::string& reason) {
+void TcpClientImpl::HandleDisconnect(const std::string& reason) {
   if (!link_up_.exchange(false)) return;  // 每个连接周期只处理一次
   open_.store(false);
   asio::error_code ig;
@@ -121,7 +121,7 @@ void TcpClientTransport::HandleDisconnect(const std::string& reason) {
   }
 }
 
-void TcpClientTransport::Close() {
+void TcpClientImpl::Close() {
   if (closing_.exchange(true)) return;
   open_.store(false);
   link_up_.store(false);

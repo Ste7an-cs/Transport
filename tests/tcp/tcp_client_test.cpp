@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpClientTransport.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -13,7 +13,7 @@
 
 using transport::Result;
 using transport::TcpClientConfig;
-using transport::TcpClientTransport;
+using transport::TcpClientImpl;
 
 namespace {
 
@@ -99,7 +99,7 @@ TcpClientConfig ClientCfg(uint16_t port, bool reconnect) {
 TEST(TcpClient, ConnectAndReceive) {
   MiniServer server;
   // 退避参数无关紧要；用默认
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(server.port(), true));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(server.port(), true));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
 
   server.WriteToPeer({7, 8, 9});
@@ -111,7 +111,7 @@ TEST(TcpClient, ConnectAndReceive) {
 
 TEST(TcpClient, ConnectRefusedReturnsError) {
   // 连接一个没有监听者的端口
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(1, false));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(1, false));
   client->SetHost("127.0.0.1");
   auto st = client->Open();
   EXPECT_FALSE(static_cast<bool>(st));
@@ -125,7 +125,7 @@ TEST(TcpClient, AutoReconnectResumesAfterServerDrop) {
   MiniServer server;
   uint16_t port = server.port();
   // 用小退避基数（10ms）+ 小封顶（100ms）避免久等
-  auto client = std::make_shared<TcpClientTransport>(
+  auto client = std::make_shared<TcpClientImpl>(
       ClientCfg(port, true), std::chrono::milliseconds(10),
       std::chrono::milliseconds(100));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
@@ -148,7 +148,7 @@ TEST(TcpClient, AutoReconnectResumesAfterServerDrop) {
 
 TEST(TcpClient, NoReconnectWhenDisabled) {
   MiniServer server;
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(server.port(), false));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(server.port(), false));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
 
   bool disconnected = false;

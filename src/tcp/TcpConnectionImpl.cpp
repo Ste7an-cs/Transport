@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 #include <utility>
 
@@ -13,14 +13,14 @@ std::string EndpointId(const asio::ip::tcp::socket& s) {
 }
 }  // namespace
 
-TcpConnection::TcpConnection(asio::ip::tcp::socket socket,
+TcpConnectionImpl::TcpConnectionImpl(asio::ip::tcp::socket socket,
                              std::shared_ptr<IFramer> framer)
     : socket_(std::move(socket)),
       strand_(asio::make_strand(socket_.get_executor())),
       assembler_(std::move(framer)),
       peer_id_(EndpointId(socket_)) {}
 
-Status TcpConnection::Open() {
+Status TcpConnectionImpl::Open() {
   bool expected = false;
   if (!open_.compare_exchange_strong(expected, true)) {
     return Status::Success(std::monostate{});  // 已打开
@@ -30,9 +30,9 @@ Status TcpConnection::Open() {
   return Status::Success(std::monostate{});
 }
 
-bool TcpConnection::IsOpen() const { return open_.load(); }
+bool TcpConnectionImpl::IsOpen() const { return open_.load(); }
 
-void TcpConnection::StartRead() {
+void TcpConnectionImpl::StartRead() {
   auto self = shared_from_this();
   socket_.async_read_some(
       asio::buffer(read_buf_),
@@ -54,7 +54,7 @@ void TcpConnection::StartRead() {
           }));
 }
 
-Status TcpConnection::Send(const std::vector<uint8_t>& data) {
+Status TcpConnectionImpl::Send(const std::vector<uint8_t>& data) {
   if (!open_.load()) return Status::Fail("conn: not connected");
   auto enc = EncodeForSend(data);
   if (!enc) return Status::Fail(enc.error);
@@ -67,7 +67,7 @@ Status TcpConnection::Send(const std::vector<uint8_t>& data) {
   return Status::Success(std::monostate{});
 }
 
-void TcpConnection::DoWrite() {
+void TcpConnectionImpl::DoWrite() {
   writing_ = true;
   auto self = shared_from_this();
   asio::async_write(
@@ -88,7 +88,7 @@ void TcpConnection::DoWrite() {
           }));
 }
 
-void TcpConnection::HandleDisconnect(const std::string& reason) {
+void TcpConnectionImpl::HandleDisconnect(const std::string& reason) {
   if (disconnected_.exchange(true)) return;  // 每周期一次
   open_.store(false);
   asio::error_code ec;
@@ -98,7 +98,7 @@ void TcpConnection::HandleDisconnect(const std::string& reason) {
   NotifyDisconnect(reason);
 }
 
-void TcpConnection::Close() {
+void TcpConnectionImpl::Close() {
   open_.store(false);
   auto self = shared_from_this();
   asio::post(strand_, [this, self]() {

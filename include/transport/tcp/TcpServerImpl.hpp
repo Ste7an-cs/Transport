@@ -16,19 +16,19 @@
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
 #include "transport/tcp/ITcpServer.hpp"
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 #include "transport/tcp/TcpServerConfig.hpp"
 
 namespace transport {
 
 // TCP 服务端：自有 io_context + 1 线程；acceptor 每 accept 造一个共享该 io_context
-// 的 TcpConnection。须以 shared_ptr 持有。
-class TcpServerTransport
+// 的 TcpConnectionImpl。须以 shared_ptr 持有。
+class TcpServerImpl
     : public ITcpServer,
-      public std::enable_shared_from_this<TcpServerTransport> {
+      public std::enable_shared_from_this<TcpServerImpl> {
  public:
-  explicit TcpServerTransport(TcpServerConfig config);
-  ~TcpServerTransport() override;
+  explicit TcpServerImpl(TcpServerConfig config);
+  ~TcpServerImpl() override;
 
   Status Open() override;
   void Close() override;
@@ -61,7 +61,7 @@ class TcpServerTransport
   std::thread io_thread_;
 
   mutable std::mutex mutex_;
-  std::map<std::string, std::shared_ptr<TcpConnection>> clients_;
+  std::map<std::string, std::shared_ptr<TcpConnectionImpl>> clients_;
   ConnectionCallback connection_cb_;
   DisconnectCallback disconnect_cb_;
   std::shared_ptr<ICodec> codec_;

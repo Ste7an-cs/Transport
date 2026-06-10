@@ -1,4 +1,4 @@
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -16,7 +16,7 @@ using transport::ICodec;
 using transport::LengthFieldFramer;
 using transport::LengthFieldFramerConfig;
 using transport::Result;
-using transport::TcpConnection;
+using transport::TcpConnectionImpl;
 
 namespace {
 
@@ -89,10 +89,10 @@ struct IoRunner {
 
 }  // namespace
 
-TEST(TcpConnection, PassthroughReceivesRawBytes) {
+TEST(TcpConnectionImpl, PassthroughReceivesRawBytes) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->Open();
 
   BlockingWriteAll(pair.client, {10, 20, 30});
@@ -103,11 +103,11 @@ TEST(TcpConnection, PassthroughReceivesRawBytes) {
   conn->Close();
 }
 
-TEST(TcpConnection, FramerAssemblesAcrossWrites) {
+TEST(TcpConnectionImpl, FramerAssemblesAcrossWrites) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto framer = std::make_shared<LengthFieldFramer>(BeConfig());
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), framer);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
   conn->Open();
 
   auto frame = BuildFrame(5, 0xAB);  // 13 字节
@@ -120,10 +120,10 @@ TEST(TcpConnection, FramerAssemblesAcrossWrites) {
   conn->Close();
 }
 
-TEST(TcpConnection, SendWritesToPeer) {
+TEST(TcpConnectionImpl, SendWritesToPeer) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->Open();
 
   auto st = conn->Send({1, 2, 3, 4});
@@ -135,10 +135,10 @@ TEST(TcpConnection, SendWritesToPeer) {
   conn->Close();
 }
 
-TEST(TcpConnection, CodecAppliedBothDirections) {
+TEST(TcpConnectionImpl, CodecAppliedBothDirections) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->SetCodec(std::make_shared<ShiftCodec>());
   conn->Open();
 
@@ -156,10 +156,10 @@ TEST(TcpConnection, CodecAppliedBothDirections) {
   conn->Close();
 }
 
-TEST(TcpConnection, PeerCloseTriggersDisconnectAndConnError) {
+TEST(TcpConnectionImpl, PeerCloseTriggersDisconnectAndConnError) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   std::string reason;
   conn->OnDisconnect([&](const std::string& r) { reason = r; });
   conn->Open();
@@ -174,13 +174,13 @@ TEST(TcpConnection, PeerCloseTriggersDisconnectAndConnError) {
   EXPECT_EQ(reason.rfind("conn:", 0), 0u);
 }
 
-TEST(TcpConnection, FrameErrorDeliversFrameError) {
+TEST(TcpConnectionImpl, FrameErrorDeliversFrameError) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto c = BeConfig();
   c.max_frame_size = 4;  // 任何正常帧都会越界
   auto framer = std::make_shared<LengthFieldFramer>(c);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), framer);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
   conn->Open();
 
   BlockingWriteAll(pair.client, BuildFrame(100, 0x44));  // 触发 frame: 错误
