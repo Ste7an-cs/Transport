@@ -14,7 +14,7 @@ ctest --test-dir build --output-on-failure
 
 - [x] Foundation：核心接口、分帧、接收交付、传输基类
 - [x] TCP（client / server）
-- [ ] UDP（单播 / 组播 / 广播）
+- [x] UDP（单播 / 组播 / 广播）
 - [ ] 串口
 - [ ] DDS（Fast DDS，pub-sub / req-resp）
 - [ ] TransportFactory + JSON 配置
