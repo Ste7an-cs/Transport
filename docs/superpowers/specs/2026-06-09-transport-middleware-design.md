@@ -166,12 +166,11 @@ classDiagram
   ITransport <|-- IUdpTransport
   ITransport <|-- IDdsTransport
 
-  class TransportBase {
-    +Receive() +OnReceive() +AsyncReceive() +SetCodec()
-    #DeliverFrame() #EncodeForSend()
-    #DeliverError() #NotifyDisconnect() #CloseQueue()
+  class TransportCore {
+    +SetCodec() +Receive() +OnReceive() +AsyncReceive() +OnDisconnect()
+    +EncodeForSend() +DeliverFrame()
+    +DeliverError() +NotifyDisconnect() +Close()
   }
-  ITransport <|.. TransportBase : 接收侧通用实现
 
   class TcpConnectionImpl
   class TcpClientImpl
@@ -180,17 +179,18 @@ classDiagram
   class DdsImpl
   class SerialImpl
 
-  TransportBase <|-- TcpConnectionImpl
+  ITransport <|.. TcpConnectionImpl
   TcpConnectionImpl <|-- TcpClientImpl
   ITcpServer <|.. TcpServerImpl
   TcpServerImpl o-- TcpConnectionImpl : 管理客户端连接
-
   IUdpTransport <|.. UdpImpl
   IDdsTransport <|.. DdsImpl
   ITransport <|.. SerialImpl
-  TransportBase <|-- SerialImpl
-  UdpImpl ..> TransportBase : 复用接收侧（继承or组合，待议）
-  DdsImpl ..> TransportBase : 复用接收侧（待议）
+
+  TcpConnectionImpl *-- TransportCore : 组合（持有）
+  UdpImpl *-- TransportCore : 组合（持有）
+  DdsImpl *-- TransportCore : 组合（持有）
+  SerialImpl *-- TransportCore : 组合（持有）
 
   class TransportFactory {
     <<factory>>
@@ -199,13 +199,13 @@ classDiagram
   TransportFactory ..> ITransport : 创建并回交接口句柄
 ```
 
-> **状态：** `ITransport` / `ITcpServer` / `TransportBase` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` 已实现（Foundation + TCP）；`IUdpTransport` / `IDdsTransport` / `UdpImpl` / `DdsImpl` / `SerialImpl` / `TransportFactory` 规划中。
+> **状态：** `ITransport` / `ITcpServer` / `IUdpTransport` / `TransportCore` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` / `UdpImpl` 已实现（Foundation + TCP + UDP）；`IDdsTransport` / `DdsImpl` / `SerialImpl` / `TransportFactory` 规划中。
 >
-> **支撑设施：** `ICodec`（用户实现）、`IFramer ◁── LengthFieldFramer`、`FrameAssembler`、`ReceiveQueue`、`Message`、`Result<T>`——均已实现。`TransportBase` 内部持有 `ReceiveQueue` 并用 `ICodec` 编解码；流式传输（TCP/串口）接收侧经 `FrameAssembler` + `IFramer` 分帧。`TcpServerImpl` 不经 `TransportBase`（只 accept + 广播，不维护接收队列）。
+> **支撑设施：** `ICodec`（用户实现）、`IFramer ◁── LengthFieldFramer`、`FrameAssembler`、`ReceiveQueue`、`Message`、`Result<T>`——均已实现。`TransportCore` 内部持有 `ReceiveQueue` 并用 `ICodec` 编解码，被各「会收数据」的传输**组合持有**；流式传输（TCP/串口）接收侧经 `FrameAssembler` + `IFramer` 分帧。`TcpServerImpl` 不组合 `TransportCore`（只 accept + 广播，不维护接收队列）。
 >
 > 为什么要 `I*` 接口而不止一个实现类：① `TransportFactory` 据接口返回句柄；② 消费者头文件不被 asio/Fast DDS 等依赖污染；③ 可替换 / 可用 fake 测试上层；④ 全框架一致。
 >
-> 注：`TransportBase` 当前 `: public ITransport`。UDP/DDS 阶段拟将其改为**被持有的组件 `TransportCore`**（组合替代继承，消除「与扩展接口同源 `ITransport`」的菱形）——该重构**待议**，详见 `docs/superpowers/specs/2026-06-10-udp-transport-design.md`。
+> 注：接收交付基座**已由继承式 `TransportBase` 重构为组合式组件 `TransportCore`**（B 方案：组合替代继承，从根上消除「与扩展接口同源 `ITransport`」的菱形）。`TcpConnectionImpl`/`UdpImpl`/（未来）`DdsImpl`/`SerialImpl` 均**持有** `TransportCore` 并转发接收侧方法。详见 `2026-06-10-foundation-tcp-architecture.md`。
 >
 > **已实现部分（Foundation + TCP）的 as-built 类图/时序图/依赖说明**见 `docs/superpowers/specs/2026-06-10-foundation-tcp-architecture.md`。
 

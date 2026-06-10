@@ -4,7 +4,7 @@
 // TcpServerImpl.hpp — TCP 服务端（ITcpServer 实现）
 // 自有 io_context + 1 后台线程（acceptor 与所有 accepted 连接共享）；每 accept
 // 造一个 TcpConnectionImpl 交给 OnNewConnection，维护 clients_ 表，Send 广播。
-// 不经 TransportBase（自身不收数据）。须以 shared_ptr 持有。
+// 不经 TransportCore（自身不收数据）。须以 shared_ptr 持有。
 // -----------------------------------------------------------------------------
 
 #include <atomic>

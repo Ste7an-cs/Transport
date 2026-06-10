@@ -14,6 +14,7 @@ add_library(transport STATIC
   src/tcp/TcpConnectionImpl.cpp
   src/tcp/TcpClientImpl.cpp
   src/tcp/TcpServerImpl.cpp
+  src/udp/UdpImpl.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -57,12 +58,14 @@ if(TRANSPORT_BUILD_TESTS)
     tests/framing/length_field_framer_test.cpp
     tests/framing/frame_assembler_test.cpp
     tests/core/receive_queue_test.cpp
-    tests/core/transport_base_test.cpp
+    tests/core/transport_core_test.cpp
     tests/tcp/asio_smoke_test.cpp
     tests/tcp/tcp_interfaces_test.cpp
     tests/tcp/tcp_connection_test.cpp
     tests/tcp/tcp_client_test.cpp
     tests/tcp/tcp_server_test.cpp
+    tests/udp/udp_interfaces_test.cpp
+    tests/udp/udp_transport_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)

@@ -129,12 +129,12 @@ void TcpClientImpl::HandleDisconnect(const std::string& reason) {
   open_.store(false);
   asio::error_code ig;
   socket_.close(ig);
-  NotifyDisconnect(reason);
+  core_.NotifyDisconnect(reason);
   if (config_.auto_reconnect && !closing_.load()) {
-    ScheduleReconnect();  // 复用接收队列，不 CloseQueue
+    ScheduleReconnect();  // 复用接收队列，不 core_.Close
   } else {
-    DeliverError(reason);
-    CloseQueue();
+    core_.DeliverError(reason);
+    core_.Close();
   }
 }
 
@@ -148,7 +148,7 @@ void TcpClientImpl::Close() {
     reconnect_timer_.cancel();
     socket_.close(ig);
   });
-  CloseQueue();
+  core_.Close();
   guard_.reset();
   ctx.stop();
   if (io_thread_.joinable()) io_thread_.join();
