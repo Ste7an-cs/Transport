@@ -1,5 +1,13 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// TransportBase.hpp — ITransport 接收侧 + 编解码的通用实现基类
+// 实现 Receive/OnReceive/AsyncReceive/SetCodec/OnDisconnect，并给子类 protected
+// 工具(EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/CloseQueue)；
+// Open/Close/IsOpen/Send 留给子类。内部组合 ReceiveQueue + 持有 ICodec。
+// 被「会收数据」的传输复用（如 TcpConnectionImpl）；TcpServerImpl 不用它。
+// -----------------------------------------------------------------------------
+
 #include <chrono>
 #include <cstdint>
 #include <memory>

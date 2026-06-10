@@ -1,5 +1,12 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// ITransport.hpp — 所有传输的统一抽象接口
+// 生命周期(Open/Close/IsOpen) + 发送(Send) + 三模式接收(Receive/OnReceive/
+// AsyncReceive) + 断连通知(OnDisconnect) + 编解码挂载(SetCodec)。
+// 具体实现：TcpConnectionImpl / TcpClientImpl / TcpServerImpl(扩展 ITcpServer) 等。
+// -----------------------------------------------------------------------------
+
 #include <cstdint>
 #include <functional>
 #include <future>

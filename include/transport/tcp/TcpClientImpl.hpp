@@ -1,5 +1,12 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// TcpClientImpl.hpp — TCP 客户端（继承 TcpConnectionImpl）
+// 在连接实现之上加 connect + connect_timeout + 指数退避自动重连；自有
+// io_context + 1 后台 I/O 线程。首基类 detail::IoContextHolder 保证 io_context
+// 先于 TcpConnectionImpl 的 socket 构造。须以 shared_ptr 持有。
+// -----------------------------------------------------------------------------
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>

@@ -1,5 +1,12 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// Result.hpp — 统一返回类型 Result<T> / Status
+// 框架不抛异常：所有可能失败的操作返回 Result<T>（成功值 + ok 标志 + 错误串）。
+// Status = Result<std::monostate>，用于「只表示成败」的操作。
+// 错误串按前缀分类：timeout: / conn: / codec: / frame: / io: / config:
+// -----------------------------------------------------------------------------
+
 #include <string>
 #include <utility>
 #include <variant>

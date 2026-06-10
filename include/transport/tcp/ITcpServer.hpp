@@ -1,5 +1,11 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// ITcpServer.hpp — TCP 服务端扩展接口（ITransport + 连接管理）
+// 在 ITransport 基础上加 OnNewConnection（每客户端独立 ITransport）/GetClients/
+// DisconnectClient；继承的 Send=广播、Receive 不适用。实现见 TcpServerImpl。
+// -----------------------------------------------------------------------------
+
 #include <functional>
 #include <memory>
 #include <string>

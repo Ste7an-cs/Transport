@@ -1,5 +1,11 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// Message.hpp — 交付给应用层的一条消息
+// 经 ICodec.Decode 后由框架组装：payload（字节）+ topic / source / timestamp。
+// 各传输统一以 Result<Message> 经 ReceiveQueue 投递给应用层。
+// -----------------------------------------------------------------------------
+
 #include <cstdint>
 #include <string>
 #include <vector>

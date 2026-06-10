@@ -2,6 +2,8 @@
 
 #include <variant>
 
+// LengthFieldFramer.cpp — 「固定 header + 长度字段」分帧实现（见 LengthFieldFramer.hpp）。
+
 namespace transport {
 
 Status LengthFieldFramer::ValidateConfig(const LengthFieldFramerConfig& c) {
@@ -23,8 +25,14 @@ Status LengthFieldFramer::ValidateConfig(const LengthFieldFramerConfig& c) {
 LengthFieldFramer::LengthFieldFramer(LengthFieldFramerConfig config)
     : config_(config) {}
 
+// 从缓冲头部尝试切出一帧：
+//  ① 不足 header 长 → 数据不足，等待；
+//  ② 按配置的偏移/宽度/字节序读出 header 内长度字段，算出整帧长 frame_size；
+//  ③ frame_size 小于 header 或超过上限 → frame: 错误（调用方应断开）；
+//  ④ 缓冲不足整帧 → 数据不足，等待；
+//  ⑤ 够了 → 返回 consumed=frame_size、has_frame=true。
 Result<FrameResult> LengthFieldFramer::TryExtract(const uint8_t* buf, size_t len) {
-  if (len < config_.header_size) {
+  if (len < config_.header_size) {  // ① 连 header 都没收全
     return Result<FrameResult>::Success(FrameResult{0, false});
   }
 

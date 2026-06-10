@@ -1,5 +1,12 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// TcpConnectionImpl.hpp — 已连接 socket 的收发实现（ITransport）
+// 继承 TransportBase；包装一个已连接的 asio tcp socket：async_read 循环经
+// FrameAssembler 切帧 → DeliverFrame，写经 strand 串行化。客户端与服务端
+// accepted 连接共用它。不拥有 io 线程（由所属 io_context 驱动）。
+// -----------------------------------------------------------------------------
+
 #include <array>
 #include <atomic>
 #include <cstdint>

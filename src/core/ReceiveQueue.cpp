@@ -4,10 +4,19 @@
 #include <utility>
 #include <variant>
 
+// ReceiveQueue.cpp — FIFO + 三模式交付实现（见 ReceiveQueue.hpp）。
+// 并发要点：锁内只做队列/模式状态变更；回调调用与 promise 兑现一律移到锁外，
+// 避免「回调里再调用本队列」造成的重入死锁。
+
 namespace transport {
 
 ReceiveQueue::~ReceiveQueue() { Close(); }
 
+// 生产侧投递：按当前模式分派——
+//   kFuture 且有未决 future → 直接兑现该 future（锁外）；
+//   kCallback → 锁外调用回调；
+//   其余（kNone/kSync）→ 入队并唤醒同步等待者。
+// 队列已 Close 则丢弃。
 void ReceiveQueue::Push(Result<Message> msg) {
   Callback cb_copy;
   {

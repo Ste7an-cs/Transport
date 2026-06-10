@@ -1,5 +1,11 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// ReceiveQueue.hpp — FIFO 消息队列 + 三模式接收交付
+// 同步(Receive)/回调(OnReceive)/future(AsyncReceive) 三种交付互斥，由首个消费
+// 侧调用锁定。线程安全：I/O 线程 Push，应用线程消费。被 TransportBase 组合拥有。
+// -----------------------------------------------------------------------------
+
 #include <condition_variable>
 #include <cstdint>
 #include <deque>

@@ -7,6 +7,16 @@
 
 #include "transport/framing/LengthFieldFramer.hpp"
 
+// TcpClientImpl.cpp — TCP 客户端实现（见 TcpClientImpl.hpp）。
+//
+// 自有 io_context + 1 后台 io 线程。连接生命周期：
+//   Open()           同步发起首连（阻塞在 future 上等成败/超时）；
+//   断线 → HandleDisconnect → 指数退避 ScheduleReconnect（复用接收队列，不关）；
+//   Close()          停重连、关 socket、停 ctx 并 join 线程（幂等）。
+// link_up_ 闩保证「每个连接周期只处理一次断连」（read/write 同时报错也只处理一次）。
+// 构造顺序：detail::IoContextHolder 作首基类，使其 ctx 先于 TcpConnectionImpl 的
+// socket 构造（socket 需绑定到 ctx）。
+
 namespace transport {
 
 TcpClientImpl::TcpClientImpl(TcpClientConfig config,
@@ -30,6 +40,8 @@ TcpClientImpl::TcpClientImpl(TcpClientConfig config,
 
 TcpClientImpl::~TcpClientImpl() { Close(); }
 
+// 同步发起首次连接：把连接动作 post 到 io 线程，阻塞等待 prom 被设置
+// （成功/失败/超时三种结局都会 set_value），返回最终 Status。
 Status TcpClientImpl::Open() {
   // framer 配置校验（spec：非法则 config: 错误）
   if (config_.framer) {
@@ -43,6 +55,9 @@ Status TcpClientImpl::Open() {
   return fut.get();  // 阻塞等待初次连接成败/超时
 }
 
+// 在 io 线程上发起一次连接：resolve → 新建 socket → 起 connect 超时定时器 →
+// async_connect。prom 非空=首连（设置结果），空=重连（失败则继续退避）。
+// 超时定时器与 connect 完成互相取消：谁先触发，另一方在 strand 上看到取消/中止。
 void TcpClientImpl::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
   auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
 
@@ -95,6 +110,8 @@ void TcpClientImpl::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
           }));
 }
 
+// 退避重连：等待 backoff_cur_ 后再发起一次连接；每次失败退避翻倍并封顶到
+// backoff_cap_；连接成功时在 StartConnect 里复位为 backoff_base_。Close 后不再排程。
 void TcpClientImpl::ScheduleReconnect() {
   if (closing_.load() || !config_.auto_reconnect) return;
   reconnect_timer_.expires_after(backoff_cur_);

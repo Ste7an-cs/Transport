@@ -1,5 +1,11 @@
 #pragma once
 
+// -----------------------------------------------------------------------------
+// FrameAssembler.hpp — 接收侧分帧装配器（header-only）
+// 把字节追加进滚动缓冲，用持有的 IFramer 循环切出完整帧；framer 为 nullptr 时
+// 透传（每次 Feed 的数据原样作为一帧）。流式传输(TcpConnectionImpl)接收侧使用。
+// -----------------------------------------------------------------------------
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>

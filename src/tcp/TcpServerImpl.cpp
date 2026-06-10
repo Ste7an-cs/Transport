@@ -5,6 +5,13 @@
 
 #include "transport/framing/LengthFieldFramer.hpp"
 
+// TcpServerImpl.cpp — TCP 服务端实现（见 TcpServerImpl.hpp）。
+//
+// 自有 io_context + 1 后台 io 线程，被 acceptor 与所有 accepted 连接共享。
+// 不复用 TransportBase：服务端不维护接收队列，Receive/AsyncReceive 返回 config:
+// 错误；收发在 OnNewConnection 交付的每客户端 TcpConnectionImpl 上进行。
+// clients_ 受 mutex_ 保护；用户回调(connection_cb_/disconnect_cb_)一律锁外调用。
+
 namespace transport {
 
 TcpServerImpl::TcpServerImpl(TcpServerConfig config)
@@ -42,6 +49,12 @@ Status TcpServerImpl::Open() {
 
 bool TcpServerImpl::IsOpen() const { return open_.load(); }
 
+// 接受循环：每次 async_accept 完成——
+//   出错（acceptor 已关）→ 通知 disconnect_cb_（监听 socket 失效）并停止；
+//   未超 max_clients → 造 TcpConnectionImpl（透传 codec、按 framer 配置分帧），
+//     登记进 clients_（键=PeerId "ip:port"），挂 OnDisconnect 以便断连自动移除，
+//     启动其读循环，锁外回调 OnNewConnection；超限 → 直接关掉新 socket（不回调）；
+//   末尾再投递下一次 accept。
 void TcpServerImpl::DoAccept() {
   auto self = shared_from_this();
   acceptor_.async_accept([this, self](asio::error_code ec,
@@ -146,6 +159,8 @@ void TcpServerImpl::DisconnectClient(const std::string& client_id) {
   conn->Close();
 }
 
+// 关闭（幂等）：停止接受、关闭所有客户端，再停 ctx 并 join io 线程。
+// 先在锁内取 clients_ 快照并清空，再锁外逐个 Close，避免与 RemoveClient 互锁。
 void TcpServerImpl::Close() {
   if (closing_.exchange(true)) return;
   open_.store(false);
