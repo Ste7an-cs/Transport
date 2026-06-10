@@ -1691,7 +1691,7 @@ git commit -m "docs: README 与构建说明（Foundation 完成）"
 
 ## 后续计划（不在本计划范围）
 
-1. **TCP** — `TcpClientConfig`/`TcpServerConfig`、`ITcpServer`、`TcpClientTransport`/`TcpServerTransport`（Asio），继承 `TransportBase`，接收侧用 `FrameAssembler`。
+1. **TCP** — `TcpClientConfig`/`TcpServerConfig`、`ITcpServer`、`TcpClientImpl`/`TcpServerImpl`（Asio），继承 `TransportBase`，接收侧用 `FrameAssembler`。
 2. **UDP** — `IUdpTransport` + `SendTo` + 单播/组播/广播。
 3. **串口** — termios + pty 回环测试。
 4. **DDS** — `RawMessage` + `FastDdsRawType`（自定义 TopicDataType）+ `FastDdsProvider` + `DdsTransport` + `DdsProviderRegistry` + `FakeDdsProvider`。

@@ -10,20 +10,20 @@
 
 ## 1. 范围与文件布局
 
-本 spec 覆盖 **TCP 客户端 + 服务端**。两者共用连接级 transport `TcpConnection`，由此自然满足主 spec §5.2「客户端与 accepted 连接共用 `ITransport`」。
+本 spec 覆盖 **TCP 客户端 + 服务端**。两者共用连接级 transport `TcpConnectionImpl`，由此自然满足主 spec §5.2「客户端与 accepted 连接共用 `ITransport`」。
 
 ```
 include/transport/tcp/
 ├── TcpClientConfig.hpp      # 主 spec §5.1（本 spec 复述）
 ├── TcpServerConfig.hpp      # 主 spec §5.1（本 spec 复述）
 ├── ITcpServer.hpp           # 主 spec §5.3（本 spec 复述）
-├── TcpConnection.hpp        # 内部：已连接 socket 的收发循环（client 与 accepted 共用）
-├── TcpClientTransport.hpp   # 客户端：connect + 指数退避重连
-└── TcpServerTransport.hpp   # 服务端：acceptor + 每连接 TcpConnection + 广播
+├── TcpConnectionImpl.hpp        # 内部：已连接 socket 的收发循环（client 与 accepted 共用）
+├── TcpClientImpl.hpp   # 客户端：connect + 指数退避重连
+└── TcpServerImpl.hpp   # 服务端：acceptor + 每连接 TcpConnectionImpl + 广播
 src/tcp/
-├── TcpConnection.cpp
-├── TcpClientTransport.cpp
-└── TcpServerTransport.cpp
+├── TcpConnectionImpl.cpp
+├── TcpClientImpl.cpp
+└── TcpServerImpl.cpp
 tests/tcp/
 ├── tcp_connection_test.cpp
 ├── tcp_client_test.cpp
@@ -62,15 +62,15 @@ struct TcpServerConfig {
 
 ## 3. 类分解
 
-### 3.1 `TcpConnection`（内部，继承 `TransportBase`）
+### 3.1 `TcpConnectionImpl`（内部，继承 `TransportBase`）
 
 包装一个**已连接**的 `asio::ip::tcp::socket`，实现 `ITransport` 的 `Open/Close/IsOpen/Send`。客户端连上后、服务端 accept 后都用它。
 
 ```cpp
-class TcpConnection : public TransportBase {
+class TcpConnectionImpl : public TransportBase {
  public:
   // socket 已连接；io 由外部 io_context 驱动（client 自有 / server 共享）
-  TcpConnection(asio::ip::tcp::socket socket,
+  TcpConnectionImpl(asio::ip::tcp::socket socket,
                 std::shared_ptr<IFramer> framer);  // framer 可为 nullptr（透传）
 
   Status Open() override;     // 启动 async_read 循环（已连接，故仅启动读）
@@ -89,15 +89,15 @@ class TcpConnection : public TransportBase {
 
 - **收：** `StartRead` 投递 `async_read_some` 到内部读缓冲；`OnRead` 把读到的字节交给 `FrameAssembler.Feed`，对每个切出的帧调用 `DeliverFrame(frame, PeerId(), "")`（topic 为空，TCP 无 topic）。Feed 返回 `frame:` 错误（帧非法）时投递错误并断开。读到 eof/错误 → 进入断连流程。
 - **发：** `Send` 先 `EncodeForSend`，再 `asio::post(strand_, ...)` 经 strand 串行化 `async_write`，避免并发写交叠。返回 `Status` 表示「已入队写出」，不代表对端已收（主 spec §10）。连接已关时返回 `conn:` 错误。
-- **断连：** `OnRead` 收到 eof/error → 标记关闭、`CloseQueue()` 唤醒接收侧、`NotifyDisconnect("conn: ...")`。`TcpConnection` 自身不重连（重连是客户端职责，见 §3.2）。
+- **断连：** `OnRead` 收到 eof/error → 标记关闭、`CloseQueue()` 唤醒接收侧、`NotifyDisconnect("conn: ...")`。`TcpConnectionImpl` 自身不重连（重连是客户端职责，见 §3.2）。
 
-### 3.2 `TcpClientTransport`（继承 `TcpConnection`）
+### 3.2 `TcpClientImpl`（继承 `TcpConnectionImpl`）
 
 ```cpp
-class TcpClientTransport : public TcpConnection {
+class TcpClientImpl : public TcpConnectionImpl {
  public:
-  explicit TcpClientTransport(TcpClientConfig config);
-  ~TcpClientTransport() override;
+  explicit TcpClientImpl(TcpClientConfig config);
+  ~TcpClientImpl() override;
 
   Status Open() override;   // connect(host:port, connect_timeout_ms) → 基类 StartRead
   void Close() override;    // 停止重连 + 关闭
@@ -109,13 +109,13 @@ class TcpClientTransport : public TcpConnection {
 - **重连（`auto_reconnect == true`）：** 断线（或初次连接失败）后，以指数退避 `1s → 2s → 4s → … 封顶 30s` 重试，直到连上或 `Close()`。每次掉线触发一次 `OnDisconnect`。重连期间 `Send` 返回 `conn:` 错误。重连成功后接收侧（同一 `ReceiveQueue` / 回调）继续工作。
 - `auto_reconnect == false`：断线只触发 `OnDisconnect`，不重连。
 
-### 3.3 `TcpServerTransport`（实现 `ITcpServer`）
+### 3.3 `TcpServerImpl`（实现 `ITcpServer`）
 
 ```cpp
-class TcpServerTransport : public ITcpServer {  // ITcpServer : public ITransport
+class TcpServerImpl : public ITcpServer {  // ITcpServer : public ITransport
  public:
-  explicit TcpServerTransport(TcpServerConfig config);
-  ~TcpServerTransport() override;
+  explicit TcpServerImpl(TcpServerConfig config);
+  ~TcpServerImpl() override;
 
   // 监听 socket 生命周期
   Status Open() override;   // bind + listen + 启动 async_accept 循环
@@ -139,14 +139,14 @@ class TcpServerTransport : public ITcpServer {  // ITcpServer : public ITranspor
 
  private:
   // io_context_ + 单后台线程（acceptor 与所有客户端连接共享）
-  // acceptor_, clients_(map<string client_id, shared_ptr<TcpConnection>>), mutex_
+  // acceptor_, clients_(map<string client_id, shared_ptr<TcpConnectionImpl>>), mutex_
   // connection_cb_, codec_（透传给新连接）, config_
 };
 ```
 
-- 拥有 **一个** `io_context` + 一个后台 I/O 线程，被 acceptor 和所有 accepted `TcpConnection` 共享。
+- 拥有 **一个** `io_context` + 一个后台 I/O 线程，被 acceptor 和所有 accepted `TcpConnectionImpl` 共享。
 - `Open()`：`bind(bind_addr:port)` + `listen` + 启动 `async_accept` 循环。bind/listen 失败返回 `conn:`/`config:` 错误。
-- **accept：** 每个 accept 成功：若未超 `max_clients`，用 accepted socket + framer 造 `TcpConnection`，加入 `clients_`（键 = `PeerId()`），`SetCodec`（若 server 设过 codec），启动其读循环，回调 `OnNewConnection(client_transport)`；超限则直接关闭新 socket。
+- **accept：** 每个 accept 成功：若未超 `max_clients`，用 accepted socket + framer 造 `TcpConnectionImpl`，加入 `clients_`（键 = `PeerId()`），`SetCodec`（若 server 设过 codec），启动其读循环，回调 `OnNewConnection(client_transport)`；超限则直接关闭新 socket。
 - 每个 `client_transport` 的断连（read eof）→ 从 `clients_` 移除。
 - `Send`：遍历 `clients_` 快照，对每个调用其 `Send`（广播）。无客户端时成功返回（空广播）。
 - `SetCodec`：记录 codec，对**之后**新建的连接生效；已存在连接不追溯改写（约定：应在 `Open()` 前或新连接到来前设好 codec）。
@@ -173,8 +173,8 @@ io 线程: async_read_some → FrameAssembler.Feed(切帧) → 每帧 DeliverFra
 - 每连接一个 `strand`，串行化该连接的所有 `async_write`，避免并发/交叠写。
 
 ### 4.3 io_context 所有权
-- **客户端：** 每个 `TcpClientTransport` 自有 io_context + 1 线程。
-- **服务端：** `TcpServerTransport` 自有 io_context + 1 线程；acceptor 与所有 accepted `TcpConnection` 共享之（accepted 连接不再各起线程）。
+- **客户端：** 每个 `TcpClientImpl` 自有 io_context + 1 线程。
+- **服务端：** `TcpServerImpl` 自有 io_context + 1 线程；acceptor 与所有 accepted `TcpConnectionImpl` 共享之（accepted 连接不再各起线程）。
 
 ---
 

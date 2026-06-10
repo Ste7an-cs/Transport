@@ -101,7 +101,7 @@ class UdpTransport : public IUdpTransport,   // IUdpTransport : public ITranspor
 
 > **设计说明（组合而非继承）：** `UdpTransport` 直接实现 `IUdpTransport`（= `ITransport` + `SendTo`），并**持有**一个 `TransportCore core_` 提供接收交付与编解码机能。接收侧五个方法一行转发给 `core_`；io handler 收到 datagram 调 `core_.DeliverFrame(...)`，发送前调 `core_.EncodeForSend(...)`。这样彻底避免「`TransportBase` 与 `IUdpTransport` 同源 `ITransport`」的菱形——无需虚继承、无多继承谜题，UDP / DDS 一视同仁。
 >
-> **这是本 spec 锁定的一处 Foundation 重构（UDP plan 的前置任务）：** 把 `TransportBase` 改造为不继承 `ITransport` 的组件 `TransportCore`（成员与方法语义不变，仅去掉 `: public ITransport` 与各 `override`，改作被持有组件；接收侧公共方法 `SetCodec/Receive/OnReceive/AsyncReceive/OnDisconnect` + 生产侧 protected 工具 `EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/Close/NowMicros` 全部保留，回调类型用 `ITransport::ReceiveCallback`/`DisconnectCallback`）。同时把现有 `TcpConnection`（及经它的 `TcpClientTransport`）从「继承 `TransportBase`」改为「持有 `TransportCore` + 五行转发」。要求 Foundation + TCP 既有 57 个测试在重构后全绿，再实现 UDP。`TcpServerTransport` 不受影响（本就未用 `TransportBase`）。
+> **这是本 spec 锁定的一处 Foundation 重构（UDP plan 的前置任务）：** 把 `TransportBase` 改造为不继承 `ITransport` 的组件 `TransportCore`（成员与方法语义不变，仅去掉 `: public ITransport` 与各 `override`，改作被持有组件；接收侧公共方法 `SetCodec/Receive/OnReceive/AsyncReceive/OnDisconnect` + 生产侧 protected 工具 `EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/Close/NowMicros` 全部保留，回调类型用 `ITransport::ReceiveCallback`/`DisconnectCallback`）。同时把现有 `TcpConnectionImpl`（及经它的 `TcpClientImpl`）从「继承 `TransportBase`」改为「持有 `TransportCore` + 五行转发」。要求 Foundation + TCP 既有 57 个测试在重构后全绿，再实现 UDP。`TcpServerImpl` 不受影响（本就未用 `TransportBase`）。
 
 ### 3.1 `Open()` 按 mode 配置
 
@@ -189,7 +189,7 @@ UDP 无连接，故不产生 `conn:`/`timeout:`/`frame:`。
 - 组合 `TransportCore`（原 `TransportBase`：编解码、三模式接收交付、时间戳）、`ReceiveQueue`。**不**使用 `IFramer`/`FrameAssembler`（UDP 报文保边界）。
 - 满足主 spec §6 全部公共 API 与 Send/SendTo 语义。
 - 唯一对外新增便利方法 `LocalPort()`（测试/运维）。
-- 一处 Foundation 重构（UDP plan 前置任务）：`TransportBase` → 不继承 `ITransport` 的组合组件 `TransportCore`，`TcpConnection` 由继承改为持有 + 五行转发（见 §3 说明）；以「Foundation + TCP 既有 57 测试在重构后全绿」为通过门槛，再实现 UDP。`UdpTransport` 组合 `TransportCore`、直接实现 `IUdpTransport`，无菱形、无虚继承。
+- 一处 Foundation 重构（UDP plan 前置任务）：`TransportBase` → 不继承 `ITransport` 的组合组件 `TransportCore`，`TcpConnectionImpl` 由继承改为持有 + 五行转发（见 §3 说明）；以「Foundation + TCP 既有 57 测试在重构后全绿」为通过门槛，再实现 UDP。`UdpTransport` 组合 `TransportCore`、直接实现 `IUdpTransport`，无菱形、无虚继承。
 
 ## 7. 后续（不在本 spec 范围）
 

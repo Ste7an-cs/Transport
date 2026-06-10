@@ -4,14 +4,14 @@
 
 **Goal:** 在 Foundation 层之上实现 TCP 客户端与服务端，基于 Standalone Asio 的异步单线程 I/O 模型，客户端支持指数退避自动重连，全部以真实回环 socket 集成测试验证。
 
-**Architecture:** `TcpConnection`（继承 `TransportBase`，包装已连接 socket，async_read 循环 + strand 串行 async_write + `FrameAssembler` 分帧）是客户端与服务端 accepted 连接的共用实现。`TcpClientTransport` 继承它，加 connect/超时/指数退避重连，自有 io_context + 1 线程。`TcpServerTransport` 实现 `ITcpServer`，自有 io_context + 1 线程，acceptor 每 accept 造一个共享该 io_context 的 `TcpConnection`，支持广播/客户端管理。所有 transport 以 `std::shared_ptr` 持有（async 处理器用 `shared_from_this` 保活）。
+**Architecture:** `TcpConnectionImpl`（继承 `TransportBase`，包装已连接 socket，async_read 循环 + strand 串行 async_write + `FrameAssembler` 分帧）是客户端与服务端 accepted 连接的共用实现。`TcpClientImpl` 继承它，加 connect/超时/指数退避重连，自有 io_context + 1 线程。`TcpServerImpl` 实现 `ITcpServer`，自有 io_context + 1 线程，acceptor 每 accept 造一个共享该 io_context 的 `TcpConnectionImpl`，支持广播/客户端管理。所有 transport 以 `std::shared_ptr` 持有（async 处理器用 `shared_from_this` 保活）。
 
 **Tech Stack:** C++17、Standalone Asio（FetchContent，`ASIO_STANDALONE`，header-only）、GoogleTest 1.14、Google C++ 风格。
 
 **实现约定（锁定）：**
 1. 所有 transport 均经 `std::make_shared` 创建（测试亦然），以支持 `shared_from_this`。
-2. `TcpConnection` 不拥有 io 线程——由其 socket 所属的 io_context 驱动（client / server 各自拥有线程）。
-3. 退避基数/封顶作为 `TcpClientTransport` 构造可注入参数（默认 1s/30s；测试用小值避免 flaky）。
+2. `TcpConnectionImpl` 不拥有 io 线程——由其 socket 所属的 io_context 驱动（client / server 各自拥有线程）。
+3. 退避基数/封顶作为 `TcpClientImpl` 构造可注入参数（默认 1s/30s；测试用小值避免 flaky）。
 
 ---
 
@@ -22,13 +22,13 @@ include/transport/tcp/
 ├── TcpClientConfig.hpp      # 客户端配置（复述自主 spec §5.1）
 ├── TcpServerConfig.hpp      # 服务端配置
 ├── ITcpServer.hpp           # 服务端扩展接口
-├── TcpConnection.hpp        # 已连接 socket 收发循环（client/accepted 共用）
-├── TcpClientTransport.hpp   # connect + 指数退避重连
-└── TcpServerTransport.hpp   # acceptor + 每连接 + 广播
+├── TcpConnectionImpl.hpp        # 已连接 socket 收发循环（client/accepted 共用）
+├── TcpClientImpl.hpp   # connect + 指数退避重连
+└── TcpServerImpl.hpp   # acceptor + 每连接 + 广播
 src/tcp/
-├── TcpConnection.cpp
-├── TcpClientTransport.cpp
-└── TcpServerTransport.cpp
+├── TcpConnectionImpl.cpp
+├── TcpClientImpl.cpp
+└── TcpServerImpl.cpp
 tests/tcp/
 ├── asio_smoke_test.cpp
 ├── tcp_connection_test.cpp
@@ -257,11 +257,11 @@ git commit -m "feat: TCP 配置结构与 ITcpServer 接口"
 
 ---
 
-## Task 3: `TcpConnection`（已连接 socket 收发循环）
+## Task 3: `TcpConnectionImpl`（已连接 socket 收发循环）
 
 **Files:**
-- Create: `include/transport/tcp/TcpConnection.hpp`
-- Create: `src/tcp/TcpConnection.cpp`
+- Create: `include/transport/tcp/TcpConnectionImpl.hpp`
+- Create: `src/tcp/TcpConnectionImpl.cpp`
 - Test: `tests/tcp/tcp_connection_test.cpp`
 - Modify: `CMakeLists.txt`（加库源 + 测试源）
 
@@ -270,7 +270,7 @@ git commit -m "feat: TCP 配置结构与 ITcpServer 接口"
 `tests/tcp/tcp_connection_test.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -288,7 +288,7 @@ using transport::ICodec;
 using transport::LengthFieldFramer;
 using transport::LengthFieldFramerConfig;
 using transport::Result;
-using transport::TcpConnection;
+using transport::TcpConnectionImpl;
 
 namespace {
 
@@ -361,10 +361,10 @@ struct IoRunner {
 
 }  // namespace
 
-TEST(TcpConnection, PassthroughReceivesRawBytes) {
+TEST(TcpConnectionImpl, PassthroughReceivesRawBytes) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->Open();
 
   BlockingWriteAll(pair.client, {10, 20, 30});
@@ -375,11 +375,11 @@ TEST(TcpConnection, PassthroughReceivesRawBytes) {
   conn->Close();
 }
 
-TEST(TcpConnection, FramerAssemblesAcrossWrites) {
+TEST(TcpConnectionImpl, FramerAssemblesAcrossWrites) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto framer = std::make_shared<LengthFieldFramer>(BeConfig());
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), framer);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
   conn->Open();
 
   auto frame = BuildFrame(5, 0xAB);  // 13 字节
@@ -392,10 +392,10 @@ TEST(TcpConnection, FramerAssemblesAcrossWrites) {
   conn->Close();
 }
 
-TEST(TcpConnection, SendWritesToPeer) {
+TEST(TcpConnectionImpl, SendWritesToPeer) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->Open();
 
   auto st = conn->Send({1, 2, 3, 4});
@@ -407,10 +407,10 @@ TEST(TcpConnection, SendWritesToPeer) {
   conn->Close();
 }
 
-TEST(TcpConnection, CodecAppliedBothDirections) {
+TEST(TcpConnectionImpl, CodecAppliedBothDirections) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->SetCodec(std::make_shared<ShiftCodec>());
   conn->Open();
 
@@ -428,10 +428,10 @@ TEST(TcpConnection, CodecAppliedBothDirections) {
   conn->Close();
 }
 
-TEST(TcpConnection, PeerCloseTriggersDisconnectAndConnError) {
+TEST(TcpConnectionImpl, PeerCloseTriggersDisconnectAndConnError) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), nullptr);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   std::string reason;
   conn->OnDisconnect([&](const std::string& r) { reason = r; });
   conn->Open();
@@ -446,13 +446,13 @@ TEST(TcpConnection, PeerCloseTriggersDisconnectAndConnError) {
   EXPECT_EQ(reason.rfind("conn:", 0), 0u);
 }
 
-TEST(TcpConnection, FrameErrorDeliversFrameError) {
+TEST(TcpConnectionImpl, FrameErrorDeliversFrameError) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto c = BeConfig();
   c.max_frame_size = 4;  // 任何正常帧都会越界
   auto framer = std::make_shared<LengthFieldFramer>(c);
-  auto conn = std::make_shared<TcpConnection>(std::move(pair.server), framer);
+  auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
   conn->Open();
 
   BlockingWriteAll(pair.client, BuildFrame(100, 0x44));  // 触发 frame: 错误
@@ -465,17 +465,17 @@ TEST(TcpConnection, FrameErrorDeliversFrameError) {
 
 - [ ] **Step 2: 把库源与测试源加入 CMake**
 
-在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpConnection.cpp`；
+在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpConnectionImpl.cpp`；
 在 `add_executable(transport_tests ...)` 追加 `tests/tcp/tcp_connection_test.cpp`。
 
 - [ ] **Step 3: 运行，确认失败**
 
 Run: `cmake --build build -j 2>&1 | head -20`
-Expected: 编译失败 —— 找不到 `TcpConnection.hpp`。
+Expected: 编译失败 —— 找不到 `TcpConnectionImpl.hpp`。
 
 - [ ] **Step 4: 写头文件**
 
-`include/transport/tcp/TcpConnection.hpp`:
+`include/transport/tcp/TcpConnectionImpl.hpp`:
 
 ```cpp
 #pragma once
@@ -499,10 +499,10 @@ namespace transport {
 
 // 已连接 socket 的收发循环：客户端连上后、服务端 accept 后均用它。
 // io 由 socket 所属的 io_context 驱动（本类不拥有线程）。须以 shared_ptr 持有。
-class TcpConnection : public TransportBase,
-                      public std::enable_shared_from_this<TcpConnection> {
+class TcpConnectionImpl : public TransportBase,
+                      public std::enable_shared_from_this<TcpConnectionImpl> {
  public:
-  TcpConnection(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer);
+  TcpConnectionImpl(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer);
 
   Status Open() override;   // 启动 async_read 循环
   void Close() override;    // 关闭 socket + CloseQueue()
@@ -538,10 +538,10 @@ class TcpConnection : public TransportBase,
 
 - [ ] **Step 5: 写实现**
 
-`src/tcp/TcpConnection.cpp`:
+`src/tcp/TcpConnectionImpl.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 #include <utility>
 
@@ -556,14 +556,14 @@ std::string EndpointId(const asio::ip::tcp::socket& s) {
 }
 }  // namespace
 
-TcpConnection::TcpConnection(asio::ip::tcp::socket socket,
+TcpConnectionImpl::TcpConnectionImpl(asio::ip::tcp::socket socket,
                              std::shared_ptr<IFramer> framer)
     : socket_(std::move(socket)),
       strand_(asio::make_strand(socket_.get_executor())),
       assembler_(std::move(framer)),
       peer_id_(EndpointId(socket_)) {}
 
-Status TcpConnection::Open() {
+Status TcpConnectionImpl::Open() {
   bool expected = false;
   if (!open_.compare_exchange_strong(expected, true)) {
     return Status::Success(std::monostate{});  // 已打开
@@ -573,9 +573,9 @@ Status TcpConnection::Open() {
   return Status::Success(std::monostate{});
 }
 
-bool TcpConnection::IsOpen() const { return open_.load(); }
+bool TcpConnectionImpl::IsOpen() const { return open_.load(); }
 
-void TcpConnection::StartRead() {
+void TcpConnectionImpl::StartRead() {
   auto self = shared_from_this();
   socket_.async_read_some(
       asio::buffer(read_buf_),
@@ -597,7 +597,7 @@ void TcpConnection::StartRead() {
           }));
 }
 
-Status TcpConnection::Send(const std::vector<uint8_t>& data) {
+Status TcpConnectionImpl::Send(const std::vector<uint8_t>& data) {
   if (!open_.load()) return Status::Fail("conn: not connected");
   auto enc = EncodeForSend(data);
   if (!enc) return Status::Fail(enc.error);
@@ -610,7 +610,7 @@ Status TcpConnection::Send(const std::vector<uint8_t>& data) {
   return Status::Success(std::monostate{});
 }
 
-void TcpConnection::DoWrite() {
+void TcpConnectionImpl::DoWrite() {
   writing_ = true;
   auto self = shared_from_this();
   asio::async_write(
@@ -631,7 +631,7 @@ void TcpConnection::DoWrite() {
           }));
 }
 
-void TcpConnection::HandleDisconnect(const std::string& reason) {
+void TcpConnectionImpl::HandleDisconnect(const std::string& reason) {
   if (disconnected_.exchange(true)) return;  // 每周期一次
   open_.store(false);
   asio::error_code ec;
@@ -641,7 +641,7 @@ void TcpConnection::HandleDisconnect(const std::string& reason) {
   NotifyDisconnect(reason);
 }
 
-void TcpConnection::Close() {
+void TcpConnectionImpl::Close() {
   open_.store(false);
   auto self = shared_from_this();
   asio::post(strand_, [this, self]() {
@@ -656,24 +656,24 @@ void TcpConnection::Close() {
 
 - [ ] **Step 6: 运行，确认通过**
 
-Run: `cmake --build build -j && ctest --test-dir build --output-on-failure -R TcpConnection`
-Expected: `TcpConnection.*`（6 个）全部 PASS；全量套件保持绿色。
+Run: `cmake --build build -j && ctest --test-dir build --output-on-failure -R TcpConnectionImpl`
+Expected: `TcpConnectionImpl.*`（6 个）全部 PASS；全量套件保持绿色。
 
 - [ ] **Step 7: 提交**
 
 ```bash
-git add include/transport/tcp/TcpConnection.hpp src/tcp/TcpConnection.cpp \
+git add include/transport/tcp/TcpConnectionImpl.hpp src/tcp/TcpConnectionImpl.cpp \
         tests/tcp/tcp_connection_test.cpp CMakeLists.txt
-git commit -m "feat: TcpConnection 已连接 socket 收发循环"
+git commit -m "feat: TcpConnectionImpl 已连接 socket 收发循环"
 ```
 
 ---
 
-## Task 4: `TcpClientTransport`（connect + 指数退避重连）
+## Task 4: `TcpClientImpl`（connect + 指数退避重连）
 
 **Files:**
-- Create: `include/transport/tcp/TcpClientTransport.hpp`
-- Create: `src/tcp/TcpClientTransport.cpp`
+- Create: `include/transport/tcp/TcpClientImpl.hpp`
+- Create: `src/tcp/TcpClientImpl.cpp`
 - Test: `tests/tcp/tcp_client_test.cpp`
 - Modify: `CMakeLists.txt`
 
@@ -682,7 +682,7 @@ git commit -m "feat: TcpConnection 已连接 socket 收发循环"
 `tests/tcp/tcp_client_test.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpClientTransport.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -696,7 +696,7 @@ git commit -m "feat: TcpConnection 已连接 socket 收发循环"
 
 using transport::Result;
 using transport::TcpClientConfig;
-using transport::TcpClientTransport;
+using transport::TcpClientImpl;
 
 namespace {
 
@@ -775,7 +775,7 @@ TcpClientConfig ClientCfg(uint16_t port, bool reconnect) {
 TEST(TcpClient, ConnectAndReceive) {
   MiniServer server;
   // 退避参数无关紧要；用默认
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(server.port(), true));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(server.port(), true));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
 
   server.WriteToPeer({7, 8, 9});
@@ -787,7 +787,7 @@ TEST(TcpClient, ConnectAndReceive) {
 
 TEST(TcpClient, ConnectRefusedReturnsError) {
   // 连接一个没有监听者的端口
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(1, false));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(1, false));
   client->SetHost("127.0.0.1");
   auto st = client->Open();
   EXPECT_FALSE(static_cast<bool>(st));
@@ -801,7 +801,7 @@ TEST(TcpClient, AutoReconnectResumesAfterServerDrop) {
   MiniServer server;
   uint16_t port = server.port();
   // 用小退避基数（10ms）+ 小封顶（100ms）避免久等
-  auto client = std::make_shared<TcpClientTransport>(
+  auto client = std::make_shared<TcpClientImpl>(
       ClientCfg(port, true), std::chrono::milliseconds(10),
       std::chrono::milliseconds(100));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
@@ -824,7 +824,7 @@ TEST(TcpClient, AutoReconnectResumesAfterServerDrop) {
 
 TEST(TcpClient, NoReconnectWhenDisabled) {
   MiniServer server;
-  auto client = std::make_shared<TcpClientTransport>(ClientCfg(server.port(), false));
+  auto client = std::make_shared<TcpClientImpl>(ClientCfg(server.port(), false));
   ASSERT_TRUE(static_cast<bool>(client->Open()));
 
   bool disconnected = false;
@@ -843,17 +843,17 @@ TEST(TcpClient, NoReconnectWhenDisabled) {
 
 - [ ] **Step 2: 把库源与测试源加入 CMake**
 
-在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpClientTransport.cpp`；
+在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpClientImpl.cpp`；
 在 `add_executable(transport_tests ...)` 追加 `tests/tcp/tcp_client_test.cpp`。
 
 - [ ] **Step 3: 运行，确认失败**
 
 Run: `cmake --build build -j 2>&1 | head -20`
-Expected: 编译失败 —— 找不到 `TcpClientTransport.hpp`。
+Expected: 编译失败 —— 找不到 `TcpClientImpl.hpp`。
 
 - [ ] **Step 4: 写头文件**
 
-`include/transport/tcp/TcpClientTransport.hpp`:
+`include/transport/tcp/TcpClientImpl.hpp`:
 
 ```cpp
 #pragma once
@@ -870,27 +870,27 @@ Expected: 编译失败 —— 找不到 `TcpClientTransport.hpp`。
 
 #include "transport/Result.hpp"
 #include "transport/tcp/TcpClientConfig.hpp"
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 namespace transport {
 
 namespace detail {
-// 仅持有 io_context。作为 TcpClientTransport 的首个基类，保证 io_context 先于
-// TcpConnection 基类构造——TcpConnection 的 socket_ 需绑定到这个 ctx。
+// 仅持有 io_context。作为 TcpClientImpl 的首个基类，保证 io_context 先于
+// TcpConnectionImpl 基类构造——TcpConnectionImpl 的 socket_ 需绑定到这个 ctx。
 struct IoContextHolder {
   asio::io_context ctx;
 };
 }  // namespace detail
 
 // TCP 客户端：自有 io_context + 1 线程；connect 超时；指数退避自动重连。
-// 须以 shared_ptr 持有（基类 TcpConnection 用 shared_from_this 保活）。
-class TcpClientTransport : public detail::IoContextHolder, public TcpConnection {
+// 须以 shared_ptr 持有（基类 TcpConnectionImpl 用 shared_from_this 保活）。
+class TcpClientImpl : public detail::IoContextHolder, public TcpConnectionImpl {
  public:
-  explicit TcpClientTransport(
+  explicit TcpClientImpl(
       TcpClientConfig config,
       std::chrono::milliseconds backoff_base = std::chrono::milliseconds(1000),
       std::chrono::milliseconds backoff_cap = std::chrono::milliseconds(30000));
-  ~TcpClientTransport() override;
+  ~TcpClientImpl() override;
 
   Status Open() override;   // 同步连接（受 connect_timeout_ms 约束），成功后启动读
   void Close() override;    // 停重连 + 关连接 + 停 io 线程
@@ -923,14 +923,14 @@ class TcpClientTransport : public detail::IoContextHolder, public TcpConnection 
 }  // namespace transport
 ```
 
-> 构造顺序要点：`TcpConnection`（基类）的 `socket_` 必须绑定到客户端自有的 `io_context`。C++ 基类按声明顺序构造，故让 `detail::IoContextHolder` 作为**首个**基类，其 `ctx` 即在 `TcpConnection` 基类之前构造完成，可在初始化列表里用 `asio::ip::tcp::socket(ctx)` 传给 `TcpConnection`。
+> 构造顺序要点：`TcpConnectionImpl`（基类）的 `socket_` 必须绑定到客户端自有的 `io_context`。C++ 基类按声明顺序构造，故让 `detail::IoContextHolder` 作为**首个**基类，其 `ctx` 即在 `TcpConnectionImpl` 基类之前构造完成，可在初始化列表里用 `asio::ip::tcp::socket(ctx)` 传给 `TcpConnectionImpl`。
 
 - [ ] **Step 5: 写实现**
 
-`src/tcp/TcpClientTransport.cpp`:
+`src/tcp/TcpClientImpl.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpClientTransport.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
 
 #include <algorithm>
 #include <future>
@@ -941,11 +941,11 @@ class TcpClientTransport : public detail::IoContextHolder, public TcpConnection 
 
 namespace transport {
 
-TcpClientTransport::TcpClientTransport(TcpClientConfig config,
+TcpClientImpl::TcpClientImpl(TcpClientConfig config,
                                        std::chrono::milliseconds backoff_base,
                                        std::chrono::milliseconds backoff_cap)
     : detail::IoContextHolder(),
-      TcpConnection(asio::ip::tcp::socket(ctx),
+      TcpConnectionImpl(asio::ip::tcp::socket(ctx),
                     config.framer
                         ? std::make_shared<LengthFieldFramer>(*config.framer)
                         : nullptr),
@@ -960,9 +960,9 @@ TcpClientTransport::TcpClientTransport(TcpClientConfig config,
   io_thread_ = std::thread([this] { ctx.run(); });
 }
 
-TcpClientTransport::~TcpClientTransport() { Close(); }
+TcpClientImpl::~TcpClientImpl() { Close(); }
 
-Status TcpClientTransport::Open() {
+Status TcpClientImpl::Open() {
   // framer 配置校验（spec：非法则 config: 错误）
   if (config_.framer) {
     auto v = LengthFieldFramer::ValidateConfig(*config_.framer);
@@ -970,13 +970,13 @@ Status TcpClientTransport::Open() {
   }
   auto prom = std::make_shared<std::promise<Status>>();
   auto fut = prom->get_future();
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
   asio::post(strand_, [this, self, prom]() { StartConnect(prom); });
   return fut.get();  // 阻塞等待初次连接成败/超时
 }
 
-void TcpClientTransport::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+void TcpClientImpl::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
 
   asio::error_code rec;
   auto endpoints =
@@ -1024,10 +1024,10 @@ void TcpClientTransport::StartConnect(std::shared_ptr<std::promise<Status>> prom
           }));
 }
 
-void TcpClientTransport::ScheduleReconnect() {
+void TcpClientImpl::ScheduleReconnect() {
   if (closing_.load() || !config_.auto_reconnect) return;
   reconnect_timer_.expires_after(backoff_cur_);
-  auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
+  auto self = std::static_pointer_cast<TcpClientImpl>(shared_from_this());
   reconnect_timer_.async_wait(asio::bind_executor(
       strand_, [this, self](asio::error_code ec) {
         if (ec || closing_.load()) return;
@@ -1036,7 +1036,7 @@ void TcpClientTransport::ScheduleReconnect() {
       }));
 }
 
-void TcpClientTransport::HandleDisconnect(const std::string& reason) {
+void TcpClientImpl::HandleDisconnect(const std::string& reason) {
   if (!link_up_.exchange(false)) return;  // 每个连接周期只处理一次
   open_.store(false);
   asio::error_code ig;
@@ -1050,7 +1050,7 @@ void TcpClientTransport::HandleDisconnect(const std::string& reason) {
   }
 }
 
-void TcpClientTransport::Close() {
+void TcpClientImpl::Close() {
   if (closing_.exchange(true)) return;
   open_.store(false);
   link_up_.store(false);
@@ -1079,18 +1079,18 @@ Expected: `TcpClient.*`（4 个）全部 PASS；全量套件保持绿色。若 `
 - [ ] **Step 7: 提交**
 
 ```bash
-git add include/transport/tcp/TcpClientTransport.hpp src/tcp/TcpClientTransport.cpp \
+git add include/transport/tcp/TcpClientImpl.hpp src/tcp/TcpClientImpl.cpp \
         tests/tcp/tcp_client_test.cpp CMakeLists.txt
-git commit -m "feat: TcpClientTransport connect + 指数退避重连"
+git commit -m "feat: TcpClientImpl connect + 指数退避重连"
 ```
 
 ---
 
-## Task 5: `TcpServerTransport`（acceptor + 广播 + ITcpServer）
+## Task 5: `TcpServerImpl`（acceptor + 广播 + ITcpServer）
 
 **Files:**
-- Create: `include/transport/tcp/TcpServerTransport.hpp`
-- Create: `src/tcp/TcpServerTransport.cpp`
+- Create: `include/transport/tcp/TcpServerImpl.hpp`
+- Create: `src/tcp/TcpServerImpl.cpp`
 - Test: `tests/tcp/tcp_server_test.cpp`
 - Modify: `CMakeLists.txt`
 
@@ -1099,7 +1099,7 @@ git commit -m "feat: TcpClientTransport connect + 指数退避重连"
 `tests/tcp/tcp_server_test.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpServerTransport.hpp"
+#include "transport/tcp/TcpServerImpl.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -1111,15 +1111,15 @@ git commit -m "feat: TcpClientTransport connect + 指数退避重连"
 
 #include <gtest/gtest.h>
 
-#include "transport/tcp/TcpClientTransport.hpp"
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpClientImpl.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 
 using transport::ITransport;
 using transport::Result;
 using transport::TcpClientConfig;
-using transport::TcpClientTransport;
+using transport::TcpClientImpl;
 using transport::TcpServerConfig;
-using transport::TcpServerTransport;
+using transport::TcpServerImpl;
 
 namespace {
 
@@ -1130,13 +1130,13 @@ TcpServerConfig ServerCfg() {
   return c;
 }
 
-std::shared_ptr<TcpClientTransport> MakeClient(uint16_t port) {
+std::shared_ptr<TcpClientImpl> MakeClient(uint16_t port) {
   TcpClientConfig c;
   c.host = "127.0.0.1";
   c.port = port;
   c.connect_timeout_ms = 1000;
   c.auto_reconnect = false;
-  return std::make_shared<TcpClientTransport>(c);
+  return std::make_shared<TcpClientImpl>(c);
 }
 
 void WaitFor(std::function<bool()> pred, int ms = 1000) {
@@ -1147,7 +1147,7 @@ void WaitFor(std::function<bool()> pred, int ms = 1000) {
 }  // namespace
 
 TEST(TcpServer, AcceptsConnectionAndDeliversPerClient) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::atomic<int> conns{0};
   std::shared_ptr<ITransport> accepted;
   server->OnNewConnection([&](std::shared_ptr<ITransport> c) {
@@ -1173,7 +1173,7 @@ TEST(TcpServer, AcceptsConnectionAndDeliversPerClient) {
 }
 
 TEST(TcpServer, BroadcastSendReachesAllClients) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::atomic<int> conns{0};
   server->OnNewConnection([&](std::shared_ptr<ITransport>) { ++conns; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));
@@ -1199,7 +1199,7 @@ TEST(TcpServer, BroadcastSendReachesAllClients) {
 }
 
 TEST(TcpServer, GetClientsAndDisconnectClient) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   std::shared_ptr<ITransport> accepted;
   server->OnNewConnection([&](std::shared_ptr<ITransport> c) { accepted = c; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));
@@ -1211,8 +1211,8 @@ TEST(TcpServer, GetClientsAndDisconnectClient) {
   WaitFor([&] { return server->GetClients().size() >= 1 && accepted != nullptr; });
   ASSERT_EQ(server->GetClients().size(), 1u);
 
-  // accepted 实为 TcpConnection；其 PeerId() 即 server 端登记的 client_id
-  auto conn = std::dynamic_pointer_cast<transport::TcpConnection>(accepted);
+  // accepted 实为 TcpConnectionImpl；其 PeerId() 即 server 端登记的 client_id
+  auto conn = std::dynamic_pointer_cast<transport::TcpConnectionImpl>(accepted);
   ASSERT_TRUE(conn != nullptr);
   server->DisconnectClient(conn->PeerId());
 
@@ -1226,7 +1226,7 @@ TEST(TcpServer, GetClientsAndDisconnectClient) {
 }
 
 TEST(TcpServer, ReceiveOnServerReturnsConfigError) {
-  auto server = std::make_shared<TcpServerTransport>(ServerCfg());
+  auto server = std::make_shared<TcpServerImpl>(ServerCfg());
   ASSERT_TRUE(static_cast<bool>(server->Open()));
   auto r = server->Receive(10);
   EXPECT_FALSE(static_cast<bool>(r));
@@ -1241,7 +1241,7 @@ TEST(TcpServer, ReceiveOnServerReturnsConfigError) {
 TEST(TcpServer, MaxClientsRejectsExtra) {
   auto cfg = ServerCfg();
   cfg.max_clients = 1;
-  auto server = std::make_shared<TcpServerTransport>(cfg);
+  auto server = std::make_shared<TcpServerImpl>(cfg);
   std::atomic<int> conns{0};
   server->OnNewConnection([&](std::shared_ptr<ITransport>) { ++conns; });
   ASSERT_TRUE(static_cast<bool>(server->Open()));
@@ -1263,17 +1263,17 @@ TEST(TcpServer, MaxClientsRejectsExtra) {
 
 - [ ] **Step 2: 把库源与测试源加入 CMake**
 
-在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpServerTransport.cpp`；
+在 `add_library(transport STATIC ...)` 追加 `src/tcp/TcpServerImpl.cpp`；
 在 `add_executable(transport_tests ...)` 追加 `tests/tcp/tcp_server_test.cpp`。
 
 - [ ] **Step 3: 运行，确认失败**
 
 Run: `cmake --build build -j 2>&1 | head -20`
-Expected: 编译失败 —— 找不到 `TcpServerTransport.hpp`。
+Expected: 编译失败 —— 找不到 `TcpServerImpl.hpp`。
 
 - [ ] **Step 4: 写头文件**
 
-`include/transport/tcp/TcpServerTransport.hpp`:
+`include/transport/tcp/TcpServerImpl.hpp`:
 
 ```cpp
 #pragma once
@@ -1294,19 +1294,19 @@ Expected: 编译失败 —— 找不到 `TcpServerTransport.hpp`。
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
 #include "transport/tcp/ITcpServer.hpp"
-#include "transport/tcp/TcpConnection.hpp"
+#include "transport/tcp/TcpConnectionImpl.hpp"
 #include "transport/tcp/TcpServerConfig.hpp"
 
 namespace transport {
 
 // TCP 服务端：自有 io_context + 1 线程；acceptor 每 accept 造一个共享该 io_context
-// 的 TcpConnection。须以 shared_ptr 持有。
-class TcpServerTransport
+// 的 TcpConnectionImpl。须以 shared_ptr 持有。
+class TcpServerImpl
     : public ITcpServer,
-      public std::enable_shared_from_this<TcpServerTransport> {
+      public std::enable_shared_from_this<TcpServerImpl> {
  public:
-  explicit TcpServerTransport(TcpServerConfig config);
-  ~TcpServerTransport() override;
+  explicit TcpServerImpl(TcpServerConfig config);
+  ~TcpServerImpl() override;
 
   Status Open() override;
   void Close() override;
@@ -1339,7 +1339,7 @@ class TcpServerTransport
   std::thread io_thread_;
 
   mutable std::mutex mutex_;
-  std::map<std::string, std::shared_ptr<TcpConnection>> clients_;
+  std::map<std::string, std::shared_ptr<TcpConnectionImpl>> clients_;
   ConnectionCallback connection_cb_;
   DisconnectCallback disconnect_cb_;
   std::shared_ptr<ICodec> codec_;
@@ -1354,10 +1354,10 @@ class TcpServerTransport
 
 - [ ] **Step 5: 写实现**
 
-`src/tcp/TcpServerTransport.cpp`:
+`src/tcp/TcpServerImpl.cpp`:
 
 ```cpp
-#include "transport/tcp/TcpServerTransport.hpp"
+#include "transport/tcp/TcpServerImpl.hpp"
 
 #include <utility>
 #include <variant>
@@ -1366,16 +1366,16 @@ class TcpServerTransport
 
 namespace transport {
 
-TcpServerTransport::TcpServerTransport(TcpServerConfig config)
+TcpServerImpl::TcpServerImpl(TcpServerConfig config)
     : config_(std::move(config)),
       guard_(ctx_.get_executor()),
       acceptor_(ctx_) {
   io_thread_ = std::thread([this] { ctx_.run(); });
 }
 
-TcpServerTransport::~TcpServerTransport() { Close(); }
+TcpServerImpl::~TcpServerImpl() { Close(); }
 
-Status TcpServerTransport::Open() {
+Status TcpServerImpl::Open() {
   if (config_.framer) {  // framer 配置校验（spec：非法则 config: 错误）
     auto v = LengthFieldFramer::ValidateConfig(*config_.framer);
     if (!v) return Status::Fail(v.error);
@@ -1399,9 +1399,9 @@ Status TcpServerTransport::Open() {
   return Status::Success(std::monostate{});
 }
 
-bool TcpServerTransport::IsOpen() const { return open_.load(); }
+bool TcpServerImpl::IsOpen() const { return open_.load(); }
 
-void TcpServerTransport::DoAccept() {
+void TcpServerImpl::DoAccept() {
   auto self = shared_from_this();
   acceptor_.async_accept([this, self](asio::error_code ec,
                                       asio::ip::tcp::socket sock) {
@@ -1409,7 +1409,7 @@ void TcpServerTransport::DoAccept() {
       if (open_.load() && disconnect_cb_) disconnect_cb_("conn: acceptor: " + ec.message());
       return;
     }
-    std::shared_ptr<TcpConnection> conn;
+    std::shared_ptr<TcpConnectionImpl> conn;
     ConnectionCallback cb_copy;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1420,11 +1420,11 @@ void TcpServerTransport::DoAccept() {
         std::shared_ptr<IFramer> framer;
         if (config_.framer)
           framer = std::make_shared<LengthFieldFramer>(*config_.framer);
-        conn = std::make_shared<TcpConnection>(std::move(sock), framer);
+        conn = std::make_shared<TcpConnectionImpl>(std::move(sock), framer);
         if (codec_) conn->SetCodec(codec_);
         const std::string id = conn->PeerId();
         clients_[id] = conn;
-        std::weak_ptr<TcpServerTransport> wself = self;
+        std::weak_ptr<TcpServerImpl> wself = self;
         conn->OnDisconnect([wself, id](const std::string&) {
           if (auto s = wself.lock()) s->RemoveClient(id);
         });
@@ -1437,13 +1437,13 @@ void TcpServerTransport::DoAccept() {
   });
 }
 
-void TcpServerTransport::RemoveClient(const std::string& id) {
+void TcpServerImpl::RemoveClient(const std::string& id) {
   std::lock_guard<std::mutex> lock(mutex_);
   clients_.erase(id);
 }
 
-Status TcpServerTransport::Send(const std::vector<uint8_t>& data) {
-  std::vector<std::shared_ptr<TcpConnection>> snapshot;
+Status TcpServerImpl::Send(const std::vector<uint8_t>& data) {
+  std::vector<std::shared_ptr<TcpConnectionImpl>> snapshot;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : clients_) snapshot.push_back(kv.second);
@@ -1452,43 +1452,43 @@ Status TcpServerTransport::Send(const std::vector<uint8_t>& data) {
   return Status::Success(std::monostate{});
 }
 
-Result<Message> TcpServerTransport::Receive(uint32_t) {
+Result<Message> TcpServerImpl::Receive(uint32_t) {
   return Result<Message>::Fail(
       "config: 请使用 OnNewConnection 获取的 client_transport 进行接收");
 }
 
-void TcpServerTransport::OnReceive(ReceiveCallback) {}
+void TcpServerImpl::OnReceive(ReceiveCallback) {}
 
-std::future<Result<Message>> TcpServerTransport::AsyncReceive() {
+std::future<Result<Message>> TcpServerImpl::AsyncReceive() {
   std::promise<Result<Message>> p;
   p.set_value(Result<Message>::Fail(
       "config: 请使用 OnNewConnection 获取的 client_transport 进行接收"));
   return p.get_future();
 }
 
-void TcpServerTransport::OnDisconnect(DisconnectCallback cb) {
+void TcpServerImpl::OnDisconnect(DisconnectCallback cb) {
   disconnect_cb_ = std::move(cb);
 }
 
-void TcpServerTransport::SetCodec(std::shared_ptr<ICodec> codec) {
+void TcpServerImpl::SetCodec(std::shared_ptr<ICodec> codec) {
   std::lock_guard<std::mutex> lock(mutex_);
   codec_ = std::move(codec);
 }
 
-void TcpServerTransport::OnNewConnection(ConnectionCallback cb) {
+void TcpServerImpl::OnNewConnection(ConnectionCallback cb) {
   std::lock_guard<std::mutex> lock(mutex_);
   connection_cb_ = std::move(cb);
 }
 
-std::vector<std::shared_ptr<ITransport>> TcpServerTransport::GetClients() const {
+std::vector<std::shared_ptr<ITransport>> TcpServerImpl::GetClients() const {
   std::vector<std::shared_ptr<ITransport>> out;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& kv : clients_) out.push_back(kv.second);
   return out;
 }
 
-void TcpServerTransport::DisconnectClient(const std::string& client_id) {
-  std::shared_ptr<TcpConnection> conn;
+void TcpServerImpl::DisconnectClient(const std::string& client_id) {
+  std::shared_ptr<TcpConnectionImpl> conn;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = clients_.find(client_id);
@@ -1499,10 +1499,10 @@ void TcpServerTransport::DisconnectClient(const std::string& client_id) {
   conn->Close();
 }
 
-void TcpServerTransport::Close() {
+void TcpServerImpl::Close() {
   if (closing_.exchange(true)) return;
   open_.store(false);
-  std::vector<std::shared_ptr<TcpConnection>> snapshot;
+  std::vector<std::shared_ptr<TcpConnectionImpl>> snapshot;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : clients_) snapshot.push_back(kv.second);
@@ -1530,9 +1530,9 @@ Expected: `TcpServer.*`（5 个）全部 PASS；全量套件保持绿色。
 - [ ] **Step 7: 提交**
 
 ```bash
-git add include/transport/tcp/TcpServerTransport.hpp src/tcp/TcpServerTransport.cpp \
+git add include/transport/tcp/TcpServerImpl.hpp src/tcp/TcpServerImpl.cpp \
         tests/tcp/tcp_server_test.cpp CMakeLists.txt
-git commit -m "feat: TcpServerTransport acceptor + 广播 + ITcpServer"
+git commit -m "feat: TcpServerImpl acceptor + 广播 + ITcpServer"
 ```
 
 ---
