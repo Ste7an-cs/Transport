@@ -31,27 +31,41 @@
 
 ### 3.1 层次图
 
-```
-┌─────────────────────────────────────────────────────┐
-│                     应用层（用户代码）                  │
-└────────────────────┬────────────────────────────────┘
-                     │  持有 shared_ptr<ITransport / IUdpTransport / IDdsTransport>
-┌────────────────────▼────────────────────────────────┐
-│                  传输抽象层                            │
-│   ITransport   ICodec   IFramer   Message            │
-│   IUdpTransport   ITcpServer   IDdsTransport         │
-│   IDdsProvider   DdsProviderRegistry   TransportFactory│
-└──┬─────────┬──────────┬──────────┬──────────────────┘
-   │         │          │          │
-┌──▼──┐  ┌──▼──┐  ┌────▼───┐  ┌──▼──────┐
-│ TCP │  │ UDP │  │  DDS   │  │  串口   │
-│     │  │     │  │        │  │         │
-│客户端│  │单播  │  │发布订阅 │  │         │
-│服务端│  │组播  │  │请求响应 │  │         │
-│     │  │广播  │  │        │  │         │
-└─────┘  └─────┘  └────────┘  └─────────┘
-                    底层实现层
-          (asio / Fast DDS 3.6 / termios)
+分层（包/层视图，UML 风格，Mermaid 渲染）：
+
+```mermaid
+flowchart TB
+  App["应用层（用户代码）<br/>持有 shared_ptr&lt;ITransport / ITcpServer / IUdpTransport / IDdsTransport&gt;"]
+
+  subgraph Abstraction["传输抽象层 include/ — 纯接口 + 数据结构（零第三方依赖）"]
+    direction LR
+    A1["ITransport"]
+    A2["ITcpServer · IUdpTransport · IDdsTransport"]
+    A3["ICodec · IFramer · Message · Result"]
+    A4["TransportFactory · IDdsProvider · DdsProviderRegistry"]
+  end
+
+  subgraph Impl["实现层 src/"]
+    direction LR
+    TCP["TCP<br/>客户端 / 服务端"]
+    UDP["UDP<br/>单播 / 组播 / 广播"]
+    DDS["DDS<br/>发布订阅 / 请求响应"]
+    Serial["串口"]
+  end
+
+  subgraph Libs["底层库"]
+    direction LR
+    asio["Asio"]
+    fastdds["Fast DDS 3.6"]
+    termios["termios"]
+  end
+
+  App --> Abstraction
+  Abstraction --> Impl
+  TCP -.-> asio
+  UDP -.-> asio
+  DDS -.-> fastdds
+  Serial -.-> termios
 ```
 
 ### 3.2 设计原则
@@ -93,11 +107,10 @@ transport/
 │   ├── framing/
 │   │   ├── LengthFieldFramer.cpp
 │   │   └── FrameAssembler.hpp        // 滚动缓冲 + IFramer 驱动的接收侧装配器
-│   ├── tcp/
-│   │   ├── TcpClientTransport.hpp
-│   │   ├── TcpClientTransport.cpp
-│   │   ├── TcpServerTransport.hpp
-│   │   └── TcpServerTransport.cpp
+│   ├── tcp/                              // 实现类用 *Impl 后缀；头文件实际在 include/transport/tcp/
+│   │   ├── TcpConnectionImpl.{hpp,cpp}   // ITransport 实现（client/accepted 连接共用）
+│   │   ├── TcpClientImpl.{hpp,cpp}       // 客户端：connect + 指数退避重连
+│   │   └── TcpServerImpl.{hpp,cpp}       // ITcpServer 实现：acceptor + 广播
 │   ├── udp/
 │   │   ├── UdpTransport.hpp
 │   │   └── UdpTransport.cpp
@@ -121,38 +134,75 @@ transport/
 
 ### 3.4 接口 vs 实现 的依赖分层
 
-框架贯穿同一约定：每类传输 = **接口 `I*`（契约，纯虚，零第三方依赖）** + **实现类 `*Transport`（落地，封装 asio / Fast DDS / termios）**。应用层与 `TransportFactory` 只依赖接口；第三方库被关在实现类内部。`ITcpServer` 与 `TcpServerTransport` 即这一关系的一个实例——前者声明服务端契约，后者用 Asio 实现它。
+框架贯穿同一约定：每类传输 = **接口 `I*`（契约，纯虚，零第三方依赖）** + **实现类 `*Impl`（落地，封装 asio / Fast DDS / termios）**。应用层与 `TransportFactory` 只依赖接口；第三方库被关在实现类内部。`ITcpServer` 与 `TcpServerImpl` 即这一关系的一个实例——前者声明服务端契约，后者用 Asio 实现它。
 
+UML 类图（Mermaid 渲染；`<|--` 继承 / `<|..` 实现 / `o--` 聚合 / `..>` 依赖）：
+
+```mermaid
+classDiagram
+  direction TB
+
+  class ITransport {
+    <<interface>>
+    +Open() +Close() +IsOpen()
+    +Send() +Receive()
+    +OnReceive() +AsyncReceive()
+    +OnDisconnect() +SetCodec()
+  }
+  class ITcpServer {
+    <<interface>>
+    +OnNewConnection()
+    +GetClients() +DisconnectClient()
+  }
+  class IUdpTransport {
+    <<interface>>
+    +SendTo()
+  }
+  class IDdsTransport {
+    <<interface>>
+    +Send(topic) +SendRequest() +OnRequest()
+  }
+  ITransport <|-- ITcpServer
+  ITransport <|-- IUdpTransport
+  ITransport <|-- IDdsTransport
+
+  class TransportBase {
+    +Receive() +OnReceive() +AsyncReceive() +SetCodec()
+    #DeliverFrame() #EncodeForSend()
+    #DeliverError() #NotifyDisconnect() #CloseQueue()
+  }
+  ITransport <|.. TransportBase : 接收侧通用实现
+
+  class TcpConnectionImpl
+  class TcpClientImpl
+  class TcpServerImpl
+  class UdpImpl
+  class DdsImpl
+  class SerialImpl
+
+  TransportBase <|-- TcpConnectionImpl
+  TcpConnectionImpl <|-- TcpClientImpl
+  ITcpServer <|.. TcpServerImpl
+  TcpServerImpl o-- TcpConnectionImpl : 管理客户端连接
+
+  IUdpTransport <|.. UdpImpl
+  IDdsTransport <|.. DdsImpl
+  ITransport <|.. SerialImpl
+  TransportBase <|-- SerialImpl
+  UdpImpl ..> TransportBase : 复用接收侧（继承or组合，待议）
+  DdsImpl ..> TransportBase : 复用接收侧（待议）
+
+  class TransportFactory {
+    <<factory>>
+    +Create(config)
+  }
+  TransportFactory ..> ITransport : 创建并回交接口句柄
 ```
-记号： A ──▷ B  「A 实现/继承 B」      A ··▷ B  「A 使用/持有 B」
-状态： [✓] 已实现（Foundation + TCP）   [ ] 规划中
 
-接口层 include/transport/（零第三方依赖）
-  ITransport [✓]  ── Open/Close/Send/Receive/OnReceive/AsyncReceive/SetCodec
-    ├─▷ ITcpServer    [✓]  + OnNewConnection / GetClients / DisconnectClient
-    ├─▷ IUdpTransport [ ]  + SendTo
-    └─▷ IDdsTransport [ ]  + Send(topic) / SendRequest / OnRequest
-
-实现层 src/（各自封装底层库）
-  TcpConnection      [✓] ──▷ ITransport      （经 TransportBase）
-    └─ TcpClientTransport [✓] ──▷ TcpConnection
-  TcpServerTransport [✓] ──▷ ITcpServer      （不经 TransportBase）
-  UdpTransport       [ ] ──▷ IUdpTransport    （经 TransportBase）
-  DdsTransport       [ ] ──▷ IDdsTransport    （经 TransportBase，且 ··▷ IDdsProvider）
-  SerialTransport    [ ] ──▷ ITransport       （经 TransportBase）
-
-复用件  TransportBase [✓] ── ITransport「接收侧」通用实现
-  （ReceiveQueue 三模式交付 + codec 编解码 + Message 组装 + 断连通知）
-    ··▷ 被「会收数据」的传输复用：TcpConnection / Udp / Dds / Serial
-    ✗ TcpServerTransport 不用它（只 accept + 广播，不维护接收队列）
-
-支撑设施 [✓]：ICodec（用户实现） · IFramer ◁── LengthFieldFramer · FrameAssembler
-            · ReceiveQueue · Message · Result<T> / Status
-
-创建入口  TransportFactory [ ] ··▷ 按 config 实例化对应实现类，
-          回交 shared_ptr<ITransport / I*Transport> —— 应用层只面向接口编程。
-```
-
+> **状态：** `ITransport` / `ITcpServer` / `TransportBase` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` 已实现（Foundation + TCP）；`IUdpTransport` / `IDdsTransport` / `UdpImpl` / `DdsImpl` / `SerialImpl` / `TransportFactory` 规划中。
+>
+> **支撑设施：** `ICodec`（用户实现）、`IFramer ◁── LengthFieldFramer`、`FrameAssembler`、`ReceiveQueue`、`Message`、`Result<T>`——均已实现。`TransportBase` 内部持有 `ReceiveQueue` 并用 `ICodec` 编解码；流式传输（TCP/串口）接收侧经 `FrameAssembler` + `IFramer` 分帧。`TcpServerImpl` 不经 `TransportBase`（只 accept + 广播，不维护接收队列）。
+>
 > 为什么要 `I*` 接口而不止一个实现类：① `TransportFactory` 据接口返回句柄；② 消费者头文件不被 asio/Fast DDS 等依赖污染；③ 可替换 / 可用 fake 测试上层；④ 全框架一致。
 >
 > 注：`TransportBase` 当前 `: public ITransport`。UDP/DDS 阶段拟将其改为**被持有的组件 `TransportCore`**（组合替代继承，消除「与扩展接口同源 `ITransport`」的菱形）——该重构**待议**，详见 `docs/superpowers/specs/2026-06-10-udp-transport-design.md`。
@@ -702,8 +752,11 @@ class TransportFactory {
 
 ### 14.1 发送路径（所有传输统一）
 
-```
-Send(data) ─▶ [若已设 ICodec: data = Encode(data)] ─▶ 传输特定写出
+```mermaid
+flowchart LR
+  S["Send(data)"] --> C{已设 ICodec?}
+  C -- 是 --> E["data = Encode(data)"] --> W["传输特定写出"]
+  C -- 否 --> W
 ```
 
 - **发送侧不分帧、不加任何前缀**——`Encode` 输出的字节流（帧长已在用户 header 内）原样写出。
@@ -713,14 +766,18 @@ Send(data) ─▶ [若已设 ICodec: data = Encode(data)] ─▶ 传输特定写
 
 ### 14.2 接收路径 — 流式（TCP / 串口）
 
-```
-I/O线程 read 字节
-  └▶ 追加滚动缓冲区
-       └▶ 循环 IFramer.TryExtract(buf, len)
-            ├─ has_frame=false ─▶ 等待更多字节
-            └─ has_frame=true  ─▶ frame = buf[0..consumed)
-                  └▶ [若已设 ICodec: frame = Decode(frame)]
-                       └▶ 组装 Message（填 source/timestamp）─▶ 投递
+```mermaid
+flowchart TB
+  R["I/O 线程 read 字节"] --> B["追加滚动缓冲区"]
+  B --> T["IFramer.TryExtract(buf, len)"]
+  T --> D{has_frame?}
+  D -- "false（数据不足）" --> Wt["等待更多字节"] --> R
+  D -- "true" --> F["frame = buf[0..consumed)"]
+  F --> C{已设 ICodec?}
+  C -- 是 --> DE["frame = Decode(frame)"] --> M
+  C -- 否 --> M["组装 Message（填 source/timestamp）"]
+  M --> P["投递到 ReceiveQueue"]
+  P --> T
 ```
 
 - 无 framer 时为「透传模式」：底层每次读到多少字节即作为一条 `Message` 投递。
@@ -728,10 +785,12 @@ I/O线程 read 字节
 
 ### 14.3 接收路径 — 报文式（UDP / DDS）
 
-```
-I/O线程 收到一个 datagram（UDP）/ 一条 RawMessage（DDS）
-  └▶ [若已设 ICodec: payload = Decode(payload)]
-       └▶ 组装 Message ─▶ 投递
+```mermaid
+flowchart LR
+  R["I/O 线程收到 datagram(UDP) / RawMessage(DDS)"] --> C{已设 ICodec?}
+  C -- 是 --> DE["payload = Decode(payload)"] --> M
+  C -- 否 --> M["组装 Message"]
+  M --> P["投递到 ReceiveQueue"]
 ```
 
 报文天然保边界，**不经分帧**。
