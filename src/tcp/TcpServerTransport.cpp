@@ -47,7 +47,12 @@ void TcpServerTransport::DoAccept() {
   acceptor_.async_accept([this, self](asio::error_code ec,
                                       asio::ip::tcp::socket sock) {
     if (ec) {
-      if (open_.load() && disconnect_cb_) disconnect_cb_("conn: acceptor: " + ec.message());
+      DisconnectCallback dcb;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_.load()) dcb = disconnect_cb_;  // 锁内拷贝，避免与 OnDisconnect 数据竞争
+      }
+      if (dcb) dcb("conn: acceptor: " + ec.message());
       return;
     }
     std::shared_ptr<TcpConnection> conn;
@@ -108,6 +113,7 @@ std::future<Result<Message>> TcpServerTransport::AsyncReceive() {
 }
 
 void TcpServerTransport::OnDisconnect(DisconnectCallback cb) {
+  std::lock_guard<std::mutex> lock(mutex_);
   disconnect_cb_ = std::move(cb);
 }
 

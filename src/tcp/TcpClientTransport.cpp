@@ -46,6 +46,9 @@ Status TcpClientTransport::Open() {
 void TcpClientTransport::StartConnect(std::shared_ptr<std::promise<Status>> prom) {
   auto self = std::static_pointer_cast<TcpClientTransport>(shared_from_this());
 
+  // 已知限制：resolver_.resolve 为同步阻塞 DNS 查询，不受 connect_timeout_ms 约束；
+  // connect_timeout_ms 仅约束 TCP 连接阶段。host 为 IP（如 127.0.0.1）时解析瞬时返回；
+  // 对慢速/黑洞 DNS 的主机名，Open() 可能阻塞超过 connect_timeout_ms。
   asio::error_code rec;
   auto endpoints =
       resolver_.resolve(config_.host, std::to_string(config_.port), rec);
