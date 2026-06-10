@@ -60,7 +60,7 @@ void TcpConnectionImpl::StartRead() {
               return;
             }
             for (auto& f : frames.value) {
-              DeliverFrame(std::move(f), peer_id_, "");
+              core_.DeliverFrame(std::move(f), peer_id_, "");
             }
             StartRead();
           }));
@@ -68,7 +68,7 @@ void TcpConnectionImpl::StartRead() {
 
 Status TcpConnectionImpl::Send(const std::vector<uint8_t>& data) {
   if (!open_.load()) return Status::Fail("conn: not connected");
-  auto enc = EncodeForSend(data);
+  auto enc = core_.EncodeForSend(data);
   if (!enc) return Status::Fail(enc.error);
   auto self = shared_from_this();
   auto buf = std::make_shared<std::vector<uint8_t>>(std::move(enc.value));
@@ -107,9 +107,9 @@ void TcpConnectionImpl::HandleDisconnect(const std::string& reason) {
   open_.store(false);
   asio::error_code ec;
   socket_.close(ec);
-  DeliverError(reason);   // 唤醒同步等待者 / 投递错误
-  CloseQueue();           // accepted 连接终态：永久关闭接收队列
-  NotifyDisconnect(reason);
+  core_.DeliverError(reason);   // 唤醒同步等待者 / 投递错误
+  core_.Close();           // accepted 连接终态：永久关闭接收队列
+  core_.NotifyDisconnect(reason);
 }
 
 void TcpConnectionImpl::Close() {
@@ -119,7 +119,7 @@ void TcpConnectionImpl::Close() {
     asio::error_code ec;
     socket_.close(ec);
   });
-  CloseQueue();
+  core_.Close();
 }
 
 }  // namespace transport

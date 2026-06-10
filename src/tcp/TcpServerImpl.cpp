@@ -8,7 +8,7 @@
 // TcpServerImpl.cpp — TCP 服务端实现（见 TcpServerImpl.hpp）。
 //
 // 自有 io_context + 1 后台 io 线程，被 acceptor 与所有 accepted 连接共享。
-// 不复用 TransportBase：服务端不维护接收队列，Receive/AsyncReceive 返回 config:
+// 不复用 TransportCore：服务端不维护接收队列，Receive/AsyncReceive 返回 config:
 // 错误；收发在 OnNewConnection 交付的每客户端 TcpConnectionImpl 上进行。
 // clients_ 受 mutex_ 保护；用户回调(connection_cb_/disconnect_cb_)一律锁外调用。
 
