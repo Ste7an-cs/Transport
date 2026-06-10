@@ -63,6 +63,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp/tcp_connection_test.cpp
     tests/tcp/tcp_client_test.cpp
     tests/tcp/tcp_server_test.cpp
+    tests/udp/udp_interfaces_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   find_package(Threads REQUIRED)
