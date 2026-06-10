@@ -206,6 +206,8 @@ classDiagram
 > 为什么要 `I*` 接口而不止一个实现类：① `TransportFactory` 据接口返回句柄；② 消费者头文件不被 asio/Fast DDS 等依赖污染；③ 可替换 / 可用 fake 测试上层；④ 全框架一致。
 >
 > 注：`TransportBase` 当前 `: public ITransport`。UDP/DDS 阶段拟将其改为**被持有的组件 `TransportCore`**（组合替代继承，消除「与扩展接口同源 `ITransport`」的菱形）——该重构**待议**，详见 `docs/superpowers/specs/2026-06-10-udp-transport-design.md`。
+>
+> **已实现部分（Foundation + TCP）的 as-built 类图/时序图/依赖说明**见 `docs/superpowers/specs/2026-06-10-foundation-tcp-architecture.md`。
 
 ---
 
