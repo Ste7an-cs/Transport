@@ -199,7 +199,7 @@ classDiagram
   TransportFactory ..> ITransport : 创建并回交接口句柄
 ```
 
-> **状态：** `ITransport` / `ITcpServer` / `IUdpTransport` / `TransportCore` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` / `UdpImpl` 已实现（Foundation + TCP + UDP）；`IDdsTransport` / `DdsImpl` / `SerialImpl` / `TransportFactory` 规划中。
+> **状态：** `ITransport` / `ITcpServer` / `IUdpTransport` / `TransportCore` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` / `UdpImpl` / `SerialImpl` 已实现（Foundation + TCP + UDP + 串口）；`IDdsTransport` / `DdsImpl` / `TransportFactory` 规划中。
 >
 > **支撑设施：** `ICodec`（用户实现）、`IFramer ◁── LengthFieldFramer`、`FrameAssembler`、`ReceiveQueue`、`Message`、`Result<T>`——均已实现。`TransportCore` 内部持有 `ReceiveQueue` 并用 `ICodec` 编解码，被各「会收数据」的传输**组合持有**；流式传输（TCP/串口）接收侧经 `FrameAssembler` + `IFramer` 分帧。`TcpServerImpl` 不组合 `TransportCore`（只 accept + 广播，不维护接收队列）。
 >
