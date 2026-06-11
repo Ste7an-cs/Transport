@@ -43,6 +43,14 @@ class TransportCore {
     return codec_->Encode(data);
   }
 
+  // 接收侧解码；无 codec 时透传。供不经 ReceiveQueue 交付的路径
+  //（如 DDS req-resp 回调）使用；常规路径走 DeliverFrame。
+  Result<std::vector<uint8_t>> DecodeForReceive(
+      const std::vector<uint8_t>& frame) {
+    if (!codec_) return Result<std::vector<uint8_t>>::Success(frame);
+    return codec_->Decode(frame);
+  }
+
   // 收到一帧/一报文：解码（无 codec 透传）后构造 Message 投递；解码失败投递 Fail。
   void DeliverFrame(std::vector<uint8_t> frame, const std::string& source,
                     const std::string& topic) {
