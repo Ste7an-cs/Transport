@@ -5,6 +5,7 @@
 **修订：**
 - 2026-06-09 增补 —— 发送时指定目的地（UDP 目的 ip:port、DDS topic）、DDS 实例内部多 topic 路由、接收侧流式分帧层、`ICodec` 可报错、所有发送接口去除 `len` 参数改用 `std::vector<uint8_t>`、移除 `DdsTransportManager`、DDS req-resp 仅客户端发请求。
 - 2026-06-09 二次增补 —— DDS 统一字节流承载：单个 `RawMessage` C++ 类（`request_id`/`reply_topic`/`payload`）+ 自定义 `TopicDataType`，绕过 IDL/Fast DDS-Gen/Fast CDR 直发原始字节；req-resp 框架自动关联（`request_id`+`reply_topic`）、自动超时，移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
+- 2026-06-11 DDS 实现期增补 —— `DdsConfig.qos_profile` 字符串改为 `DdsQos` 结构体（reliability/durability/history_depth，借鉴 Apollo Cyber RT 的 QoS 简化包装）；Fast DDS 版本 3.6 → **2.13+**（仅用 DDS-PIM API + 自定义 `TopicDataType`，版本敏感面封在 provider 文件对内，RTPS 线协议与 3.x 互通）；同机 SHM 由 Fast DDS 内建 SHM transport 覆盖，自研 SHM 传输列入远期 roadmap。详见 `2026-06-11-dds-transport-design.md`。
 
 ---
 
@@ -56,7 +57,7 @@ flowchart TB
   subgraph Libs["底层库"]
     direction LR
     asio["Asio"]
-    fastdds["Fast DDS 3.6"]
+    fastdds["Fast DDS 2.13+"]
     termios["termios"]
   end
 
@@ -463,11 +464,21 @@ class IUdpTransport : public ITransport {
 ```cpp
 enum class DdsMode { kPubSub, kReqResp };
 
+// QoS 简化结构（借鉴 Apollo Cyber RT）：可枚举、可校验、provider 无关；
+// provider 负责映射到底层 DDS QoS 策略。
+struct DdsQos {
+  enum class Reliability { kReliable, kBestEffort };
+  enum class Durability  { kVolatile, kTransientLocal };
+  Reliability reliability   = Reliability::kReliable;
+  Durability  durability    = Durability::kVolatile;
+  uint32_t    history_depth = 10;   // KEEP_LAST depth
+};
+
 struct DdsConfig {
   DdsMode                  mode      = DdsMode::kPubSub;
   std::vector<std::string> topics;          // 实例关注的 topic 列表；topics[0] 为默认 topic
   int                      domain_id = 0;    // 一个实例 = 一个 DomainParticipant（绑定 domain_id）
-  std::string              qos_profile;      // 为空时使用默认 QoS
+  DdsQos                   qos;              // writer/reader 共用（原 qos_profile 字符串已废除）
   std::string              provider  = "FastDDS";  // 选择已注册的 IDdsProvider
 };
 ```
@@ -476,7 +487,7 @@ struct DdsConfig {
 
 ### 7.2 DDS 承载类 `RawMessage` 与自定义 `TopicDataType`
 
-Fast DDS **不强制使用 IDL 或 CDR**——它只要求实现 `TopicDataType` 的序列化/反序列化接口。框架据此采用 Fast DDS 3.6 推荐的高级用法：**自定义 `TopicDataType`，完全绕过 IDL、Fast DDS-Gen 与 Fast CDR，直接收发原始字节流。** TCP/UDP/串口本就直接发送 `std::vector<uint8_t>`，仅 DDS 需要这层承载类把字节装进 sample。
+Fast DDS **不强制使用 IDL 或 CDR**——它只要求实现 `TopicDataType` 的序列化/反序列化接口。框架据此采用 Fast DDS（2.13+）推荐的高级用法：**自定义 `TopicDataType`，完全绕过 IDL、Fast DDS-Gen 与 Fast CDR，直接收发原始字节流。** TCP/UDP/串口本就直接发送 `std::vector<uint8_t>`，仅 DDS 需要这层承载类把字节装进 sample。
 
 承载类是一个**普通 C++ 类（非 IDL）**，provider 无关，pub-sub 与 req-resp 共用一个类型：
 
@@ -724,7 +735,7 @@ class TransportFactory {
 | 模块 | 库 | 版本要求 |
 |------|----|---------|
 | TCP / UDP | standalone Asio（≥ 1.28）或 Boost.Asio（Boost ≥ 1.81） | 二选一 |
-| DDS（Fast DDS） | Fast DDS | 3.6 |
+| DDS（Fast DDS） | Fast DDS | 2.13+（DDS-PIM API；升 3.x 仅改 provider 文件对） |
 | JSON 配置 | nlohmann/json | ≥ 3.11 |
 | 串口 | POSIX termios（无额外依赖） | — |
 | 单元测试 | GoogleTest | ≥ 1.14 |
