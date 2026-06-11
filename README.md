@@ -19,7 +19,7 @@
 ## 特点
 
 - **统一抽象 `ITransport`**：生命周期 + 发送 + 三模式接收 + 断连通知 + 编解码挂载，所有传输同一套用法。
-- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）、串口。（DDS / 工厂规划中。）
+- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）、串口、DDS（Fast DDS 2.13+，pub-sub 多 topic / req-resp 自动关联超时）。（工厂规划中。）
 - **可插拔编解码 `ICodec`**：框架在 `Send` 前 `Encode`、收到后 `Decode`；不设则字节透传。
 - **可插拔分帧 `IFramer`**：流式传输（TCP/串口）接收侧把字节流切回整帧；内置「长度字段」实现 `LengthFieldFramer`；UDP/DDS 报文天然保边界，自动跳过。
 - **三种接收交付模式**（互斥）：同步阻塞 `Receive`、回调 `OnReceive`、future `AsyncReceive`。
@@ -153,6 +153,43 @@ udp->Send({1, 2, 3});                       // 发往默认目的地（按 mode�
 udp->SendTo({4, 5, 6}, "10.0.0.7", 7000);   // 运行期指定目的地，忽略默认 remote
 ```
 
+### DDS（pub-sub 多 topic + req-resp）
+
+```cpp
+#include "transport/dds/DdsImpl.hpp"
+using namespace transport;
+
+// pub-sub：一个实例 = 一个 DomainParticipant，内部多 topic
+DdsConfig pc;
+pc.mode = DdsMode::kPubSub;
+pc.topics = {"cmd", "telemetry"};        // topics[0] 为 Send(data) 默认 topic
+pc.domain_id = 0;
+auto dds = std::make_shared<DdsImpl>(pc);
+dds->Open();
+dds->Subscribe("telemetry");
+dds->OnReceive([](Result<Message> m) { /* m.value.topic 标识来源 */ });
+dds->Send({1, 2, 3}, "cmd");             // 向指定 topic 发布
+
+// req-resp：响应端
+DdsConfig sc;
+sc.mode = DdsMode::kReqResp;
+sc.topics = {"calc"};
+auto server = std::make_shared<DdsImpl>(sc);
+server->Open();
+server->OnRequest("calc", [](const Message& req, IDdsTransport::ReplyFn reply) {
+  reply(Compute(req.payload));           // 可同步或异步调用 reply
+});
+
+// req-resp：客户端（框架自动生成 request_id、配对响应、超时）
+auto client = std::make_shared<DdsImpl>(sc);
+client->Open();
+client->SendRequest(request_bytes, "calc",
+    [](Result<Message> r) {
+      if (!r) { /* r.error 形如 "timeout:..." */ return; }
+      Use(r.value.payload);
+    }, /*timeout_ms=*/3000);
+```
+
 ### 三种接收模式（任选其一，单实例上互斥）
 
 ```cpp
@@ -181,7 +218,7 @@ t->OnDisconnect([](const std::string& reason) { /* reason 形如 "conn:..." */ }
 - [x] TCP（client / server）
 - [x] UDP（单播 / 组播 / 广播）
 - [x] 串口
-- [ ] DDS（Fast DDS，pub-sub / req-resp）
+- [x] DDS（Fast DDS，pub-sub / req-resp）
 - [ ] TransportFactory + JSON 配置
 
 ---

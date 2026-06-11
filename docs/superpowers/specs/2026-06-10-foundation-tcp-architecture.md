@@ -1,8 +1,8 @@
-# Foundation + TCP + UDP 整体设计与依赖关系（as-built）
+# Foundation + TCP + UDP + 串口 + DDS 整体设计与依赖关系（as-built）
 
-> 本文用 UML 说明**已实现部分**（Foundation 层 + TCP + UDP 传输）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。命名约定：`I*` = 接口，`*Impl` = 具体实现。
+> 本文用 UML 说明**已实现部分**（Foundation 层 + TCP / UDP / 串口 / DDS 传输）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。命名约定：`I*` = 接口，`*Impl` = 具体实现。
 >
-> 接收交付基座为**组合式组件 `TransportCore`**（不是 `ITransport`）：会收数据的传输（TCP 连接 / UDP / 串口 /（未来）DDS）**持有**它并把接收侧方法转发过去——从根上避免「与扩展接口同源 `ITransport`」的菱形。
+> 接收交付基座为**组合式组件 `TransportCore`**（不是 `ITransport`）：会收数据的传输（TCP 连接 / UDP / 串口 / DDS）**持有**它并把接收侧方法转发过去——从根上避免「与扩展接口同源 `ITransport`」的菱形。
 
 ---
 
@@ -147,6 +147,53 @@ classDiagram
   IUdpTransport <|.. UdpImpl : 实现
   UdpImpl *-- TransportCore : 组合（持有；无 framer）
   UdpImpl ..> UdpConfig : 使用
+
+  %% ===== 串口传输 =====
+  class SerialImpl {
+    +Open() +Close() +Send()
+    +Receive()/OnReceive()/... 转发 core_
+    -serial_port + io_context+thread (自有)
+  }
+  ITransport <|.. SerialImpl : 实现
+  SerialImpl *-- TransportCore : 组合（持有）
+  SerialImpl *-- FrameAssembler : 拥有(接收侧分帧)
+
+  %% ===== DDS 传输 =====
+  class IDdsTransport {
+    <<interface>>
+    +Send(data,topic) +Subscribe() +Unsubscribe()
+    +SendRequest() +OnRequest()
+    +Mode() +Provider()
+  }
+  class IDdsProvider {
+    <<interface>>
+    +Init() +Publish() +Subscribe()
+    +SendRequest() +SubscribeReplies()
+    +ServeRequests() +Reply() +Shutdown()
+  }
+  class DdsImpl {
+    +pub-sub 路由 / req-resp 关联+超时
+    +Receive()/OnReceive()/... 转发 core_
+    -pending_ map + io_context+thread(超时timer)
+  }
+  class FastDdsProvider {
+    -participant + 懒加载 writer/reader
+    -DdsQos→FastDDS QoS 映射
+  }
+  class RawMessage {
+    +request_id +reply_topic +payload
+  }
+  class DdsProviderRegistry {
+    +RegisterProvider()$ +Create()$
+  }
+
+  ITransport <|-- IDdsTransport : 扩展
+  IDdsTransport <|.. DdsImpl : 实现
+  DdsImpl *-- TransportCore : 组合（持有；无 framer）
+  DdsImpl o-- IDdsProvider : 注入持有
+  IDdsProvider <|.. FastDdsProvider : 实现(FastDDS 2.13)
+  FastDdsProvider ..> RawMessage : 收发承载
+  DdsImpl ..> DdsProviderRegistry : 默认按名创建
 ```
 
 ---
@@ -178,6 +225,14 @@ classDiagram
 - **`UdpConfig`**：mode + 本地绑定 + 默认目的地 + 组播组/TTL。
 
 > `UdpImpl` 正是「组合优于继承」的范例：它要同时是 `IUdpTransport`（=`ITransport`+`SendTo`）又复用接收机能；若让基座 `TransportCore` 也继承 `ITransport`，就会两路到达 `ITransport` 形成菱形。把基座做成**被持有的组件**，`UdpImpl` 到 `ITransport` 只剩 `IUdpTransport` 一条路，菱形不复存在。
+
+### 2.3b 串口 / DDS 对 Foundation 的依赖
+
+- **`SerialImpl` ⋯▷ `ITransport`，且 `*--` `TransportCore` + `FrameAssembler`**：流式（分帧同 TCP），底层 `asio::serial_port`，无连接/无重连。
+- **`IDdsTransport` ──▷ `ITransport`**：DDS 扩展接口（按 topic `Send`/`Subscribe`/req-resp/`Mode`/`Provider`）。
+- **`DdsImpl` ⋯▷ `IDdsTransport`，且 `*--` `TransportCore`、`o--` `IDdsProvider`（构造注入）**：provider 无关的全部业务逻辑——pub-sub 多 topic 路由、req-resp `request_id` 关联/超时（自有 io 线程跑 per-request `steady_timer`，`pending_` take-then-invoke 保证 `on_reply` 恰好一次）、codec 边界、模式约束。**长期回调一律捕获 `weak_ptr`**（避免 `DdsImpl→provider→callback→DdsImpl` 引用环）。
+- **`IDdsProvider` ← `FastDdsProvider`**：底层 DDS 抽象；FastDDS 2.13 实现 = participant + `RawMessage` 类型注册（`FastDdsRawType` 手写 wire layout，不经 CDR）+ 懒加载 topic→writer/reader + `DdsQos` 映射。版本敏感面全封在这对文件。测试用 `FakeDdsProvider`（进程内 topic 总线）替换——DDS 业务逻辑零 FastDDS 依赖即可全测。
+- **`DdsProviderRegistry`**：name→工厂；`DdsImpl` 未注入 provider 时按 `config.provider` 创建。
 
 ### 2.4 依赖方向（原则）
 
