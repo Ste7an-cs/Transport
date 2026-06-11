@@ -74,6 +74,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_interfaces_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp
+    tests/dds/dds_impl_reqresp_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)

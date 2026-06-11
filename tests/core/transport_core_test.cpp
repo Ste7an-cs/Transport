@@ -93,3 +93,14 @@ TEST(TransportCore, DisconnectCallbackInvoked) {
   core.NotifyDisconnect("conn: peer closed");
   EXPECT_EQ(reason, "conn: peer closed");
 }
+
+TEST(TransportCore, DecodeForReceivePassthroughAndCodec) {
+  transport::TransportCore core;
+  auto p = core.DecodeForReceive({1, 2});
+  ASSERT_TRUE(static_cast<bool>(p));
+  EXPECT_EQ(p.value, (std::vector<uint8_t>{1, 2}));
+  core.SetCodec(std::make_shared<ShiftCodec>());
+  auto d = core.DecodeForReceive({2, 3});
+  ASSERT_TRUE(static_cast<bool>(d));
+  EXPECT_EQ(d.value, (std::vector<uint8_t>{1, 2}));
+}

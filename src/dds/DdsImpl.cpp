@@ -166,8 +166,13 @@ Status DdsImpl::SendRequest(const std::vector<uint8_t>& data,
     std::lock_guard<std::mutex> lk(mutex_);
     pending_[id] = Pending{std::move(on_reply), timer};
   }
-  timer->async_wait([self, id](asio::error_code ec) {
+  // 注意：捕获 weak_ptr（而非 self）。strong 捕获会让本 handler 成为最后一个
+  // DdsImpl 引用——其析构在 io 线程触发 ~DdsImpl→Close→io_thread_.join() 自我
+  // join（EDEADLK，"Resource deadlock avoided" 终止进程）。weak 锁定后无此风险。
+  timer->async_wait([wself, id](asio::error_code ec) {
     if (ec) return;  // 被取消（reply 已到）
+    auto self = wself.lock();
+    if (!self) return;
     Pending entry;
     {
       std::lock_guard<std::mutex> lk(self->mutex_);
