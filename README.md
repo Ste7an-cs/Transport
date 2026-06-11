@@ -19,7 +19,7 @@
 ## 特点
 
 - **统一抽象 `ITransport`**：生命周期 + 发送 + 三模式接收 + 断连通知 + 编解码挂载，所有传输同一套用法。
-- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）。（串口 / DDS / 工厂规划中。）
+- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）、串口。（DDS / 工厂规划中。）
 - **可插拔编解码 `ICodec`**：框架在 `Send` 前 `Encode`、收到后 `Decode`；不设则字节透传。
 - **可插拔分帧 `IFramer`**：流式传输（TCP/串口）接收侧把字节流切回整帧；内置「长度字段」实现 `LengthFieldFramer`；UDP/DDS 报文天然保边界，自动跳过。
 - **三种接收交付模式**（互斥）：同步阻塞 `Receive`、回调 `OnReceive`、future `AsyncReceive`。
@@ -180,7 +180,7 @@ t->OnDisconnect([](const std::string& reason) { /* reason 形如 "conn:..." */ }
 - [x] Foundation：核心接口、分帧、接收交付（`TransportCore`）、`Result`/`Message`
 - [x] TCP（client / server）
 - [x] UDP（单播 / 组播 / 广播）
-- [ ] 串口
+- [x] 串口
 - [ ] DDS（Fast DDS，pub-sub / req-resp）
 - [ ] TransportFactory + JSON 配置
 
