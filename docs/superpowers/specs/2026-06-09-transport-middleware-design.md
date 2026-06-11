@@ -6,6 +6,7 @@
 - 2026-06-09 增补 —— 发送时指定目的地（UDP 目的 ip:port、DDS topic）、DDS 实例内部多 topic 路由、接收侧流式分帧层、`ICodec` 可报错、所有发送接口去除 `len` 参数改用 `std::vector<uint8_t>`、移除 `DdsTransportManager`、DDS req-resp 仅客户端发请求。
 - 2026-06-09 二次增补 —— DDS 统一字节流承载：单个 `RawMessage` C++ 类（`request_id`/`reply_topic`/`payload`）+ 自定义 `TopicDataType`，绕过 IDL/Fast DDS-Gen/Fast CDR 直发原始字节；req-resp 框架自动关联（`request_id`+`reply_topic`）、自动超时，移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
 - 2026-06-11 DDS 实现期增补 —— `DdsConfig.qos_profile` 字符串改为 `DdsQos` 结构体（reliability/durability/history_depth，借鉴 Apollo Cyber RT 的 QoS 简化包装）；Fast DDS 版本 3.6 → **2.13+**（仅用 DDS-PIM API + 自定义 `TopicDataType`，版本敏感面封在 provider 文件对内，RTPS 线协议与 3.x 互通）；同机 SHM 由 Fast DDS 内建 SHM transport 覆盖，自研 SHM 传输列入远期 roadmap。详见 `2026-06-11-dds-transport-design.md`。
+- 2026-06-12 Factory 实现期修订 —— `CreateFromFile` 返回 `Result<vector<...>>`（原裸 vector 无错误通道，违背不抛异常约定）；§9.1 明确枚举字符串/`framer`/`qos` 子对象映射与**严格校验**（未知字段报错不静默）。详见 `2026-06-12-transport-factory-design.md`。
 
 ---
 
@@ -686,7 +687,10 @@ class TransportFactory {
 
   // 配置文件方式（JSON）。解析传输对象数组，每条配置返回一个实例。
   // 返回基类指针；如需专属方法可 dynamic_pointer_cast 到对应接口。
-  static std::vector<std::shared_ptr<ITransport>> CreateFromFile(const std::string& path);
+  // 解析/校验失败返回 Fail("config: transports[i].field: ...")（带条目定位）；
+  // 任一条目失败 → 整体失败，不返回部分结果。
+  static Result<std::vector<std::shared_ptr<ITransport>>> CreateFromFile(
+      const std::string& path);
 };
 ```
 
@@ -706,6 +710,12 @@ class TransportFactory {
   ]
 }
 ```
+
+映射规则（实现细节见 `2026-06-12-transport-factory-design.md`）：
+- 字段名 = config 结构体字段名；缺省字段用结构体默认值；`host`/`port`/`device`/`topics` 为必填。
+- 枚举字符串：udp `mode`: `"unicast"/"multicast"/"broadcast"`；dds `mode`: `"pubsub"/"reqresp"`；serial `parity`: `"N"/"E"/"O"`。
+- 子对象：`framer`（tcp_client/tcp_server/serial，→ `LengthFieldFramerConfig`）；`qos`（dds，→ `DdsQos`：`reliability`: `"reliable"/"best_effort"`、`durability`: `"volatile"/"transient_local"`、`history_depth`）。
+- **严格校验**：未知 `type`/未知字段/类型不符/枚举非法/必填缺失 → `config:` 错误（含条目序号与字段名），不静默忽略。
 
 ---
 
