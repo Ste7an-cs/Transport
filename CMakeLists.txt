@@ -69,6 +69,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/udp/udp_transport_test.cpp
     tests/serial/serial_interfaces_test.cpp
     tests/serial/serial_transport_test.cpp
+    tests/dds/dds_interfaces_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)
