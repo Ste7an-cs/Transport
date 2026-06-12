@@ -57,7 +57,18 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-依赖（CMake 经 FetchContent 自动拉取）：Standalone Asio 1.30、GoogleTest 1.14。C++17。
+**离线自包含**：核心依赖已 vendored 到 `third_party/`（Standalone Asio 1.30.2、nlohmann/json 3.11.3、GoogleTest 1.14.0），CMake **不再联网拉取**。在全新环境上 `git clone` 后即可直接 `cmake && build`，无需下载任何第三方库。C++17。
+
+### 唯一可选外部依赖：Fast DDS
+
+DDS 子系统的**真实** provider 基于 Fast DDS 2.13.x（编译型库，带 `fastcdr` / `foonathan_memory` / `tinyxml2` 三个传递依赖），体积大且与平台 ABI 相关，故**未内置**，由 CMake `find_package` 自动探测：
+
+| 环境 | 结果 |
+|---|---|
+| **未安装 Fast DDS** | 自动 `Fast DDS NOT found`，跳过 `FastDdsProvider` 及其 8 个互通测试，离线构建 **108/108 通过**。DDS 接口与逻辑仍可用（`FakeDdsProvider` / 用户自注册 provider）。 |
+| **已安装 Fast DDS** | 自动启用 `FastDdsProvider`，**116/116 通过**。 |
+
+启用真实 DDS（一次性系统安装，非每次构建）：在目标机装好 Fast DDS 2.13.x（含 fastcdr/foonathan_memory/tinyxml2，源码或发行包均可），CMake 即自动探测启用。第三方依赖清单与版本见 [`third_party/README.md`](third_party/README.md)。
 
 ---
 
