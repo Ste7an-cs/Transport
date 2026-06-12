@@ -79,7 +79,8 @@ void TcpServerImpl::DoAccept() {
         std::shared_ptr<IFramer> framer;
         if (config_.framer)
           framer = std::make_shared<LengthFieldFramer>(*config_.framer);
-        conn = std::make_shared<TcpConnectionImpl>(std::move(sock), framer);
+        conn = std::make_shared<TcpConnectionImpl>(std::move(sock), framer,
+                                                   config_.enable_topic_routing);
         if (codec_) conn->SetCodec(codec_);
         const std::string id = conn->PeerId();
         clients_[id] = conn;

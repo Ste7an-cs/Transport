@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "transport/core/TopicEnvelope.hpp"
+
 // TcpConnectionImpl.cpp — 已连接 socket 的收发实现（见 TcpConnectionImpl.hpp）。
 //
 // 并发模型：
@@ -24,11 +26,13 @@ std::string EndpointId(const asio::ip::tcp::socket& s) {
 }  // namespace
 
 TcpConnectionImpl::TcpConnectionImpl(asio::ip::tcp::socket socket,
-                             std::shared_ptr<IFramer> framer)
+                             std::shared_ptr<IFramer> framer,
+                             bool enable_topic_routing)
     : socket_(std::move(socket)),
       strand_(asio::make_strand(socket_.get_executor())),
       assembler_(std::move(framer)),
-      peer_id_(EndpointId(socket_)) {}
+      peer_id_(EndpointId(socket_)),
+      enable_topic_routing_(enable_topic_routing) {}
 
 Status TcpConnectionImpl::Open() {
   bool expected = false;
@@ -54,29 +58,63 @@ void TcpConnectionImpl::StartRead() {
               HandleDisconnect(std::string("conn: ") + ec.message());
               return;
             }
-            auto frames = assembler_.Feed(read_buf_.data(), n);
-            if (!frames) {
-              HandleDisconnect(frames.error);  // frame: 错误
-              return;
-            }
-            for (auto& f : frames.value) {
-              core_.DeliverFrame(std::move(f), peer_id_, "");
+            if (enable_topic_routing_) {
+              auto tfs = topic_assembler_.Feed(read_buf_.data(), n);
+              if (!tfs) {
+                HandleDisconnect(tfs.error);
+                return;
+              }
+              for (auto& tf : tfs.value) {
+                core_.DeliverFrame(std::move(tf.body), peer_id_, tf.topic);
+              }
+            } else {
+              auto frames = assembler_.Feed(read_buf_.data(), n);
+              if (!frames) {
+                HandleDisconnect(frames.error);  // frame: 错误
+                return;
+              }
+              for (auto& f : frames.value) {
+                core_.DeliverFrame(std::move(f), peer_id_, "");
+              }
             }
             StartRead();
           }));
 }
 
 Status TcpConnectionImpl::Send(const std::vector<uint8_t>& data) {
+  if (enable_topic_routing_) {
+    Message m;
+    m.payload = data;  // topic 空
+    return Send(m, Endpoint::Default());
+  }
   if (!open_.load()) return Status::Fail("conn: not connected");
   auto enc = core_.EncodeForSend(data);
   if (!enc) return Status::Fail(enc.error);
+  EnqueueWrite(std::move(enc.value));
+  return Status::Success(std::monostate{});
+}
+
+Status TcpConnectionImpl::Send(const Message& msg, const Endpoint& to) {
+  if (!enable_topic_routing_) {
+    if (!msg.topic.empty())
+      return Status::Fail("config: topic routing not enabled");
+    return Send(msg.payload);  // 退化(TCP 地址即连接,忽略 to)
+  }
+  (void)to;  // TCP 地址即连接
+  if (!open_.load()) return Status::Fail("conn: not connected");
+  auto enc = core_.EncodeForSend(msg.payload, msg.topic);
+  if (!enc) return Status::Fail(enc.error);
+  EnqueueWrite(FrameStream(msg.topic, enc.value));
+  return Status::Success(std::monostate{});
+}
+
+void TcpConnectionImpl::EnqueueWrite(std::vector<uint8_t> bytes) {
   auto self = shared_from_this();
-  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(enc.value));
+  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
   asio::post(strand_, [this, self, buf]() {
     write_queue_.push_back(std::move(*buf));
     if (!writing_) DoWrite();
   });
-  return Status::Success(std::monostate{});
 }
 
 // 串行化写：一次只 async_write 队首 buffer，完成后弹出并发下一个，直到队空。

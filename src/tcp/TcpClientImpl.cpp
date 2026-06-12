@@ -26,7 +26,8 @@ TcpClientImpl::TcpClientImpl(TcpClientConfig config,
       TcpConnectionImpl(asio::ip::tcp::socket(ctx),
                     config.framer
                         ? std::make_shared<LengthFieldFramer>(*config.framer)
-                        : nullptr),
+                        : nullptr,
+                    config.enable_topic_routing),
       config_(std::move(config)),
       backoff_base_(backoff_base),
       backoff_cap_(backoff_cap),

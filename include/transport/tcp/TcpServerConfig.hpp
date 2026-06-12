@@ -18,6 +18,7 @@ struct TcpServerConfig {
   uint16_t    port        = 0;     // 0 = 由 OS 分配临时端口
   int         max_clients = 10;
   std::optional<LengthFieldFramerConfig> framer;  // 应用于每个 accepted 连接的接收侧
+  bool enable_topic_routing = false;  // 开启 topic→codec 多路复用(in-band envelope)
 };
 
 }  // namespace transport
