@@ -30,7 +30,7 @@ class TransportFactory {
   // ---- 代码配置方式：构造不失败（配置校验在 Open()），返回最具体接口 ----
   static std::shared_ptr<ITransport>    Create(const TcpClientConfig& config);
   static std::shared_ptr<ITcpServer>    Create(const TcpServerConfig& config);
-  static std::shared_ptr<IUdpTransport> Create(const UdpConfig& config);
+  static std::shared_ptr<ITransport>    Create(const UdpConfig& config);
   static std::shared_ptr<IDdsTransport> Create(const DdsConfig& config);
   static std::shared_ptr<ITransport>    Create(const SerialConfig& config);
 

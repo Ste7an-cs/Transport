@@ -24,7 +24,7 @@
 - **可插拔分帧 `IFramer`**：流式传输（TCP/串口）接收侧把字节流切回整帧；内置「长度字段」实现 `LengthFieldFramer`；UDP/DDS 报文天然保边界，自动跳过。
 - **三种接收交付模式**（互斥）：同步阻塞 `Receive`、回调 `OnReceive`、future `AsyncReceive`。
 - **不抛异常**：所有可失败操作返回 `Result<T>`，错误串带前缀分类：`timeout:` / `conn:` / `codec:` / `frame:` / `io:` / `config:`。
-- **TCP 客户端自动重连**（指数退避，封顶）；**TCP 服务端广播**；**UDP 运行期指定目的地** `SendTo`。
+- **TCP 客户端自动重连**（指数退避，封顶）；**TCP 服务端广播**；**统一寻址发送** `Send(data, Endpoint)`（UDP `Endpoint::Net` / DDS `Endpoint::Topic`，基类句柄即可寻址）。
 - **异步单线程 I/O**：每个传输实例自有 `io_context` + 1 后台线程（Standalone Asio），接收落入**线程安全**的 FIFO 队列。
 - **接口层零第三方依赖**：`include/` 只含纯接口与数据结构；Asio / Fast DDS 关在实现层，消费者头文件不被污染。
 
@@ -35,7 +35,7 @@
 | 需求 | 设计应对 |
 |------|----------|
 | 传输与内容解耦 | 库只搬字节；编解码下放到用户实现的 `ICodec`，框架在收发边界自动调用 |
-| 多协议、一套用法 | 所有传输实现统一接口 `ITransport`；扩展能力用 `I*Transport`（如 `ITcpServer.OnNewConnection`、`IUdpTransport.SendTo`） |
+| 多协议、一套用法 | 所有传输实现统一接口 `ITransport`；扩展能力用 `I*Transport`（如 `ITcpServer.OnNewConnection`、`IDdsTransport.SendRequest`）；一次性寻址发送统一为 `Send(data, Endpoint)` |
 | 不同应用风格的接收 | 同步 / 回调 / future 三模式，单实例上互斥，由首次接收调用锁定 |
 | 流式协议的粘包/半包 | 接收侧 `FrameAssembler` + `IFramer` 用滚动缓冲切帧；报文式传输跳过分帧 |
 | 健壮的错误传递 | 全程 `Result<T>`、不抛异常；错误前缀分类，连接级错误也经接收队列投递 |
@@ -161,7 +161,7 @@ cfg.remote_port = 6000;
 auto udp = std::make_shared<UdpImpl>(cfg);
 udp->Open();
 udp->Send({1, 2, 3});                       // 发往默认目的地（按 mode）
-udp->SendTo({4, 5, 6}, "10.0.0.7", 7000);   // 运行期指定目的地，忽略默认 remote
+udp->Send({4, 5, 6}, Endpoint::Net("10.0.0.7", 7000));  // 运行期指定目的地，忽略默认 remote
 ```
 
 ### DDS（pub-sub 多 topic + req-resp）
@@ -179,7 +179,7 @@ auto dds = std::make_shared<DdsImpl>(pc);
 dds->Open();
 dds->Subscribe("telemetry");
 dds->OnReceive([](Result<Message> m) { /* m.value.topic 标识来源 */ });
-dds->Send({1, 2, 3}, "cmd");             // 向指定 topic 发布
+dds->Send({1, 2, 3}, Endpoint::Topic("cmd"));  // 向指定 topic 发布
 
 // req-resp：响应端
 DdsConfig sc;

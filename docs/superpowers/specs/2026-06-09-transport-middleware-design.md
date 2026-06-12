@@ -7,6 +7,7 @@
 - 2026-06-09 二次增补 —— DDS 统一字节流承载：单个 `RawMessage` C++ 类（`request_id`/`reply_topic`/`payload`）+ 自定义 `TopicDataType`，绕过 IDL/Fast DDS-Gen/Fast CDR 直发原始字节；req-resp 框架自动关联（`request_id`+`reply_topic`）、自动超时，移除 `DdsConfig.type_name`；明确 TCP/UDP/串口直接发送 `std::vector<uint8_t>`；新增 req-resp 响应端 `OnRequest`、`SendRequest` 增 `timeout_ms`；新增「收发数据流与调用时序」「测试策略」「使用示例」章节。
 - 2026-06-11 DDS 实现期增补 —— `DdsConfig.qos_profile` 字符串改为 `DdsQos` 结构体（reliability/durability/history_depth，借鉴 Apollo Cyber RT 的 QoS 简化包装）；Fast DDS 版本 3.6 → **2.13+**（仅用 DDS-PIM API + 自定义 `TopicDataType`，版本敏感面封在 provider 文件对内，RTPS 线协议与 3.x 互通）；同机 SHM 由 Fast DDS 内建 SHM transport 覆盖，自研 SHM 传输列入远期 roadmap。详见 `2026-06-11-dds-transport-design.md`。
 - 2026-06-12 Factory 实现期修订 —— `CreateFromFile` 返回 `Result<vector<...>>`（原裸 vector 无错误通道，违背不抛异常约定）；§9.1 明确枚举字符串/`framer`/`qos` 子对象映射与**严格校验**（未知字段报错不静默）。详见 `2026-06-12-transport-factory-design.md`。
+- 2026-06-12：Endpoint 统一寻址发送——ITransport 加 Send(data, Endpoint) 默认实现；删除 IUdpTransport（掏空）与 IDdsTransport::Send(data,topic)（破坏性）。理由：基类句柄无法寻址发送 + 各传输寻址 API 形态不一。详见 specs/2026-06-12-endpoint-send-design.md
 
 ---
 
@@ -37,12 +38,12 @@
 
 ```mermaid
 flowchart TB
-  App["应用层（用户代码）<br/>持有 shared_ptr&lt;ITransport / ITcpServer / IUdpTransport / IDdsTransport&gt;"]
+  App["应用层（用户代码）<br/>持有 shared_ptr&lt;ITransport / ITcpServer / IDdsTransport&gt;"]
 
   subgraph Abstraction["传输抽象层 include/ — 纯接口 + 数据结构（零第三方依赖）"]
     direction LR
     A1["ITransport"]
-    A2["ITcpServer · IUdpTransport · IDdsTransport"]
+    A2["ITcpServer · IDdsTransport"]
     A3["ICodec · IFramer · Message · Result"]
     A4["TransportFactory · IDdsProvider · DdsProviderRegistry"]
   end
@@ -84,6 +85,7 @@ flowchart TB
 transport/
 ├── include/transport/
 │   ├── ITransport.hpp
+│   ├── Endpoint.hpp
 │   ├── ICodec.hpp
 │   ├── IFramer.hpp
 │   ├── Message.hpp
@@ -96,8 +98,7 @@ transport/
 │   │   ├── TcpServerConfig.hpp
 │   │   └── ITcpServer.hpp
 │   ├── udp/
-│   │   ├── UdpConfig.hpp
-│   │   └── IUdpTransport.hpp
+│   │   └── UdpConfig.hpp
 │   ├── dds/
 │   │   ├── DdsConfig.hpp
 │   │   ├── IDdsTransport.hpp
@@ -147,7 +148,7 @@ classDiagram
   class ITransport {
     <<interface>>
     +Open() +Close() +IsOpen()
-    +Send() +Receive()
+    +Send() +Send(data, Endpoint) +Receive()
     +OnReceive() +AsyncReceive()
     +OnDisconnect() +SetCodec()
   }
@@ -156,16 +157,11 @@ classDiagram
     +OnNewConnection()
     +GetClients() +DisconnectClient()
   }
-  class IUdpTransport {
-    <<interface>>
-    +SendTo()
-  }
   class IDdsTransport {
     <<interface>>
-    +Send(topic) +SendRequest() +OnRequest()
+    +SendRequest() +OnRequest()
   }
   ITransport <|-- ITcpServer
-  ITransport <|-- IUdpTransport
   ITransport <|-- IDdsTransport
 
   class TransportCore {
@@ -185,7 +181,7 @@ classDiagram
   TcpConnectionImpl <|-- TcpClientImpl
   ITcpServer <|.. TcpServerImpl
   TcpServerImpl o-- TcpConnectionImpl : 管理客户端连接
-  IUdpTransport <|.. UdpImpl
+  ITransport <|.. UdpImpl
   IDdsTransport <|.. DdsImpl
   ITransport <|.. SerialImpl
 
@@ -201,7 +197,7 @@ classDiagram
   TransportFactory ..> ITransport : 创建并回交接口句柄
 ```
 
-> **状态：** `ITransport` / `ITcpServer` / `IUdpTransport` / `IDdsTransport` / `TransportCore` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` / `UdpImpl` / `SerialImpl` / `DdsImpl`（+`IDdsProvider`/`FastDdsProvider`/`DdsProviderRegistry`/`RawMessage`）已实现（Foundation + TCP + UDP + 串口 + DDS）；`TransportFactory`（5 类型化 Create + CreateFromFile JSON）已实现——**主 spec 全部规划范围完成**。
+> **状态：** `ITransport` / `ITcpServer` / `IDdsTransport` / `TransportCore` / `TcpConnectionImpl` / `TcpClientImpl` / `TcpServerImpl` / `UdpImpl` / `SerialImpl` / `DdsImpl`（+`IDdsProvider`/`FastDdsProvider`/`DdsProviderRegistry`/`RawMessage`）已实现（Foundation + TCP + UDP + 串口 + DDS）；`TransportFactory`（5 类型化 Create + CreateFromFile JSON）已实现——**主 spec 全部规划范围完成**。
 >
 > **支撑设施：** `ICodec`（用户实现）、`IFramer ◁── LengthFieldFramer`、`FrameAssembler`、`ReceiveQueue`、`Message`、`Result<T>`——均已实现。`TransportCore` 内部持有 `ReceiveQueue` 并用 `ICodec` 编解码，被各「会收数据」的传输**组合持有**；流式传输（TCP/串口）接收侧经 `FrameAssembler` + `IFramer` 分帧。`TcpServerImpl` 不组合 `TransportCore`（只 accept + 广播，不维护接收队列）。
 >
@@ -317,6 +313,23 @@ struct LengthFieldFramerConfig {
 
 ### 4.5 `ITransport`
 
+中立的寻址目的地值类型 `Endpoint`（`include/transport/Endpoint.hpp`，零第三方依赖），镜像 `Message` 的两种寻址（`source`="ip:port" / `topic`）：
+
+```cpp
+struct Endpoint {
+  enum class Kind { kDefault, kNet, kTopic };
+
+  Kind kind = Kind::kDefault;
+  std::string host;     // kNet: ip
+  uint16_t port{0};     // kNet
+  std::string topic;    // kTopic
+
+  static Endpoint Default();                          // 用 config 默认目的地
+  static Endpoint Net(std::string ip, uint16_t port); // UDP 寻址
+  static Endpoint Topic(std::string name);            // DDS 寻址
+};
+```
+
 ```cpp
 class ITransport {
  public:
@@ -332,6 +345,10 @@ class ITransport {
 
   // 发送（若已设置 ICodec，自动 Encode 后传输）。data 自带长度，无需 len。
   virtual Status  Send(const std::vector<uint8_t>& data) = 0;
+
+  // 寻址发送（非纯虚，基类默认实现）：kDefault 退化调 Send(data)，
+  // 其余 kind → Fail("io: addressed send not supported")。UDP/DDS 覆写。
+  virtual Status  Send(const std::vector<uint8_t>& data, const Endpoint& to);
 
   // 同步接收（阻塞直到收到数据或超时；timeout_ms == 0 表示永久阻塞）
   virtual Result<Message> Receive(uint32_t timeout_ms = 0) = 0;
@@ -350,7 +367,7 @@ class ITransport {
 };
 ```
 
-**`Send` 语义：** `Send(data)` 发往实例创建时绑定的默认目的地——UDP 发往 config 的 `remote_addr:remote_port`（组播时为 `multicast_group`）、DDS 发往 config 的默认 `topic`、TCP/串口发往已建立的连接。运行期指定目的地见 §6（UDP `SendTo`）、§7（DDS `Send(data, topic)`）。返回的 `Status` 表示「入队/写出成功」，不代表对端已收（见 §10）。
+**`Send` 语义：** `Send(data)` 发往实例创建时绑定的默认目的地——UDP 发往 config 的 `remote_addr:remote_port`（组播时为 `multicast_group`）、DDS 发往 config 的默认 `topic`、TCP/串口发往已建立的连接。运行期指定目的地统一用 `Send(data, Endpoint)`（UDP `Endpoint::Net`、DDS `Endpoint::Topic`）。返回的 `Status` 表示「入队/写出成功」，不代表对端已收（见 §10）。
 
 **接收模式规则：**
 - 同步（`Receive`）、回调（`OnReceive`）、future（`AsyncReceive`）三种模式在同一实例上互斥。
@@ -439,21 +456,12 @@ struct UdpConfig {
 };
 ```
 
-### 6.1 `IUdpTransport`
+### 6.1 运行期寻址
 
-UDP 需要在发送时动态指定目的地（而非仅静态绑定）。
-
-```cpp
-class IUdpTransport : public ITransport {
- public:
-  // 发往运行期指定的目的地；忽略 config 的默认 remote
-  virtual Status SendTo(const std::vector<uint8_t>& data,
-                        const std::string& ip, uint16_t port) = 0;
-};
-```
+UDP 无专属扩展接口（`UdpImpl` 直接实现 `ITransport`）。运行期指定目的地用基类的 `Send(data, Endpoint::Net(ip, port))`，忽略 config 的默认 remote；无效地址 → `config: invalid address`，传入 `Endpoint::Topic` → `config: udp expects net endpoint`。
 
 - `Send(data)`（基类）：单播/广播模式发往 `remote_addr:remote_port`，组播模式发往 `multicast_group:remote_port`。
-- `SendTo(data, ip, port)`：发往运行期指定地址，适合无固定对端的场景。
+- `Send(data, Endpoint::Net(ip, port))`：发往运行期指定地址，适合无固定对端的场景。
 - 接收到的 `Message.source` 包含发送方地址。
 
 ---
@@ -527,15 +535,14 @@ pub-sub 时 `request_id`/`reply_topic` 为空串（各占 2 字节长度前缀 =
 
 ### 7.3 `IDdsTransport`（实例内部多 topic + req-resp）
 
-一个 `IDdsTransport` 实例对应一个 `DomainParticipant`，内部以 `map<topic, writer/reader>` 懒加载维护多个 topic：`Send(data, topic)` 自动创建/复用该 topic 的 DataWriter，`Subscribe(topic)` 自动创建该 topic 的 DataReader。因此「同一用户用 map 维护多个 topic」由实例内部完成，无需外部管理器。
+一个 `IDdsTransport` 实例对应一个 `DomainParticipant`，内部以 `map<topic, writer/reader>` 懒加载维护多个 topic：按 topic 发布走基类的 `Send(data, Endpoint::Topic(name))` 自动创建/复用该 topic 的 DataWriter，`Subscribe(topic)` 自动创建该 topic 的 DataReader。因此「同一用户用 map 维护多个 topic」由实例内部完成，无需外部管理器。
+
+> **按 topic 发送：** 走基类的 `Send(data, Endpoint::Topic(...))`（`DdsImpl` 覆写该重载）；`kDefault` 发往 `topics[0]` 默认 topic，传入 `Endpoint::Net` → `config: dds expects topic endpoint`。`IDdsTransport` 不再提供专属的双参 `Send(data, topic)`。
 
 ```cpp
 class IDdsTransport : public ITransport {
  public:
   // ---- pub-sub ----
-  // 向运行期指定 topic 发布（topic 不存在则建 writer，存在则复用）
-  virtual Status Send(const std::vector<uint8_t>& data,
-                      const std::string& topic) = 0;
   // 动态订阅/退订；收到的消息经 OnReceive/Receive/AsyncReceive 交付，
   // Message.topic 标识来源 topic
   virtual Status Subscribe(const std::string& topic)   = 0;
@@ -673,7 +680,7 @@ struct SerialConfig {
 
 ## 9. TransportFactory
 
-所有传输实例的统一创建入口。返回各传输的最具体接口，以便访问 `SendTo`/按 topic `Send` 等专属方法。
+所有传输实例的统一创建入口。返回各传输的最具体接口（UDP 已无专属扩展接口，返回 `ITransport`）；寻址发送统一 `Send(data, Endpoint)`。
 
 ```cpp
 class TransportFactory {
@@ -681,7 +688,7 @@ class TransportFactory {
   // 代码配置方式
   static std::shared_ptr<ITransport>     Create(const TcpClientConfig& config);
   static std::shared_ptr<ITcpServer>     Create(const TcpServerConfig& config);
-  static std::shared_ptr<IUdpTransport>  Create(const UdpConfig& config);
+  static std::shared_ptr<ITransport>     Create(const UdpConfig& config);
   static std::shared_ptr<IDdsTransport>  Create(const DdsConfig& config);
   static std::shared_ptr<ITransport>     Create(const SerialConfig& config);
 
@@ -847,7 +854,7 @@ flowchart LR
 ### 15.3 回环集成测试
 
 - **TCP**：localhost 上 server↔client，覆盖连接建立、`OnNewConnection`、每客户端独立收发、广播 `Send`、`DisconnectClient`、`auto_reconnect`。
-- **UDP**：localhost 单播、组播（loopback 加入组）、`SendTo` 动态目的地、`Message.source` 正确。
+- **UDP**：localhost 单播、组播（loopback 加入组）、`Endpoint::Net` 动态目的地、`Message.source` 正确。
 - **串口**：用 `openpty`/`socat -d -d pty,raw pty,raw` 造虚拟串口对，覆盖分帧与透传两种模式。
 - **DDS（Fast DDS）**：同 `domain_id` 双 participant，覆盖 pub-sub 多 topic、req-resp 端到端（含响应端 `OnRequest` 同步与异步回包）、超时。
 
@@ -877,7 +884,7 @@ auto udp = TransportFactory::Create(UdpConfig{
     .local_port = 5000, .remote_port = 5000});
 udp->Open();
 udp->Send(payload);                       // 发往组播组
-udp->SendTo(payload, "10.0.0.7", 6000);   // 运行期指定单播目的地
+udp->Send(payload, Endpoint::Net("10.0.0.7", 6000));  // 运行期指定单播目的地
 
 // 3) DDS pub-sub：单实例内部多 topic
 auto dds = TransportFactory::Create(DdsConfig{
@@ -885,7 +892,7 @@ auto dds = TransportFactory::Create(DdsConfig{
 dds->Open();
 dds->Subscribe("telemetry");
 dds->OnReceive([](Result<Message> m) { /* m.topic 标识来源 */ });
-dds->Send(payload, "cmd");                // 向指定 topic 发布
+dds->Send(payload, Endpoint::Topic("cmd"));  // 向指定 topic 发布
 ```
 
 ### 16.2 DDS 请求响应（框架自动关联）

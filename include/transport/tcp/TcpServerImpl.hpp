@@ -41,6 +41,7 @@ class TcpServerImpl
   void Close() override;
   bool IsOpen() const override;
 
+  using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
   Status Send(const std::vector<uint8_t>& data) override;  // 广播
 
   // 服务端不适用的接收方法（主 spec §5.3）

@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "FakeDdsProvider.hpp"
+#include "transport/Endpoint.hpp"
 
 using transport::DdsConfig;
 using transport::DdsImpl;
@@ -157,7 +158,7 @@ TEST(DdsReqResp, ModeConstraintRejectsPubSubMethods) {
   auto t = Make(bus, ReqRespCfg());
   t->Open();
   EXPECT_EQ(t->Send({1}).error.rfind("config:", 0), 0u);
-  EXPECT_EQ(t->Send({1}, "x").error.rfind("config:", 0), 0u);
+  EXPECT_EQ(t->Send({1}, transport::Endpoint::Topic("x")).error.rfind("config:", 0), 0u);
   EXPECT_EQ(t->Subscribe("x").error.rfind("config:", 0), 0u);
   EXPECT_EQ(t->Unsubscribe("x").error.rfind("config:", 0), 0u);
 }

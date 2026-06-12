@@ -37,6 +37,7 @@ class SerialImpl : public ITransport,
   Status Open() override;   // 打开串口 + 配置参数 + 启动接收循环
   void Close() override;    // 关 port + core_.Close() + 停 io 线程
   bool IsOpen() const override;
+  using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
   Status Send(const std::vector<uint8_t>& data) override;
 
   // 接收侧：一行转发给 core_

@@ -1,5 +1,6 @@
-#include "transport/udp/IUdpTransport.hpp"
+#include "transport/ITransport.hpp"
 #include "transport/udp/UdpConfig.hpp"
+#include "transport/udp/UdpImpl.hpp"
 
 #include <type_traits>
 
@@ -14,7 +15,7 @@ TEST(UdpConfig, Defaults) {
   EXPECT_EQ(c.ttl, 1);
 }
 
-TEST(UdpConfig, IUdpTransportIsTransport) {
+TEST(UdpConfig, UdpImplIsTransport) {
   EXPECT_TRUE((std::is_base_of<transport::ITransport,
-                               transport::IUdpTransport>::value));
+                               transport::UdpImpl>::value));
 }

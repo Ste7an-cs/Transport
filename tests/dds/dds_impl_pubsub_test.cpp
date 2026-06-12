@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "FakeDdsProvider.hpp"
+#include "transport/Endpoint.hpp"
 #include "transport/ICodec.hpp"
 
 using transport::DdsConfig;
@@ -70,8 +71,8 @@ TEST(DdsPubSub, SendToSpecificTopicAndMultiTopicRouting) {
   ASSERT_TRUE(static_cast<bool>(rx->Subscribe("a")));
   ASSERT_TRUE(static_cast<bool>(rx->Subscribe("b")));
 
-  ASSERT_TRUE(static_cast<bool>(tx->Send({1}, "a")));
-  ASSERT_TRUE(static_cast<bool>(tx->Send({2}, "b")));
+  ASSERT_TRUE(static_cast<bool>(tx->Send({1}, transport::Endpoint::Topic("a"))));
+  ASSERT_TRUE(static_cast<bool>(tx->Send({2}, transport::Endpoint::Topic("b"))));
   auto r1 = rx->Receive(1000);
   auto r2 = rx->Receive(1000);
   ASSERT_TRUE(static_cast<bool>(r1));

@@ -7,8 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include "transport/Endpoint.hpp"
 #include "transport/ICodec.hpp"
 
+using transport::Endpoint;
 using transport::ICodec;
 using transport::Result;
 using transport::UdpConfig;
@@ -60,7 +62,7 @@ TEST(UdpTransport, UnicastSendReceive) {
   rx->Close();
 }
 
-TEST(UdpTransport, SendToOverridesDefault) {
+TEST(UdpTransport, EndpointNetOverridesDefault) {
   auto rx = std::make_shared<UdpImpl>(UnicastCfg("", 0));
   ASSERT_TRUE(static_cast<bool>(rx->Open()));
   uint16_t rport = rx->LocalPort();
@@ -68,7 +70,7 @@ TEST(UdpTransport, SendToOverridesDefault) {
   auto tx = std::make_shared<UdpImpl>(UnicastCfg("", 0));  // 无默认 remote
   ASSERT_TRUE(static_cast<bool>(tx->Open()));
 
-  ASSERT_TRUE(static_cast<bool>(tx->SendTo({4, 5}, "127.0.0.1", rport)));
+  ASSERT_TRUE(static_cast<bool>(tx->Send({4, 5}, Endpoint::Net("127.0.0.1", rport))));
   auto r = rx->Receive(1000);
   ASSERT_TRUE(static_cast<bool>(r));
   EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{4, 5}));
@@ -112,7 +114,7 @@ TEST(UdpTransport, MulticastLoopbackOrSkip) {
 
   uint16_t port = m->LocalPort();
   // 经 enable_loopback 发给自身的组播组:本端口
-  auto sent = m->SendTo({7, 8, 9}, "239.255.0.1", port);
+  auto sent = m->Send({7, 8, 9}, Endpoint::Net("239.255.0.1", port));
   if (!sent) {
     m->Close();
     GTEST_SKIP() << "multicast send failed: " << sent.error;

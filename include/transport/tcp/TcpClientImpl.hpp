@@ -41,6 +41,8 @@ class TcpClientImpl : public detail::IoContextHolder, public TcpConnectionImpl {
       std::chrono::milliseconds backoff_cap = std::chrono::milliseconds(30000));
   ~TcpClientImpl() override;
 
+  using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
+
   Status Open() override;   // 同步连接（受 connect_timeout_ms 约束），成功后启动读
   void Close() override;    // 停重连 + 关连接 + 停 io 线程
 

@@ -60,7 +60,7 @@ Status UdpImpl::Open() {
     if (ec) return Status::Fail("config: invalid remote_addr");
     default_dest_ = asio::ip::udp::endpoint(raddr, config_.remote_port);
   }
-  // 单播/广播 remote_addr 为空：default_dest_ 留默认（仅 SendTo/接收可用）；
+  // 单播/广播 remote_addr 为空：default_dest_ 留默认（仅 Endpoint::Net 寻址/接收可用）；
   // 此时调 Send() 会向 0.0.0.0:0 发出并经 core_.DeliverError 报 io: 错误。
 
   asio::error_code lec;  // 用 error_code 重载，遵守框架不抛异常约定
@@ -114,12 +114,20 @@ Status UdpImpl::Send(const std::vector<uint8_t>& data) {
   return SendToEndpoint(data, default_dest_);
 }
 
-Status UdpImpl::SendTo(const std::vector<uint8_t>& data, const std::string& ip,
-                       uint16_t port) {
-  asio::error_code ec;
-  auto addr = asio::ip::make_address(ip, ec);
-  if (ec) return Status::Fail("config: invalid address");
-  return SendToEndpoint(data, asio::ip::udp::endpoint(addr, port));
+Status UdpImpl::Send(const std::vector<uint8_t>& data, const Endpoint& to) {
+  switch (to.kind) {
+    case Endpoint::Kind::kDefault:
+      return Send(data);
+    case Endpoint::Kind::kNet: {
+      asio::error_code ec;
+      auto addr = asio::ip::make_address(to.host, ec);
+      if (ec) return Status::Fail("config: invalid address");
+      return SendToEndpoint(data, asio::ip::udp::endpoint(addr, to.port));
+    }
+    case Endpoint::Kind::kTopic:
+      return Status::Fail("config: udp expects net endpoint");
+  }
+  return Status::Fail("config: unknown endpoint kind");
 }
 
 void UdpImpl::Close() {

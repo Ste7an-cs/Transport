@@ -36,7 +36,7 @@ std::shared_ptr<ITcpServer> TransportFactory::Create(
   return std::make_shared<TcpServerImpl>(config);
 }
 
-std::shared_ptr<IUdpTransport> TransportFactory::Create(
+std::shared_ptr<ITransport> TransportFactory::Create(
     const UdpConfig& config) {
   return std::make_shared<UdpImpl>(config);
 }

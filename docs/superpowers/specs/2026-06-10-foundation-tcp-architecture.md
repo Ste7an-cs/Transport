@@ -53,7 +53,7 @@ classDiagram
   class ITransport {
     <<interface>>
     +Open() +Close() +IsOpen()
-    +Send(bytes)
+    +Send(bytes) +Send(data, Endpoint)
     +Receive() +OnReceive() +AsyncReceive()
     +OnDisconnect() +SetCodec()
   }
@@ -126,12 +126,8 @@ classDiagram
   TcpServerImpl ..> TcpServerConfig : 使用
 
   %% ===== UDP 传输 =====
-  class IUdpTransport {
-    <<interface>>
-    +SendTo(data,ip,port)
-  }
   class UdpImpl {
-    +Open() +Close() +Send() +SendTo()
+    +Open() +Close() +Send() +Send(data,Endpoint)
     +Receive()/OnReceive()/... 转发 core_
     +LocalPort()
     -udp_socket + io_context+thread (自有)
@@ -143,8 +139,7 @@ classDiagram
     +multicast_group +ttl
   }
 
-  ITransport <|-- IUdpTransport : 扩展
-  IUdpTransport <|.. UdpImpl : 实现
+  ITransport <|.. UdpImpl : 直接实现
   UdpImpl *-- TransportCore : 组合（持有；无 framer）
   UdpImpl ..> UdpConfig : 使用
 
@@ -232,16 +227,16 @@ classDiagram
 
 ### 2.3 UDP 对 Foundation 的依赖
 
-- **`IUdpTransport` ──▷ `ITransport`**：UDP 扩展接口（加 `SendTo`，运行期指定目的地）。
-- **`UdpImpl` ⋯▷ `IUdpTransport`，且 `*--` `TransportCore`**：单类处理单播/组播/广播，**直接实现** `IUdpTransport`、**组合持有** `TransportCore core_`（接收侧转发）。自有 `io_context`+线程；`Open()` 按 `mode` 配置 socket。**无 `FrameAssembler`**——UDP 报文天然保边界，每个 datagram 经 `core_.DeliverFrame` 直接成一条 `Message`。
+- **`UdpImpl` ──▷ `ITransport`**：直接实现（`Endpoint::Net` 运行期寻址）。
+- **`UdpImpl` ⋯▷ `ITransport`，且 `*--` `TransportCore`**：单类处理单播/组播/广播，**直接实现** `ITransport`（无专属扩展接口）、**组合持有** `TransportCore core_`（接收侧转发）。自有 `io_context`+线程；`Open()` 按 `mode` 配置 socket。**无 `FrameAssembler`**——UDP 报文天然保边界，每个 datagram 经 `core_.DeliverFrame` 直接成一条 `Message`。
 - **`UdpConfig`**：mode + 本地绑定 + 默认目的地 + 组播组/TTL。
 
-> `UdpImpl` 正是「组合优于继承」的范例：它要同时是 `IUdpTransport`（=`ITransport`+`SendTo`）又复用接收机能；若让基座 `TransportCore` 也继承 `ITransport`，就会两路到达 `ITransport` 形成菱形。把基座做成**被持有的组件**，`UdpImpl` 到 `ITransport` 只剩 `IUdpTransport` 一条路，菱形不复存在。
+> `UdpImpl` 正是「组合优于继承」的范例：它要实现 `ITransport`（含 `Endpoint::Net` 运行期寻址）又复用接收机能；若让基座 `TransportCore` 也继承 `ITransport`，就会两路到达 `ITransport` 形成菱形。把基座做成**被持有的组件**，`UdpImpl` 到 `ITransport` 只剩直接实现一条路，菱形不复存在。
 
 ### 2.3b 串口 / DDS 对 Foundation 的依赖
 
 - **`SerialImpl` ⋯▷ `ITransport`，且 `*--` `TransportCore` + `FrameAssembler`**：流式（分帧同 TCP），底层 `asio::serial_port`，无连接/无重连。
-- **`IDdsTransport` ──▷ `ITransport`**：DDS 扩展接口（按 topic `Send`/`Subscribe`/req-resp/`Mode`/`Provider`）。
+- **`IDdsTransport` ──▷ `ITransport`**：DDS 扩展接口（`Subscribe`/req-resp/`Mode`/`Provider`；按 topic 发送走基类 `Send(data, Endpoint::Topic(...))`）。
 - **`DdsImpl` ⋯▷ `IDdsTransport`，且 `*--` `TransportCore`、`o--` `IDdsProvider`（构造注入）**：provider 无关的全部业务逻辑——pub-sub 多 topic 路由、req-resp `request_id` 关联/超时（自有 io 线程跑 per-request `steady_timer`，`pending_` take-then-invoke 保证 `on_reply` 恰好一次）、codec 边界、模式约束。**长期回调一律捕获 `weak_ptr`**（避免 `DdsImpl→provider→callback→DdsImpl` 引用环）。
 - **`IDdsProvider` ← `FastDdsProvider`**：底层 DDS 抽象；FastDDS 2.13 实现 = participant + `RawMessage` 类型注册（`FastDdsRawType` 手写 wire layout，不经 CDR）+ 懒加载 topic→writer/reader + `DdsQos` 映射。版本敏感面全封在这对文件。测试用 `FakeDdsProvider`（进程内 topic 总线）替换——DDS 业务逻辑零 FastDDS 依赖即可全测。
 - **`DdsProviderRegistry`**：name→工厂；`DdsImpl` 未注入 provider 时按 `config.provider` 创建。

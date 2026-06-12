@@ -20,7 +20,6 @@
 #include "transport/tcp/ITcpServer.hpp"
 #include "transport/tcp/TcpClientConfig.hpp"
 #include "transport/tcp/TcpServerConfig.hpp"
-#include "transport/udp/IUdpTransport.hpp"
 #include "transport/udp/UdpConfig.hpp"
 
 namespace transport {
@@ -30,7 +29,7 @@ class TransportFactory {
   // ---- 代码配置方式 ----
   static std::shared_ptr<ITransport> Create(const TcpClientConfig& config);
   static std::shared_ptr<ITcpServer> Create(const TcpServerConfig& config);
-  static std::shared_ptr<IUdpTransport> Create(const UdpConfig& config);
+  static std::shared_ptr<ITransport> Create(const UdpConfig& config);
   static std::shared_ptr<IDdsTransport> Create(const DdsConfig& config);
   static std::shared_ptr<ITransport> Create(const SerialConfig& config);
 
