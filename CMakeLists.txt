@@ -75,6 +75,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/version_test.cpp
     tests/endpoint_send_test.cpp
     tests/result_test.cpp
+    tests/topic_routing_test.cpp
     tests/interfaces_test.cpp
     tests/framing/length_field_framer_test.cpp
     tests/framing/frame_assembler_test.cpp
