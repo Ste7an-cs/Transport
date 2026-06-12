@@ -80,6 +80,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/framing/frame_assembler_test.cpp
     tests/core/receive_queue_test.cpp
     tests/core/transport_core_test.cpp
+    tests/core/topic_envelope_test.cpp
     tests/tcp/asio_smoke_test.cpp
     tests/tcp/tcp_interfaces_test.cpp
     tests/tcp/tcp_connection_test.cpp
