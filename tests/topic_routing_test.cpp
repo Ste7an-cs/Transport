@@ -186,3 +186,63 @@ TEST(TcpTopicRouting, RoutingOffRejectsTopicSend) {
   EXPECT_FALSE(st.ok);
   EXPECT_EQ(st.error, "config: topic routing not enabled");
 }
+
+// ---- UDP topic 路由(回环) ----
+#include "transport/udp/UdpConfig.hpp"
+#include "transport/udp/UdpImpl.hpp"
+
+TEST(UdpTopicRouting, RoundTripSelectsCodecByTopic) {
+  using namespace transport;
+  UdpConfig rcfg;
+  rcfg.mode = UdpMode::kUnicast;
+  rcfg.local_addr = "127.0.0.1";
+  rcfg.local_port = 0;
+  rcfg.enable_topic_routing = true;
+  auto rx = std::make_shared<UdpImpl>(rcfg);
+  ASSERT_TRUE(rx->Open().ok);
+  rx->SetCodec("a", std::make_shared<TagCodec2>(0xAA));
+  rx->SetCodec("b", std::make_shared<TagCodec2>(0xBB));
+
+  UdpConfig scfg;
+  scfg.mode = UdpMode::kUnicast;
+  scfg.local_addr = "127.0.0.1";
+  scfg.local_port = 0;
+  scfg.remote_addr = "127.0.0.1";
+  scfg.remote_port = rx->LocalPort();
+  scfg.enable_topic_routing = true;
+  auto tx = std::make_shared<UdpImpl>(scfg);
+  ASSERT_TRUE(tx->Open().ok);
+  tx->SetCodec("a", std::make_shared<TagCodec2>(0xAA));
+  tx->SetCodec("b", std::make_shared<TagCodec2>(0xBB));
+
+  Message mb;
+  mb.payload = Bytes{9, 8, 7};
+  mb.topic = "b";
+  ASSERT_TRUE(tx->Send(mb).ok);
+
+  auto r = rx->Receive(2000);
+  ASSERT_TRUE(r.ok);
+  EXPECT_EQ(r.value.topic, "b");
+  EXPECT_EQ(r.value.payload, (Bytes{9, 8, 7}));
+
+  tx->Close();
+  rx->Close();
+}
+
+TEST(UdpTopicRouting, RoutingOffRejectsTopicSend) {
+  using namespace transport;
+  UdpConfig cfg;
+  cfg.mode = UdpMode::kUnicast;
+  cfg.local_addr = "127.0.0.1";
+  cfg.local_port = 0;
+  cfg.enable_topic_routing = false;
+  auto u = std::make_shared<UdpImpl>(cfg);
+  ASSERT_TRUE(u->Open().ok);
+  Message m;
+  m.payload = Bytes{1};
+  m.topic = "x";
+  auto st = u->Send(m);
+  EXPECT_FALSE(st.ok);
+  EXPECT_EQ(st.error, "config: topic routing not enabled");
+  u->Close();
+}

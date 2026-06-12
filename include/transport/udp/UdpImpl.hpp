@@ -21,6 +21,7 @@
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
+#include "transport/core/TopicEnvelope.hpp"
 #include "transport/core/TransportCore.hpp"
 #include "transport/udp/UdpConfig.hpp"
 
@@ -36,9 +37,12 @@ class UdpImpl : public ITransport,
   void Close() override;
   bool IsOpen() const override;
   using ITransport::Send;
+  using ITransport::SetCodec;
   Status Send(const std::vector<uint8_t>& data) override;             // 默认目的地
   Status Send(const std::vector<uint8_t>& data,
               const Endpoint& to) override;                           // kNet 运行期目的地
+  Status Send(const Message& msg,
+              const Endpoint& to = Endpoint::Default()) override;     // topic 路由
 
   // 接收侧：转发给 core_
   Result<Message> Receive(uint32_t timeout_ms) override { return core_.Receive(timeout_ms); }
@@ -46,13 +50,17 @@ class UdpImpl : public ITransport,
   std::future<Result<Message>> AsyncReceive() override { return core_.AsyncReceive(); }
   void OnDisconnect(DisconnectCallback cb) override { core_.OnDisconnect(std::move(cb)); }
   void SetCodec(std::shared_ptr<ICodec> codec) override { core_.SetCodec(std::move(codec)); }
+  void SetCodec(const std::string& topic, std::shared_ptr<ICodec> codec) override {
+    core_.SetCodec(topic, std::move(codec));
+  }
 
   uint16_t LocalPort() const { return local_port_; }
 
  private:
   void StartReceive();
-  Status SendToEndpoint(const std::vector<uint8_t>& data,
-                        const asio::ip::udp::endpoint& dest);
+  Result<asio::ip::udp::endpoint> ResolveDest(const Endpoint& to);
+  Status SendRaw(std::vector<uint8_t> bytes,
+                 const asio::ip::udp::endpoint& dest);
 
   UdpConfig config_;
   TransportCore core_;

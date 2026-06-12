@@ -3,6 +3,8 @@
 #include <utility>
 #include <variant>
 
+#include "transport/core/TopicEnvelope.hpp"
+
 // UdpImpl.cpp — UDP 单播/组播/广播实现（见 UdpImpl.hpp）。
 // 并发：自有 io_context + 1 io 线程；收/发都经 strand_ 串行化（async_receive_from
 // 与 strand 上的同步 send_to 互不并发）。报文保边界 → 无分帧，每个 datagram 一条
@@ -90,17 +92,42 @@ void UdpImpl::StartReceive() {
                                  std::to_string(recv_from_.port());
             std::vector<uint8_t> datagram(recv_buf_.begin(),
                                           recv_buf_.begin() + n);
-            core_.DeliverFrame(std::move(datagram), source, "");
+            if (config_.enable_topic_routing) {
+              auto tf = UnpackTopic(datagram.data(), datagram.size());
+              if (!tf) {
+                core_.DeliverError(tf.error);  // 坏报文,不致命
+              } else {
+                core_.DeliverFrame(std::move(tf.value.body), source,
+                                   tf.value.topic);
+              }
+            } else {
+              core_.DeliverFrame(std::move(datagram), source, "");
+            }
             StartReceive();
           }));
 }
 
-Status UdpImpl::SendToEndpoint(const std::vector<uint8_t>& data,
-                               const asio::ip::udp::endpoint& dest) {
+Result<asio::ip::udp::endpoint> UdpImpl::ResolveDest(const Endpoint& to) {
+  using R = Result<asio::ip::udp::endpoint>;
+  switch (to.kind) {
+    case Endpoint::Kind::kDefault:
+      return R::Success(default_dest_);
+    case Endpoint::Kind::kNet: {
+      asio::error_code ec;
+      auto addr = asio::ip::make_address(to.host, ec);
+      if (ec) return R::Fail("config: invalid address");
+      return R::Success(asio::ip::udp::endpoint(addr, to.port));
+    }
+    case Endpoint::Kind::kTopic:
+      return R::Fail("config: udp expects net endpoint");
+  }
+  return R::Fail("config: unknown endpoint kind");
+}
+
+Status UdpImpl::SendRaw(std::vector<uint8_t> bytes,
+                        const asio::ip::udp::endpoint& dest) {
   if (!open_.load()) return Status::Fail("config: socket not open");
-  auto enc = core_.EncodeForSend(data);
-  if (!enc) return Status::Fail(enc.error);
-  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(enc.value));
+  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
   auto self = shared_from_this();
   asio::post(strand_, [this, self, buf, dest]() {
     asio::error_code ec;
@@ -111,23 +138,40 @@ Status UdpImpl::SendToEndpoint(const std::vector<uint8_t>& data,
 }
 
 Status UdpImpl::Send(const std::vector<uint8_t>& data) {
-  return SendToEndpoint(data, default_dest_);
+  if (config_.enable_topic_routing) {
+    Message m;
+    m.payload = data;
+    return Send(m, Endpoint::Default());
+  }
+  auto enc = core_.EncodeForSend(data);
+  if (!enc) return Status::Fail(enc.error);
+  return SendRaw(std::move(enc.value), default_dest_);
 }
 
 Status UdpImpl::Send(const std::vector<uint8_t>& data, const Endpoint& to) {
-  switch (to.kind) {
-    case Endpoint::Kind::kDefault:
-      return Send(data);
-    case Endpoint::Kind::kNet: {
-      asio::error_code ec;
-      auto addr = asio::ip::make_address(to.host, ec);
-      if (ec) return Status::Fail("config: invalid address");
-      return SendToEndpoint(data, asio::ip::udp::endpoint(addr, to.port));
-    }
-    case Endpoint::Kind::kTopic:
-      return Status::Fail("config: udp expects net endpoint");
+  if (config_.enable_topic_routing) {
+    Message m;
+    m.payload = data;
+    return Send(m, to);
   }
-  return Status::Fail("config: unknown endpoint kind");
+  auto dest = ResolveDest(to);
+  if (!dest) return Status::Fail(dest.error);
+  auto enc = core_.EncodeForSend(data);
+  if (!enc) return Status::Fail(enc.error);
+  return SendRaw(std::move(enc.value), dest.value);
+}
+
+Status UdpImpl::Send(const Message& msg, const Endpoint& to) {
+  if (!config_.enable_topic_routing) {
+    if (!msg.topic.empty())
+      return Status::Fail("config: topic routing not enabled");
+    return Send(msg.payload, to);
+  }
+  auto dest = ResolveDest(to);
+  if (!dest) return Status::Fail(dest.error);
+  auto enc = core_.EncodeForSend(msg.payload, msg.topic);
+  if (!enc) return Status::Fail(enc.error);
+  return SendRaw(PackTopic(msg.topic, enc.value), dest.value);
 }
 
 void UdpImpl::Close() {
