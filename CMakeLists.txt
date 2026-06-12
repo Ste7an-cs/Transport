@@ -18,9 +18,13 @@ add_library(transport STATIC
   src/serial/SerialImpl.cpp
   src/dds/DdsProviderRegistry.cpp
   src/dds/DdsImpl.cpp
+  src/TransportFactory.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_include_directories(transport PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(transport PUBLIC cxx_std_17)
 
@@ -58,6 +62,16 @@ if(TRANSPORT_HAS_FASTDDS)
   target_compile_definitions(transport PUBLIC TRANSPORT_HAS_FASTDDS)
 endif()
 
+find_package(nlohmann_json 3.11 QUIET)
+if(NOT nlohmann_json_FOUND)
+  FetchContent_Declare(
+    json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  )
+  FetchContent_MakeAvailable(json)
+endif()
+target_link_libraries(transport PRIVATE nlohmann_json::nlohmann_json)
+
 if(TRANSPORT_BUILD_TESTS)
   enable_testing()
   include(FetchContent)
@@ -92,6 +106,8 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp
     tests/dds/dds_impl_reqresp_test.cpp
+    tests/factory/factory_create_test.cpp
+    tests/factory/factory_json_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)

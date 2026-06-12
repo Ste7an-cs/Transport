@@ -1,6 +1,6 @@
-# Foundation + TCP + UDP + 串口 + DDS 整体设计与依赖关系（as-built）
+# Foundation + TCP / UDP / 串口 / DDS + Factory 整体设计与依赖关系（as-built）
 
-> 本文用 UML 说明**已实现部分**（Foundation 层 + TCP / UDP / 串口 / DDS 传输）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。命名约定：`I*` = 接口，`*Impl` = 具体实现。
+> 本文用 UML 说明**已实现部分**（Foundation 层 + TCP / UDP / 串口 / DDS 传输 + TransportFactory）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。命名约定：`I*` = 接口，`*Impl` = 具体实现。
 >
 > 接收交付基座为**组合式组件 `TransportCore`**（不是 `ITransport`）：会收数据的传输（TCP 连接 / UDP / 串口 / DDS）**持有**它并把接收侧方法转发过去——从根上避免「与扩展接口同源 `ITransport`」的菱形。
 
@@ -194,6 +194,18 @@ classDiagram
   IDdsProvider <|.. FastDdsProvider : 实现(FastDDS 2.13)
   FastDdsProvider ..> RawMessage : 收发承载
   DdsImpl ..> DdsProviderRegistry : 默认按名创建
+
+  %% ===== 统一创建入口 =====
+  class TransportFactory {
+    <<factory>>
+    +Create(各 config)$ 最具体接口
+    +CreateFromFile(path)$ Result~vector~
+  }
+  TransportFactory ..> TcpClientImpl : 创建
+  TransportFactory ..> TcpServerImpl : 创建
+  TransportFactory ..> UdpImpl : 创建
+  TransportFactory ..> DdsImpl : 创建
+  TransportFactory ..> SerialImpl : 创建
 ```
 
 ---
@@ -233,6 +245,10 @@ classDiagram
 - **`DdsImpl` ⋯▷ `IDdsTransport`，且 `*--` `TransportCore`、`o--` `IDdsProvider`（构造注入）**：provider 无关的全部业务逻辑——pub-sub 多 topic 路由、req-resp `request_id` 关联/超时（自有 io 线程跑 per-request `steady_timer`，`pending_` take-then-invoke 保证 `on_reply` 恰好一次）、codec 边界、模式约束。**长期回调一律捕获 `weak_ptr`**（避免 `DdsImpl→provider→callback→DdsImpl` 引用环）。
 - **`IDdsProvider` ← `FastDdsProvider`**：底层 DDS 抽象；FastDDS 2.13 实现 = participant + `RawMessage` 类型注册（`FastDdsRawType` 手写 wire layout，不经 CDR）+ 懒加载 topic→writer/reader + `DdsQos` 映射。版本敏感面全封在这对文件。测试用 `FakeDdsProvider`（进程内 topic 总线）替换——DDS 业务逻辑零 FastDDS 依赖即可全测。
 - **`DdsProviderRegistry`**：name→工厂；`DdsImpl` 未注入 provider 时按 `config.provider` 创建。
+
+### 2.3c Factory
+
+- **`TransportFactory`**：统一创建入口，依赖全部 `*Impl` 与各 config（创建关系 `..>`）。JSON 解析（nlohmann/json）PRIVATE 封装在 `TransportFactory.cpp`，公共头零第三方类型；`CreateFromFile` 严格校验（未知字段报错），错误带 `transports[i].field` 定位，任一条目失败整体失败。`Create(DdsConfig)` 显式调用 `RegisterFastDdsProvider()`，根治静态库下匿名注册器被链接器裁剪的问题。
 
 ### 2.4 依赖方向（原则）
 
