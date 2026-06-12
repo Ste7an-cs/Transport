@@ -20,6 +20,7 @@ struct SerialConfig {
   uint8_t     stop_bits  = 1;      // 1 或 2
   char        parity     = 'N';    // 'N'（无）/ 'E'（偶）/ 'O'（奇）
   std::optional<LengthFieldFramerConfig> framer;  // 不设则接收为透传模式
+  bool enable_topic_routing = false;  // 开启 topic→codec 多路复用(忽略 framer)
 };
 
 }  // namespace transport

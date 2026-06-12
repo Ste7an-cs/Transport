@@ -246,3 +246,21 @@ TEST(UdpTopicRouting, RoutingOffRejectsTopicSend) {
   EXPECT_EQ(st.error, "config: topic routing not enabled");
   u->Close();
 }
+
+// ---- 串口 topic 路由(开关行为,离线可测) ----
+#include "transport/serial/SerialConfig.hpp"
+#include "transport/serial/SerialImpl.hpp"
+
+TEST(SerialTopicRouting, RoutingOffRejectsTopicSend) {
+  using namespace transport;
+  SerialConfig cfg;
+  cfg.device = "/dev/null";  // 不依赖真实串口;routing-off 分支在 open 检查前返回
+  cfg.enable_topic_routing = false;
+  auto s = std::make_shared<SerialImpl>(cfg);
+  Message m;
+  m.payload = Bytes{1};
+  m.topic = "x";
+  auto st = s->Send(m);
+  EXPECT_FALSE(st.ok);
+  EXPECT_EQ(st.error, "config: topic routing not enabled");
+}

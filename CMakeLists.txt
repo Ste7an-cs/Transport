@@ -92,6 +92,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/udp/udp_transport_test.cpp
     tests/serial/serial_interfaces_test.cpp
     tests/serial/serial_transport_test.cpp
+    tests/serial/serial_topic_routing_test.cpp
     tests/dds/dds_interfaces_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp

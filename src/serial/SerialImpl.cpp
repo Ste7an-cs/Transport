@@ -3,6 +3,7 @@
 #include <utility>
 #include <variant>
 
+#include "transport/core/TopicEnvelope.hpp"
 #include "transport/framing/LengthFieldFramer.hpp"
 
 // SerialImpl.cpp — 串口传输实现（见 SerialImpl.hpp）。
@@ -19,7 +20,8 @@ SerialImpl::SerialImpl(SerialConfig config)
                      : nullptr),
       guard_(ctx_.get_executor()),
       strand_(ctx_.get_executor()),
-      port_(ctx_) {
+      port_(ctx_),
+      enable_topic_routing_(config_.enable_topic_routing) {
   io_thread_ = std::thread([this] { ctx_.run(); });
 }
 
@@ -86,29 +88,63 @@ void SerialImpl::StartRead() {
               HandleDisconnect(std::string("conn: ") + ec.message());
               return;
             }
-            auto frames = assembler_.Feed(read_buf_.data(), n);
-            if (!frames) {
-              HandleDisconnect(frames.error);  // frame: 错误
-              return;
-            }
-            for (auto& f : frames.value) {
-              core_.DeliverFrame(std::move(f), config_.device, "");
+            if (enable_topic_routing_) {
+              auto tfs = topic_assembler_.Feed(read_buf_.data(), n);
+              if (!tfs) {
+                HandleDisconnect(tfs.error);
+                return;
+              }
+              for (auto& tf : tfs.value) {
+                core_.DeliverFrame(std::move(tf.body), config_.device, tf.topic);
+              }
+            } else {
+              auto frames = assembler_.Feed(read_buf_.data(), n);
+              if (!frames) {
+                HandleDisconnect(frames.error);  // frame: 错误
+                return;
+              }
+              for (auto& f : frames.value) {
+                core_.DeliverFrame(std::move(f), config_.device, "");
+              }
             }
             StartRead();
           }));
 }
 
 Status SerialImpl::Send(const std::vector<uint8_t>& data) {
+  if (enable_topic_routing_) {
+    Message m;
+    m.payload = data;
+    return Send(m, Endpoint::Default());
+  }
   if (!open_.load()) return Status::Fail("config: serial not open");
   auto enc = core_.EncodeForSend(data);
   if (!enc) return Status::Fail(enc.error);
-  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(enc.value));
+  EnqueueWrite(std::move(enc.value));
+  return Status::Success(std::monostate{});
+}
+
+Status SerialImpl::Send(const Message& msg, const Endpoint& to) {
+  if (!enable_topic_routing_) {
+    if (!msg.topic.empty())
+      return Status::Fail("config: topic routing not enabled");
+    return Send(msg.payload);
+  }
+  (void)to;
+  if (!open_.load()) return Status::Fail("config: serial not open");
+  auto enc = core_.EncodeForSend(msg.payload, msg.topic);
+  if (!enc) return Status::Fail(enc.error);
+  EnqueueWrite(FrameStream(msg.topic, enc.value));
+  return Status::Success(std::monostate{});
+}
+
+void SerialImpl::EnqueueWrite(std::vector<uint8_t> bytes) {
+  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
   auto self = shared_from_this();
   asio::post(strand_, [this, self, buf]() {
     write_queue_.push_back(std::move(*buf));
     if (!writing_) DoWrite();
   });
-  return Status::Success(std::monostate{});
 }
 
 void SerialImpl::DoWrite() {
