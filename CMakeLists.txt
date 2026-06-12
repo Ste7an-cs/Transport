@@ -18,9 +18,13 @@ add_library(transport STATIC
   src/serial/SerialImpl.cpp
   src/dds/DdsProviderRegistry.cpp
   src/dds/DdsImpl.cpp
+  src/TransportFactory.cpp
 )
 target_include_directories(transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_include_directories(transport PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(transport PUBLIC cxx_std_17)
 
@@ -92,6 +96,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp
     tests/dds/dds_impl_reqresp_test.cpp
+    tests/factory/factory_create_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)
