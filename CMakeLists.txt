@@ -28,18 +28,11 @@ target_include_directories(transport PRIVATE
 )
 target_compile_features(transport PUBLIC cxx_std_17)
 
-include(FetchContent)
 find_package(Threads REQUIRED)
 
-FetchContent_Declare(
-  asio
-  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-  GIT_TAG asio-1-30-2
-)
-FetchContent_MakeAvailable(asio)
-
+# asio (standalone, header-only) —— 已 vendored 到 third_party/asio（asio 1.30.2），不再联网拉取
 add_library(asio_standalone INTERFACE)
-target_include_directories(asio_standalone INTERFACE ${asio_SOURCE_DIR}/asio/include)
+target_include_directories(asio_standalone INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio/include)
 target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
 target_link_libraries(asio_standalone INTERFACE Threads::Threads)
 
@@ -62,26 +55,19 @@ if(TRANSPORT_HAS_FASTDDS)
   target_compile_definitions(transport PUBLIC TRANSPORT_HAS_FASTDDS)
 endif()
 
-find_package(nlohmann_json 3.11 QUIET)
-if(NOT nlohmann_json_FOUND)
-  FetchContent_Declare(
-    json
-    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-  )
-  FetchContent_MakeAvailable(json)
-endif()
+# nlohmann/json (single header) —— 已 vendored 到 third_party/nlohmann（json 3.11.3），不再联网拉取
+add_library(nlohmann_json INTERFACE)
+add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+target_include_directories(nlohmann_json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_compile_features(nlohmann_json INTERFACE cxx_std_17)
 target_link_libraries(transport PRIVATE nlohmann_json::nlohmann_json)
 
 if(TRANSPORT_BUILD_TESTS)
   enable_testing()
-  include(FetchContent)
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.14.0
-  )
+  # googletest 1.14.0 —— 已 vendored 到 third_party/googletest，不再联网拉取
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/googletest)
 
   include(GoogleTest)
 
