@@ -2,7 +2,7 @@
 
 // -----------------------------------------------------------------------------
 // ITransport.hpp — 所有传输的统一抽象接口
-// 生命周期(Open/Close/IsOpen) + 发送(Send) + 三模式接收(Receive/OnReceive/
+// 生命周期(Open/Close/IsOpen) + 发送(Send / Send+Endpoint 统一寻址) + 三模式接收(Receive/OnReceive/
 // AsyncReceive) + 断连通知(OnDisconnect) + 编解码挂载(SetCodec)。
 // 具体实现：TcpConnectionImpl / TcpClientImpl / TcpServerImpl(扩展 ITcpServer) 等。
 // -----------------------------------------------------------------------------
@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "transport/Endpoint.hpp"
 #include "transport/ICodec.hpp"
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
@@ -34,6 +35,14 @@ class ITransport {
 
   // 发送（若已设置 ICodec，自动 Encode 后传输）。data 自带长度。
   virtual Status Send(const std::vector<uint8_t>& data) = 0;
+
+  // 统一寻址发送(非纯虚,基类默认实现):
+  //   kDefault → 退化调 Send(data);其余 kind → Fail("io: addressed send not supported")。
+  // UdpImpl 覆写支持 kNet,DdsImpl 覆写支持 kTopic;TCP/串口继承默认行为。
+  virtual Status Send(const std::vector<uint8_t>& data, const Endpoint& to) {
+    if (to.kind == Endpoint::Kind::kDefault) return Send(data);
+    return Status::Fail("io: addressed send not supported");
+  }
 
   // 同步接收（阻塞至收到数据或超时；timeout_ms == 0 表示永久阻塞）
   virtual Result<Message> Receive(uint32_t timeout_ms = 0) = 0;

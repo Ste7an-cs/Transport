@@ -36,6 +36,7 @@ class TcpConnectionImpl : public ITransport,
   Status Open() override;   // 启动 async_read 循环
   void Close() override;    // 关闭 socket + core_.Close()
   bool IsOpen() const override;
+  using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
   Status Send(const std::vector<uint8_t>& data) override;
 
   // 接收侧：转发给 core_

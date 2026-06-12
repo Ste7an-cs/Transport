@@ -73,6 +73,7 @@ if(TRANSPORT_BUILD_TESTS)
 
   add_executable(transport_tests
     tests/version_test.cpp
+    tests/endpoint_send_test.cpp
     tests/result_test.cpp
     tests/interfaces_test.cpp
     tests/framing/length_field_framer_test.cpp
