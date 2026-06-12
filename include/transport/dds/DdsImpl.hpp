@@ -42,7 +42,10 @@ class DdsImpl : public IDdsTransport,
   Status Open() override;
   void Close() override;
   bool IsOpen() const override;
+  using ITransport::Send;
   Status Send(const std::vector<uint8_t>& data) override;  // → topics[0]
+  Status Send(const std::vector<uint8_t>& data,
+              const Endpoint& to) override;                // kTopic 寻址
 
   // 接收侧：转发 core_（仅 kPubSub 交付订阅消息）
   void SetCodec(std::shared_ptr<ICodec> c) override { core_.SetCodec(std::move(c)); }
@@ -52,7 +55,6 @@ class DdsImpl : public IDdsTransport,
   void OnDisconnect(DisconnectCallback cb) override { core_.OnDisconnect(std::move(cb)); }
 
   // IDdsTransport — pub-sub
-  Status Send(const std::vector<uint8_t>& data, const std::string& topic) override;
   Status Subscribe(const std::string& topic) override;
   Status Unsubscribe(const std::string& topic) override;
 
@@ -70,6 +72,8 @@ class DdsImpl : public IDdsTransport,
     std::function<void(Result<Message>)> on_reply;
     std::shared_ptr<asio::steady_timer> timer;
   };
+
+  Status SendToTopic(const std::vector<uint8_t>& data, const std::string& topic);
 
   Status RequireOpen() const;
   Status RequireMode(DdsMode m) const;

@@ -63,11 +63,23 @@ Status DdsImpl::RequireMode(DdsMode m) const {
 // ---------- pub-sub ----------
 
 Status DdsImpl::Send(const std::vector<uint8_t>& data) {
-  return Send(data, config_.topics[0]);
+  return SendToTopic(data, config_.topics[0]);
 }
 
-Status DdsImpl::Send(const std::vector<uint8_t>& data,
-                     const std::string& topic) {
+Status DdsImpl::Send(const std::vector<uint8_t>& data, const Endpoint& to) {
+  switch (to.kind) {
+    case Endpoint::Kind::kDefault:
+      return Send(data);
+    case Endpoint::Kind::kTopic:
+      return SendToTopic(data, to.topic);
+    case Endpoint::Kind::kNet:
+      return Status::Fail("config: dds expects topic endpoint");
+  }
+  return Status::Fail("config: unknown endpoint kind");
+}
+
+Status DdsImpl::SendToTopic(const std::vector<uint8_t>& data,
+                            const std::string& topic) {
   if (auto st = RequireMode(DdsMode::kPubSub); !st) return st;
   if (auto st = RequireOpen(); !st) return st;
   auto enc = core_.EncodeForSend(data);

@@ -3,6 +3,7 @@
 // -----------------------------------------------------------------------------
 // IDdsTransport.hpp — DDS 扩展接口（ITransport + 多 topic pub-sub + req-resp）
 // 一个实例对应一个 DomainParticipant，内部懒加载维护多个 topic。实现见 DdsImpl。
+// 按 topic 发送统一走 `ITransport::Send(data, Endpoint::Topic(...))`。
 // -----------------------------------------------------------------------------
 
 #include <cstdint>
@@ -18,9 +19,6 @@ namespace transport {
 class IDdsTransport : public ITransport {
  public:
   // ---- pub-sub ----
-  using ITransport::Send;  // 保留基类 Send(data)（发往默认 topic）
-  virtual Status Send(const std::vector<uint8_t>& data,
-                      const std::string& topic) = 0;
   virtual Status Subscribe(const std::string& topic) = 0;
   virtual Status Unsubscribe(const std::string& topic) = 0;
 

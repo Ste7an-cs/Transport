@@ -6,9 +6,12 @@
 
 #include "transport/Endpoint.hpp"
 #include "transport/ITransport.hpp"
+#include "transport/dds/DdsImpl.hpp"
 #include "transport/tcp/TcpClientImpl.hpp"
 #include "transport/tcp/TcpServerImpl.hpp"
 #include "transport/udp/UdpImpl.hpp"
+
+#include "dds/FakeDdsProvider.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -141,4 +144,56 @@ TEST(EndpointSend, UdpDefaultEndpointUsesConfigRemote) {
   EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{7}));
   tx->Close();
   rx->Close();
+}
+
+namespace {
+DdsConfig DdsPubSubCfg(std::vector<std::string> topics) {
+  DdsConfig c;
+  c.mode = DdsMode::kPubSub;
+  c.topics = std::move(topics);
+  return c;
+}
+std::shared_ptr<DdsImpl> MakeDds(std::shared_ptr<FakeDdsProvider::Bus> bus,
+                                 DdsConfig cfg) {
+  return std::make_shared<DdsImpl>(std::move(cfg),
+                                   std::make_unique<FakeDdsProvider>(bus));
+}
+}  // namespace
+
+// 基类句柄 + Endpoint::Topic 寻址,经 FakeDdsProvider 总线送达订阅方
+TEST(EndpointSend, DdsTopicAddressingViaBaseHandle) {
+  auto bus = std::make_shared<FakeDdsProvider::Bus>();
+  std::shared_ptr<ITransport> tx = MakeDds(bus, DdsPubSubCfg({"a"}));
+  auto rx = MakeDds(bus, DdsPubSubCfg({"a"}));
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Subscribe("b")));
+
+  ASSERT_TRUE(static_cast<bool>(tx->Send({9}, Endpoint::Topic("b"))));
+  auto r = rx->Receive(1000);
+  ASSERT_TRUE(static_cast<bool>(r));
+  EXPECT_EQ(r.value.topic, "b");
+  EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{9}));
+}
+
+TEST(EndpointSend, DdsRejectsNetEndpoint) {
+  auto bus = std::make_shared<FakeDdsProvider::Bus>();
+  auto t = MakeDds(bus, DdsPubSubCfg({"a"}));
+  ASSERT_TRUE(static_cast<bool>(t->Open()));
+  auto st = t->Send({1}, Endpoint::Net("127.0.0.1", 1));
+  EXPECT_FALSE(static_cast<bool>(st));
+  EXPECT_EQ(st.error.rfind("config:", 0), 0u);
+}
+
+TEST(EndpointSend, DdsDefaultEndpointUsesFirstTopic) {
+  auto bus = std::make_shared<FakeDdsProvider::Bus>();
+  auto tx = MakeDds(bus, DdsPubSubCfg({"t0"}));
+  auto rx = MakeDds(bus, DdsPubSubCfg({"t0"}));
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Subscribe("t0")));
+  ASSERT_TRUE(static_cast<bool>(tx->Send({3}, Endpoint::Default())));
+  auto r = rx->Receive(1000);
+  ASSERT_TRUE(static_cast<bool>(r));
+  EXPECT_EQ(r.value.topic, "t0");
 }
