@@ -8,6 +8,7 @@
 #include "transport/ITransport.hpp"
 #include "transport/tcp/TcpClientImpl.hpp"
 #include "transport/tcp/TcpServerImpl.hpp"
+#include "transport/udp/UdpImpl.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -89,4 +90,55 @@ TEST(EndpointSend, BothOverloadsCallableViaBaseHandle) {
   std::shared_ptr<ITransport> t = std::make_shared<TcpClientImpl>(cc);
   EXPECT_FALSE(static_cast<bool>(t->Send({1})));                     // 未打开
   EXPECT_FALSE(static_cast<bool>(t->Send({1}, Endpoint::Topic("x"))));
+}
+
+namespace {
+UdpConfig UnicastCfg(const std::string& remote, uint16_t rport) {
+  UdpConfig c;
+  c.local_addr = "127.0.0.1";
+  c.local_port = 0;
+  c.remote_addr = remote;
+  c.remote_port = rport;
+  return c;
+}
+}  // namespace
+
+// 基类句柄 + Endpoint::Net 寻址,真实回环送达 —— 本设计的核心收益
+TEST(EndpointSend, UdpNetAddressingViaBaseHandle) {
+  auto rx = std::make_shared<UdpImpl>(UnicastCfg("", 0));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  uint16_t rport = rx->LocalPort();
+
+  std::shared_ptr<ITransport> tx = std::make_shared<UdpImpl>(UnicastCfg("", 0));
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+
+  ASSERT_TRUE(static_cast<bool>(
+      tx->Send({4, 5}, Endpoint::Net("127.0.0.1", rport))));
+  auto r = rx->Receive(1000);
+  ASSERT_TRUE(static_cast<bool>(r));
+  EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{4, 5}));
+  tx->Close();
+  rx->Close();
+}
+
+TEST(EndpointSend, UdpRejectsTopicEndpoint) {
+  auto tx = std::make_shared<UdpImpl>(UnicastCfg("127.0.0.1", 9999));
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  auto st = tx->Send({1}, Endpoint::Topic("x"));
+  EXPECT_FALSE(static_cast<bool>(st));
+  EXPECT_EQ(st.error.rfind("config:", 0), 0u);
+  tx->Close();
+}
+
+TEST(EndpointSend, UdpDefaultEndpointUsesConfigRemote) {
+  auto rx = std::make_shared<UdpImpl>(UnicastCfg("", 0));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  auto tx = std::make_shared<UdpImpl>(UnicastCfg("127.0.0.1", rx->LocalPort()));
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  ASSERT_TRUE(static_cast<bool>(tx->Send({7}, Endpoint::Default())));
+  auto r = rx->Receive(1000);
+  ASSERT_TRUE(static_cast<bool>(r));
+  EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{7}));
+  tx->Close();
+  rx->Close();
 }
