@@ -78,11 +78,16 @@ Status DdsImpl::Send(const std::vector<uint8_t>& data, const Endpoint& to) {
   return Status::Fail("config: unknown endpoint kind");
 }
 
+Status DdsImpl::Send(const Message& msg, const Endpoint& to) {
+  if (msg.topic.empty()) return Send(msg.payload, to);
+  return SendToTopic(msg.payload, msg.topic);
+}
+
 Status DdsImpl::SendToTopic(const std::vector<uint8_t>& data,
                             const std::string& topic) {
   if (auto st = RequireMode(DdsMode::kPubSub); !st) return st;
   if (auto st = RequireOpen(); !st) return st;
-  auto enc = core_.EncodeForSend(data);
+  auto enc = core_.EncodeForSend(data, topic);  // 按 topic 选 codec
   if (!enc) return Status::Fail(enc.error);
   return provider_->Publish(topic, enc.value);
 }

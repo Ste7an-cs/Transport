@@ -97,6 +97,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp
     tests/dds/dds_impl_reqresp_test.cpp
+    tests/dds/dds_topic_routing_test.cpp
     tests/factory/factory_create_test.cpp
     tests/factory/factory_json_test.cpp
   )
