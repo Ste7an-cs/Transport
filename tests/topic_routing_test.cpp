@@ -187,6 +187,22 @@ TEST(TcpTopicRouting, RoutingOffRejectsTopicSend) {
   EXPECT_EQ(st.error, "config: topic routing not enabled");
 }
 
+TEST(TcpTopicRouting, OversizeTopicRejected) {
+  using namespace transport;
+  TcpClientConfig ccfg;
+  ccfg.host = "127.0.0.1";
+  ccfg.port = 1;
+  ccfg.auto_reconnect = false;
+  ccfg.enable_topic_routing = true;
+  auto client = std::make_shared<TcpClientImpl>(ccfg);
+  Message m;
+  m.payload = Bytes{1};
+  m.topic = std::string(70000, 'x');  // > 65535
+  auto st = client->Send(m);
+  EXPECT_FALSE(st.ok);
+  EXPECT_EQ(st.error, "frame: topic too long");
+}
+
 // ---- UDP topic 路由(回环) ----
 #include "transport/udp/UdpConfig.hpp"
 #include "transport/udp/UdpImpl.hpp"

@@ -100,6 +100,8 @@ Status TcpConnectionImpl::Send(const Message& msg, const Endpoint& to) {
       return Status::Fail("config: topic routing not enabled");
     return Send(msg.payload);  // 退化(TCP 地址即连接,忽略 to)
   }
+  if (!TopicFitsEnvelope(msg.topic))
+    return Status::Fail("frame: topic too long");
   (void)to;  // TCP 地址即连接
   if (!open_.load()) return Status::Fail("conn: not connected");
   auto enc = core_.EncodeForSend(msg.payload, msg.topic);

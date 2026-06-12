@@ -167,6 +167,8 @@ Status UdpImpl::Send(const Message& msg, const Endpoint& to) {
       return Status::Fail("config: topic routing not enabled");
     return Send(msg.payload, to);
   }
+  if (!TopicFitsEnvelope(msg.topic))
+    return Status::Fail("frame: topic too long");
   auto dest = ResolveDest(to);
   if (!dest) return Status::Fail(dest.error);
   auto enc = core_.EncodeForSend(msg.payload, msg.topic);

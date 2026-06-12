@@ -130,6 +130,8 @@ Status SerialImpl::Send(const Message& msg, const Endpoint& to) {
       return Status::Fail("config: topic routing not enabled");
     return Send(msg.payload);
   }
+  if (!TopicFitsEnvelope(msg.topic))
+    return Status::Fail("frame: topic too long");
   (void)to;
   if (!open_.load()) return Status::Fail("config: serial not open");
   auto enc = core_.EncodeForSend(msg.payload, msg.topic);
