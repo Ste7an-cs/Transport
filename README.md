@@ -19,7 +19,7 @@
 ## 特点
 
 - **统一抽象 `ITransport`**：生命周期 + 发送 + 三模式接收 + 断连通知 + 编解码挂载，所有传输同一套用法。
-- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）、串口、DDS（Fast DDS 2.13+，pub-sub 多 topic / req-resp 自动关联超时）。（工厂规划中。）
+- **已实现传输**：TCP（客户端 / 服务端）、UDP（单播 / 组播 / 广播）、串口、DDS（Fast DDS 2.13+，pub-sub 多 topic / req-resp 自动关联超时）+ **TransportFactory 统一创建入口（含 JSON 配置文件）**。
 - **可插拔编解码 `ICodec`**：框架在 `Send` 前 `Encode`、收到后 `Decode`；不设则字节透传。
 - **可插拔分帧 `IFramer`**：流式传输（TCP/串口）接收侧把字节流切回整帧；内置「长度字段」实现 `LengthFieldFramer`；UDP/DDS 报文天然保边界，自动跳过。
 - **三种接收交付模式**（互斥）：同步阻塞 `Receive`、回调 `OnReceive`、future `AsyncReceive`。
@@ -63,7 +63,7 @@ ctest --test-dir build --output-on-failure
 
 ## 用法
 
-> 当前经具体实现类构造（`std::make_shared<*Impl>(config)`）；统一的 `TransportFactory` 入口规划中。所有实例须以 `std::shared_ptr` 持有。
+> 推荐经 `TransportFactory` 创建（也可直接 `std::make_shared<*Impl>(config)`）。所有实例须以 `std::shared_ptr` 持有。
 
 ### 自定义编解码（可选）
 
@@ -207,6 +207,22 @@ Result<Message> r = fut.get();
 t->OnDisconnect([](const std::string& reason) { /* reason 形如 "conn:..." */ });
 ```
 
+### TransportFactory（统一创建 + JSON 配置文件）
+
+```cpp
+#include "transport/TransportFactory.hpp"
+using namespace transport;
+
+// 代码配置：返回最具体接口
+TcpClientConfig cc; cc.host = "127.0.0.1"; cc.port = 9000;
+auto client = TransportFactory::Create(cc);
+
+// JSON 配置文件：一次创建多个实例（格式见主 spec §9.1）
+auto r = TransportFactory::CreateFromFile("transports.json");
+if (!r) { /* r.error 形如 "config: transports[2].port: ..." */ }
+for (auto& t : r.value) t->Open();
+```
+
 `Result<T>` 用法：`if (r) use(r.value); else log(r.error);`（`operator bool` == `r.ok`）。
 `Message` 字段：`payload`（字节）、`source`（"ip:port" 等）、`topic`（DDS 用，TCP/UDP 为空）、`timestamp`（接收微秒时间戳）。
 
@@ -219,7 +235,7 @@ t->OnDisconnect([](const std::string& reason) { /* reason 形如 "conn:..." */ }
 - [x] UDP（单播 / 组播 / 广播）
 - [x] 串口
 - [x] DDS（Fast DDS，pub-sub / req-resp）
-- [ ] TransportFactory + JSON 配置
+- [x] TransportFactory + JSON 配置
 
 ---
 
