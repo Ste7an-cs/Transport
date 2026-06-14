@@ -285,6 +285,8 @@ for (auto& t : r.value) t->Open();
 - **需求规格说明书（SRS）**：[`docs/需求规格说明书.md`](docs/需求规格说明书.md) —— 功能需求 FR-1~11 + 非功能需求 NFR-1~9 + 外部接口 + 约束。
 - **设计说明书（SDD）**：[`docs/设计说明书.md`](docs/设计说明书.md) —— 架构 / UML / wire 格式 / 数据流时序 / 并发模型 / 设计依据。
 
+- **变更日志**：[`CHANGELOG.md`](CHANGELOG.md) —— 按里程碑汇总历次变更（含破坏性变更标注）。
+
 过程历史（逐特性 spec / plan，保留备查）：`docs/superpowers/specs/`、`docs/superpowers/plans/`（含总设计 `2026-06-09`、as-built 架构 `2026-06-10`）。
 
 ### 关键约束（详见 SRS/SDD）
