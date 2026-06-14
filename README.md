@@ -201,6 +201,34 @@ client->SendRequest(request_bytes, "calc",
     }, /*timeout_ms=*/3000);
 ```
 
+### 单连接多帧格式（topic 路由）
+
+一条 TCP/UDP/串口连接上同时跑多种帧格式，按 `Message.topic` 选 codec 并打 in-band 信封；DDS 用原生 topic（无需开关、零线格变化）。
+
+```cpp
+// 一条 TCP 连接上跑多种帧格式，按 topic 选 codec
+TcpClientConfig cfg;
+cfg.host = "10.0.0.7"; cfg.port = 9000;
+cfg.enable_topic_routing = true;            // 开启 topic 路由
+auto t = TransportFactory::Create(cfg);
+t->SetCodec("telemetry", std::make_shared<TelemetryCodec>());
+t->SetCodec("command",   std::make_shared<CommandCodec>());
+t->Open();
+
+Message msg;
+msg.payload = serialize(my_telemetry);      // 应用原始字节
+msg.topic   = "telemetry";                   // 选 codec + in-band 通道
+t->Send(msg);
+
+auto m = t->Receive();                        // m.topic 标明通道，m.payload 已解码
+t->Send(m.value);                             // echo：按同 topic 重新编码往返
+```
+
+- `enable_topic_routing` 默认 **关**：关时与旧帧格式逐字节一致（无信封、零行为变化）。
+- DDS **无需该开关**：topic 是原生维度，注册表始终在线，线格不变。
+- topic 超过 64KB（> 65535 字节）会被拒绝：`Send(Message)` 返回 `frame: topic too long`。
+- in-band 信封：流式（TCP/串口）`[frame_len:4][topic_len:2][topic][body]`，报文式（UDP）`[topic_len:2][topic][body]`。
+
 ### 三种接收模式（任选其一，单实例上互斥）
 
 ```cpp
@@ -235,7 +263,7 @@ for (auto& t : r.value) t->Open();
 ```
 
 `Result<T>` 用法：`if (r) use(r.value); else log(r.error);`（`operator bool` == `r.ok`）。
-`Message` 字段：`payload`（字节）、`source`（"ip:port" 等）、`topic`（DDS 用，TCP/UDP 为空）、`timestamp`（接收微秒时间戳）。
+`Message` 字段：`payload`（字节）、`source`（"ip:port" 等）、`topic`（DDS 原生维度；TCP/UDP/串口开启 topic 路由后标识通道，否则为空）、`timestamp`（接收微秒时间戳）。
 
 ---
 

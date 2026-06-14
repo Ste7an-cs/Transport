@@ -8,6 +8,7 @@
 - 2026-06-11 DDS 实现期增补 —— `DdsConfig.qos_profile` 字符串改为 `DdsQos` 结构体（reliability/durability/history_depth，借鉴 Apollo Cyber RT 的 QoS 简化包装）；Fast DDS 版本 3.6 → **2.13+**（仅用 DDS-PIM API + 自定义 `TopicDataType`，版本敏感面封在 provider 文件对内，RTPS 线协议与 3.x 互通）；同机 SHM 由 Fast DDS 内建 SHM transport 覆盖，自研 SHM 传输列入远期 roadmap。详见 `2026-06-11-dds-transport-design.md`。
 - 2026-06-12 Factory 实现期修订 —— `CreateFromFile` 返回 `Result<vector<...>>`（原裸 vector 无错误通道，违背不抛异常约定）；§9.1 明确枚举字符串/`framer`/`qos` 子对象映射与**严格校验**（未知字段报错不静默）。详见 `2026-06-12-transport-factory-design.md`。
 - 2026-06-12：Endpoint 统一寻址发送——ITransport 加 Send(data, Endpoint) 默认实现；删除 IUdpTransport（掏空）与 IDdsTransport::Send(data,topic)（破坏性）。理由：基类句柄无法寻址发送 + 各传输寻址 API 形态不一。详见 specs/2026-06-12-endpoint-send-design.md
+- 2026-06-12：topic 路由编解码多路复用（§4.6）——ITransport 加 `Send(Message, Endpoint=Default())` 与 `SetCodec(topic, codec)` 基类默认实现；`TransportCore` 升级为 `topic→codec` 注册表 + 默认 codec；新增 header-only `TopicEnvelope`（in-band 信封）。TCP/UDP/串口经 config `enable_topic_routing`（默认关）opt-in，开时一条连接跑多帧格式；DDS 用原生 topic（无开关、无信封、线格不变）。topic > 64KB 由 `TopicFitsEnvelope` 守卫拒绝（`frame: topic too long`）。详见 specs/2026-06-12-topic-codec-multiplexing-design.md
 
 ---
 
@@ -350,6 +351,10 @@ class ITransport {
   // 其余 kind → Fail("io: addressed send not supported")。UDP/DDS 覆写。
   virtual Status  Send(const std::vector<uint8_t>& data, const Endpoint& to);
 
+  // topic 路由发送（非纯虚，基类默认实现）：topic 空 → 退化调 Send(payload)，
+  // 非空 → Fail("io: topic routing not supported")。TCP/UDP/串口/DDS 覆写。
+  virtual Status  Send(const Message& msg, const Endpoint& to = Endpoint::Default());
+
   // 同步接收（阻塞直到收到数据或超时；timeout_ms == 0 表示永久阻塞）
   virtual Result<Message> Receive(uint32_t timeout_ms = 0) = 0;
 
@@ -362,8 +367,11 @@ class ITransport {
   // 断连通知（TCP 客户端、串口适用）
   virtual void OnDisconnect(DisconnectCallback cb) = 0;
 
-  // 挂载编解码器；未设置时原始字节直接透传
+  // 挂载默认编解码器（topic 为空 / 路由关闭时使用）；未设置时原始字节直接透传
   virtual void SetCodec(std::shared_ptr<ICodec> codec) = 0;
+
+  // 按 topic 挂载编解码器（topic 路由）；基类默认 no-op，各传输覆写。
+  virtual void SetCodec(const std::string& topic, std::shared_ptr<ICodec> codec);
 };
 ```
 
@@ -373,6 +381,14 @@ class ITransport {
 - 同步（`Receive`）、回调（`OnReceive`）、future（`AsyncReceive`）三种模式在同一实例上互斥。
 - 模式由 `Open()` 后首次接收调用决定，之后不可切换。
 - 回调和 future 模式在内部启动 I/O 线程；同步模式阻塞调用方线程。
+
+### 4.6 topic 路由（单连接多帧格式）
+
+一条 TCP/UDP/串口连接上同时承载多种帧格式：发送时按 `Message.topic` 选 codec 编码并打 in-band 信封，接收侧按 topic 解信封 + 选 codec 解码。`TransportCore` 内部维护 `topic→codec` 注册表（`SetCodec(topic, codec)` 注册、`EncodeForSend(data, topic)` 编码、`DeliverFrame(frame, source, topic)` 按 topic 解码），信封编解码由 header-only 的 `TopicEnvelope`（`PackTopic`/`UnpackTopic`/`FrameStream`/`TopicFrameAssembler`/`TopicFitsEnvelope`）承担。
+
+- **开关：** TCP/UDP/串口在各自 config 上加 `enable_topic_routing`（默认 **关**）。关闭时与旧帧格式逐字节一致（无信封、零行为变化），仅退化的 `Send(payload)` 路径可用，且 `Send(Message{topic 非空})` 返回 `config: topic routing not enabled`。
+- **in-band 信封：** 流式（TCP/串口）`[frame_len:4][topic_len:2][topic][body]`，报文式（UDP）`[topic_len:2][topic][body]`（`body` 为 codec 编码后的应用帧）。`topic_len` 为 `uint16`，故 topic 上限 65535 字节；超限由 `TopicFitsEnvelope` 守卫，`Send(Message)` 返回 `frame: topic too long`。
+- **DDS 例外：** topic 是 DDS 原生维度，注册表始终在线、**无 `enable_topic_routing` 开关、无信封、线格不变**；按 topic 发送复用 `Send(data, Endpoint::Topic(...))` / `Send(Message)`。
 
 ---
 

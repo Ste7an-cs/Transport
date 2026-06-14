@@ -75,11 +75,14 @@ if(TRANSPORT_BUILD_TESTS)
     tests/version_test.cpp
     tests/endpoint_send_test.cpp
     tests/result_test.cpp
+    tests/topic_routing_test.cpp
     tests/interfaces_test.cpp
     tests/framing/length_field_framer_test.cpp
     tests/framing/frame_assembler_test.cpp
     tests/core/receive_queue_test.cpp
     tests/core/transport_core_test.cpp
+    tests/core/topic_envelope_test.cpp
+    tests/core/transport_core_codec_test.cpp
     tests/tcp/asio_smoke_test.cpp
     tests/tcp/tcp_interfaces_test.cpp
     tests/tcp/tcp_connection_test.cpp
@@ -89,10 +92,12 @@ if(TRANSPORT_BUILD_TESTS)
     tests/udp/udp_transport_test.cpp
     tests/serial/serial_interfaces_test.cpp
     tests/serial/serial_transport_test.cpp
+    tests/serial/serial_topic_routing_test.cpp
     tests/dds/dds_interfaces_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_impl_pubsub_test.cpp
     tests/dds/dds_impl_reqresp_test.cpp
+    tests/dds/dds_topic_routing_test.cpp
     tests/factory/factory_create_test.cpp
     tests/factory/factory_json_test.cpp
   )

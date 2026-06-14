@@ -44,6 +44,15 @@ class ITransport {
     return Status::Fail("io: addressed send not supported");
   }
 
+  // topic 路由发送(非纯虚,基类默认):
+  //   topic 为空 → 退化 Send(payload, to);否则 → Fail(该实现不支持路由)。
+  // TCP/UDP/串口/DDS 覆写以支持 topic→codec 路由。
+  virtual Status Send(const Message& msg,
+                      const Endpoint& to = Endpoint::Default()) {
+    if (msg.topic.empty()) return Send(msg.payload, to);
+    return Status::Fail("io: topic routing not supported");
+  }
+
   // 同步接收（阻塞至收到数据或超时；timeout_ms == 0 表示永久阻塞）
   virtual Result<Message> Receive(uint32_t timeout_ms = 0) = 0;
 
@@ -58,6 +67,14 @@ class ITransport {
 
   // 挂载编解码器；未设置时原始字节直接透传
   virtual void SetCodec(std::shared_ptr<ICodec> codec) = 0;
+
+  // 为某 topic 注册 codec(topic 路由);基类 no-op,路由能力的实现覆写转发给
+  // 自己的 TransportCore。
+  virtual void SetCodec(const std::string& topic,
+                        std::shared_ptr<ICodec> codec) {
+    (void)topic;
+    (void)codec;
+  }
 };
 
 }  // namespace transport

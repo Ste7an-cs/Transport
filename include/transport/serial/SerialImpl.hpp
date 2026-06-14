@@ -22,6 +22,7 @@
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
+#include "transport/core/TopicEnvelope.hpp"
 #include "transport/core/TransportCore.hpp"
 #include "transport/framing/FrameAssembler.hpp"
 #include "transport/serial/SerialConfig.hpp"
@@ -38,10 +39,16 @@ class SerialImpl : public ITransport,
   void Close() override;    // 关 port + core_.Close() + 停 io 线程
   bool IsOpen() const override;
   using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
+  using ITransport::SetCodec;  // 保留基类 SetCodec(topic,codec) 重载,避免名字隐藏
   Status Send(const std::vector<uint8_t>& data) override;
+  Status Send(const Message& msg,
+              const Endpoint& to = Endpoint::Default()) override;
 
   // 接收侧：一行转发给 core_
   void SetCodec(std::shared_ptr<ICodec> c) override { core_.SetCodec(std::move(c)); }
+  void SetCodec(const std::string& topic, std::shared_ptr<ICodec> codec) override {
+    core_.SetCodec(topic, std::move(codec));
+  }
   Result<Message> Receive(uint32_t timeout_ms) override { return core_.Receive(timeout_ms); }
   void OnReceive(ReceiveCallback cb) override { core_.OnReceive(std::move(cb)); }
   std::future<Result<Message>> AsyncReceive() override { return core_.AsyncReceive(); }
@@ -50,6 +57,7 @@ class SerialImpl : public ITransport,
  private:
   void StartRead();
   void DoWrite();
+  void EnqueueWrite(std::vector<uint8_t> bytes);
   void HandleDisconnect(const std::string& reason);
 
   SerialConfig config_;
@@ -66,6 +74,8 @@ class SerialImpl : public ITransport,
   std::atomic<bool> open_{false};
   std::atomic<bool> closing_{false};
   std::atomic<bool> disconnected_{false};
+  bool enable_topic_routing_;
+  TopicFrameAssembler topic_assembler_;
 };
 
 }  // namespace transport

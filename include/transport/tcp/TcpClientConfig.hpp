@@ -19,6 +19,7 @@ struct TcpClientConfig {
   uint32_t    connect_timeout_ms = 5000;
   bool        auto_reconnect     = true;
   std::optional<LengthFieldFramerConfig> framer;  // 不设则接收为透传模式
+  bool enable_topic_routing = false;  // 开启 topic→codec 多路复用(in-band envelope)
 };
 
 }  // namespace transport

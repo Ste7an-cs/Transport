@@ -20,7 +20,9 @@
 
 #include "transport/IFramer.hpp"
 #include "transport/ITransport.hpp"
+#include "transport/Message.hpp"
 #include "transport/Result.hpp"
+#include "transport/core/TopicEnvelope.hpp"
 #include "transport/core/TransportCore.hpp"
 #include "transport/framing/FrameAssembler.hpp"
 
@@ -31,13 +33,17 @@ namespace transport {
 class TcpConnectionImpl : public ITransport,
                           public std::enable_shared_from_this<TcpConnectionImpl> {
  public:
-  TcpConnectionImpl(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer);
+  TcpConnectionImpl(asio::ip::tcp::socket socket, std::shared_ptr<IFramer> framer,
+                    bool enable_topic_routing = false);
 
   Status Open() override;   // 启动 async_read 循环
   void Close() override;    // 关闭 socket + core_.Close()
   bool IsOpen() const override;
   using ITransport::Send;  // 保留基类 Send(data,Endpoint) 重载,避免名字隐藏
+  using ITransport::SetCodec;  // 保留基类 SetCodec(codec) 重载,避免名字隐藏
   Status Send(const std::vector<uint8_t>& data) override;
+  Status Send(const Message& msg,
+              const Endpoint& to = Endpoint::Default()) override;
 
   // 接收侧：转发给 core_
   Result<Message> Receive(uint32_t timeout_ms) override { return core_.Receive(timeout_ms); }
@@ -45,6 +51,9 @@ class TcpConnectionImpl : public ITransport,
   std::future<Result<Message>> AsyncReceive() override { return core_.AsyncReceive(); }
   void OnDisconnect(DisconnectCallback cb) override { core_.OnDisconnect(std::move(cb)); }
   void SetCodec(std::shared_ptr<ICodec> codec) override { core_.SetCodec(std::move(codec)); }
+  void SetCodec(const std::string& topic, std::shared_ptr<ICodec> codec) override {
+    core_.SetCodec(topic, std::move(codec));
+  }
 
   const std::string& PeerId() const { return peer_id_; }
 
@@ -62,6 +71,7 @@ class TcpConnectionImpl : public ITransport,
 
  private:
   void DoWrite();
+  void EnqueueWrite(std::vector<uint8_t> bytes);  // 入队 + 触发 DoWrite
 
   FrameAssembler assembler_;
   std::array<uint8_t, 4096> read_buf_;
@@ -69,6 +79,8 @@ class TcpConnectionImpl : public ITransport,
   bool writing_ = false;
   std::string peer_id_;
   std::atomic<bool> disconnected_{false};
+  bool enable_topic_routing_;
+  TopicFrameAssembler topic_assembler_;
 };
 
 }  // namespace transport

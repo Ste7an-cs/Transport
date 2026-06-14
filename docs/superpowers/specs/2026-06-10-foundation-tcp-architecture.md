@@ -58,13 +58,15 @@ classDiagram
     +OnDisconnect() +SetCodec()
   }
   class TransportCore {
-    +SetCodec() +Receive() +OnReceive() +AsyncReceive() +OnDisconnect()
-    +EncodeForSend(bytes) Result
+    +SetCodec(codec) +SetCodec(topic,codec)
+    +Receive() +OnReceive() +AsyncReceive() +OnDisconnect()
+    +EncodeForSend(bytes,topic="") Result
     +DeliverFrame(frame,source,topic)
     +DeliverError(err)
     +NotifyDisconnect(reason)
     +Close()
     -shared_ptr~ICodec~ codec_
+    -map~string,shared_ptr~ICodec~~ topic_codecs_
     -ReceiveQueue queue_
   }
 
@@ -210,12 +212,13 @@ classDiagram
 ### 2.1 Foundation 内部
 
 - **`Result<T>` / `Status`**：所有可能失败的操作的返回值，框架不抛异常。被 `ICodec` / `IFramer` / `ITransport` / `ReceiveQueue` 普遍依赖（图中只画了 codec/framer 的 `..> Result` 以免线太密）。
-- **`ICodec`（接口）**：发送/接收边界的编解码扩展点，由**用户实现**。`TransportCore` 以 `shared_ptr<ICodec>` 持有它（聚合 `o--`），发送前 `Encode`、接收后 `Decode`。
+- **`ICodec`（接口）**：发送/接收边界的编解码扩展点，由**用户实现**。`TransportCore` 维护一个默认 codec（`shared_ptr<ICodec>`，聚合 `o--`）+ 一张 `topic→codec` 注册表（`topic_codecs_`）；发送前按 topic 选 codec `Encode`、接收后按 topic 选 codec `Decode`，topic 为空或未注册则用默认 codec / 透传。
 - **`IFramer`（接口）← `LengthFieldFramer`**：流式分帧扩展点。`LengthFieldFramer` 是内置实现（长度字段协议）。
 - **`FrameAssembler`**：滚动缓冲 + 持有一个 `shared_ptr<IFramer>`（聚合），把字节流循环切成整帧；framer 为空则透传。**仅流式传输接收侧需要**（UDP 不用）。
 - **`ReceiveQueue`**：FIFO + 同步/回调/future 三模式互斥交付。被 `TransportCore` **组合拥有**（`*--`，值成员）。
 - **`ITransport`（接口）**：所有传输的统一抽象（生命周期/发送/三模式接收/编解码挂载）。
-- **`TransportCore`（组件，非 `ITransport`）**：把「接收侧 + 编解码」机能收成一个**被持有**的组件——公开 `SetCodec/Receive/OnReceive/AsyncReceive/OnDisconnect`（持有者转发给 `ITransport`）+ 生产侧 `EncodeForSend/DeliverFrame/DeliverError/NotifyDisconnect/Close`（io 线程调用）。内部组合 `ReceiveQueue`、持有 `ICodec`、产出 `Message`。**它不在 `ITransport` 继承树上**，所以任何「扩展接口 + 复用接收机能」的传输都不会产生菱形。
+- **`TransportCore`（组件，非 `ITransport`）**：把「接收侧 + 编解码」机能收成一个**被持有**的组件——公开默认 + 按 topic 两种 `SetCodec`、`Receive/OnReceive/AsyncReceive/OnDisconnect`（持有者转发给 `ITransport`）+ 生产侧 `EncodeForSend(bytes, topic="")` / `DeliverFrame(frame, source, topic)`（按 topic 选 codec 解码）/ `DeliverError/NotifyDisconnect/Close`（io 线程调用）。内部组合 `ReceiveQueue`、持有默认 `ICodec` + `topic→codec` 注册表、产出 `Message`。**它不在 `ITransport` 继承树上**，所以任何「扩展接口 + 复用接收机能」的传输都不会产生菱形。
+- **`TopicEnvelope`（header-only）**：topic 路由的 in-band 信封编解码——`PackTopic`/`UnpackTopic`（报文式 `[topic_len:2][topic][body]`）、`FrameStream`/`TopicFrameAssembler`（流式 `[frame_len:4][topic_len:2][topic][body]`）、`TopicFitsEnvelope`（topic ≤ 65535 字节守卫）。无状态纯函数 + 一个流式装配器，无第三方依赖；TCP/UDP/串口在 `enable_topic_routing` 开启时使用，DDS 不用（原生 topic）。
 
 ### 2.2 TCP 对 Foundation 的依赖
 

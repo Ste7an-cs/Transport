@@ -46,9 +46,15 @@ class DdsImpl : public IDdsTransport,
   Status Send(const std::vector<uint8_t>& data) override;  // → topics[0]
   Status Send(const std::vector<uint8_t>& data,
               const Endpoint& to) override;                // kTopic 寻址
+  Status Send(const Message& msg,
+              const Endpoint& to = Endpoint::Default()) override;
 
   // 接收侧：转发 core_（仅 kPubSub 交付订阅消息）
+  using ITransport::SetCodec;
   void SetCodec(std::shared_ptr<ICodec> c) override { core_.SetCodec(std::move(c)); }
+  void SetCodec(const std::string& topic, std::shared_ptr<ICodec> codec) override {
+    core_.SetCodec(topic, std::move(codec));
+  }
   Result<Message> Receive(uint32_t timeout_ms) override { return core_.Receive(timeout_ms); }
   void OnReceive(ReceiveCallback cb) override { core_.OnReceive(std::move(cb)); }
   std::future<Result<Message>> AsyncReceive() override { return core_.AsyncReceive(); }
