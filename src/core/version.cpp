@@ -4,6 +4,6 @@
 
 namespace transport {
 
-std::string LibraryVersion() { return "0.1.0"; }
+std::string LibraryVersion() { return kVersion; }
 
 }  // namespace transport
