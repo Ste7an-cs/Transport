@@ -45,7 +45,7 @@
 | 复用接收机能又不被继承绑死 | 接收交付 + 编解码抽成**被持有的组件 `TransportCore`**（组合优于继承），各传输持有它并转发——从根上消除「扩展接口 + 复用基座」的 `ITransport` 菱形 |
 | 一个用户同时持有多类 / 多实例 | 所有实例独立、`std::shared_ptr` 持有，互不干扰 |
 
-架构与依赖关系详见 `docs/superpowers/specs/2026-06-10-foundation-tcp-architecture.md`（UML 类图 / 时序图）与主 spec `2026-06-09-transport-middleware-design.md` §3。
+完整需求见 [`docs/需求规格说明书.md`](docs/需求规格说明书.md)（SRS）；架构、UML 类图 / 时序图、wire 格式、设计依据见 [`docs/设计说明书.md`](docs/设计说明书.md)（SDD）。
 
 ---
 
@@ -280,6 +280,20 @@ for (auto& t : r.value) t->Open();
 
 ## 文档
 
-- 框架总设计：`docs/superpowers/specs/2026-06-09-transport-middleware-design.md`
-- 已实现部分 as-built 架构（UML 类图 / 时序图）：`docs/superpowers/specs/2026-06-10-foundation-tcp-architecture.md`
-- 各子系统 spec / plan：`docs/superpowers/specs/`、`docs/superpowers/plans/`
+权威参考（基于当前实现汇总）：
+
+- **需求规格说明书（SRS）**：[`docs/需求规格说明书.md`](docs/需求规格说明书.md) —— 功能需求 FR-1~11 + 非功能需求 NFR-1~9 + 外部接口 + 约束。
+- **设计说明书（SDD）**：[`docs/设计说明书.md`](docs/设计说明书.md) —— 架构 / UML / wire 格式 / 数据流时序 / 并发模型 / 设计依据。
+
+过程历史（逐特性 spec / plan，保留备查）：`docs/superpowers/specs/`、`docs/superpowers/plans/`（含总设计 `2026-06-09`、as-built 架构 `2026-06-10`）。
+
+### 关键约束（详见 SRS/SDD）
+
+- **不抛异常**：所有可能失败的操作返回 `Result<T>` / `Status`，错误按前缀分类（`timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`）。〔[SRS NFR-2 / FR-11](docs/需求规格说明书.md)、[SDD §12](docs/设计说明书.md)〕
+- **抽象层零第三方依赖**：`include/transport/` 只含纯接口 + 数据结构；asio/Fast DDS/termios 封在 `*Impl` / provider 内。〔[SRS NFR-4](docs/需求规格说明书.md)、[SDD §2.2](docs/设计说明书.md)〕
+- **接收三模式互斥**：同步 / 回调 / future 在单实例上互斥，由 `Open()` 后首次接收调用锁定，不可切换。〔[SRS FR-1.3](docs/需求规格说明书.md)、[SDD §10.3](docs/设计说明书.md)〕
+- **每实例单 io 线程 + strand**：socket 读写与共享状态经 strand 串行化；async handler 以 `shared_from_this` 保活，故 `*Impl` 须 `shared_ptr` 持有。〔[SRS NFR-3](docs/需求规格说明书.md)、[SDD §11](docs/设计说明书.md)〕
+- **分帧仅流式接收侧**：TCP/串口接收经 `IFramer` 切帧；发送侧不加前缀，codec 输出原样写出；UDP/DDS 报文保边界不分帧。〔[SRS FR-4](docs/需求规格说明书.md)、[SDD §7.1](docs/设计说明书.md)〕
+- **topic 路由 opt-in 且两端一致**：`enable_topic_routing` 默认关、关时逐字节兼容旧格式；开时框架自有信封分帧、codec 只编 body、用户 framer 被忽略；topic ≤ 65535 字节（超限 `frame: topic too long`）；DDS 用原生 topic 无开关无信封。〔[SRS FR-5](docs/需求规格说明书.md)、[SDD §7.2 / §8](docs/设计说明书.md)〕
+- **离线自包含构建**：第三方依赖已 vendored 进 `third_party/`，零联网；Fast DDS 2.13+ 为唯一可选外部依赖，`find_package` 自动探测。〔[SRS NFR-6/NFR-7](docs/需求规格说明书.md)、[SDD §14](docs/设计说明书.md)〕
+- **DDS 互通约定**：承载统一为 `RawMessage`（自定义 `TopicDataType`，绕过 IDL/CDR），对端须注册同名 type 并遵循固定 wire layout。〔[SRS FR-9.5/NFR-9](docs/需求规格说明书.md)、[SDD §7.3](docs/设计说明书.md)〕
