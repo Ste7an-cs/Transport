@@ -1,8 +1,10 @@
-# Foundation + TCP / UDP / 串口 / DDS + Factory 整体设计与依赖关系（as-built）
+# Foundation + TCP / UDP / 串口 / DDS + Factory 整体设计与依赖关系（as-built 总结版）
 
-> 本文用 UML 说明**已实现部分**（Foundation 层 + TCP / UDP / 串口 / DDS 传输 + TransportFactory）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。命名约定：`I*` = 接口，`*Impl` = 具体实现。
+> 本文用 UML 总结**全部已实现部分**（Foundation 层 + TCP / UDP / 串口 / DDS 传输 + TransportFactory，含 Endpoint 寻址、topic 路由、`TransportCore` 组合内核）的真实类结构与运行期协作，是对主 spec §3.4 框架级视图的「落地详图」。完整设计见 [`docs/设计说明书.md`](../../设计说明书.md)（SDD）。命名约定：`I*` = 接口，`*Impl` = 具体实现。
 >
 > 接收交付基座为**组合式组件 `TransportCore`**（不是 `ITransport`）：会收数据的传输（TCP 连接 / UDP / 串口 / DDS）**持有**它并把接收侧方法转发过去——从根上避免「与扩展接口同源 `ITransport`」的菱形。
+>
+> **§3 运行期协作覆盖全部四种传输的收发**：发送统一一图（§3.1），接收分流式（§3.2）/ 报文式（§3.3），DDS 收发 + req-resp 单列（§3.4）。
 
 ---
 
@@ -53,20 +55,20 @@ classDiagram
   class ITransport {
     <<interface>>
     +Open() +Close() +IsOpen()
-    +Send(bytes) +Send(data, Endpoint)
+    +Send(bytes) +Send(data, Endpoint) +Send(Message, Endpoint)
     +Receive() +OnReceive() +AsyncReceive()
-    +OnDisconnect() +SetCodec()
+    +OnDisconnect() +SetCodec(codec) +SetCodec(topic,codec)
   }
   class TransportCore {
-    +SetCodec(codec) +SetCodec(topic,codec)
+    +SetCodec(codec) +SetCodec(topic,codec) +CodecFor(topic)
     +Receive() +OnReceive() +AsyncReceive() +OnDisconnect()
     +EncodeForSend(bytes,topic="") Result
     +DeliverFrame(frame,source,topic)
     +DeliverError(err)
     +NotifyDisconnect(reason)
     +Close()
-    -shared_ptr~ICodec~ codec_
-    -map~string,shared_ptr~ICodec~~ topic_codecs_
+    -shared_ptr~ICodec~ default_codec_
+    -map~string,shared_ptr~ICodec~~ codecs_
     -ReceiveQueue queue_
   }
 
@@ -158,7 +160,7 @@ classDiagram
   %% ===== DDS 传输 =====
   class IDdsTransport {
     <<interface>>
-    +Send(data,topic) +Subscribe() +Unsubscribe()
+    +Subscribe() +Unsubscribe()
     +SendRequest() +OnRequest()
     +Mode() +Provider()
   }
@@ -219,6 +221,7 @@ classDiagram
 - **`ITransport`（接口）**：所有传输的统一抽象（生命周期/发送/三模式接收/编解码挂载）。
 - **`TransportCore`（组件，非 `ITransport`）**：把「接收侧 + 编解码」机能收成一个**被持有**的组件——公开默认 + 按 topic 两种 `SetCodec`、`Receive/OnReceive/AsyncReceive/OnDisconnect`（持有者转发给 `ITransport`）+ 生产侧 `EncodeForSend(bytes, topic="")` / `DeliverFrame(frame, source, topic)`（按 topic 选 codec 解码）/ `DeliverError/NotifyDisconnect/Close`（io 线程调用）。内部组合 `ReceiveQueue`、持有默认 `ICodec` + `topic→codec` 注册表、产出 `Message`。**它不在 `ITransport` 继承树上**，所以任何「扩展接口 + 复用接收机能」的传输都不会产生菱形。
 - **`TopicEnvelope`（header-only）**：topic 路由的 in-band 信封编解码——`PackTopic`/`UnpackTopic`（报文式 `[topic_len:2][topic][body]`）、`FrameStream`/`TopicFrameAssembler`（流式 `[frame_len:4][topic_len:2][topic][body]`）、`TopicFitsEnvelope`（topic ≤ 65535 字节守卫）。无状态纯函数 + 一个流式装配器，无第三方依赖；TCP/UDP/串口在 `enable_topic_routing` 开启时使用，DDS 不用（原生 topic）。
+- **`StreamSend`（header-only）**：流式发送决策自由函数 `BuildStreamFrame(core, routing, payload, topic)`——把 TCP 与串口完全相同的「routing 分支 + `TopicFitsEnvelope` 守卫 + 按 topic `EncodeForSend` + `FrameStream`」收成一处；各传输只保留自身 open 检查 + 入队（绑定各自 socket/strand）。UDP 报文寻址不同，单独走 `PackTopic` + `ResolveDest`/`SendRaw`。
 
 ### 2.2 TCP 对 Foundation 的依赖
 
@@ -263,66 +266,149 @@ flowchart LR
 
 ---
 
-## 3. 运行期协作（UML 时序图）
+## 3. 运行期协作（UML 时序图，覆盖全部传输的收发）
 
-### 3.1 TCP 接收一帧（流式：分帧 + 交付）
+四种传输共享同一**编码（`TransportCore.EncodeForSend` 按 topic 选 codec）+ 交付（`TransportCore.DeliverFrame` → `ReceiveQueue`）**内核；差异只在「写出 / 取入」的传输特定层。下面四图：3.1 发送（全部）、3.2 流式接收（TCP/串口）、3.3 报文接收（UDP）、3.4 DDS 收发 + req-resp。
+
+### 3.1 发送路径（所有传输：统一编码 + 各自写出）
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant Sock as asio socket（io 线程）
-  participant Conn as TcpConnectionImpl
-  participant FA as FrameAssembler
-  participant FR as LengthFieldFramer
+  participant App as 应用线程
+  participant T as *Impl（Send）
+  participant Core as TransportCore
+  participant IO as 传输特定写出（io 线程 / strand）
+
+  App->>T: Send(data) ｜ Send(data, Endpoint) ｜ Send(Message)
+  Note over T: 取 topic：默认 "" / Endpoint::Topic / Message.topic
+
+  alt TCP / 串口（流式，BuildStreamFrame）
+    Note over T: routing 关 + topic 非空 → config: topic routing not enabled<br/>topic 超长 → frame: topic too long
+    T->>Core: EncodeForSend(payload, topic)
+    Core-->>T: enc
+    Note over T: routing 开 → FrameStream(topic, enc)；关 → enc 原样
+    T->>IO: EnqueueWrite → strand：write_queue_ → DoWrite → async_write
+  else UDP（报文）
+    T->>Core: EncodeForSend(payload, topic)
+    Core-->>T: enc
+    Note over T: routing 开 → PackTopic(topic, enc)；ResolveDest(Endpoint)
+    T->>IO: SendRaw → strand：socket.send_to(dest)
+  else DDS（原生 topic，无信封）
+    T->>Core: EncodeForSend(payload, topic)
+    Core-->>T: enc
+    Note over T: 装 RawMessage（req-resp 附 request_id/reply_topic）
+    T->>IO: provider.Publish(topic, enc)
+  end
+  IO-->>App: Status（入队/写出成功，不代表对端已收）
+```
+
+### 3.2 接收路径 — 流式（TCP / 串口）
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Sock as socket / serial_port（io 线程）
+  participant Conn as TcpConnectionImpl / SerialImpl
+  participant FA as FrameAssembler ｜ TopicFrameAssembler
   participant Core as TransportCore (core_)
   participant Q as ReceiveQueue
   participant App as 应用线程
 
   Sock->>Conn: async_read_some 完成 → OnRead(bytes)
-  Conn->>FA: Feed(bytes)
-  loop 缓冲区中每一帧
-    FA->>FR: TryExtract(buf, len)
-    FR-->>FA: Result<FrameResult>(consumed, has_frame)
-  end
-  FA-->>Conn: frames[]（0..N 个完整帧）
-  loop 每个完整帧
-    Conn->>Core: core_.DeliverFrame(frame, source, "")
-    alt 已设 ICodec
-      Core->>Core: Decode(frame)
+  alt routing 关（用户 framer）
+    Conn->>FA: FrameAssembler.Feed(bytes)（按 codec 内嵌长度切帧）
+    FA-->>Conn: frames[]
+    loop 每帧
+      Conn->>Core: DeliverFrame(frame, source, "")
     end
-    Core->>Q: Push(Result<Message>)
+  else routing 开（框架自有分帧）
+    Conn->>FA: TopicFrameAssembler.Feed(bytes)（解 [frame_len][topic_len][topic][body]）
+    FA-->>Conn: (topic, body)[]
+    loop 每帧
+      Conn->>Core: DeliverFrame(body, source, topic)
+    end
   end
+  Core->>Core: CodecFor(topic).Decode(...)（无 codec → 透传）
+  Core->>Q: Push(Result<Message>)
   Conn->>Sock: 再投递 async_read_some
-
-  App->>Q: Receive(timeout) / OnReceive / AsyncReceive
+  App->>Q: Receive / OnReceive / AsyncReceive
   Q-->>App: Result<Message>
 ```
 
-### 3.2 UDP 接收一个报文（报文式：无分帧）
+### 3.3 接收路径 — 报文式（UDP）
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant Sock as asio udp socket（io 线程）
+  participant Sock as udp socket（io 线程）
   participant Udp as UdpImpl
   participant Core as TransportCore (core_)
   participant Q as ReceiveQueue
   participant App as 应用线程
 
-  Sock->>Udp: async_receive_from 完成 → (bytes, sender)
-  Udp->>Core: core_.DeliverFrame(datagram, "ip:port", "")
-  alt 已设 ICodec
-    Core->>Core: Decode(datagram)
+  Sock->>Udp: async_receive_from 完成 → (datagram, sender)
+  alt routing 开
+    Udp->>Udp: UnpackTopic(datagram) → (topic, body)
+    Udp->>Core: DeliverFrame(body, "ip:port", topic)
+  else routing 关
+    Udp->>Core: DeliverFrame(datagram, "ip:port", "")
   end
+  Core->>Core: CodecFor(topic).Decode(...)
   Core->>Q: Push(Result<Message>)
   Udp->>Sock: 再投递 async_receive_from
-
-  App->>Q: Receive(timeout) / OnReceive / AsyncReceive
+  App->>Q: Receive / OnReceive / AsyncReceive
   Q-->>App: Result<Message>
 ```
 
-要点：分帧（`FrameAssembler`+`IFramer`）只在流式传输出现；交付（`TransportCore`+`ReceiveQueue`）对所有传输统一。I/O 线程只负责切帧/取报文 + 入队，应用线程按三模式之一出队。两图唯一区别就是 UDP 跳过了分帧那段。
+报文天然保边界，**不经分帧**；UDP 无 `FrameAssembler`。
+
+### 3.4 DDS 收发（pub-sub + req-resp；原生 topic，无 in-band 信封）
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant App as 应用线程
+  participant Dds as DdsImpl
+  participant Core as TransportCore
+  participant Prov as IDdsProvider
+  participant Tmr as steady_timer（io 线程）
+
+  Note over App,Prov: ① pub-sub 发送
+  App->>Dds: Send(data, Endpoint::Topic(t)) ｜ Send(Message{topic=t})
+  Dds->>Core: EncodeForSend(data, t)
+  Dds->>Prov: Publish(t, enc)（装 RawMessage）
+
+  Note over App,Prov: ② pub-sub 接收
+  Prov-->>Dds: 订阅回调(topic t, payload)
+  Dds->>Core: DeliverFrame(payload, t, t) → Decode → Push(Queue)
+  App->>Core: Receive / OnReceive / AsyncReceive → Result<Message>
+
+  Note over App,Tmr: ③ req-resp 客户端
+  App->>Dds: SendRequest(data, t, on_reply, timeout)
+  Dds->>Prov: SubscribeReplies(t_Reply) + SendRequest(t_Request, request_id, reply_topic, enc)
+  Dds->>Tmr: 起 per-request 超时定时器
+  alt 收到匹配 request_id 的回复
+    Prov-->>Dds: reply(request_id, payload)
+    Dds->>App: on_reply(Success(Decode(payload)))（取出 pending 兑现恰好一次）
+  else 超时
+    Tmr-->>Dds: 到期 → on_reply(Fail("timeout:..."))
+  end
+
+  Note over App,Prov: ④ req-resp 响应端
+  App->>Dds: OnRequest(t, handler)
+  Prov-->>Dds: 请求回调(payload, request_id, reply_topic)
+  Dds->>App: handler(Message, ReplyFn)
+  App->>Dds: reply(bytes)
+  Dds->>Prov: Reply(reply_topic, request_id, Encode(bytes))
+```
+
+**统一要点：**
+- **编码/解码内核统一**：四种传输都经 `TransportCore.EncodeForSend(payload, topic)` 编码、`DeliverFrame(..., topic)` 按 `CodecFor(topic)` 解码并入 `ReceiveQueue`；I/O 线程只切帧/取报文 + 入队，应用线程按三模式之一出队（互斥）。
+- **分帧只在流式**：TCP/串口接收侧用 `FrameAssembler`（关路由）或 `TopicFrameAssembler`（开路由）；UDP/DDS 报文保边界、无分帧。
+- **写出各异**：TCP/串口经 strand 的 `write_queue_`/`DoWrite`，UDP `socket.send_to`，DDS `provider.Publish`。`Status` 一律表「入队/写出成功」，不代表对端已收。
+- **topic 路由 opt-in**：TCP/UDP/串口由 `enable_topic_routing` 决定是否加 in-band 信封（关时与旧格式逐字节一致）；DDS 用原生 topic，无开关无信封。
 
 ---
 
-> 框架级（含规划中的 DDS / 串口 / 工厂）视图见主 spec `2026-06-09-transport-middleware-design.md` §3.1 / §3.4。
+> 完整需求/设计见 [`docs/需求规格说明书.md`](../../需求规格说明书.md)（SRS）、[`docs/设计说明书.md`](../../设计说明书.md)（SDD）；框架级总设计见主 spec `2026-06-09-transport-middleware-design.md`。
