@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "transport/core/StreamSend.hpp"
 #include "transport/core/TopicEnvelope.hpp"
 
 // TcpConnectionImpl.cpp — 已连接 socket 的收发实现（见 TcpConnectionImpl.hpp）。
@@ -82,31 +83,20 @@ void TcpConnectionImpl::StartRead() {
 }
 
 Status TcpConnectionImpl::Send(const std::vector<uint8_t>& data) {
-  if (enable_topic_routing_) {
-    Message m;
-    m.payload = data;  // topic 空
-    return Send(m, Endpoint::Default());
-  }
+  auto bytes = BuildStreamFrame(core_, enable_topic_routing_, data, "");
+  if (!bytes) return Status::Fail(bytes.error);
   if (!open_.load()) return Status::Fail("conn: not connected");
-  auto enc = core_.EncodeForSend(data);
-  if (!enc) return Status::Fail(enc.error);
-  EnqueueWrite(std::move(enc.value));
+  EnqueueWrite(std::move(bytes.value));
   return Status::Success(std::monostate{});
 }
 
 Status TcpConnectionImpl::Send(const Message& msg, const Endpoint& to) {
-  if (!enable_topic_routing_) {
-    if (!msg.topic.empty())
-      return Status::Fail("config: topic routing not enabled");
-    return Send(msg.payload);  // 退化(TCP 地址即连接,忽略 to)
-  }
-  if (!TopicFitsEnvelope(msg.topic))
-    return Status::Fail("frame: topic too long");
   (void)to;  // TCP 地址即连接
+  auto bytes =
+      BuildStreamFrame(core_, enable_topic_routing_, msg.payload, msg.topic);
+  if (!bytes) return Status::Fail(bytes.error);
   if (!open_.load()) return Status::Fail("conn: not connected");
-  auto enc = core_.EncodeForSend(msg.payload, msg.topic);
-  if (!enc) return Status::Fail(enc.error);
-  EnqueueWrite(FrameStream(msg.topic, enc.value));
+  EnqueueWrite(std::move(bytes.value));
   return Status::Success(std::monostate{});
 }
 

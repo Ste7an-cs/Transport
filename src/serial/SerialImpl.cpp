@@ -3,6 +3,7 @@
 #include <utility>
 #include <variant>
 
+#include "transport/core/StreamSend.hpp"
 #include "transport/core/TopicEnvelope.hpp"
 #include "transport/framing/LengthFieldFramer.hpp"
 
@@ -112,31 +113,20 @@ void SerialImpl::StartRead() {
 }
 
 Status SerialImpl::Send(const std::vector<uint8_t>& data) {
-  if (enable_topic_routing_) {
-    Message m;
-    m.payload = data;
-    return Send(m, Endpoint::Default());
-  }
+  auto bytes = BuildStreamFrame(core_, enable_topic_routing_, data, "");
+  if (!bytes) return Status::Fail(bytes.error);
   if (!open_.load()) return Status::Fail("config: serial not open");
-  auto enc = core_.EncodeForSend(data);
-  if (!enc) return Status::Fail(enc.error);
-  EnqueueWrite(std::move(enc.value));
+  EnqueueWrite(std::move(bytes.value));
   return Status::Success(std::monostate{});
 }
 
 Status SerialImpl::Send(const Message& msg, const Endpoint& to) {
-  if (!enable_topic_routing_) {
-    if (!msg.topic.empty())
-      return Status::Fail("config: topic routing not enabled");
-    return Send(msg.payload);
-  }
-  if (!TopicFitsEnvelope(msg.topic))
-    return Status::Fail("frame: topic too long");
   (void)to;
+  auto bytes =
+      BuildStreamFrame(core_, enable_topic_routing_, msg.payload, msg.topic);
+  if (!bytes) return Status::Fail(bytes.error);
   if (!open_.load()) return Status::Fail("config: serial not open");
-  auto enc = core_.EncodeForSend(msg.payload, msg.topic);
-  if (!enc) return Status::Fail(enc.error);
-  EnqueueWrite(FrameStream(msg.topic, enc.value));
+  EnqueueWrite(std::move(bytes.value));
   return Status::Success(std::monostate{});
 }
 
