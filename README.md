@@ -23,7 +23,7 @@
 - **可插拔编解码 `ICodec`**：框架在 `Send` 前 `Encode`、收到后 `Decode`；不设则字节透传。
 - **可插拔分帧 `IFramer`**：流式传输（TCP/串口）接收侧把字节流切回整帧；内置「长度字段」实现 `LengthFieldFramer`；UDP/DDS 报文天然保边界，自动跳过。
 - **三种接收交付模式**（互斥）：同步阻塞 `Receive`、回调 `OnReceive`、future `AsyncReceive`。
-- **不抛异常**：所有可失败操作返回 `Result<T>`，错误串带前缀分类：`timeout:` / `conn:` / `codec:` / `frame:` / `io:` / `config:`。
+- **不抛异常**：所有可失败操作返回 `Result<T>`（标 `[[nodiscard]]`，忽略错误返回值即编译期告警），错误串带前缀分类：`timeout:` / `conn:` / `codec:` / `frame:` / `io:` / `config:`。
 - **TCP 客户端自动重连**（指数退避，封顶）；**TCP 服务端广播**；**统一寻址发送** `Send(data, Endpoint)`（UDP `Endpoint::Net` / DDS `Endpoint::Topic`，基类句柄即可寻址）。
 - **异步单线程 I/O**：每个传输实例自有 `io_context` + 1 后台线程（Standalone Asio），接收落入**线程安全**的 FIFO 队列。
 - **接口层零第三方依赖**：`include/` 只含纯接口与数据结构；Asio / Fast DDS 关在实现层，消费者头文件不被污染。
@@ -38,7 +38,7 @@
 | 多协议、一套用法 | 所有传输实现统一接口 `ITransport`；扩展能力用 `I*Transport`（如 `ITcpServer.OnNewConnection`、`IDdsTransport.SendRequest`）；一次性寻址发送统一为 `Send(data, Endpoint)` |
 | 不同应用风格的接收 | 同步 / 回调 / future 三模式，单实例上互斥，由首次接收调用锁定 |
 | 流式协议的粘包/半包 | 接收侧 `FrameAssembler` + `IFramer` 用滚动缓冲切帧；报文式传输跳过分帧 |
-| 健壮的错误传递 | 全程 `Result<T>`、不抛异常；错误前缀分类，连接级错误也经接收队列投递 |
+| 健壮的错误传递 | 全程 `Result<T>`（`[[nodiscard]]`，忽略错误编译期告警）、不抛异常；错误前缀分类，连接级错误也经接收队列投递 |
 | 网络抖动 | TCP 客户端指数退避自动重连，重连期间接收队列保活 |
 | 线程安全与简单心智 | 每实例单 io 线程 + strand 串行化 socket 操作；接收队列自带锁，应用线程安全消费 |
 | 接口干净、可替换、可测 | 接口 / 实现分离（`I*` ↔ `*Impl`）；可写 fake 接口测上层；第三方库不进接口头 |
@@ -65,8 +65,8 @@ DDS 子系统的**真实** provider 基于 Fast DDS 2.13.x（编译型库，带 
 
 | 环境 | 结果 |
 |---|---|
-| **未安装 Fast DDS** | 自动 `Fast DDS NOT found`，跳过 `FastDdsProvider` 及其 8 个互通测试，离线构建 **108/108 通过**。DDS 接口与逻辑仍可用（`FakeDdsProvider` / 用户自注册 provider）。 |
-| **已安装 Fast DDS** | 自动启用 `FastDdsProvider`，**116/116 通过**。 |
+| **未安装 Fast DDS** | 自动 `Fast DDS NOT found`，跳过 `FastDdsProvider` 及其 8 个互通测试，离线构建 **142/142 通过**。DDS 接口与逻辑仍可用（`FakeDdsProvider` / 用户自注册 provider）。 |
+| **已安装 Fast DDS** | 自动启用 `FastDdsProvider`，**150/150 通过**。 |
 
 启用真实 DDS（一次性系统安装，非每次构建）：在目标机装好 Fast DDS 2.13.x（含 fastcdr/foonathan_memory/tinyxml2，源码或发行包均可），CMake 即自动探测启用。第三方依赖清单与版本见 [`third_party/README.md`](third_party/README.md)。
 
@@ -291,7 +291,7 @@ for (auto& t : r.value) t->Open();
 
 ### 关键约束（详见 SRS/SDD）
 
-- **不抛异常**：所有可能失败的操作返回 `Result<T>` / `Status`，错误按前缀分类（`timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`）。〔[SRS NFR-2 / FR-11](docs/需求规格说明书.md)、[SDD §12](docs/设计说明书.md)〕
+- **不抛异常**：所有可能失败的操作返回 `Result<T>` / `Status`（标 `[[nodiscard]]`，忽略错误返回值即编译期告警），错误按前缀分类（`timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`）。〔[SRS NFR-2 / FR-11](docs/需求规格说明书.md)、[SDD §12](docs/设计说明书.md)〕
 - **抽象层零第三方依赖**：`include/transport/` 只含纯接口 + 数据结构；asio/Fast DDS/termios 封在 `*Impl` / provider 内。〔[SRS NFR-4](docs/需求规格说明书.md)、[SDD §2.2](docs/设计说明书.md)〕
 - **接收三模式互斥**：同步 / 回调 / future 在单实例上互斥，由 `Open()` 后首次接收调用锁定，不可切换。〔[SRS FR-1.3](docs/需求规格说明书.md)、[SDD §10.3](docs/设计说明书.md)〕
 - **每实例单 io 线程 + strand**：socket 读写与共享状态经 strand 串行化；async handler 以 `shared_from_this` 保活，故 `*Impl` 须 `shared_ptr` 持有。〔[SRS NFR-3](docs/需求规格说明书.md)、[SDD §11](docs/设计说明书.md)〕

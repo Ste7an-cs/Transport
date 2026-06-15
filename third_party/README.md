@@ -18,7 +18,7 @@ googletest 经 `add_subdirectory` 引入。
 Fast DDS 2.13.x（编译型库，传递依赖 `fastcdr` / `foonathan_memory` / `tinyxml2`）体积大、与平台 ABI
 强相关，**有意不内置**，由 CMake `find_package(fastrtps/fastcdr QUIET)` 自动探测：
 
-- **未装** → 跳过 `FastDdsProvider` 及其 8 个真实互通测试，离线构建 108/108 通过（DDS 逻辑仍可用 `FakeDdsProvider`）。
-- **已装** → 自动启用，116/116 通过。
+- **未装** → 跳过 `FastDdsProvider` 及其 8 个真实互通测试，离线构建 142/142 通过（DDS 逻辑仍可用 `FakeDdsProvider`）。
+- **已装** → 自动启用，150/150 通过。
 
 仅当需要真实 DDS 互通时，在目标机一次性安装 Fast DDS 2.13.x 即可（非每次构建拉取）。详见根 `README.md`「构建」节。
