@@ -10,6 +10,7 @@ option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
 add_library(transport STATIC
   src/core/version.cpp
   src/codec/LengthFieldCodec.cpp
+  src/codec/SystemCodec.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -37,6 +38,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/result_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
+    tests/codec/system_codec_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   gtest_discover_tests(transport_tests)
