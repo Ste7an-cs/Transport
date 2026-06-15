@@ -87,10 +87,11 @@ TEST(DdsPubSub, UnsubscribeStopsDelivery) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto tx = Make(bus, PubSubCfg({"t"}));
   auto rx = Make(bus, PubSubCfg({"t"}));
-  tx->Open(); rx->Open();
-  rx->Subscribe("t");
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Subscribe("t")));
   ASSERT_TRUE(static_cast<bool>(rx->Unsubscribe("t")));
-  tx->Send({9});
+  ASSERT_TRUE(static_cast<bool>(tx->Send({9})));
   auto r = rx->Receive(50);
   EXPECT_FALSE(static_cast<bool>(r));  // timeout:
   EXPECT_EQ(r.error.rfind("timeout:", 0), 0u);
@@ -102,10 +103,11 @@ TEST(DdsPubSub, CodecAppliedBothDirections) {
   auto rx = Make(bus, PubSubCfg({"t"}));
   tx->SetCodec(std::make_shared<ShiftCodec>());
   rx->SetCodec(std::make_shared<ShiftCodec>());
-  tx->Open(); rx->Open();
-  rx->Subscribe("t");
+  ASSERT_TRUE(static_cast<bool>(tx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Open()));
+  ASSERT_TRUE(static_cast<bool>(rx->Subscribe("t")));
 
-  tx->Send({1, 2, 3});                    // Encode +1 → 总线上 {2,3,4}
+  ASSERT_TRUE(static_cast<bool>(tx->Send({1, 2, 3})));  // Encode +1 → 总线上 {2,3,4}
   auto r = rx->Receive(1000);             // Decode -1 → {1,2,3}
   ASSERT_TRUE(static_cast<bool>(r));
   EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{1, 2, 3}));
@@ -114,7 +116,7 @@ TEST(DdsPubSub, CodecAppliedBothDirections) {
 TEST(DdsPubSub, ModeConstraintRejectsReqRespMethods) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto t = Make(bus, PubSubCfg({"t"}));
-  t->Open();
+  ASSERT_TRUE(static_cast<bool>(t->Open()));
   auto st = t->SendRequest({1}, "t", [](Result<transport::Message>) {}, 1000);
   EXPECT_FALSE(static_cast<bool>(st));
   EXPECT_EQ(st.error.rfind("config:", 0), 0u);

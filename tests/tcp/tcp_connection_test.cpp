@@ -93,7 +93,7 @@ TEST(TcpConnectionImpl, PassthroughReceivesRawBytes) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   BlockingWriteAll(pair.client, {10, 20, 30});
   auto r = conn->Receive(1000);
@@ -108,7 +108,7 @@ TEST(TcpConnectionImpl, FramerAssemblesAcrossWrites) {
   auto pair = MakeConnectedPair(io.ctx);
   auto framer = std::make_shared<LengthFieldFramer>(BeConfig());
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   auto frame = BuildFrame(5, 0xAB);  // 13 字节
   BlockingWriteAll(pair.client, std::vector<uint8_t>(frame.begin(), frame.begin() + 6));
@@ -124,7 +124,7 @@ TEST(TcpConnectionImpl, SendWritesToPeer) {
   IoRunner io;
   auto pair = MakeConnectedPair(io.ctx);
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   auto st = conn->Send({1, 2, 3, 4});
   ASSERT_TRUE(static_cast<bool>(st));
@@ -140,7 +140,7 @@ TEST(TcpConnectionImpl, CodecAppliedBothDirections) {
   auto pair = MakeConnectedPair(io.ctx);
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   conn->SetCodec(std::make_shared<ShiftCodec>());
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   // 发送：{1,2,3} 经 Encode(+1) → 对端应收 {2,3,4}
   ASSERT_TRUE(static_cast<bool>(conn->Send({1, 2, 3})));
@@ -162,7 +162,7 @@ TEST(TcpConnectionImpl, PeerCloseTriggersDisconnectAndConnError) {
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), nullptr);
   std::string reason;
   conn->OnDisconnect([&](const std::string& r) { reason = r; });
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   pair.client.close();  // 对端关闭
   auto r = conn->Receive(1000);
@@ -181,7 +181,7 @@ TEST(TcpConnectionImpl, FrameErrorDeliversFrameError) {
   c.max_frame_size = 4;  // 任何正常帧都会越界
   auto framer = std::make_shared<LengthFieldFramer>(c);
   auto conn = std::make_shared<TcpConnectionImpl>(std::move(pair.server), framer);
-  conn->Open();
+  ASSERT_TRUE(static_cast<bool>(conn->Open()));
 
   BlockingWriteAll(pair.client, BuildFrame(100, 0x44));  // 触发 frame: 错误
   auto r = conn->Receive(1000);

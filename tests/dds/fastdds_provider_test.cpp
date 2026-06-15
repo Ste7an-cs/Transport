@@ -66,7 +66,7 @@ TEST(FastDdsIntegration, ReqRespRoundtrip) {
       "icalc", [](const Message& req, IDdsTransport::ReplyFn reply) {
         auto out = req.payload;
         for (auto& b : out) b = static_cast<uint8_t>(b + 1);
-        reply(out);
+        (void)reply(out);
       })));
 
   auto client = MakeReal(Cfg(DdsMode::kReqResp, {"icalc"}));

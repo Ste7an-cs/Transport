@@ -57,9 +57,9 @@ TEST(ReceiveQueue, CallbackDrainsBacklog) {
   ReceiveQueue q;
   q.Push(MakeMsg(9));
   std::vector<uint8_t> got;
-  q.SetCallback([&](Result<Message> m) {
+  ASSERT_TRUE(static_cast<bool>(q.SetCallback([&](Result<Message> m) {
     if (m) got.push_back(m.value.payload[0]);
-  });
+  })));
   ASSERT_EQ(got.size(), 1u);
   EXPECT_EQ(got[0], 9);
 }
@@ -102,7 +102,7 @@ TEST(ReceiveQueue, ModeExclusivitySyncThenCallbackFails) {
 
 TEST(ReceiveQueue, ModeExclusivityCallbackThenAsyncFails) {
   ReceiveQueue q;
-  q.SetCallback([](Result<Message>) {});
+  ASSERT_TRUE(static_cast<bool>(q.SetCallback([](Result<Message>) {})));
   auto fut = q.AsyncReceive();
   auto r = fut.get();
   EXPECT_FALSE(static_cast<bool>(r));

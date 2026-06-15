@@ -66,19 +66,21 @@ TEST(DdsReqResp, ConcurrentRequestsDoNotCross) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto server = Make(bus, ReqRespCfg());
   auto client = Make(bus, ReqRespCfg());
-  server->Open(); client->Open();
+  ASSERT_TRUE(static_cast<bool>(server->Open()));
+  ASSERT_TRUE(static_cast<bool>(client->Open()));
   // echo 服务
-  server->OnRequest("calc", [](const Message& req, IDdsTransport::ReplyFn reply) {
-    reply(req.payload);
-  });
+  ASSERT_TRUE(static_cast<bool>(server->OnRequest(
+      "calc", [](const Message& req, IDdsTransport::ReplyFn reply) {
+        (void)reply(req.payload);
+      })));
 
   std::promise<std::vector<uint8_t>> p1, p2;
-  client->SendRequest({1}, "calc",
+  ASSERT_TRUE(static_cast<bool>(client->SendRequest({1}, "calc",
       [&](Result<Message> r) { p1.set_value(r ? r.value.payload
-                                              : std::vector<uint8_t>{}); }, 1000);
-  client->SendRequest({2}, "calc",
+                                              : std::vector<uint8_t>{}); }, 1000)));
+  ASSERT_TRUE(static_cast<bool>(client->SendRequest({2}, "calc",
       [&](Result<Message> r) { p2.set_value(r ? r.value.payload
-                                              : std::vector<uint8_t>{}); }, 1000);
+                                              : std::vector<uint8_t>{}); }, 1000)));
   EXPECT_EQ(p1.get_future().get(), (std::vector<uint8_t>{1}));
   EXPECT_EQ(p2.get_future().get(), (std::vector<uint8_t>{2}));
 }
@@ -86,7 +88,7 @@ TEST(DdsReqResp, ConcurrentRequestsDoNotCross) {
 TEST(DdsReqResp, TimeoutWhenNoServer) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto client = Make(bus, ReqRespCfg());
-  client->Open();
+  ASSERT_TRUE(static_cast<bool>(client->Open()));
   std::promise<Result<Message>> prom;
   auto fut = prom.get_future();
   ASSERT_TRUE(static_cast<bool>(client->SendRequest(
@@ -101,21 +103,23 @@ TEST(DdsReqResp, AsyncReplyFromAnotherThread) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto server = Make(bus, ReqRespCfg());
   auto client = Make(bus, ReqRespCfg());
-  server->Open(); client->Open();
+  ASSERT_TRUE(static_cast<bool>(server->Open()));
+  ASSERT_TRUE(static_cast<bool>(client->Open()));
 
   std::thread worker;
-  server->OnRequest("calc", [&](const Message& req, IDdsTransport::ReplyFn reply) {
+  ASSERT_TRUE(static_cast<bool>(server->OnRequest(
+      "calc", [&](const Message& req, IDdsTransport::ReplyFn reply) {
     auto payload = req.payload;
     worker = std::thread([reply, payload] {
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
-      reply(payload);  // 异步回包
+      (void)reply(payload);  // 异步回包
     });
-  });
+  })));
 
   std::promise<Result<Message>> prom;
   auto fut = prom.get_future();
-  client->SendRequest({7}, "calc",
-      [&](Result<Message> r) { prom.set_value(std::move(r)); }, 2000);
+  ASSERT_TRUE(static_cast<bool>(client->SendRequest({7}, "calc",
+      [&](Result<Message> r) { prom.set_value(std::move(r)); }, 2000)));
   auto r = fut.get();
   if (worker.joinable()) worker.join();
   ASSERT_TRUE(static_cast<bool>(r));
@@ -125,14 +129,14 @@ TEST(DdsReqResp, AsyncReplyFromAnotherThread) {
 TEST(DdsReqResp, UnknownReplyIdIgnored) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto client = Make(bus, ReqRespCfg());
-  client->Open();
+  ASSERT_TRUE(static_cast<bool>(client->Open()));
   std::promise<Result<Message>> prom;
   auto fut = prom.get_future();
-  client->SendRequest({1}, "calc",
-      [&](Result<Message> r) { prom.set_value(std::move(r)); }, 300);
+  ASSERT_TRUE(static_cast<bool>(client->SendRequest({1}, "calc",
+      [&](Result<Message> r) { prom.set_value(std::move(r)); }, 300)));
   // 直接向 reply topic 投一个无关 id 的回复
   FakeDdsProvider stranger(bus);
-  stranger.Reply("calc_Reply", "not-our-id", {9});
+  ASSERT_TRUE(static_cast<bool>(stranger.Reply("calc_Reply", "not-our-id", {9})));
   auto r = fut.get();  // 仍按超时收场（无关回复被忽略）
   EXPECT_FALSE(static_cast<bool>(r));
   EXPECT_EQ(r.error.rfind("timeout:", 0), 0u);
@@ -141,12 +145,12 @@ TEST(DdsReqResp, UnknownReplyIdIgnored) {
 TEST(DdsReqResp, CloseCancelsPendingWithConnError) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto client = Make(bus, ReqRespCfg());
-  client->Open();
+  ASSERT_TRUE(static_cast<bool>(client->Open()));
   std::promise<Result<Message>> prom;
   auto fut = prom.get_future();
-  client->SendRequest({1}, "calc",
+  ASSERT_TRUE(static_cast<bool>(client->SendRequest({1}, "calc",
       [&](Result<Message> r) { prom.set_value(std::move(r)); },
-      /*timeout_ms=*/60000);
+      /*timeout_ms=*/60000)));
   client->Close();
   auto r = fut.get();
   EXPECT_FALSE(static_cast<bool>(r));
@@ -156,7 +160,7 @@ TEST(DdsReqResp, CloseCancelsPendingWithConnError) {
 TEST(DdsReqResp, ModeConstraintRejectsPubSubMethods) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   auto t = Make(bus, ReqRespCfg());
-  t->Open();
+  ASSERT_TRUE(static_cast<bool>(t->Open()));
   EXPECT_EQ(t->Send({1}).error.rfind("config:", 0), 0u);
   EXPECT_EQ(t->Send({1}, transport::Endpoint::Topic("x")).error.rfind("config:", 0), 0u);
   EXPECT_EQ(t->Subscribe("x").error.rfind("config:", 0), 0u);

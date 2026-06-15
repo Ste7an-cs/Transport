@@ -63,6 +63,6 @@ TEST(DdsRegistry, FakeBusRoundtrip) {
   // Unsubscribe 生效
   got.clear();
   ASSERT_TRUE(static_cast<bool>(b.Unsubscribe("t")));
-  a.Publish("t", {7});
+  ASSERT_TRUE(static_cast<bool>(a.Publish("t", {7})));
   EXPECT_TRUE(got.empty());
 }
