@@ -13,6 +13,7 @@ add_library(transport STATIC
   src/codec/SystemCodec.cpp
   src/udp/UdpTransport.cpp
   src/tcp/TcpClientTransport.cpp
+  src/serial/SerialTransport.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -44,7 +45,9 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/datagram_codec_test.cpp
     tests/transport/udp_transport_test.cpp
     tests/transport/tcp_transport_test.cpp
+    tests/transport/serial_transport_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
+  target_link_libraries(transport_tests PRIVATE util)
   gtest_discover_tests(transport_tests)
 endif()
