@@ -72,6 +72,11 @@ class ITransport {
  public:
   virtual ~ITransport() = default;
 
+  // bytes = 收到的字节(失败时为错误);from = 来源标识字符串
+  //   (UDP/TCP 为 "ip:port",串口为设备路径),失败时为空。
+  using BytesCallback =
+      std::function<void(Result<std::vector<uint8_t>> bytes, const std::string& from)>;
+
   virtual Status Open() = 0;
   virtual void   Close() = 0;
   virtual bool   IsOpen() const = 0;
@@ -81,10 +86,7 @@ class ITransport {
 
   // 收裸字节(io 线程,经 strand 串行化):
   //   流式(TCP/串口)= 本次 read 到的切片;报文式(UDP)= 一个完整 datagram。
-  //   from = 来源标识字符串(UDP/TCP 为 "ip:port",串口为设备路径);失败时 from 为空。
-  virtual void OnBytes(
-      std::function<void(Result<std::vector<uint8_t>> bytes,
-                         const std::string& from)> cb) = 0;
+  virtual void OnBytes(BytesCallback cb) = 0;
 
   virtual void OnConnect(std::function<void()> cb) = 0;                       // 建连(含重连)
   virtual void OnDisconnect(std::function<void(const std::string&)> cb) = 0; // 断开
