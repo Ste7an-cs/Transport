@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### ⚠️ 重大重构:底层分层(Transport + ICodec 两层解耦)— 2026-06-15
+> 面向 0.2.0 的破坏性重构第一阶段(PR #1)。把臃肿的富 `ITransport` 拆成两个**解耦的底层层**;上层 `System` 交互模式基类、TCP 服务端、DDS 留作后续阶段(设计见 `docs/superpowers/specs/2026-06-15-system-codec-transport-design.md`)。`v0.1.0` 标签保留完整旧实现备查。
+
+- **新增** `ITransport` 纯字节管道:仅 `Open/Close/IsOpen` + `Send(bytes)` / `Send(bytes, Endpoint)` + `OnBytes` / `OnConnect` / `OnDisconnect`,不再涉及 Message/codec/分帧/topic。实现 `UdpTransport`、`TcpClientTransport`(合并旧 client+connection 为单类)、`SerialTransport`。
+- **新增** `ICodec` 线缆格式(分帧 + 序列化 + 交互元数据,有状态):`Encode(Message) → bytes` / `Decode(bytes) → 0..N Message`。实现 `SystemCodec`(默认线缆格式,承载 `kind`+`correlation_id`+`topic`+`payload`)、`LengthFieldCodec`(吸收旧 `LengthFieldFramer`+`FrameAssembler`)、`DatagramCodec`(报文直通,header-only)。
+- **新增** `Message` 交互元数据:`MessageKind{kOneway,kRequest,kReply,kFeedback,kNotify}` + `correlation_id`,为后续 `System` 的请求-应答/请求-结果反馈/订阅预置。
+- **⚠️ 破坏性移除** 旧 `TransportCore`、`IFramer`/`LengthFieldFramer`/`FrameAssembler`、`TopicEnvelope`/`StreamSend`、`ReceiveQueue` 与三模式接收(`Receive`/`OnReceive`/`AsyncReceive`)、topic 路由、`TcpConnectionImpl`/`TcpServerImpl`/`ITcpServer`、整个 DDS(`DdsImpl`/`IDdsProvider`/`FastDdsProvider` 等)、`TransportFactory`。`ICodec` 由无状态 `bytes↔bytes` 改为有状态 `Message↔bytes`。
+- **说明** 本次移除使上一条「健壮性优化」中的 `DdsImpl::Send` 空 `topics` 防护、`TransportFactory::ParseSubFramer` 随相关文件一并删除(对当前代码不再适用);`Result<T>`/`Status` 的 `[[nodiscard]]` 保留。
+- **解耦** Transport 不依赖 `Message`/`ICodec`,`ICodec` 不依赖任何 transport(唯一交叉点是组合冒烟测试)。
+- **验证** 干净构建零告警,27/27 测试通过(TDD,11 commits;含 UDP/TCP 回环、串口 openpty、两层组合冒烟)。
+
 ### 健壮性与可维护性优化 — 2026-06-15
 - **变更** `Result<T>`/`Status` 标 `[[nodiscard]]`：框架不抛异常、靠返回值传错，忽略 `Open`/`Send` 等返回值改为**编译期告警**；同步清理由此暴露的全部静默丢错（生产代码有意忽略处显式 `(void)` 标注，测试中期望成功的调用升级为 `ASSERT_TRUE` 断言）。
 - **修复** `DdsImpl::Send(data)` 增加空 `topics` 前置校验（返回 `config: no topic configured`），堵住先于 `Open` 调用导致 `topics[0]` 越界的未定义行为。
