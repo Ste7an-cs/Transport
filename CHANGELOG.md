@@ -6,6 +6,14 @@
 
 ---
 
+## [Unreleased]
+
+### 健壮性与可维护性优化 — 2026-06-15
+- **变更** `Result<T>`/`Status` 标 `[[nodiscard]]`：框架不抛异常、靠返回值传错，忽略 `Open`/`Send` 等返回值改为**编译期告警**；同步清理由此暴露的全部静默丢错（生产代码有意忽略处显式 `(void)` 标注，测试中期望成功的调用升级为 `ASSERT_TRUE` 断言）。
+- **修复** `DdsImpl::Send(data)` 增加空 `topics` 前置校验（返回 `config: no topic configured`），堵住先于 `Open` 调用导致 `topics[0]` 越界的未定义行为。
+- **重构** `TransportFactory` 中 `tcp_client`/`tcp_server`/`serial` 三处重复的 framer 子解析合并为 `ParseSubFramer` 辅助函数。
+- **验证** 干净构建零告警，150/150 测试通过。
+
 ## [0.1.0] - 2026-06-14
 
 **首个发布版本**，聚合下列全部里程碑。`transport::LibraryVersion()` 返回 `"0.1.0"`，对应 git 标签 `v0.1.0`。本节内各里程碑的 **⚠️ 破坏性** 均为 0.1.0 发布**之前**的开发期内部变更（彼时尚无已发布版本可破坏）；自 0.1.0 起，破坏性变更将触发主/次版本号递增。
@@ -68,4 +76,5 @@
 
 ---
 
+[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.1.0
