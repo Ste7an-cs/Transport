@@ -164,6 +164,22 @@ void ParseFramer(const json& j, Ctx& ctx,
   if (ctx.ok()) *out = f;
 }
 
+// 解析可选的 framer 子对象（tcp_client / tcp_server / serial 三处复用）。
+// 子上下文错误回填主 ctx；返回 false 表示出错，调用方应立即返回 nullptr。
+// 不存在 → 返回 ctx.ok()（缺省正常）；类型非对象 → Sub 已置 ctx.Fail，返回 false。
+bool ParseSubFramer(Fields& p, Ctx& ctx,
+                    std::optional<LengthFieldFramerConfig>* out) {
+  const json* f = p.Sub("framer");
+  if (f == nullptr) return ctx.ok();
+  Ctx sub{ctx.where + ".framer", ""};
+  ParseFramer(*f, sub, out);
+  if (!sub.ok()) {
+    ctx.err = sub.err;
+    return false;
+  }
+  return true;
+}
+
 void ParseQos(const json& j, Ctx& ctx, DdsQos* out) {
   Fields p(j, ctx);
   std::string rel, dur;
@@ -201,11 +217,7 @@ std::shared_ptr<ITransport> ParseEntry(const json& e, Ctx& ctx) {
     p.Uint("port", &c.port, 0xFFFF, true);
     p.Uint("connect_timeout_ms", &c.connect_timeout_ms, 0xFFFFFFFFull);
     p.Bool("auto_reconnect", &c.auto_reconnect);
-    if (const json* f = p.Sub("framer")) {
-      Ctx sub{ctx.where + ".framer", ""};
-      ParseFramer(*f, sub, &c.framer);
-      if (!sub.ok()) { ctx.err = sub.err; return nullptr; }
-    }
+    if (!ParseSubFramer(p, ctx, &c.framer)) return nullptr;
     p.CheckUnknown();
     if (!ctx.ok()) return nullptr;
     return TransportFactory::Create(c);
@@ -216,11 +228,7 @@ std::shared_ptr<ITransport> ParseEntry(const json& e, Ctx& ctx) {
     p.Str("bind_addr", &c.bind_addr);
     p.Uint("port", &c.port, 0xFFFF, true);
     p.Int("max_clients", &c.max_clients);
-    if (const json* f = p.Sub("framer")) {
-      Ctx sub{ctx.where + ".framer", ""};
-      ParseFramer(*f, sub, &c.framer);
-      if (!sub.ok()) { ctx.err = sub.err; return nullptr; }
-    }
+    if (!ParseSubFramer(p, ctx, &c.framer)) return nullptr;
     p.CheckUnknown();
     if (!ctx.ok()) return nullptr;
     return TransportFactory::Create(c);
@@ -277,11 +285,7 @@ std::shared_ptr<ITransport> ParseEntry(const json& e, Ctx& ctx) {
     p.Uint("data_bits", &c.data_bits, 0xFF);
     p.Uint("stop_bits", &c.stop_bits, 0xFF);
     p.Str("parity", &parity);
-    if (const json* f = p.Sub("framer")) {
-      Ctx sub{ctx.where + ".framer", ""};
-      ParseFramer(*f, sub, &c.framer);
-      if (!sub.ok()) { ctx.err = sub.err; return nullptr; }
-    }
+    if (!ParseSubFramer(p, ctx, &c.framer)) return nullptr;
     p.CheckUnknown();
     if (!ctx.ok()) return nullptr;
     if (!parity.empty()) {

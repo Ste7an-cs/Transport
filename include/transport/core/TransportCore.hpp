@@ -44,7 +44,8 @@ class TransportCore {
     return default_codec_;
   }
   Result<Message> Receive(uint32_t timeout_ms) { return queue_.Receive(timeout_ms); }
-  void OnReceive(ReceiveCallback cb) { queue_.SetCallback(std::move(cb)); }
+  // ITransport::OnReceive 返回 void，模式冲突错误无处上抛，此处有意丢弃 SetCallback 的 Status。
+  void OnReceive(ReceiveCallback cb) { (void)queue_.SetCallback(std::move(cb)); }
   std::future<Result<Message>> AsyncReceive() { return queue_.AsyncReceive(); }
   void OnDisconnect(DisconnectCallback cb) { disconnect_cb_ = std::move(cb); }
 

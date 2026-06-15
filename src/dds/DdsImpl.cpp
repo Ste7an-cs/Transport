@@ -63,6 +63,8 @@ Status DdsImpl::RequireMode(DdsMode m) const {
 // ---------- pub-sub ----------
 
 Status DdsImpl::Send(const std::vector<uint8_t>& data) {
+  if (config_.topics.empty())
+    return Status::Fail("config: no topic configured");
   return SendToTopic(data, config_.topics[0]);
 }
 

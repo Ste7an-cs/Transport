@@ -88,7 +88,7 @@ void TcpServerImpl::DoAccept() {
         conn->OnDisconnect([wself, id](const std::string&) {
           if (auto s = wself.lock()) s->RemoveClient(id);
         });
-        conn->Open();
+        (void)conn->Open();  // 已连接 socket 起读循环；失败经该连接接收侧错误暴露
         cb_copy = connection_cb_;
       }
     }
@@ -108,7 +108,7 @@ Status TcpServerImpl::Send(const std::vector<uint8_t>& data) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : clients_) snapshot.push_back(kv.second);
   }
-  for (auto& c : snapshot) c->Send(data);
+  for (auto& c : snapshot) (void)c->Send(data);  // 尽力广播：单个客户端失败不影响其余
   return Status::Success(std::monostate{});
 }
 

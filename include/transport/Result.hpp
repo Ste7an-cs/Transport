@@ -16,8 +16,10 @@ namespace transport {
 // 所有可能失败的操作返回 Result<T>；框架不抛异常。
 // 错误字符串前缀分类：timeout: / conn: / codec: / frame: / io: / config:
 // 约束：T 必须可默认构造（Fail 时以 T{} 初始化 value）。
+// [[nodiscard]]：框架靠返回值传错误（不抛异常），忽略 Result/Status 会静默丢错——
+// 加此属性令「忽略返回值」在编译期告警。
 template <typename T>
-struct Result {
+struct [[nodiscard]] Result {
   T value{};
   bool ok = false;
   std::string error;
