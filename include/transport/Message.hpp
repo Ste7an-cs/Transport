@@ -1,9 +1,9 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Message.hpp — 交付给应用层的一条消息
-// 经 ICodec.Decode 后由框架组装：payload（字节）+ topic / source / timestamp。
-// 各传输统一以 Result<Message> 经 ReceiveQueue 投递给应用层。
+// Message.hpp — 一条消息的数据模型(含交互元数据)
+// payload/topic + kind/correlation_id(交互语义,由 ICodec 上线缆,由 System 消费)。
+// source/timestamp 由上层 System 填(本轮底层留默认)。
 // -----------------------------------------------------------------------------
 
 #include <cstdint>
@@ -12,12 +12,21 @@
 
 namespace transport {
 
-// 经 ICodec.Decode 处理后交付给应用层的一条消息。
+enum class MessageKind {
+  kOneway,    // 单向(无需应答)
+  kRequest,   // 请求(期待应答/反馈)
+  kReply,     // 终结应答(请求-应答的应答,或请求-结果反馈的最终结果)
+  kFeedback,  // 中间结果反馈(可多次,非终结)
+  kNotify,    // 订阅通知(主动推送)
+};
+
 struct Message {
-  std::vector<uint8_t> payload;       // 解码后的字节流（含用户 header + body）
-  std::string topic;                  // DDS topic / 逻辑通道名；TCP/UDP/串口为空
-  std::string source;                 // 发送方标识："ip:port"、topic 名、设备路径等
-  int64_t timestamp = 0;              // 接收时间戳（微秒，由框架填充）
+  std::vector<uint8_t> payload;                 // 应用字节
+  std::string topic;                            // 操作/通道名;否则空
+  std::string source;                           // 来源标识;本轮底层留空
+  int64_t timestamp = 0;                        // 本轮留 0
+  MessageKind kind = MessageKind::kOneway;      // 交互种类
+  std::string correlation_id;                   // 配对请求↔应答/反馈;非请求为空
 };
 
 }  // namespace transport
