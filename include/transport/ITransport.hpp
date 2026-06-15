@@ -1,22 +1,18 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// ITransport.hpp — 所有传输的统一抽象接口
-// 生命周期(Open/Close/IsOpen) + 发送(Send / Send+Endpoint 统一寻址) + 三模式接收(Receive/OnReceive/
-// AsyncReceive) + 断连通知(OnDisconnect) + 编解码挂载(SetCodec)。
-// 具体实现：TcpConnectionImpl / TcpClientImpl / TcpServerImpl(扩展 ITcpServer) 等。
+// ITransport.hpp — 纯字节管道接口
+// 只收发裸字节,不知道 Message/ICodec/分帧/交互模式。各实现自有 io 线程 + strand。
+// 收侧经 OnBytes 回调(io 线程,串行)交付本次读到的字节切片(流式)或整 datagram(报文式)。
 // -----------------------------------------------------------------------------
 
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "transport/Endpoint.hpp"
-#include "transport/ICodec.hpp"
-#include "transport/Message.hpp"
 #include "transport/Result.hpp"
 
 namespace transport {
@@ -25,56 +21,20 @@ class ITransport {
  public:
   virtual ~ITransport() = default;
 
-  using ReceiveCallback = std::function<void(Result<Message>)>;
-  using DisconnectCallback = std::function<void(const std::string& reason)>;
+  // bytes = 收到的字节(失败时为错误);from = 来源标识("ip:port"/设备路径),失败时空。
+  using BytesCallback =
+      std::function<void(Result<std::vector<uint8_t>> bytes, const std::string& from)>;
 
-  // 生命周期
   virtual Status Open() = 0;
-  virtual void Close() = 0;
-  virtual bool IsOpen() const = 0;
+  virtual void   Close() = 0;
+  virtual bool   IsOpen() const = 0;
 
-  // 发送（若已设置 ICodec，自动 Encode 后传输）。data 自带长度。
-  virtual Status Send(const std::vector<uint8_t>& data) = 0;
+  virtual Status Send(const std::vector<uint8_t>& bytes) = 0;
+  virtual Status Send(const std::vector<uint8_t>& bytes, const Endpoint& to) = 0;
 
-  // 统一寻址发送(非纯虚,基类默认实现):
-  //   kDefault → 退化调 Send(data);其余 kind → Fail("io: addressed send not supported")。
-  // UdpImpl 覆写支持 kNet,DdsImpl 覆写支持 kTopic;TCP/串口继承默认行为。
-  virtual Status Send(const std::vector<uint8_t>& data, const Endpoint& to) {
-    if (to.kind == Endpoint::Kind::kDefault) return Send(data);
-    return Status::Fail("io: addressed send not supported");
-  }
-
-  // topic 路由发送(非纯虚,基类默认):
-  //   topic 为空 → 退化 Send(payload, to);否则 → Fail(该实现不支持路由)。
-  // TCP/UDP/串口/DDS 覆写以支持 topic→codec 路由。
-  virtual Status Send(const Message& msg,
-                      const Endpoint& to = Endpoint::Default()) {
-    if (msg.topic.empty()) return Send(msg.payload, to);
-    return Status::Fail("io: topic routing not supported");
-  }
-
-  // 同步接收（阻塞至收到数据或超时；timeout_ms == 0 表示永久阻塞）
-  virtual Result<Message> Receive(uint32_t timeout_ms = 0) = 0;
-
-  // 异步接收 —— 回调模式（回调在内部 I/O 线程执行，必须非阻塞）
-  virtual void OnReceive(ReceiveCallback cb) = 0;
-
-  // 异步接收 —— future 模式（每次调用消费一条到来的消息）
-  virtual std::future<Result<Message>> AsyncReceive() = 0;
-
-  // 断连通知（TCP 客户端、串口适用）
-  virtual void OnDisconnect(DisconnectCallback cb) = 0;
-
-  // 挂载编解码器；未设置时原始字节直接透传
-  virtual void SetCodec(std::shared_ptr<ICodec> codec) = 0;
-
-  // 为某 topic 注册 codec(topic 路由);基类 no-op,路由能力的实现覆写转发给
-  // 自己的 TransportCore。
-  virtual void SetCodec(const std::string& topic,
-                        std::shared_ptr<ICodec> codec) {
-    (void)topic;
-    (void)codec;
-  }
+  virtual void OnBytes(BytesCallback cb) = 0;
+  virtual void OnConnect(std::function<void()> cb) = 0;
+  virtual void OnDisconnect(std::function<void(const std::string& reason)> cb) = 0;
 };
 
 }  // namespace transport

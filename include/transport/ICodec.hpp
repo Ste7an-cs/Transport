@@ -1,28 +1,32 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// ICodec.hpp — 编解码扩展点（接口，用户实现）
-// 框架在发送前(Encode)/接收后(Decode)自动调用，用于组装/解析协议帧。
-// 未设置时字节原样透传；TransportCore 以 shared_ptr<ICodec> 持有。
+// ICodec.hpp — 线缆格式扩展点(分帧 + 序列化 + 承载交互元数据)
+// Encode: 一条 Message → 一段线缆字节(一对一)。
+// Decode: 喂入字节切片 → 切出 0..N 条完整 Message(内部维护滚动缓冲,有状态)。
+// 不依赖 Transport;由(未来)transport io 线程单线程喂,无需线程安全。
 // -----------------------------------------------------------------------------
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include "transport/Message.hpp"
 #include "transport/Result.hpp"
 
 namespace transport {
 
-// 发送/接收边界由框架自动调用；未设置时原始字节直接透传。
 class ICodec {
  public:
   virtual ~ICodec() = default;
 
-  // 发送前调用：将数据编码为字节流（用户在此组装 header + body）
-  virtual Result<std::vector<uint8_t>> Encode(const std::vector<uint8_t>& data) = 0;
+  // 发:一条消息 → 一段线缆字节。
+  virtual Result<std::vector<uint8_t>> Encode(const Message& msg) = 0;
 
-  // 接收后调用：将一帧完整字节流解码
-  virtual Result<std::vector<uint8_t>> Decode(const std::vector<uint8_t>& data) = 0;
+  // 收:喂入字节切片 → 切出 0..N 条完整消息(半包返回空、粘包返回多条)。
+  // 解析错误(坏帧头/越界)→ Fail("frame: ..." / "codec: ...")。
+  virtual Result<std::vector<Message>> Decode(const uint8_t* data,
+                                              std::size_t len) = 0;
 };
 
 }  // namespace transport

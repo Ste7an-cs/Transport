@@ -1,0 +1,39 @@
+#pragma once
+
+// LengthFieldCodec.hpp — 「固定 header + 长度字段」分帧 codec。
+// Encode 透传 payload;Decode 用滚动缓冲按长度字段切帧,每帧作为一条 kOneway Message。
+// 由原 LengthFieldFramer + FrameAssembler 合并而来。
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include "transport/ICodec.hpp"
+#include "transport/Result.hpp"
+
+namespace transport {
+
+struct LengthFieldCodecConfig {
+  std::size_t header_size = 0;
+  std::size_t length_offset = 0;
+  std::size_t length_size = 4;            // 2 / 4 / 8
+  bool big_endian = true;
+  bool length_includes_header = false;
+  std::size_t max_frame_size = 16 * 1024 * 1024;
+};
+
+class LengthFieldCodec : public ICodec {
+ public:
+  // 配置非法(header_size==0 / length_size∉{2,4,8} / 长度字段越出 header /
+  // max_frame_size < header_size)→ 构造仍成功,但首次 Decode 返回 config: 错误。
+  explicit LengthFieldCodec(LengthFieldCodecConfig config);
+
+  Result<std::vector<uint8_t>> Encode(const Message& msg) override;
+  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override;
+
+ private:
+  LengthFieldCodecConfig config_;
+  std::vector<uint8_t> buffer_;
+};
+
+}  // namespace transport

@@ -20,7 +20,6 @@ struct UdpConfig {
   uint16_t    remote_port     = 0;
   std::string multicast_group;         // 仅 kMulticast：Send() 默认目的地
   uint8_t     ttl             = 1;     // 组播 TTL（hops）
-  bool        enable_topic_routing = false;  // 开启 topic→codec 多路复用
 };
 
 }  // namespace transport
