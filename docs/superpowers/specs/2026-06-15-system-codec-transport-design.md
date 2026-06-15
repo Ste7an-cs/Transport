@@ -98,6 +98,13 @@ class ITransport {
 - 各回调单消费者(注册一次);回调在 transport io 线程 + strand 上,串行不并发。
 - 连接生命周期(connect/超时/指数退避重连/断开)是 transport I/O 职责;重连透明恢复字节流并触发 `OnConnect`。
 
+**`OnBytes` 语义(何时被谁调用):**
+- `OnBytes(cb)` 仅**注册**回调(单消费者,后注册覆盖先注册);本身不触发任何事,应在 `Open()` **之前**注册以免漏掉最早到达的数据。
+- 回调由 **transport 自己的 io 线程**在**异步读完成**时调用,绑定在 `strand_` 上 → 多次回调**严格串行、绝不并发**;回调在 io 线程执行,**必须非阻塞**,且**不可在其中 `Close()` 本对象**(自我 join 死锁)。
+- **每次回调对应**:报文式(UDP)= 一个完整 datagram;流式(TCP/串口)= 本次 `read` 到的字节切片(可能半条/一条/多条粘连)。**「一次回调 ≠ 一条消息」**,切帧由上层 `ICodec` 负责。
+- **`from`**:成功时为来源标识(UDP=发送方 `"ip:port"`,逐包可变;TCP=对端 `"ip:port"`;串口=设备路径),失败时为空。
+- **错误分流**:UDP 的收/发 I/O 错误经 `OnBytes` 投 `Result::Fail`(单包出错不致命,继续监听);TCP/串口的连接级读写错误改走 `OnDisconnect`(其 `OnBytes` 只会收到成功字节)。`OnConnect` 在建连(含重连成功)时调,UDP/串口在 `Open()` 成功后调一次。
+
 **内置实现(本轮):** `TcpClientTransport` / `SerialTransport` / `UdpTransport`,由现有 `TcpClientImpl` / `SerialImpl` / `UdpImpl` 剥离 `TransportCore`/codec/framing 改造——接收路径改吐裸字节 + `from`,删 `SetCodec`/`Send(Message)`/topic/三模式接收。
 
 ---
