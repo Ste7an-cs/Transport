@@ -11,6 +11,7 @@ add_library(transport STATIC
   src/core/version.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
+  src/udp/UdpTransport.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -40,6 +41,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
+    tests/transport/udp_transport_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   gtest_discover_tests(transport_tests)
