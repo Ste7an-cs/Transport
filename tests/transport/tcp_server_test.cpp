@@ -30,7 +30,7 @@ void WireEcho(std::shared_ptr<ITransport> conn) {
   auto weak = std::weak_ptr<ITransport>(conn);
   conn->OnBytes([weak](Result<std::vector<uint8_t>> r, const std::string&) {
     if (!r) return;
-    if (auto c = weak.lock()) c->Send(r.value);
+    if (auto c = weak.lock()) (void)c->Send(r.value);  // 尽力回显,忽略发送结果
   });
 }
 }  // namespace

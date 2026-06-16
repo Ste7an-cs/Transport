@@ -68,7 +68,7 @@ void TcpServerTransport::DoAccept() {
             conns_.end());
         conns_.push_back(conn);
         if (accept_cb_) accept_cb_(conn);
-        conn->Open();
+        (void)conn->Open();  // 已连接 socket 起读循环;失败经该连接接收侧暴露
         DoAccept();
       }));
 }
