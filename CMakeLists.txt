@@ -18,6 +18,7 @@ add_library(transport STATIC
   src/serial/SerialTransport.cpp
   src/dds/DdsProviderRegistry.cpp
   src/dds/FakeDdsProvider.cpp
+  src/dds/DdsTransport.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -55,6 +56,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/transport/combination_smoke_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/fake_dds_provider_test.cpp
+    tests/dds/dds_transport_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)
