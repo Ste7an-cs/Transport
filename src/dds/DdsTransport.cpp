@@ -6,6 +6,9 @@
 
 #include "transport/dds/DdsProviderRegistry.hpp"
 #include "transport/dds/FakeDdsProvider.hpp"
+#ifdef TRANSPORT_HAS_FASTDDS
+#include "dds/FastDdsProvider.hpp"
+#endif
 
 // DdsTransport.cpp — 见 .hpp。订阅回调捕获 weak_ptr 防引用环
 // (provider→callback→weak(transport);transport→unique_ptr(provider))。
@@ -22,7 +25,10 @@ void RegisterBuiltinProviders() {
   std::call_once(once, [] {
     DdsProviderRegistry::RegisterProvider(
         "fake", [] { return std::make_unique<FakeDdsProvider>(); });
-    // FastDDS 注册在 Task 4 以 #ifdef TRANSPORT_HAS_FASTDDS 加入。
+#ifdef TRANSPORT_HAS_FASTDDS
+    DdsProviderRegistry::RegisterProvider(
+        "fastdds", [] { return std::make_unique<FastDdsProvider>(); });
+#endif
   });
 }
 }  // namespace
