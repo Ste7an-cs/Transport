@@ -11,6 +11,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <asio.hpp>
