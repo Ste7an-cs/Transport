@@ -25,7 +25,14 @@ void ThreadExecutor::Stop() {
   }
   work_cv_.notify_all();
   space_cv_.notify_all();  // 解除可能阻塞的投递方
-  if (worker_.joinable()) worker_.join();
+  if (worker_.joinable()) {
+    // 若 Stop() 在 worker 线程自身(用户 hook 中调 Close())→ 不能 join(自连接死锁),
+    // 改为 detach:worker 见 stopping_ 自行退出循环并析构。其他线程仍走 join。
+    if (worker_.get_id() == std::this_thread::get_id())
+      worker_.detach();
+    else
+      worker_.join();
+  }
 }
 
 void ThreadExecutor::Post(Task task) {

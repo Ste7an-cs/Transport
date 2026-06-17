@@ -1,9 +1,18 @@
 #include "transport/comm/CommNode.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <random>
 #include <utility>
 #include <variant>
+
+#if defined(_WIN32)
+#include <process.h>
+#define TRANSPORT_GETPID _getpid
+#else
+#include <unistd.h>
+#define TRANSPORT_GETPID getpid
+#endif
 
 #include "transport/comm/ThreadExecutor.hpp"
 
@@ -37,8 +46,12 @@ CommNode::CommNode(std::shared_ptr<ITransport> transport, std::unique_ptr<ICodec
       codec_(std::move(codec)),
       executor_(executor ? std::move(executor)
                          : std::unique_ptr<IExecutor>(new ThreadExecutor(queue_capacity))) {
+  // 相关 id 前缀:random_device + pid + 进程内原子计数器,防同进程内多 CommNode 近时构造撞前缀。
+  static std::atomic<uint64_t> node_counter{0};
   std::random_device rd;
-  id_prefix_ = std::to_string(rd()) + "-";
+  id_prefix_ = std::to_string(rd()) + "-" +
+               std::to_string(static_cast<unsigned long>(TRANSPORT_GETPID())) + "-" +
+               std::to_string(node_counter.fetch_add(1)) + "-";
 }
 
 CommNode::~CommNode() { Close(); }
@@ -62,7 +75,16 @@ Status CommNode::Open() {
     auto msgs = s->codec_->Decode(r.value.data(), r.value.size());
     if (!msgs) {
       std::string e = msgs.error;
-      s->executor_->Post([wself, e] { if (auto s2 = wself.lock()) s2->OnError(e); });
+      // 规约 §8:frame: 坏帧 → 流式不可恢复(SystemCodec 不消费坏字节,后续 Decode 必复现)
+      //   → OnError 后终结(HandleDisconnect 终结挂起 + OnDisconnected);
+      // codec: 单条解码失败 → 丢弃该批 + OnError,继续。
+      const bool fatal = e.rfind("frame:", 0) == 0;
+      s->executor_->Post([wself, e, fatal] {
+        auto s2 = wself.lock();
+        if (!s2) return;
+        s2->OnError(e);
+        if (fatal) s2->HandleDisconnect(e);
+      });
       return;
     }
     for (auto& m : msgs.value) {
@@ -81,9 +103,11 @@ Status CommNode::Open() {
     if (auto s = wself.lock())
       s->executor_->Post([wself, reason] { if (auto s2 = wself.lock()) s2->HandleDisconnect(reason); });
   });
-  auto st = transport_->Open();
-  if (!st) { executor_->Stop(); return st; }
+  // open_ 须在 transport_->Open() 之前置位:transport 可能在 Open() 内同步触发 OnConnect,
+  // posted 的 OnConnected hook 若立即 Send/Request 需要 open_ 已为 true。
   open_.store(true);
+  auto st = transport_->Open();
+  if (!st) { open_.store(false); executor_->Stop(); return st; }
   return Ok();
 }
 
@@ -124,6 +148,12 @@ Status CommNode::RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_fin
   std::weak_ptr<CommNode> wself = weak_from_this();
   {  // 登记挂起 + 排超时(原子,防 reply/超时早于登记)
     std::lock_guard<std::mutex> lk(mu_);
+    // 与 Close() 竞态:closing_ 在 Close 取 mu_ swap pending 之前已置位。
+    // 在同一把 mu_ 下检查,确保此处登记不会在 Close 的 swap 之后落空(丢请求)。
+    if (closing_.load() || !open_.load()) {
+      if (on_final) on_final(Result<Message>::Fail("conn: node closing"));
+      return Status::Fail("conn: node closing");
+    }
     IExecutor::TimerId timer = executor_->ScheduleAt(
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms),
         [wself, corr] { if (auto s = wself.lock()) s->FireTimeout(corr); });

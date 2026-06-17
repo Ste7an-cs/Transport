@@ -147,6 +147,32 @@ TEST(CommNode, DisconnectFinalizesPending) {
   a->Close();
 }
 
+// FIX 1:用户 hook 在 worker 线程内调 Close() → ThreadExecutor::Stop() 不能 join 自身。
+// 自连接守卫:改 detach,进程不得 terminate;调用须返回。
+TEST(CommNode, HookCallsCloseFromWorkerNoSelfJoinCrash) {
+  class SelfCloser : public CommNode {
+   public:
+    using CommNode::CommNode;
+    std::promise<void> closed;
+    void OnMessage(const Message&) override {
+      this->Close();          // worker 线程内 → 触发 ThreadExecutor::Stop() 自连接路径
+      closed.set_value();
+    }
+  };
+  auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
+  FakeTransport::Link(ta, tb);
+  // a 用真实 ThreadExecutor(executor=nullptr);b 同步交付 oneway 给 a。
+  auto a = std::make_shared<SelfCloser>(ta, std::make_unique<SystemCodec>(), nullptr);
+  auto b = std::make_shared<EchoNode>(tb, std::make_unique<SystemCodec>(), nullptr);
+  auto fut = a->closed.get_future();
+  (void)a->Open(); (void)b->Open();
+  ASSERT_TRUE(static_cast<bool>(b->Send(Msg({1, 2, 3}))));  // → a 的 worker 跑 OnMessage→Close()
+  // 确定性等待:hook 完成(不靠纯 sleep)。守卫生效则按时就绪;否则进程早已 terminate。
+  ASSERT_EQ(fut.wait_for(2s), std::future_status::ready) << "hook 未完成(疑自连接 crash)";
+  EXPECT_FALSE(a->IsOpen());
+  b->Close();
+}
+
 // 执行器可换性:同一交互逻辑换 ThreadExecutor 也通(真实线程)。
 TEST(CommNode, WorksWithThreadExecutor) {
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
