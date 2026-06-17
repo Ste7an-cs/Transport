@@ -16,6 +16,9 @@ add_library(transport STATIC
   src/tcp/TcpConnection.cpp
   src/tcp/TcpServerTransport.cpp
   src/serial/SerialTransport.cpp
+  src/dds/DdsProviderRegistry.cpp
+  src/dds/FakeDdsProvider.cpp
+  src/dds/DdsTransport.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -30,6 +33,19 @@ target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE ASIO_NO_DEP
 target_link_libraries(asio_standalone INTERFACE Threads::Threads)
 target_link_libraries(transport PUBLIC asio_standalone)
 target_link_libraries(transport PUBLIC Threads::Threads)
+
+find_package(fastcdr QUIET)
+find_package(fastrtps QUIET)
+if(fastrtps_FOUND AND fastcdr_FOUND)
+  set(TRANSPORT_HAS_FASTDDS ON)
+  message(STATUS "Fast DDS found: enabling FastDdsProvider")
+  target_sources(transport PRIVATE src/dds/FastDdsRawType.cpp src/dds/FastDdsProvider.cpp)
+  target_link_libraries(transport PUBLIC fastrtps fastcdr)
+  target_compile_definitions(transport PUBLIC TRANSPORT_HAS_FASTDDS)
+else()
+  set(TRANSPORT_HAS_FASTDDS OFF)
+  message(STATUS "Fast DDS NOT found: building without FastDdsProvider")
+endif()
 
 if(TRANSPORT_BUILD_TESTS)
   enable_testing()
@@ -51,8 +67,14 @@ if(TRANSPORT_BUILD_TESTS)
     tests/transport/tcp_connection_test.cpp
     tests/transport/tcp_server_test.cpp
     tests/transport/combination_smoke_test.cpp
+    tests/dds/dds_registry_test.cpp
+    tests/dds/fake_dds_provider_test.cpp
+    tests/dds/dds_transport_test.cpp
   )
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
   target_link_libraries(transport_tests PRIVATE util)
+  if(TRANSPORT_HAS_FASTDDS)
+    target_sources(transport_tests PRIVATE tests/dds/fastdds_provider_test.cpp)
+  endif()
   gtest_discover_tests(transport_tests)
 endif()
