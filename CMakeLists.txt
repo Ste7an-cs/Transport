@@ -21,6 +21,7 @@ add_library(transport STATIC
   src/dds/DdsTransport.cpp
   src/comm/ThreadExecutor.cpp
   src/comm/CommNode.cpp
+  src/comm/DdsNode.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -75,6 +76,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_transport_test.cpp
     tests/comm/thread_executor_test.cpp
     tests/comm/comm_node_test.cpp
+    tests/comm/dds_node_test.cpp
   )
   target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
