@@ -27,6 +27,7 @@ struct Message {
   int64_t timestamp = 0;                        // 本轮留 0
   MessageKind kind = MessageKind::kOneway;      // 交互种类
   std::string correlation_id;                   // 配对请求↔应答/反馈;非请求为空
+  std::string reply_to;                         // 应答回送目的(topic-based 传输);否则空
 };
 
 }  // namespace transport
