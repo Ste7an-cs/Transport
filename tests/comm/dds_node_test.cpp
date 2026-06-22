@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+using transport::CommNode;
 using transport::DdsCodec;
 using transport::DdsConfig;
 using transport::DdsNode;
@@ -183,6 +184,53 @@ TEST(DdsNode, RequestTimeoutOverTopics) {
   exa->FireAll();                        // 驱动 a 的超时定时器
   ASSERT_FALSE(static_cast<bool>(got));
   EXPECT_EQ(got.error.rfind("timeout:", 0), 0u);
+  a->Close(); b->Close();
+}
+
+// Open 已虚化:经 CommNode 基类句柄调用 Open() 仍订阅 inbox + 设应答地址,应答能回。
+TEST(DdsNode, OpenIsVirtualThroughBaseHandle) {
+  Net net;
+  auto a = net.Make("A_in", nullptr);
+  auto b = net.Make("B_in", nullptr);
+  b->on_req = [](const Message& req, Responder r) {
+    auto out = req.payload; out.push_back(0xFF);
+    (void)r.Reply(Msg(out));  // 经 reply_to(=A_in)回送
+  };
+  std::shared_ptr<CommNode> a_base = a;  // 以公共基类型持有
+  ASSERT_TRUE(static_cast<bool>(a_base->Open()));  // 经基类句柄调用 → 必须跑 DdsNode::Open override
+  ASSERT_TRUE(static_cast<bool>(b->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Subscribe("svc")));
+  Result<Message> got = Result<Message>::Fail("none");
+  ASSERT_TRUE(static_cast<bool>(
+      a_base->Request(Msg({7}), [&](Result<Message> r) { got = std::move(r); }, 1000,
+                      Endpoint::Topic("svc"))));
+  ASSERT_TRUE(static_cast<bool>(got));  // 应答抵达(未超时)=> override 已运行,inbox 已订阅
+  EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{7, 0xFF}));
+  a->Close(); b->Close();
+}
+
+// 重复应答:OnRequest 对同一请求 Reply 两次,requester 终态回调只触发一次(pending 已擦除)。
+TEST(DdsNode, DuplicateReplyIgnored) {
+  Net net;
+  auto a = net.Make("A_in", nullptr);
+  auto b = net.Make("B_in", nullptr);
+  b->on_req = [](const Message& req, Responder r) {
+    auto first = req.payload; first.push_back(0x01);
+    (void)r.Reply(Msg(first));   // 第一次应答(终结)
+    auto second = req.payload; second.push_back(0x02);
+    (void)r.Reply(Msg(second));  // 第二次应答(同 correlation_id,应被丢弃)
+  };
+  ASSERT_TRUE(static_cast<bool>(a->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Subscribe("svc")));
+  int calls = 0;
+  Result<Message> got = Result<Message>::Fail("none");
+  ASSERT_TRUE(static_cast<bool>(
+      a->Request(Msg({5}), [&](Result<Message> r) { ++calls; got = std::move(r); }, 1000,
+                 Endpoint::Topic("svc"))));
+  EXPECT_EQ(calls, 1);  // 终态回调恰好一次,无二次/崩溃
+  ASSERT_TRUE(static_cast<bool>(got));
+  EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{5, 0x01}));  // 第一个应答的 payload
   a->Close(); b->Close();
 }
 

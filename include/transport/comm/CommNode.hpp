@@ -49,7 +49,7 @@ class CommNode : public std::enable_shared_from_this<CommNode> {
            std::size_t queue_capacity = 1024);
   virtual ~CommNode();
 
-  Status Open();
+  virtual Status Open();
   void   Close();
   bool   IsOpen() const { return open_.load(); }
 

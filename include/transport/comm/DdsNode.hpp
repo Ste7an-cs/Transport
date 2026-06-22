@@ -23,7 +23,7 @@ class DdsNode : public CommNode {
           std::unique_ptr<IExecutor> executor = nullptr,  // null → ThreadExecutor
           std::size_t queue_capacity = 1024);
 
-  Status Open();                                  // CommNode::Open + 订阅 inbox + 设应答地址
+  Status Open() override;                         // CommNode::Open + 订阅 inbox + 设应答地址
   Status Subscribe(const std::string& topic);     // DDS 独有能力
   Status Unsubscribe(const std::string& topic);
 

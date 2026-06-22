@@ -72,6 +72,15 @@ TEST(DdsCodec, BadKindRejected) {
   EXPECT_EQ(dec.error.rfind("codec:", 0), 0u);
 }
 
+TEST(DdsCodec, EncodeRejectsOverlongField) {
+  DdsCodec c;
+  // correlation_id 超 uint16 长度前缀上限 → Encode 拒绝(避免长度前缀截断 → 静默坏帧)。
+  std::string overlong(70000, 'x');
+  auto enc = c.Encode(Make(MessageKind::kRequest, overlong, "", {1}));
+  ASSERT_FALSE(static_cast<bool>(enc));
+  EXPECT_EQ(enc.error.rfind("codec:", 0), 0u);
+}
+
 TEST(DdsCodec, StatelessConcurrentDecodeSafe) {
   DdsCodec c;
   // 预先编码 N 条不同消息;多线程在同一 codec 实例上并发 Decode,各自结果正确。

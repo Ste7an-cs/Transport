@@ -19,6 +19,8 @@ namespace transport {
 class DdsCodec : public ICodec {
  public:
   Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+    if (msg.correlation_id.size() > 0xFFFF || msg.reply_to.size() > 0xFFFF)
+      return Result<std::vector<uint8_t>>::Fail("codec: dds field too long");
     std::vector<uint8_t> out;
     out.reserve(1 + 2 + msg.correlation_id.size() + 2 + msg.reply_to.size() +
                 msg.payload.size());
