@@ -63,6 +63,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
+    tests/codec/dds_codec_test.cpp
     tests/transport/udp_transport_test.cpp
     tests/transport/tcp_transport_test.cpp
     tests/transport/serial_transport_test.cpp
