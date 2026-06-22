@@ -89,6 +89,7 @@ Status CommNode::Open() {
     }
     for (auto& m : msgs.value) {
       m.source = from;
+      if (m.topic.empty()) m.topic = from;  // DDS:来源 topic;p2p:wire 已带则不覆盖
       m.timestamp = NowMicros();
       s->executor_->Post([wself, msg = std::move(m)]() mutable {
         if (auto s2 = wself.lock()) s2->Dispatch(std::move(msg));
@@ -139,7 +140,7 @@ Status CommNode::Send(Message msg, const Endpoint& to) {
 }
 
 Status CommNode::RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_final,
-                             uint32_t timeout_ms) {
+                             uint32_t timeout_ms, const Endpoint& to) {
   if (!open_.load()) {
     if (on_final) on_final(Result<Message>::Fail("config: node not open"));
     return Status::Fail("config: node not open");
@@ -161,8 +162,9 @@ Status CommNode::RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_fin
   }
   msg.kind = MessageKind::kRequest;
   msg.correlation_id = corr;
+  msg.reply_to = reply_address_;  // 告知服务端应答回送到何处(p2p 空)
   auto bytes = codec_->Encode(msg);
-  Status send_st = bytes ? transport_->Send(bytes.value) : Status::Fail(bytes.error);
+  Status send_st = bytes ? transport_->Send(bytes.value, to) : Status::Fail(bytes.error);
   if (!send_st) {  // 编码/发送失败 → 回滚挂起 + 立即以该错误终结
     ReplyFn cb;
     { std::lock_guard<std::mutex> lk(mu_);
@@ -174,18 +176,22 @@ Status CommNode::RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_fin
   return Ok();
 }
 
-Status CommNode::Request(Message msg, ReplyFn on_reply, uint32_t timeout_ms) {
-  return RequestImpl(std::move(msg), nullptr, std::move(on_reply), timeout_ms);
+Status CommNode::Request(Message msg, ReplyFn on_reply, uint32_t timeout_ms,
+                         const Endpoint& to) {
+  return RequestImpl(std::move(msg), nullptr, std::move(on_reply), timeout_ms, to);
 }
 Status CommNode::Request(Message msg, FeedbackFn on_feedback, ReplyFn on_final,
-                         uint32_t timeout_ms) {
-  return RequestImpl(std::move(msg), std::move(on_feedback), std::move(on_final), timeout_ms);
+                         uint32_t timeout_ms, const Endpoint& to) {
+  return RequestImpl(std::move(msg), std::move(on_feedback), std::move(on_final),
+                     timeout_ms, to);
 }
-std::future<Result<Message>> CommNode::Request(Message msg, uint32_t timeout_ms) {
+std::future<Result<Message>> CommNode::Request(Message msg, uint32_t timeout_ms,
+                                               const Endpoint& to) {
   auto prom = std::make_shared<std::promise<Result<Message>>>();
   auto fut = prom->get_future();
   (void)RequestImpl(std::move(msg), nullptr,
-                    [prom](Result<Message> r) { prom->set_value(std::move(r)); }, timeout_ms);
+                    [prom](Result<Message> r) { prom->set_value(std::move(r)); },
+                    timeout_ms, to);
   return fut;
 }
 
@@ -209,9 +215,12 @@ void CommNode::Dispatch(Message msg) {
       else { if (fb) fb(msg); }
       break;
     }
-    case MessageKind::kRequest:
-      OnRequest(msg, Responder(weak_from_this(), msg.correlation_id, Endpoint::Default()));
+    case MessageKind::kRequest: {
+      Endpoint reply = msg.reply_to.empty() ? Endpoint::Default()
+                                            : Endpoint::Topic(msg.reply_to);
+      OnRequest(msg, Responder(weak_from_this(), msg.correlation_id, reply));
       break;
+    }
     case MessageKind::kOneway:
     case MessageKind::kNotify:
       OnMessage(msg);

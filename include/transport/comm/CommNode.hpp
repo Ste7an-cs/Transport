@@ -54,11 +54,15 @@ class CommNode : public std::enable_shared_from_this<CommNode> {
   bool   IsOpen() const { return open_.load(); }
 
   Status Send(Message msg, const Endpoint& to = Endpoint::Default());
-  Status Request(Message msg, ReplyFn on_reply, uint32_t timeout_ms);
-  Status Request(Message msg, FeedbackFn on_feedback, ReplyFn on_final, uint32_t timeout_ms);
-  std::future<Result<Message>> Request(Message msg, uint32_t timeout_ms);
+  Status Request(Message msg, ReplyFn on_reply, uint32_t timeout_ms,
+                 const Endpoint& to = Endpoint::Default());
+  Status Request(Message msg, FeedbackFn on_feedback, ReplyFn on_final, uint32_t timeout_ms,
+                 const Endpoint& to = Endpoint::Default());
+  std::future<Result<Message>> Request(Message msg, uint32_t timeout_ms,
+                                       const Endpoint& to = Endpoint::Default());
 
  protected:
+  std::string reply_address_;  // 出站请求填入 msg.reply_to(默认空=p2p;DdsNode 设为 inbox topic)
   virtual void OnMessage(const Message& msg) {}
   virtual void OnRequest(const Message& req, Responder responder) {}
   virtual void OnConnected() {}
@@ -68,7 +72,8 @@ class CommNode : public std::enable_shared_from_this<CommNode> {
  private:
   friend class Responder;
   Status SendKind(Message msg, MessageKind kind, const std::string& corr, const Endpoint& to);
-  Status RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_final, uint32_t timeout_ms);
+  Status RequestImpl(Message msg, FeedbackFn on_feedback, ReplyFn on_final,
+                     uint32_t timeout_ms, const Endpoint& to);
   void Dispatch(Message msg);
   void HandleDisconnect(const std::string& reason);
   void FireTimeout(const std::string& corr);
