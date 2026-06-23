@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互节点)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+
+### 特性:外部协议栈(`SystemCodec` 协议帧 + `ProtocolNode`)— 2026-06-23(PR #6)
+> 面向某外部系统的具体通信协议。`CommNode`/`DdsNode`/`DdsCodec` 不动(DDS 不走此协议)。
+- **变更** `SystemCodec` 由通用线缆格式**改造为外部协议帧 codec**:`[head_flag:4=AA BB CC DD][frm_type:1][protocol_id:1][session_id:1][reserve:4=0][crc:2 LE][frm_len:2 LE][frm_body: message_id:2 LE | payload]`,小端、有状态流式解码 + 坏帧 **resync**(同步头/CRC 不符 → 前移 1 字节重扫)。**CRC 经 `CrcFn` 注入**(默认占位 `DefaultCrc16`);`frm_type` 枚举占位值 —— 真实外部字节值/算法实现前替换。
+- **新增** `Message` 协议字段 `frm_type`/`protocol_id`/`session_id`/`message_id`(加性,通用字段不变)。
+- **新增** `ProtocolNode`(独立节点,复用 `ITransport`+`ICodec`+`IExecutor`):5 种发送交互模式 `noresponse` / `needresponse`(等 RESPONSE)/ `withfeedback`(等 RESULT)/ `needfeedback`(RESPONSE→RESULT→自动回 RESPONSE ack)/ `repeating`(定时发 STATE,可停)+ 周期心跳 + 收发双角色(`OnCommand` + `Responder.Response()/Result()`);匹配键 **(session_id, message_id)**;超时**重发 ≤3** 后失败。
+- **变更** `SystemCodec` 改为协议专用后,`comm_node_test`/`combination_smoke_test` 改用 `DdsCodec`(仍覆盖 CommNode 通用 req-resp)。
+- **验证** 干净构建零告警,86/86 测试两次连跑稳定(含确定性 `InlineExecutor` 与真实 `ThreadExecutor` 双跑)。
+
+### 特性:`DdsNode`(DDS pub-sub + 多路 req-resp)— 2026-06-17(PR #5)
+- **新增** `DdsNode : CommNode`,复用交互引擎,加性补 DDS 订阅能力 + 基于 `reply_to` topic 的精确应答路由:多 topic 发布(即 `Send(Endpoint::Topic)`)/ 订阅(`Subscribe`/`Unsubscribe`)/ 多路请求-应答(请求带自身 inbox topic 入 `reply_to`,服务端 `Responder.Reply` 据此精确回送,`correlation_id` 配对)。
+- **新增** `DdsCodec`(无状态、带交互元数据 `kind`/`correlation_id`/`reply_to` 的 DDS 线缆格式;DDS 每 sample 即一条完整消息,无滚动缓冲 → 多 topic 并发解码安全);`Message.reply_to` 字段。
+- **变更** `CommNode` 加性泛化(`Request` 收可选目的 `Endpoint`、出站填 `reply_to`、`Responder` 按 `reply_to` 回送、入站 `topic` 缺省取来源);p2p 行为不变。
+
+### 特性:`CommNode` 交互层(`IExecutor` + 交互模式基类)— 2026-06-17(PR #4)
+- **新增** `IExecutor` 执行器缝(`Post`/`ScheduleAt`/`Cancel`/`Start`/`Stop`)+ 内置 `ThreadExecutor`(1 worker 线程 + 有界队列背压 + 最小堆定时器);为未来自研协程 `CoroExecutor` 预留可换线程模型。
+- **新增** `CommNode`(用户继承的交互模式基类,复用任一 `ITransport`):单向 `Send`、请求-应答 `Request`(回调 / `std::future`)、请求-结果反馈、服务端 `OnRequest`+`Responder`;io 线程内联 `Decode` → `executor.Post` → 单 worker 串行 `Dispatch`(按 `kind`),背压在队列;请求超时 / 断连终结挂起 / 恰好一次。
+- **新增** `Message` 交互元数据补 `reply_to`;错误前缀新增 `timeout:`(请求超时)。
+
+### 特性:DDS 底层(`IDdsTransport` + `DdsTransport` + provider 抽象)— 2026-06-16(PR #3)
+- **新增** `IDdsTransport : ITransport`(加 `Subscribe`/`Unsubscribe`);`DdsTransport` 持有 `IDdsProvider`:`Send(bytes, Endpoint::Topic)` → publish,`Subscribe(topic)` → 样本到达直接在 provider listener 线程调 `OnBytes(bytes, from=topic)`(同 topic 有序、跨 topic 并发)。
+- **新增** provider 抽象 `IDdsProvider` + `DdsProviderRegistry`(按名)+ `FakeDdsProvider`(进程内内存 topic 总线,DI 共享 `Bus`,DDS 业务零 FastDDS 依赖即可全测)+ 可选 `FastDdsProvider`(Fast DDS 2.13,手写 `FastDdsRawType` 绕过 IDL/CDR)。
+- **变更** `DdsConfig` 精简为 `{domain_id, default_topic, provider, qos}`;`DdsTransport` 是**纯字节管道**(req-resp/关联/超时移交 `DdsNode`,不再在传输层)。
+
+### 特性:TCP 服务端 `TcpServerTransport` — 2026-06-16(PR #2)
+- **新增** `TcpServerTransport`(独立接受器,非 `ITransport`):监听 `bind_addr:port`,每 accept 造一个 `TcpConnection`(实现 `ITransport`,client/accepted 共用),经 `OnAccept(shared_ptr<ITransport>)` 交付给用户在每连接上独立收发;`OnError` 通知接受错误;`LocalPort()` 取回 OS 分配端口。
+- **设计** 服务端不再继承 `ITransport`/不广播(广播由用户在各连接 transport 上自行实现);与旧 `ITcpServer` 的「服务端即 transport」模型解耦。
+
 ### ⚠️ 重大重构:底层分层(Transport + ICodec 两层解耦)— 2026-06-15
 > 面向 0.2.0 的破坏性重构第一阶段(PR #1)。把臃肿的富 `ITransport` 拆成两个**解耦的底层层**;上层 `System` 交互模式基类、TCP 服务端、DDS 留作后续阶段(设计见 `docs/superpowers/specs/2026-06-15-system-codec-transport-design.md`)。`v0.1.0` 标签保留完整旧实现备查。
 
