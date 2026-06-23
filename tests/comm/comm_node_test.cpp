@@ -1,6 +1,6 @@
 #include "transport/comm/CommNode.hpp"
 
-#include "transport/codec/SystemCodec.hpp"
+#include "transport/codec/DdsCodec.hpp"
 #include "fake_transport.hpp"
 #include "inline_executor.hpp"
 
@@ -17,7 +17,7 @@ using transport::Message;
 using transport::MessageKind;
 using transport::Responder;
 using transport::Result;
-using transport::SystemCodec;
+using transport::DdsCodec;
 using testutil::FakeTransport;
 using testutil::InlineExecutor;
 using namespace std::chrono_literals;
@@ -47,8 +47,8 @@ struct Pair {
     FakeTransport::Link(ta, tb);
     auto ea = std::make_unique<InlineExecutor>(); exa = ea.get();
     auto eb = std::make_unique<InlineExecutor>(); exb = eb.get();
-    a = std::make_shared<EchoNode>(ta, std::make_unique<SystemCodec>(), std::move(ea));
-    b = std::make_shared<EchoNode>(tb, std::make_unique<SystemCodec>(), std::move(eb));
+    a = std::make_shared<EchoNode>(ta, std::make_unique<DdsCodec>(), std::move(ea));
+    b = std::make_shared<EchoNode>(tb, std::make_unique<DdsCodec>(), std::move(eb));
   }
   void Open() { (void)b->Open(); (void)a->Open(); }
   void Close() { a->Close(); b->Close(); }
@@ -88,8 +88,8 @@ TEST(CommNode, RequestTimeout) {
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
   FakeTransport::Link(ta, tb);
   auto ea = std::make_unique<InlineExecutor>(); auto* pea = ea.get();
-  auto a = std::make_shared<Silent>(ta, std::make_unique<SystemCodec>(), std::move(ea));
-  auto b = std::make_shared<Silent>(tb, std::make_unique<SystemCodec>(),
+  auto a = std::make_shared<Silent>(ta, std::make_unique<DdsCodec>(), std::move(ea));
+  auto b = std::make_shared<Silent>(tb, std::make_unique<DdsCodec>(),
                                     std::make_unique<InlineExecutor>());
   (void)b->Open(); (void)a->Open();
   Result<Message> got = Result<Message>::Fail("none");
@@ -110,9 +110,9 @@ TEST(CommNode, FeedbackThenFinal) {
     } };
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
   FakeTransport::Link(ta, tb);
-  auto a = std::make_shared<Worker>(ta, std::make_unique<SystemCodec>(),
+  auto a = std::make_shared<Worker>(ta, std::make_unique<DdsCodec>(),
                                     std::make_unique<InlineExecutor>());
-  auto b = std::make_shared<Worker>(tb, std::make_unique<SystemCodec>(),
+  auto b = std::make_shared<Worker>(tb, std::make_unique<DdsCodec>(),
                                     std::make_unique<InlineExecutor>());
   (void)b->Open(); (void)a->Open();
   std::vector<std::vector<uint8_t>> feedbacks; Result<Message> fin = Result<Message>::Fail("none");
@@ -134,9 +134,9 @@ TEST(CommNode, DisconnectFinalizesPending) {
     void OnRequest(const Message&, Responder) override {} };
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
   FakeTransport::Link(ta, tb);
-  auto a = std::make_shared<Hold>(ta, std::make_unique<SystemCodec>(),
+  auto a = std::make_shared<Hold>(ta, std::make_unique<DdsCodec>(),
                                   std::make_unique<InlineExecutor>());
-  auto b = std::make_shared<Hold>(tb, std::make_unique<SystemCodec>(),
+  auto b = std::make_shared<Hold>(tb, std::make_unique<DdsCodec>(),
                                   std::make_unique<InlineExecutor>());
   (void)b->Open(); (void)a->Open();
   (void)a->Request(Msg({1}), [&](Result<Message> r) { got = std::move(r); }, 100000);
@@ -162,8 +162,8 @@ TEST(CommNode, HookCallsCloseFromWorkerNoSelfJoinCrash) {
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
   FakeTransport::Link(ta, tb);
   // a 用真实 ThreadExecutor(executor=nullptr);b 同步交付 oneway 给 a。
-  auto a = std::make_shared<SelfCloser>(ta, std::make_unique<SystemCodec>(), nullptr);
-  auto b = std::make_shared<EchoNode>(tb, std::make_unique<SystemCodec>(), nullptr);
+  auto a = std::make_shared<SelfCloser>(ta, std::make_unique<DdsCodec>(), nullptr);
+  auto b = std::make_shared<EchoNode>(tb, std::make_unique<DdsCodec>(), nullptr);
   auto fut = a->closed.get_future();
   (void)a->Open(); (void)b->Open();
   ASSERT_TRUE(static_cast<bool>(b->Send(Msg({1, 2, 3}))));  // → a 的 worker 跑 OnMessage→Close()
@@ -177,8 +177,8 @@ TEST(CommNode, HookCallsCloseFromWorkerNoSelfJoinCrash) {
 TEST(CommNode, WorksWithThreadExecutor) {
   auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
   FakeTransport::Link(ta, tb);
-  auto a = std::make_shared<EchoNode>(ta, std::make_unique<SystemCodec>(), nullptr);  // 默认 ThreadExecutor
-  auto b = std::make_shared<EchoNode>(tb, std::make_unique<SystemCodec>(), nullptr);
+  auto a = std::make_shared<EchoNode>(ta, std::make_unique<DdsCodec>(), nullptr);  // 默认 ThreadExecutor
+  auto b = std::make_shared<EchoNode>(tb, std::make_unique<DdsCodec>(), nullptr);
   (void)b->Open(); (void)a->Open();
   auto r = a->Request(Msg({3}), 2000).get();   // future 等回(真实线程)
   ASSERT_TRUE(static_cast<bool>(r));

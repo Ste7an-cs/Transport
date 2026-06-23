@@ -20,6 +20,15 @@ enum class MessageKind {
   kNotify,    // 订阅通知(主动推送)
 };
 
+enum class FrameType : uint8_t {   // 占位值,实现前替换为外部真实字节值
+  kUnknown   = 0,
+  kCommand   = 1,
+  kResponse  = 2,
+  kResult    = 3,
+  kState     = 4,
+  kHeartbeat = 5,
+};
+
 struct Message {
   std::vector<uint8_t> payload;                 // 应用字节
   std::string topic;                            // 操作/通道名;否则空
@@ -28,6 +37,10 @@ struct Message {
   MessageKind kind = MessageKind::kOneway;      // 交互种类
   std::string correlation_id;                   // 配对请求↔应答/反馈;非请求为空
   std::string reply_to;                         // 应答回送目的(topic-based 传输);否则空
+  FrameType frm_type    = FrameType::kUnknown;  // 协议:帧类型
+  uint8_t   protocol_id = 0;                    // 协议:外部系统 id
+  uint8_t   session_id  = 0;                    // 协议:会话 id
+  uint16_t  message_id  = 0;                    // 协议:帧唯一 id
 };
 
 }  // namespace transport

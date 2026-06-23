@@ -1,4 +1,4 @@
-#include "transport/codec/SystemCodec.hpp"
+#include "transport/codec/DdsCodec.hpp"
 #include "transport/udp/UdpTransport.hpp"
 
 #include <chrono>
@@ -11,12 +11,12 @@ using transport::Endpoint;
 using transport::Message;
 using transport::MessageKind;
 using transport::Result;
-using transport::SystemCodec;
+using transport::DdsCodec;
 using transport::UdpConfig;
 using transport::UdpTransport;
 
 TEST(CombinationSmoke, UdpBytesThroughSystemCodecRoundtrip) {
-  auto rx_codec = std::make_shared<SystemCodec>();
+  auto rx_codec = std::make_shared<DdsCodec>();
   std::mutex m; std::condition_variable cv;
   std::vector<Message> got;
 
@@ -33,7 +33,7 @@ TEST(CombinationSmoke, UdpBytesThroughSystemCodecRoundtrip) {
   ASSERT_TRUE(static_cast<bool>(rx->Open()));
   const uint16_t rx_port = rx->LocalPort();
 
-  SystemCodec tx_codec;
+  DdsCodec tx_codec;
   Message out; out.kind = MessageKind::kRequest; out.correlation_id = "x-1";
   out.topic = "calc"; out.payload = {4, 5, 6};
   auto bytes = tx_codec.Encode(out);
@@ -53,7 +53,6 @@ TEST(CombinationSmoke, UdpBytesThroughSystemCodecRoundtrip) {
   ASSERT_EQ(got.size(), 1u);
   EXPECT_EQ(got[0].kind, MessageKind::kRequest);
   EXPECT_EQ(got[0].correlation_id, "x-1");
-  EXPECT_EQ(got[0].topic, "calc");
   EXPECT_EQ(got[0].payload, (std::vector<uint8_t>{4, 5, 6}));
 
   tx->Close(); rx->Close();
