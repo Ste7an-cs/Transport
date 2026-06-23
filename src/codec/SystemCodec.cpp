@@ -1,99 +1,108 @@
 #include "transport/codec/SystemCodec.hpp"
 
+#include <array>
 #include <utility>
 
-// SystemCodec.cpp — 见 SystemCodec.hpp。
+// SystemCodec.cpp — 见 .hpp。小端;坏帧 resync;CRC 注入。
 
 namespace transport {
 
 namespace {
+constexpr std::array<uint8_t, 4> kHeadFlag{0xAA, 0xBB, 0xCC, 0xDD};
 
-void PutU16(std::vector<uint8_t>& out, uint16_t v) {
-  out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+void PutU16LE(std::vector<uint8_t>& out, uint16_t v) {
   out.push_back(static_cast<uint8_t>(v & 0xFF));
-}
-void PutU32(std::vector<uint8_t>& out, uint32_t v) {
-  out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
-  out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
   out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
-  out.push_back(static_cast<uint8_t>(v & 0xFF));
 }
-uint16_t GetU16(const uint8_t* p) {
-  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+uint16_t GetU16LE(const uint8_t* p) {
+  return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
 }
-uint32_t GetU32(const uint8_t* p) {
-  return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+bool MatchFlag(const uint8_t* p) {
+  return p[0] == kHeadFlag[0] && p[1] == kHeadFlag[1] &&
+         p[2] == kHeadFlag[2] && p[3] == kHeadFlag[3];
 }
-
-uint8_t KindToByte(MessageKind k) { return static_cast<uint8_t>(k); }
-
-bool ByteToKind(uint8_t b, MessageKind* out) {
-  if (b > static_cast<uint8_t>(MessageKind::kNotify)) return false;
-  *out = static_cast<MessageKind>(b);
-  return true;
-}
-
 }  // namespace
 
-Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
-  std::vector<uint8_t> body;
-  body.push_back(KindToByte(msg.kind));
-  PutU16(body, static_cast<uint16_t>(msg.correlation_id.size()));
-  body.insert(body.end(), msg.correlation_id.begin(), msg.correlation_id.end());
-  PutU16(body, static_cast<uint16_t>(msg.topic.size()));
-  body.insert(body.end(), msg.topic.begin(), msg.topic.end());
-  body.insert(body.end(), msg.payload.begin(), msg.payload.end());
-
-  std::vector<uint8_t> out;
-  out.reserve(4 + body.size());
-  PutU32(out, static_cast<uint32_t>(body.size()));
-  out.insert(out.end(), body.begin(), body.end());
-  return Result<std::vector<uint8_t>>::Success(std::move(out));
+uint16_t DefaultCrc16(const uint8_t* body, std::size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (std::size_t i = 0; i < len; ++i) {
+    crc ^= static_cast<uint16_t>(static_cast<uint16_t>(body[i]) << 8);
+    for (int b = 0; b < 8; ++b)
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
+                           : static_cast<uint16_t>(crc << 1);
+  }
+  return crc;
 }
 
-Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data,
-                                                 std::size_t len) {
+SystemCodec::SystemCodec(CrcFn crc) : crc_(std::move(crc)) {}
+
+Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
+  using R = Result<std::vector<uint8_t>>;
+  if (msg.payload.size() + 2 > kMaxBody) return R::Fail("frame: payload too long");
+
+  std::vector<uint8_t> body;
+  body.reserve(2 + msg.payload.size());
+  PutU16LE(body, msg.message_id);
+  body.insert(body.end(), msg.payload.begin(), msg.payload.end());
+  const uint16_t crc = crc_(body.data(), body.size());
+
+  std::vector<uint8_t> out;
+  out.reserve(kHeaderLen + body.size());
+  out.insert(out.end(), kHeadFlag.begin(), kHeadFlag.end());          // head_flag
+  out.push_back(static_cast<uint8_t>(msg.frm_type));                  // frm_type
+  out.push_back(msg.protocol_id);                                    // protocol_id
+  out.push_back(msg.session_id);                                     // session_id
+  out.insert(out.end(), {0, 0, 0, 0});                               // reserve
+  PutU16LE(out, crc);                                                // crc
+  PutU16LE(out, static_cast<uint16_t>(body.size()));                 // frm_len
+  out.insert(out.end(), body.begin(), body.end());                   // frm_body
+  return R::Success(std::move(out));
+}
+
+Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
   using R = Result<std::vector<Message>>;
   buffer_.insert(buffer_.end(), data, data + len);
   std::vector<Message> out;
-  std::size_t offset = 0;
-  while (buffer_.size() - offset >= 4) {
-    const std::size_t frame_len = GetU32(buffer_.data() + offset);
-    if (frame_len > kMaxFrame) return R::Fail("frame: frame length exceeds max");
-    if (buffer_.size() - offset - 4 < frame_len) break;
+  std::size_t off = 0;
 
-    const uint8_t* b = buffer_.data() + offset + 4;
-    std::size_t pos = 0;
-    auto need = [&](std::size_t n) { return pos + n <= frame_len; };
+  while (true) {
+    // 1. 同步:从 off 起找 head_flag。
+    std::size_t flag = off;
+    bool found = false;
+    while (flag + 4 <= buffer_.size()) {
+      if (MatchFlag(buffer_.data() + flag)) { found = true; break; }
+      ++flag;
+    }
+    if (!found) { off = flag; break; }   // 保留末尾 ≤3 字节(可能半个同步头)
+    off = flag;
 
-    if (!need(1)) return R::Fail("frame: frame too short for kind");
-    MessageKind kind;
-    if (!ByteToKind(b[pos], &kind)) return R::Fail("codec: unknown message kind");
-    pos += 1;
+    if (buffer_.size() - off < kHeaderLen) break;                 // 头不全,等
+    const uint8_t* h = buffer_.data() + off;
+    const uint16_t crc_in = GetU16LE(h + 11);
+    const uint16_t frm_len = GetU16LE(h + 13);
+    if (buffer_.size() - off - kHeaderLen < frm_len) break;       // body 不全,等
 
-    if (!need(2)) return R::Fail("frame: corr_len exceeds frame");
-    const std::size_t corr_len = GetU16(b + pos); pos += 2;
-    if (!need(corr_len)) return R::Fail("frame: corr_id exceeds frame");
-    std::string corr(reinterpret_cast<const char*>(b + pos), corr_len);
-    pos += corr_len;
-
-    if (!need(2)) return R::Fail("frame: topic_len exceeds frame");
-    const std::size_t topic_len = GetU16(b + pos); pos += 2;
-    if (!need(topic_len)) return R::Fail("frame: topic exceeds frame");
-    std::string topic(reinterpret_cast<const char*>(b + pos), topic_len);
-    pos += topic_len;
+    const uint8_t* bd = h + kHeaderLen;
+    if (crc_(bd, frm_len) != crc_in) { off += 1; continue; }      // CRC 不符 → resync
 
     Message m;
-    m.kind = kind;
-    m.correlation_id = std::move(corr);
-    m.topic = std::move(topic);
-    m.payload.assign(b + pos, b + frame_len);
+    m.frm_type = static_cast<FrameType>(h[4]);
+    switch (m.frm_type) {                                         // 未知字节 → kUnknown
+      case FrameType::kUnknown: case FrameType::kCommand: case FrameType::kResponse:
+      case FrameType::kResult: case FrameType::kState: case FrameType::kHeartbeat: break;
+      default: m.frm_type = FrameType::kUnknown;
+    }
+    m.protocol_id = h[5];
+    m.session_id = h[6];
+    if (frm_len >= 2) {
+      m.message_id = GetU16LE(bd);
+      m.payload.assign(bd + 2, bd + frm_len);
+    }
     out.push_back(std::move(m));
-
-    offset += 4 + frame_len;
+    off += kHeaderLen + frm_len;
   }
-  if (offset > 0) buffer_.erase(buffer_.begin(), buffer_.begin() + offset);
+
+  if (off > 0) buffer_.erase(buffer_.begin(), buffer_.begin() + off);
   return R::Success(std::move(out));
 }
 
