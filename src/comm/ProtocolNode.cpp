@@ -1,0 +1,216 @@
+#include "transport/comm/ProtocolNode.hpp"
+
+#include <chrono>
+#include <utility>
+#include <variant>
+
+#include "transport/codec/SystemCodec.hpp"
+#include "transport/comm/ThreadExecutor.hpp"
+
+// ProtocolNode.cpp — 见 .hpp。posted 任务/transport 回调捕获 weak_ptr;
+// pending_ 由 mu_ 保护;Encode+Send 在锁外;超时与 Dispatch 同在 worker → 恰好一次。
+
+namespace transport {
+
+namespace {
+Status Ok() { return Status::Success(std::monostate{}); }
+}  // namespace
+
+Status ProtocolNode::Responder::Response(std::vector<uint8_t> payload) {
+  auto s = node_.lock();
+  if (!s) return Status::Fail("conn: node gone");
+  return s->SendFrame(FrameType::kResponse, session_, message_, payload);
+}
+Status ProtocolNode::Responder::Result(std::vector<uint8_t> payload) {
+  auto s = node_.lock();
+  if (!s) return Status::Fail("conn: node gone");
+  return s->SendFrame(FrameType::kResult, session_, message_, payload);
+}
+
+ProtocolNode::ProtocolNode(std::shared_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
+                           ProtocolConfig config, std::unique_ptr<IExecutor> executor,
+                           std::size_t queue_capacity)
+    : transport_(std::move(transport)),
+      codec_(codec ? std::move(codec) : std::unique_ptr<ICodec>(new SystemCodec())),
+      executor_(executor ? std::move(executor)
+                         : std::unique_ptr<IExecutor>(new ThreadExecutor(queue_capacity))),
+      config_(config) {}
+
+ProtocolNode::~ProtocolNode() { Close(); }
+
+std::pair<uint8_t, uint16_t> ProtocolNode::NextId() {
+  std::lock_guard<std::mutex> lk(mu_);
+  uint8_t s = session_ctr_++;
+  uint16_t m = message_ctr_++;
+  return {s, m};
+}
+
+Status ProtocolNode::Open() {
+  executor_->Start();
+  std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  transport_->OnBytes([wself](Result<std::vector<uint8_t>> r, const std::string&) {
+    auto s = wself.lock();
+    if (!s) return;
+    if (!r) {
+      std::string e = r.error;
+      s->executor_->Post([wself, e] { if (auto s2 = wself.lock()) s2->OnError(e); });
+      return;
+    }
+    auto msgs = s->codec_->Decode(r.value.data(), r.value.size());
+    if (!msgs) {
+      std::string e = msgs.error;
+      s->executor_->Post([wself, e] { if (auto s2 = wself.lock()) s2->OnError(e); });
+      return;
+    }
+    for (auto& m : msgs.value)
+      s->executor_->Post([wself, msg = std::move(m)]() mutable {
+        if (auto s2 = wself.lock()) s2->Dispatch(std::move(msg));
+      });
+  });
+  transport_->OnConnect([] {});
+  transport_->OnDisconnect([wself](const std::string& reason) {
+    if (auto s = wself.lock())
+      s->executor_->Post([wself, reason] { if (auto s2 = wself.lock()) s2->HandleDisconnect(reason); });
+  });
+  open_.store(true);
+  auto st = transport_->Open();
+  if (!st) { open_.store(false); executor_->Stop(); return st; }
+  return Ok();
+}
+
+void ProtocolNode::Close() {
+  if (closing_.exchange(true)) return;
+  open_.store(false);
+  std::map<uint32_t, Pending> taken;
+  { std::lock_guard<std::mutex> lk(mu_); taken.swap(pending_); }
+  for (auto& kv : taken) {
+    executor_->Cancel(kv.second.timer);
+    auto& p = kv.second;
+    if (p.mode == Mode::kNeedResponse && p.on_response)
+      p.on_response(Result<Message>::Fail("conn: node closed"));
+  }
+  executor_->Stop();
+  transport_->Close();
+}
+
+Status ProtocolNode::SendFrame(FrameType type, uint8_t session, uint16_t message,
+                               const std::vector<uint8_t>& payload) {
+  if (!open_.load()) return Status::Fail("config: node not open");
+  Message m;
+  m.frm_type = type;
+  m.protocol_id = config_.protocol_id;
+  m.session_id = session;
+  m.message_id = message;
+  m.payload = payload;
+  auto bytes = codec_->Encode(m);
+  if (!bytes) return Status::Fail(bytes.error);
+  return transport_->Send(bytes.value);
+}
+
+Status ProtocolNode::SendNoResponse(std::vector<uint8_t> payload) {
+  auto id = NextId();
+  return SendFrame(FrameType::kCommand, id.first, id.second, payload);
+}
+
+Status ProtocolNode::Request(std::vector<uint8_t> payload, ReplyFn on_response) {
+  if (!open_.load()) {
+    if (on_response) on_response(Result<Message>::Fail("config: node not open"));
+    return Status::Fail("config: node not open");
+  }
+  auto id = NextId();
+  const uint32_t key = Key(id.first, id.second);
+  std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (closing_.load() || !open_.load()) {
+      if (on_response) on_response(Result<Message>::Fail("conn: node closing"));
+      return Status::Fail("conn: node closing");
+    }
+    IExecutor::TimerId timer = executor_->ScheduleAt(
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.response_timeout_ms),
+        [wself, key] { if (auto s = wself.lock()) s->OnTimeout(key); });
+    Pending p;
+    p.mode = Mode::kNeedResponse; p.payload = payload;
+    p.session = id.first; p.message = id.second;
+    p.on_response = std::move(on_response); p.timer = timer;
+    pending_[key] = std::move(p);
+  }
+  Status st = SendFrame(FrameType::kCommand, id.first, id.second, payload);
+  if (!st) {
+    ReplyFn cb;
+    { std::lock_guard<std::mutex> lk(mu_);
+      auto it = pending_.find(key);
+      if (it != pending_.end()) { executor_->Cancel(it->second.timer); cb = std::move(it->second.on_response); pending_.erase(it); } }
+    if (cb) cb(Result<Message>::Fail(st.error));
+    return st;
+  }
+  return Ok();
+}
+
+void ProtocolNode::OnTimeout(uint32_t key) {
+  ReplyFn fail_cb;
+  bool resend = false; FrameType rt = FrameType::kCommand;
+  uint8_t s = 0; uint16_t m = 0; std::vector<uint8_t> payload;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = pending_.find(key);
+    if (it == pending_.end()) return;
+    Pending& p = it->second;
+    if (p.retries < config_.max_retries) {
+      ++p.retries;
+      std::weak_ptr<ProtocolNode> wself = weak_from_this();
+      p.timer = executor_->ScheduleAt(
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.response_timeout_ms),
+          [wself, key] { if (auto s2 = wself.lock()) s2->OnTimeout(key); });
+      resend = true; s = p.session; m = p.message; payload = p.payload;
+    } else {
+      fail_cb = std::move(p.on_response);
+      pending_.erase(it);
+    }
+  }
+  if (resend) (void)SendFrame(rt, s, m, payload);
+  if (fail_cb) fail_cb(Result<Message>::Fail("timeout: request timed out"));
+}
+
+void ProtocolNode::Dispatch(Message msg) {
+  switch (msg.frm_type) {
+    case FrameType::kCommand:
+    case FrameType::kState:
+      OnCommand(msg, Responder(weak_from_this(), msg.session_id, msg.message_id));
+      break;
+    case FrameType::kResponse: {
+      const uint32_t key = Key(msg.session_id, msg.message_id);
+      ReplyFn cb;
+      { std::lock_guard<std::mutex> lk(mu_);
+        auto it = pending_.find(key);
+        if (it != pending_.end() && it->second.mode == Mode::kNeedResponse) {
+          cb = std::move(it->second.on_response);
+          executor_->Cancel(it->second.timer);
+          pending_.erase(it);
+        } }
+      if (cb) cb(Result<Message>::Success(std::move(msg)));
+      break;
+    }
+    case FrameType::kResult:
+      break;  // Task 3 处理
+    case FrameType::kHeartbeat:
+      OnHeartbeat(msg);
+      break;
+    case FrameType::kUnknown:
+      OnError("codec: unknown frame type");
+      break;
+  }
+}
+
+void ProtocolNode::HandleDisconnect(const std::string& reason) {
+  std::map<uint32_t, Pending> taken;
+  { std::lock_guard<std::mutex> lk(mu_); taken.swap(pending_); }
+  for (auto& kv : taken) {
+    executor_->Cancel(kv.second.timer);
+    auto& p = kv.second;
+    if (p.mode == Mode::kNeedResponse && p.on_response)
+      p.on_response(Result<Message>::Fail(reason));
+  }
+}
+
+}  // namespace transport
