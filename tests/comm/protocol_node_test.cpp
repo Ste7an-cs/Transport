@@ -232,6 +232,14 @@ TEST(ProtocolNode, RepeatingSendsPeriodicallyUntilStopped) {
   p.Close();
 }
 
+TEST(ProtocolNode, RepeatingZeroIntervalRejected) {
+  Pair p; p.Open();
+  uint32_t h = p.a->StartRepeating(P({0xAB}), 0);
+  EXPECT_EQ(h, 0u);              // 0 间隔被拒,返回无效句柄 0
+  EXPECT_EQ(p.b->commands, 0);   // 未发任何 STATE 帧
+  p.Close();
+}
+
 TEST(ProtocolNode, HeartbeatPeriodic) {
   ProtocolConfig ca = Cfg(); ca.heartbeat_interval_ms = 100;  // a 周期发心跳
   Pair p(ca, Cfg());

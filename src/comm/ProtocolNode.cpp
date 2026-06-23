@@ -39,6 +39,8 @@ ProtocolNode::ProtocolNode(std::shared_ptr<ITransport> transport, std::unique_pt
 ProtocolNode::~ProtocolNode() { Close(); }
 
 std::pair<uint8_t, uint16_t> ProtocolNode::NextId() {
+  // session_id(1B)与 message_id(2B)各自每发一帧自增 → (session,message) 匹配键空间为 2^24,
+  // 仅每 2^24 次发送才整体重合。切勿把双计数器并成单一 message 计数器(那会把键空间缩到 2^16)。
   std::lock_guard<std::mutex> lk(mu_);
   uint8_t s = session_ctr_++;
   uint16_t m = message_ctr_++;
@@ -175,7 +177,7 @@ Status ProtocolNode::RequestImpl(Mode mode, std::vector<uint8_t> payload,
 
 void ProtocolNode::OnTimeout(uint32_t key) {
   ReplyFn fail_cb;
-  bool resend = false; FrameType rt = FrameType::kCommand;
+  bool resend = false;
   uint8_t s = 0; uint16_t m = 0; std::vector<uint8_t> payload;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -195,7 +197,7 @@ void ProtocolNode::OnTimeout(uint32_t key) {
       pending_.erase(it);
     }
   }
-  if (resend) (void)SendFrame(rt, s, m, payload);
+  if (resend) (void)SendFrame(FrameType::kCommand, s, m, payload);
   if (fail_cb) fail_cb(Result<Message>::Fail("timeout: request timed out"));
 }
 
@@ -261,18 +263,21 @@ void ProtocolNode::HandleDisconnect(const std::string& reason) {
 
 void ProtocolNode::ScheduleHeartbeat() {
   std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  std::lock_guard<std::mutex> lk(mu_);  // heartbeat_timer_ 写与 Close 读取/取消同受 mu_ 保护
+  if (!open_.load()) return;            // Close 后不再起新心跳定时器
   heartbeat_timer_ = executor_->ScheduleAt(
       std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.heartbeat_interval_ms),
       [wself] {
         auto s = wself.lock();
         if (!s || !s->open_.load()) return;
         auto id = s->NextId();
-        (void)s->SendFrame(FrameType::kHeartbeat, id.first, id.second, {});
-        s->ScheduleHeartbeat();  // 重排
+        (void)s->SendFrame(FrameType::kHeartbeat, id.first, id.second, {});  // 锁外发帧
+        s->ScheduleHeartbeat();  // 重排:heartbeat_timer_ 的写入在 ScheduleHeartbeat 内受 mu_ 保护
       });
 }
 
 uint32_t ProtocolNode::StartRepeating(std::vector<uint8_t> payload, uint32_t interval_ms) {
+  if (interval_ms == 0) return 0;  // 0 间隔会忙转 worker 并饿死 Dispatch;0 是无效句柄(repeat_next_ 起于 1)
   uint32_t handle;
   {
     std::lock_guard<std::mutex> lk(mu_);
