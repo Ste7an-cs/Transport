@@ -220,3 +220,24 @@ TEST(ProtocolNode, NeedFeedbackCloseAfterResponseNoDoubleInvoke) {
   EXPECT_EQ(result_calls, 1);   // on_result 因关闭失败一次
   EXPECT_EQ(result_err.rfind("conn:", 0), 0u);
 }
+
+TEST(ProtocolNode, RepeatingSendsPeriodicallyUntilStopped) {
+  Pair p; p.Open();
+  uint32_t h = p.a->StartRepeating(P({0xAB}), 100);
+  EXPECT_EQ(p.b->commands, 1);   // 起始即发一帧 STATE
+  p.exa->FireAll(); EXPECT_EQ(p.b->commands, 2);  // 到点再发
+  p.exa->FireAll(); EXPECT_EQ(p.b->commands, 3);
+  p.a->StopRepeating(h);
+  p.exa->FireAll(); EXPECT_EQ(p.b->commands, 3);  // 停后不再发
+  p.Close();
+}
+
+TEST(ProtocolNode, HeartbeatPeriodic) {
+  ProtocolConfig ca = Cfg(); ca.heartbeat_interval_ms = 100;  // a 周期发心跳
+  Pair p(ca, Cfg());
+  p.Open();
+  EXPECT_EQ(p.b->heartbeats, 0);   // 尚未到点
+  p.exa->FireAll();                // a 的心跳定时器触发 → 发 HEARTBEAT → b 收
+  EXPECT_GE(p.b->heartbeats, 1);   // b 的 OnHeartbeat 被调
+  p.Close();
+}

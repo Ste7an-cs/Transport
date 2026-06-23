@@ -75,6 +75,7 @@ Status ProtocolNode::Open() {
   open_.store(true);
   auto st = transport_->Open();
   if (!st) { open_.store(false); executor_->Stop(); return st; }
+  if (config_.heartbeat_interval_ms > 0) ScheduleHeartbeat();
   return Ok();
 }
 
@@ -89,6 +90,10 @@ void ProtocolNode::Close() {
     if (p.on_response) p.on_response(Result<Message>::Fail("conn: node closed"));
     if (p.on_result) p.on_result(Result<Message>::Fail("conn: node closed"));
   }
+  { std::lock_guard<std::mutex> lk(mu_);
+    if (heartbeat_timer_) { executor_->Cancel(heartbeat_timer_); heartbeat_timer_ = 0; }
+    for (auto& kv : repeats_) if (kv.second.timer) executor_->Cancel(kv.second.timer);
+    repeats_.clear(); }
   executor_->Stop();
   transport_->Close();
 }
@@ -252,6 +257,64 @@ void ProtocolNode::HandleDisconnect(const std::string& reason) {
     if (p.on_response) p.on_response(Result<Message>::Fail(reason));
     if (p.on_result) p.on_result(Result<Message>::Fail(reason));
   }
+}
+
+void ProtocolNode::ScheduleHeartbeat() {
+  std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  heartbeat_timer_ = executor_->ScheduleAt(
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.heartbeat_interval_ms),
+      [wself] {
+        auto s = wself.lock();
+        if (!s || !s->open_.load()) return;
+        auto id = s->NextId();
+        (void)s->SendFrame(FrameType::kHeartbeat, id.first, id.second, {});
+        s->ScheduleHeartbeat();  // 重排
+      });
+}
+
+uint32_t ProtocolNode::StartRepeating(std::vector<uint8_t> payload, uint32_t interval_ms) {
+  uint32_t handle;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    handle = repeat_next_++;
+    repeats_[handle] = Repeat{payload, interval_ms, 0};
+  }
+  // 起始即发一帧,并排下一次。
+  auto id = NextId();
+  (void)SendFrame(FrameType::kState, id.first, id.second, payload);
+  std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = repeats_.find(handle);
+  if (it != repeats_.end())
+    it->second.timer = executor_->ScheduleAt(
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms),
+        [wself, handle] { if (auto s = wself.lock()) s->FireRepeat(handle); });
+  return handle;
+}
+
+void ProtocolNode::FireRepeat(uint32_t handle) {
+  std::vector<uint8_t> payload; uint32_t interval = 0; bool alive = false;
+  { std::lock_guard<std::mutex> lk(mu_);
+    auto it = repeats_.find(handle);
+    if (it != repeats_.end()) { payload = it->second.payload; interval = it->second.interval_ms; alive = true; } }
+  if (!alive || !open_.load()) return;
+  auto id = NextId();
+  (void)SendFrame(FrameType::kState, id.first, id.second, payload);
+  std::weak_ptr<ProtocolNode> wself = weak_from_this();
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = repeats_.find(handle);
+  if (it != repeats_.end())
+    it->second.timer = executor_->ScheduleAt(
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(interval),
+        [wself, handle] { if (auto s = wself.lock()) s->FireRepeat(handle); });
+}
+
+void ProtocolNode::StopRepeating(uint32_t handle) {
+  IExecutor::TimerId t = 0;
+  { std::lock_guard<std::mutex> lk(mu_);
+    auto it = repeats_.find(handle);
+    if (it != repeats_.end()) { t = it->second.timer; repeats_.erase(it); } }
+  if (t) executor_->Cancel(t);
 }
 
 }  // namespace transport

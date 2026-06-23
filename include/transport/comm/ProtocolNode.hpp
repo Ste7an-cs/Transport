@@ -67,6 +67,9 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   Status RequestNeedFeedback(std::vector<uint8_t> payload,
                              ReplyFn on_response, ReplyFn on_result);                  // needfeedback
 
+  uint32_t StartRepeating(std::vector<uint8_t> payload, uint32_t interval_ms);
+  void     StopRepeating(uint32_t handle);
+
  protected:
   virtual void OnCommand(const Message& cmd, Responder responder) {}
   virtual void OnHeartbeat(const Message& hb) {}
@@ -96,6 +99,8 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   void HandleDisconnect(const std::string& reason);
   Status RequestImpl(Mode mode, std::vector<uint8_t> payload,
                      ReplyFn on_response, ReplyFn on_result);
+  void ScheduleHeartbeat();
+  void FireRepeat(uint32_t handle);
 
   std::shared_ptr<ITransport> transport_;
   std::unique_ptr<ICodec> codec_;
@@ -107,6 +112,11 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   std::map<uint32_t, Pending> pending_;
   uint8_t session_ctr_ = 0;
   uint16_t message_ctr_ = 0;
+
+  struct Repeat { std::vector<uint8_t> payload; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
+  std::map<uint32_t, Repeat> repeats_;
+  uint32_t repeat_next_ = 1;
+  IExecutor::TimerId heartbeat_timer_ = 0;
 };
 
 }  // namespace transport
