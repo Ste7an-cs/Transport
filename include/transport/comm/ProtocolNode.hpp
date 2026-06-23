@@ -63,6 +63,9 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
 
   Status SendNoResponse(std::vector<uint8_t> payload);          // noresponse
   Status Request(std::vector<uint8_t> payload, ReplyFn on_response);  // needresponse
+  Status RequestWithResult(std::vector<uint8_t> payload, ReplyFn on_result);          // withfeedback
+  Status RequestNeedFeedback(std::vector<uint8_t> payload,
+                             ReplyFn on_response, ReplyFn on_result);                  // needfeedback
 
  protected:
   virtual void OnCommand(const Message& cmd, Responder responder) {}
@@ -70,7 +73,7 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   virtual void OnError(const std::string& error) {}
 
  private:
-  enum class Mode { kNeedResponse };   // Task 3 续加 kWithResult / kNeedFeedback
+  enum class Mode { kNeedResponse, kWithResult, kNeedFeedback };
   struct Pending {
     Mode mode;
     std::vector<uint8_t> payload;      // 重发用
@@ -91,6 +94,8 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   void Dispatch(Message msg);
   void OnTimeout(uint32_t key);
   void HandleDisconnect(const std::string& reason);
+  Status RequestImpl(Mode mode, std::vector<uint8_t> payload,
+                     ReplyFn on_response, ReplyFn on_result);
 
   std::shared_ptr<ITransport> transport_;
   std::unique_ptr<ICodec> codec_;

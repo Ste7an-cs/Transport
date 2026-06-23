@@ -86,8 +86,8 @@ void ProtocolNode::Close() {
   for (auto& kv : taken) {
     executor_->Cancel(kv.second.timer);
     auto& p = kv.second;
-    if (p.mode == Mode::kNeedResponse && p.on_response)
-      p.on_response(Result<Message>::Fail("conn: node closed"));
+    if (p.on_response) p.on_response(Result<Message>::Fail("conn: node closed"));
+    if (p.on_result) p.on_result(Result<Message>::Fail("conn: node closed"));
   }
   executor_->Stop();
   transport_->Close();
@@ -113,8 +113,22 @@ Status ProtocolNode::SendNoResponse(std::vector<uint8_t> payload) {
 }
 
 Status ProtocolNode::Request(std::vector<uint8_t> payload, ReplyFn on_response) {
+  return RequestImpl(Mode::kNeedResponse, std::move(payload), std::move(on_response), nullptr);
+}
+Status ProtocolNode::RequestWithResult(std::vector<uint8_t> payload, ReplyFn on_result) {
+  return RequestImpl(Mode::kWithResult, std::move(payload), nullptr, std::move(on_result));
+}
+Status ProtocolNode::RequestNeedFeedback(std::vector<uint8_t> payload,
+                                         ReplyFn on_response, ReplyFn on_result) {
+  return RequestImpl(Mode::kNeedFeedback, std::move(payload),
+                     std::move(on_response), std::move(on_result));
+}
+
+Status ProtocolNode::RequestImpl(Mode mode, std::vector<uint8_t> payload,
+                                 ReplyFn on_response, ReplyFn on_result) {
   if (!open_.load()) {
     if (on_response) on_response(Result<Message>::Fail("config: node not open"));
+    if (on_result) on_result(Result<Message>::Fail("config: node not open"));
     return Status::Fail("config: node not open");
   }
   auto id = NextId();
@@ -124,24 +138,31 @@ Status ProtocolNode::Request(std::vector<uint8_t> payload, ReplyFn on_response) 
     std::lock_guard<std::mutex> lk(mu_);
     if (closing_.load() || !open_.load()) {
       if (on_response) on_response(Result<Message>::Fail("conn: node closing"));
+      if (on_result) on_result(Result<Message>::Fail("conn: node closing"));
       return Status::Fail("conn: node closing");
     }
     IExecutor::TimerId timer = executor_->ScheduleAt(
         std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.response_timeout_ms),
         [wself, key] { if (auto s = wself.lock()) s->OnTimeout(key); });
     Pending p;
-    p.mode = Mode::kNeedResponse; p.payload = payload;
+    p.mode = mode; p.payload = payload;
     p.session = id.first; p.message = id.second;
-    p.on_response = std::move(on_response); p.timer = timer;
+    p.on_response = std::move(on_response); p.on_result = std::move(on_result);
+    p.timer = timer;
     pending_[key] = std::move(p);
   }
   Status st = SendFrame(FrameType::kCommand, id.first, id.second, payload);
   if (!st) {
-    ReplyFn cb;
+    ReplyFn cr, cf;
     { std::lock_guard<std::mutex> lk(mu_);
       auto it = pending_.find(key);
-      if (it != pending_.end()) { executor_->Cancel(it->second.timer); cb = std::move(it->second.on_response); pending_.erase(it); } }
-    if (cb) cb(Result<Message>::Fail(st.error));
+      if (it != pending_.end()) {
+        executor_->Cancel(it->second.timer);
+        cr = std::move(it->second.on_response); cf = std::move(it->second.on_result);
+        pending_.erase(it);
+      } }
+    if (cr) cr(Result<Message>::Fail(st.error));
+    if (cf) cf(Result<Message>::Fail(st.error));
     return st;
   }
   return Ok();
@@ -156,7 +177,8 @@ void ProtocolNode::OnTimeout(uint32_t key) {
     auto it = pending_.find(key);
     if (it == pending_.end()) return;
     Pending& p = it->second;
-    if (p.retries < config_.max_retries) {
+    const bool no_retransmit = (p.mode == Mode::kNeedFeedback && p.got_response);
+    if (!no_retransmit && p.retries < config_.max_retries) {
       ++p.retries;
       std::weak_ptr<ProtocolNode> wself = weak_from_this();
       p.timer = executor_->ScheduleAt(
@@ -164,7 +186,7 @@ void ProtocolNode::OnTimeout(uint32_t key) {
           [wself, key] { if (auto s2 = wself.lock()) s2->OnTimeout(key); });
       resend = true; s = p.session; m = p.message; payload = p.payload;
     } else {
-      fail_cb = std::move(p.on_response);
+      fail_cb = p.on_result ? std::move(p.on_result) : std::move(p.on_response);
       pending_.erase(it);
     }
   }
@@ -180,19 +202,38 @@ void ProtocolNode::Dispatch(Message msg) {
       break;
     case FrameType::kResponse: {
       const uint32_t key = Key(msg.session_id, msg.message_id);
-      ReplyFn cb;
+      ReplyFn cb; bool intermediate = false;
       { std::lock_guard<std::mutex> lk(mu_);
         auto it = pending_.find(key);
-        if (it != pending_.end() && it->second.mode == Mode::kNeedResponse) {
-          cb = std::move(it->second.on_response);
-          executor_->Cancel(it->second.timer);
-          pending_.erase(it);
+        if (it != pending_.end()) {
+          Pending& p = it->second;
+          if (p.mode == Mode::kNeedResponse) {
+            cb = std::move(p.on_response); executor_->Cancel(p.timer); pending_.erase(it);
+          } else if (p.mode == Mode::kNeedFeedback && !p.got_response) {
+            p.got_response = true; cb = p.on_response; intermediate = true;  // 中间回应,保留挂起
+          }
         } }
+      if (cb) cb(Result<Message>::Success(std::move(msg)));
+      (void)intermediate;
+      break;
+    }
+    case FrameType::kResult: {
+      const uint32_t key = Key(msg.session_id, msg.message_id);
+      ReplyFn cb; bool ack = false; uint8_t s = 0; uint16_t m = 0;
+      { std::lock_guard<std::mutex> lk(mu_);
+        auto it = pending_.find(key);
+        if (it != pending_.end()) {
+          Pending& p = it->second;
+          if (p.mode == Mode::kWithResult || p.mode == Mode::kNeedFeedback) {
+            cb = std::move(p.on_result); executor_->Cancel(p.timer);
+            ack = (p.mode == Mode::kNeedFeedback); s = p.session; m = p.message;
+            pending_.erase(it);
+          }
+        } }
+      if (ack) (void)SendFrame(FrameType::kResponse, s, m, {});  // needfeedback 自动回 RESPONSE
       if (cb) cb(Result<Message>::Success(std::move(msg)));
       break;
     }
-    case FrameType::kResult:
-      break;  // Task 3 处理
     case FrameType::kHeartbeat:
       OnHeartbeat(msg);
       break;
@@ -208,8 +249,8 @@ void ProtocolNode::HandleDisconnect(const std::string& reason) {
   for (auto& kv : taken) {
     executor_->Cancel(kv.second.timer);
     auto& p = kv.second;
-    if (p.mode == Mode::kNeedResponse && p.on_response)
-      p.on_response(Result<Message>::Fail(reason));
+    if (p.on_response) p.on_response(Result<Message>::Fail(reason));
+    if (p.on_result) p.on_result(Result<Message>::Fail(reason));
   }
 }
 

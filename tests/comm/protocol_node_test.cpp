@@ -130,3 +130,35 @@ TEST(ProtocolNode, WorksWithThreadExecutor) {
   EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{3, 0xEE}));
   a->Close(); b->Close();
 }
+
+TEST(ProtocolNode, WithFeedbackCompletesOnResult) {
+  Pair p; p.Open();
+  p.b->on_cmd = [](const Message& m, Responder r) {
+    auto out = m.payload; out.push_back(0xCC); (void)r.Result(out);  // 直接发 RESULT
+  };
+  Result<Message> got = Result<Message>::Fail("none");
+  ASSERT_TRUE(static_cast<bool>(
+      p.a->RequestWithResult(P({6}), [&](Result<Message> rr) { got = std::move(rr); })));
+  ASSERT_TRUE(static_cast<bool>(got));
+  EXPECT_EQ(got.value.frm_type, FrameType::kResult);
+  EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{6, 0xCC}));
+  p.Close();
+}
+
+TEST(ProtocolNode, NeedFeedbackResponseThenResultThenAck) {
+  Pair p; p.Open();
+  // 对端:收 COMMAND → 回 RESPONSE,再回 RESULT(发起方收 RESULT 后会自动回 RESPONSE ack)。
+  p.b->on_cmd = [](const Message& m, Responder r) {
+    (void)r.Response(P({0x01}));
+    (void)r.Result(m.payload);
+  };
+  std::vector<uint8_t> resp, res; int order = 0; int resp_at = 0, res_at = 0;
+  ASSERT_TRUE(static_cast<bool>(p.a->RequestNeedFeedback(
+      P({7}),
+      [&](Result<Message> rr) { if (rr) { resp = rr.value.payload; resp_at = ++order; } },
+      [&](Result<Message> rr) { if (rr) { res = rr.value.payload; res_at = ++order; } })));
+  EXPECT_EQ(resp, (std::vector<uint8_t>{0x01}));   // 中间 RESPONSE
+  EXPECT_EQ(res, (std::vector<uint8_t>{7}));         // 最终 RESULT
+  EXPECT_LT(resp_at, res_at);                        // 先 RESPONSE 后 RESULT
+  p.Close();
+}
