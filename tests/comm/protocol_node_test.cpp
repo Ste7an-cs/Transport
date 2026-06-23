@@ -3,6 +3,8 @@
 #include "fake_transport.hpp"
 #include "inline_executor.hpp"
 
+#include "transport/codec/SystemCodec.hpp"
+
 #include <functional>
 #include <future>
 #include <memory>
@@ -23,6 +25,16 @@ using testutil::InlineExecutor;
 
 namespace {
 std::vector<uint8_t> P(std::initializer_list<uint8_t> l) { return std::vector<uint8_t>(l); }
+
+// 录制本端 Send 的出站字节(仍照常转发给对端),用于观测自动 ack。
+class RecordingTransport : public FakeTransport {
+ public:
+  std::vector<std::vector<uint8_t>> sent;
+  transport::Status Send(const std::vector<uint8_t>& bytes) override {
+    sent.push_back(bytes);
+    return FakeTransport::Send(bytes);
+  }
+};
 
 // 测试子类:记录收到的 COMMAND,可设回应行为。
 class TestNode : public ProtocolNode {
@@ -146,19 +158,65 @@ TEST(ProtocolNode, WithFeedbackCompletesOnResult) {
 }
 
 TEST(ProtocolNode, NeedFeedbackResponseThenResultThenAck) {
-  Pair p; p.Open();
+  // 发起方 a 用 RecordingTransport 录出站字节,以真实观测收 RESULT 后自动回的 RESPONSE ack。
+  auto ta = std::make_shared<RecordingTransport>();
+  auto tb = std::make_shared<FakeTransport>();
+  FakeTransport::Link(ta, tb);
+  auto a = std::make_shared<TestNode>(ta, nullptr, Cfg(), std::make_unique<InlineExecutor>());
+  auto b = std::make_shared<TestNode>(tb, nullptr, Cfg(), std::make_unique<InlineExecutor>());
+  std::vector<uint8_t> resp, res; int order = 0; int resp_at = 0, res_at = 0;
+  Message req_seen;
   // 对端:收 COMMAND → 回 RESPONSE,再回 RESULT(发起方收 RESULT 后会自动回 RESPONSE ack)。
-  p.b->on_cmd = [](const Message& m, Responder r) {
+  b->on_cmd = [&](const Message& m, Responder r) {
+    req_seen = m;
     (void)r.Response(P({0x01}));
     (void)r.Result(m.payload);
   };
-  std::vector<uint8_t> resp, res; int order = 0; int resp_at = 0, res_at = 0;
-  ASSERT_TRUE(static_cast<bool>(p.a->RequestNeedFeedback(
+  (void)b->Open(); (void)a->Open();
+  ta->sent.clear();  // 丢弃 Open 期间无关字节,只看请求后的出站
+  ASSERT_TRUE(static_cast<bool>(a->RequestNeedFeedback(
       P({7}),
       [&](Result<Message> rr) { if (rr) { resp = rr.value.payload; resp_at = ++order; } },
       [&](Result<Message> rr) { if (rr) { res = rr.value.payload; res_at = ++order; } })));
   EXPECT_EQ(resp, (std::vector<uint8_t>{0x01}));   // 中间 RESPONSE
   EXPECT_EQ(res, (std::vector<uint8_t>{7}));         // 最终 RESULT
   EXPECT_LT(resp_at, res_at);                        // 先 RESPONSE 后 RESULT
+
+  // 观测自动 ack:解码 a 的出站字节,最后一帧应为 RESPONSE,且 session/message 回显请求帧。
+  transport::SystemCodec codec;
+  bool ack_after_result = false;
+  for (const auto& bytes : ta->sent) {
+    auto decoded = codec.Decode(bytes.data(), bytes.size());
+    ASSERT_TRUE(static_cast<bool>(decoded));
+    for (const auto& fm : decoded.value) {
+      if (fm.frm_type == FrameType::kResponse &&
+          fm.session_id == req_seen.session_id && fm.message_id == req_seen.message_id) {
+        ack_after_result = true;
+      }
+    }
+  }
+  EXPECT_TRUE(ack_after_result);  // 删掉自动 ack 此断言即失败
+  // 出站序列只应有 COMMAND(请求)与 RESPONSE(自动 ack)两帧。
+  EXPECT_EQ(ta->sent.size(), 2u);
+  a->Close(); b->Close();
+}
+
+// 回归(FIX 1):needfeedback 收到中间 RESPONSE 后未收 RESULT 即 Close,
+// on_response 必须只触发一次(不被 Close 二次触发),on_result 以 conn: 失败一次。
+TEST(ProtocolNode, NeedFeedbackCloseAfterResponseNoDoubleInvoke) {
+  Pair p; p.Open();
+  // 对端只回 RESPONSE,不回 RESULT。
+  p.b->on_cmd = [](const Message& m, Responder r) { (void)m; (void)r.Response(P({0x55})); };
+  int resp_calls = 0, result_calls = 0;
+  std::string result_err;
+  ASSERT_TRUE(static_cast<bool>(p.a->RequestNeedFeedback(
+      P({8}),
+      [&](Result<Message> rr) { (void)rr; ++resp_calls; },
+      [&](Result<Message> rr) { ++result_calls; if (!rr) result_err = rr.error; })));
+  EXPECT_EQ(resp_calls, 1);     // 中间 RESPONSE 已触发一次
+  EXPECT_EQ(result_calls, 0);   // 尚无 RESULT
   p.Close();
+  EXPECT_EQ(resp_calls, 1);     // Close 未二次触发 on_response
+  EXPECT_EQ(result_calls, 1);   // on_result 因关闭失败一次
+  EXPECT_EQ(result_err.rfind("conn:", 0), 0u);
 }

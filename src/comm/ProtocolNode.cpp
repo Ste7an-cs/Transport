@@ -202,7 +202,7 @@ void ProtocolNode::Dispatch(Message msg) {
       break;
     case FrameType::kResponse: {
       const uint32_t key = Key(msg.session_id, msg.message_id);
-      ReplyFn cb; bool intermediate = false;
+      ReplyFn cb;
       { std::lock_guard<std::mutex> lk(mu_);
         auto it = pending_.find(key);
         if (it != pending_.end()) {
@@ -210,11 +210,11 @@ void ProtocolNode::Dispatch(Message msg) {
           if (p.mode == Mode::kNeedResponse) {
             cb = std::move(p.on_response); executor_->Cancel(p.timer); pending_.erase(it);
           } else if (p.mode == Mode::kNeedFeedback && !p.got_response) {
-            p.got_response = true; cb = p.on_response; intermediate = true;  // 中间回应,保留挂起
+            // 中间回应:消费 on_response(保留挂起等 RESULT),清空防 Close/disconnect 二次触发。
+            p.got_response = true; cb = std::move(p.on_response);
           }
         } }
       if (cb) cb(Result<Message>::Success(std::move(msg)));
-      (void)intermediate;
       break;
     }
     case FrameType::kResult: {
