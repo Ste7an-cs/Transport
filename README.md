@@ -20,6 +20,8 @@
 | **ICodec** 线缆格式 | `ICodec`(`Encode(Message)→bytes` / `Decode(bytes)→0..N Message`) | `SystemCodec`(外部协议帧)、`DdsCodec`(无状态,带交互元数据)、`LengthFieldCodec`、`DatagramCodec` |
 | **Comm** 交互节点 | `IExecutor`(线程模型缝)+ 节点基类 | `ThreadExecutor`;`CommNode`(通用 req-resp)、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈) |
 
+> **用户面定位:** **Comm 节点是编程主入口** —— 继承 `CommNode`/`DdsNode`/`ProtocolNode` 重写交互钩子。`ITransport` **不是直接收发面**(对比 0.1.0),而是 ① **装配缝**(你实例化一个具体 transport 注入节点构造,换协议只换 transport)+ ② **裸字节逃生口**(只要字节管道时直接持 `shared_ptr<ITransport>` 用 `OnBytes`/`Send`,如下方 UDP 例)。它保持公共干净接口,是分层、可测(`FakeTransport`)、可替换的支点。
+
 - **统一寻址 `Endpoint`**:发布即 `Send(msg, Endpoint::Topic(t))`、UDP 寻址即 `Send(bytes, Endpoint::Net(ip,port))`,基类句柄即可寻址,无形态不一的 `SendTo`。
 - **不抛异常**:所有可失败操作返回 `Result<T>`(标 `[[nodiscard]]`,忽略错误返回值即编译期告警),错误串前缀分类 `timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`。
 - **可换线程模型**:`IExecutor` 缝使同一交互逻辑在确定性 `InlineExecutor`(测试)与真实 `ThreadExecutor` 下都跑,未来 `CoroExecutor`(自研协程)即插即换。
