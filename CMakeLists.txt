@@ -21,7 +21,6 @@ add_library(transport STATIC
   src/dds/DdsTransport.cpp
   src/comm/ThreadExecutor.cpp
   src/comm/InteractionEngine.cpp
-  src/comm/CommNode.cpp
   src/comm/DdsNode.cpp
   src/comm/ProtocolNode.cpp
 )
@@ -77,7 +76,6 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_transport_test.cpp
     tests/comm/thread_executor_test.cpp
-    tests/comm/comm_node_test.cpp
     tests/comm/dds_node_test.cpp
     tests/comm/interaction_engine_test.cpp
     tests/comm/protocol_node_test.cpp

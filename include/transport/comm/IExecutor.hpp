@@ -1,7 +1,7 @@
 #pragma once
 
 // IExecutor.hpp — 执行器缝:决定"业务回调在哪/怎么跑"+ 定时。
-// CommNode 只依赖此接口;v1=ThreadExecutor(线程),将来=CoroExecutor(协程),测试=InlineExecutor。
+// InteractionEngine 只依赖此接口;v1=ThreadExecutor(线程),将来=CoroExecutor(协程),测试=InlineExecutor。
 
 #include <chrono>
 #include <cstdint>
@@ -16,7 +16,7 @@ class IExecutor {
 
   virtual ~IExecutor() = default;
   virtual void Start() = 0;
-  virtual void Stop()  = 0;  // 停止并 drain/join,确保无任务在 CommNode 析构后跑
+  virtual void Stop()  = 0;  // 停止并 drain/join,确保无任务在节点析构后跑
 
   // 投递任务到业务上下文【串行】执行;容量满时【阻塞调用方】(背压)。
   virtual void Post(Task task) = 0;
