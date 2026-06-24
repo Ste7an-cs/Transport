@@ -11,7 +11,6 @@
 
 #include <gtest/gtest.h>
 
-using transport::CommNode;
 using transport::DdsCodec;
 using transport::DdsConfig;
 using transport::DdsNode;
@@ -21,7 +20,7 @@ using transport::FakeDdsProvider;
 using transport::ICodec;
 using transport::IExecutor;
 using transport::Message;
-using transport::Responder;
+using Responder = transport::DdsNode::Responder;
 using transport::Result;
 using testutil::InlineExecutor;
 
@@ -184,28 +183,6 @@ TEST(DdsNode, RequestTimeoutOverTopics) {
   exa->FireAll();                        // 驱动 a 的超时定时器
   ASSERT_FALSE(static_cast<bool>(got));
   EXPECT_EQ(got.error.rfind("timeout:", 0), 0u);
-  a->Close(); b->Close();
-}
-
-// Open 已虚化:经 CommNode 基类句柄调用 Open() 仍订阅 inbox + 设应答地址,应答能回。
-TEST(DdsNode, OpenIsVirtualThroughBaseHandle) {
-  Net net;
-  auto a = net.Make("A_in", nullptr);
-  auto b = net.Make("B_in", nullptr);
-  b->on_req = [](const Message& req, Responder r) {
-    auto out = req.payload; out.push_back(0xFF);
-    (void)r.Reply(Msg(out));  // 经 reply_to(=A_in)回送
-  };
-  std::shared_ptr<CommNode> a_base = a;  // 以公共基类型持有
-  ASSERT_TRUE(static_cast<bool>(a_base->Open()));  // 经基类句柄调用 → 必须跑 DdsNode::Open override
-  ASSERT_TRUE(static_cast<bool>(b->Open()));
-  ASSERT_TRUE(static_cast<bool>(b->Subscribe("svc")));
-  Result<Message> got = Result<Message>::Fail("none");
-  ASSERT_TRUE(static_cast<bool>(
-      a_base->Request(Msg({7}), [&](Result<Message> r) { got = std::move(r); }, 1000,
-                      Endpoint::Topic("svc"))));
-  ASSERT_TRUE(static_cast<bool>(got));  // 应答抵达(未超时)=> override 已运行,inbox 已订阅
-  EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{7, 0xFF}));
   a->Close(); b->Close();
 }
 
