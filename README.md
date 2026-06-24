@@ -172,6 +172,7 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 
 - **需求规格说明书(SRS)**:[`docs/需求规格说明书.md`](docs/需求规格说明书.md) —— 功能需求 FR-1~13 + 非功能需求 + 约束。
 - **设计说明书(SDD)**:[`docs/设计说明书.md`](docs/设计说明书.md) —— 三层架构 / UML / 协议帧格式 / 数据流时序 / 执行器与并发模型 / 设计依据。
+- **架构与运行期协作(UML)**:[`docs/架构与运行期协作.md`](docs/架构与运行期协作.md) —— 整体设计图 / 构件清单 / 依赖类图 / 运行期协作时序图(收发骨架·DDS 多路 req-resp·协议 needfeedback·repeating/心跳·TCP 服务端)。
 - **变更日志**:[`CHANGELOG.md`](CHANGELOG.md) —— 按 PR/里程碑汇总(含破坏性变更标注)。
 - 过程历史(逐特性 spec / plan,备查):`docs/superpowers/specs/`、`docs/superpowers/plans/`。
 
