@@ -20,6 +20,7 @@ add_library(transport STATIC
   src/dds/FakeDdsProvider.cpp
   src/dds/DdsTransport.cpp
   src/comm/ThreadExecutor.cpp
+  src/comm/InteractionEngine.cpp
   src/comm/CommNode.cpp
   src/comm/DdsNode.cpp
   src/comm/ProtocolNode.cpp
@@ -78,6 +79,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/comm/thread_executor_test.cpp
     tests/comm/comm_node_test.cpp
     tests/comm/dds_node_test.cpp
+    tests/comm/interaction_engine_test.cpp
     tests/comm/protocol_node_test.cpp
   )
   target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
