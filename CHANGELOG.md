@@ -8,7 +8,16 @@
 
 ## [Unreleased]
 
-> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互节点)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+
+### 重构:交互机制抽象(`InteractionEngine` + `InteractionPolicy`)— 2026-06-24(PR #7)
+> `CommNode` 与 `ProtocolNode` 曾各自重写同一套交互机制(且各被评审抓出过一个并发 Critical)。三个真实交互节点 = 足够样本,合并机制为一份、最难写对的并发生命周期只写一处。**纯内部重构,DDS/协议行为保持。**
+- **新增** `InteractionEngine`(通用机制一份):3 原语 `Fire`(单向)/ `RequestAwait`(发+等回应,带超时/重发/自动 ack)/ `StartPeriodic`(定时发);挂起表、超时、重发、periodic 定时器、io→Decode→Post→单 worker Dispatch、并发纪律(weak_ptr / `Encode`+`Send` 锁外 / 中间帧拷贝调用·终结帧移出调用防双触发 / `Close` 先终结挂起再停定时器再停执行器再关传输 / 恰好一次)全部集中此处。
+- **新增** `InteractionPolicy`(声明式协议策略,7 法 `TagOf`/`SetTag`/`NewCorrelation`/`KeyOf`/`EchoCorrelation`/`ReplyTo`/`RouteUnmatched`):匹配键 `Key`=`std::string`、判别符 `FrameTag`=`int`,**引擎只做相等比较、从不解释**(零 per-protocol 泄漏)。`RequestSpec` 配置 request-await;**「首帧停重发」一条规则**(首个配上的中间/终结帧停重发)覆盖各模式,免协议专属 flag。实现 `ProtocolPolicy`(`Key`=(session,message)、`session_id` 滚动、`message_id`=命令码)、`DdsPolicy`(`Key`=correlation_id、`reply_to`=inbox 路由)。
+- **变更** `DdsNode` 重做成 `InteractionEngine`+`DdsPolicy` 薄壳(**不再继承 `CommNode`**);`dds_node_test` 仅去 CommNode 依赖、断言不变。
+- **变更** `ProtocolNode` 重做成 `InteractionEngine`+`ProtocolPolicy` 薄壳;发送方法**新增首参 `uint16_t cmd`(=`message_id` 命令码)**(纠正旧实现 `message_id` 自增的语义);心跳改为首拍即发。
+- **⚠️ 移除** 通用 corr+kind 的 `CommNode`(其机制即引擎,不被实用);`comm_node_test` 转为引擎级 `interaction_engine_test`(覆盖原通用交互面 + worker 内 Close 自连接守卫)。
+- **验证** 干净构建零告警,86/86 测试两次连跑稳定;引擎/策略代码零 `frm_type`/`kind`/节点名(缝切对的护栏)。
 
 ### 特性:外部协议栈(`SystemCodec` 协议帧 + `ProtocolNode`)— 2026-06-23(PR #6)
 > 面向某外部系统的具体通信协议。`CommNode`/`DdsNode`/`DdsCodec` 不动(DDS 不走此协议)。
