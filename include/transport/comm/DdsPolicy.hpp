@@ -2,7 +2,6 @@
 
 // DdsPolicy.hpp — DDS 策略(header-only)。Key=correlation_id;tag=kind;reply_to=inbox(请求)/路由(应答)。
 
-#include <atomic>
 #include <cstdint>
 #include <random>
 #include <string>

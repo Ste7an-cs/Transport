@@ -3,3 +3,4 @@
 *.a
 compile_commands.json
 /.claude/
+*.swp

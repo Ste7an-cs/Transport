@@ -40,6 +40,8 @@ Status InteractionEngine::Open() {
     }
     auto msgs = s->codec_->Decode(r.value.data(), r.value.size());
     if (!msgs) {
+      // 有意:仅上报解码错误,不把 frame: 失败升级为断连(旧 CommNode 会)。
+      // 在用编解码器(SystemCodec 自重同步、DdsCodec)从不从 Decode 返回致命 frame:,故升级为死代码。
       std::string e = msgs.error;
       s->executor_->Post([wself, e] { if (auto s2 = wself.lock()) if (s2->on_error_) s2->on_error_(e); });
       return;
@@ -52,6 +54,7 @@ Status InteractionEngine::Open() {
       });
     }
   });
+  // 引擎有意不暴露 connect 钩子;此空 handler 仅为满足 transport 接口而注册。
   transport_->OnConnect([] {});
   transport_->OnDisconnect([wself](const std::string& reason) {
     if (auto s = wself.lock())

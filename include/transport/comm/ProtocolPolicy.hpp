@@ -33,6 +33,8 @@ class ProtocolPolicy : public InteractionPolicy {
     switch (in.frm_type) {
       case FrameType::kCommand: case FrameType::kState: return Route::kInboundRequest;
       case FrameType::kHeartbeat: return Route::kDeliver;
+      // 有意:未挂起的 RESPONSE/RESULT 与 kUnknown 均静默丢弃。
+      // (旧 ProtocolNode 对 kUnknown 发 OnError("codec: unknown frame type");按 spec 现改为静默 drop。)
       default: return Route::kDrop;  // RESPONSE/RESULT(无挂起)/UNKNOWN
     }
   }

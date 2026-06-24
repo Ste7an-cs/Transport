@@ -4,6 +4,7 @@
 #include "fake_transport.hpp"
 #include "inline_executor.hpp"
 
+#include <chrono>
 #include <future>
 #include <memory>
 #include <vector>
@@ -180,4 +181,21 @@ TEST(InteractionEngine, WorksWithThreadExecutor) {
   auto r = fut.get();
   ASSERT_TRUE(static_cast<bool>(r)); EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{3, 0xEE}));
   a->Close(); b->Close();
+}
+
+// 从真实 ThreadExecutor worker 线程内调用 Close() 不得自连接/崩溃(守卫在 ThreadExecutor::Stop)。
+TEST(InteractionEngine, CloseFromWorkerNoSelfJoinCrash) {
+  auto ta = std::make_shared<FakeTransport>(), tb = std::make_shared<FakeTransport>();
+  FakeTransport::Link(ta, tb);
+  auto a = std::make_shared<InteractionEngine>(ta, std::make_unique<DdsCodec>(), std::make_unique<TestPolicy>(), nullptr);
+  auto b = std::make_shared<InteractionEngine>(tb, std::make_unique<DdsCodec>(), std::make_unique<TestPolicy>(), nullptr);
+  std::promise<void> prom; auto fut = prom.get_future();
+  // inbound handler 在 worker 线程内自关闭,然后置位 promise。
+  a->OnInboundDeliver([a, &prom](const Message&) { a->Close(); prom.set_value(); });
+  (void)b->Open(); (void)a->Open();
+  ASSERT_TRUE(static_cast<bool>(b->Fire(Pay({1}), T(MessageKind::kOneway))));
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  fut.get();
+  EXPECT_FALSE(a->IsOpen());
+  b->Close();
 }
