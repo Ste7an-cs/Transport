@@ -74,7 +74,7 @@ struct Pair {
 
 TEST(ProtocolNode, NoResponseSends) {
   Pair p; p.Open();
-  ASSERT_TRUE(static_cast<bool>(p.a->SendNoResponse(P({1, 2, 3}))));
+  ASSERT_TRUE(static_cast<bool>(p.a->SendNoResponse(0x10, P({1, 2, 3}))));
   EXPECT_EQ(p.b->commands, 1);  // 对端收到 COMMAND(InlineExecutor 同步)
   p.Close();
 }
@@ -86,7 +86,7 @@ TEST(ProtocolNode, NeedResponseCompletesOnResponse) {
   };
   Result<Message> got = Result<Message>::Fail("none");
   ASSERT_TRUE(static_cast<bool>(
-      p.a->Request(P({5}), [&](Result<Message> rr) { got = std::move(rr); })));
+      p.a->Request(0x10, P({5}), [&](Result<Message> rr) { got = std::move(rr); })));
   ASSERT_TRUE(static_cast<bool>(got));
   EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{5, 0xEE}));
   EXPECT_EQ(got.value.frm_type, FrameType::kResponse);
@@ -98,7 +98,7 @@ TEST(ProtocolNode, ReceiverRoleHandlesIncomingCommand) {
   Message seen;
   p.b->on_cmd = [&](const Message& m, Responder r) { seen = m; (void)r.Response(P({9})); };
   Result<Message> got = Result<Message>::Fail("none");
-  (void)p.a->Request(P({0x42}), [&](Result<Message> rr) { got = std::move(rr); });
+  (void)p.a->Request(0x10, P({0x42}), [&](Result<Message> rr) { got = std::move(rr); });
   EXPECT_EQ(seen.frm_type, FrameType::kCommand);
   EXPECT_EQ(seen.protocol_id, 1);
   EXPECT_EQ(seen.payload, (std::vector<uint8_t>{0x42}));
@@ -112,7 +112,7 @@ TEST(ProtocolNode, TimeoutRetransmitsUpToThreeThenFails) {
   p.Open();
   // 对端只计数不回应。
   Result<Message> got = Result<Message>::Success(Message{});
-  (void)p.a->Request(P({1}), [&](Result<Message> rr) { got = std::move(rr); });
+  (void)p.a->Request(0x10, P({1}), [&](Result<Message> rr) { got = std::move(rr); });
   EXPECT_EQ(p.b->commands, 1);                 // 初次发送
   p.exa->FireAll();                            // 超时 → 重发1
   EXPECT_EQ(p.b->commands, 2);
@@ -136,7 +136,7 @@ TEST(ProtocolNode, WorksWithThreadExecutor) {
   (void)b->Open(); (void)a->Open();
   std::promise<Result<Message>> prom; auto fut = prom.get_future();
   ASSERT_TRUE(static_cast<bool>(
-      a->Request(P({3}), [&](Result<Message> r) { prom.set_value(std::move(r)); })));
+      a->Request(0x10, P({3}), [&](Result<Message> r) { prom.set_value(std::move(r)); })));
   auto r = fut.get();
   ASSERT_TRUE(static_cast<bool>(r));
   EXPECT_EQ(r.value.payload, (std::vector<uint8_t>{3, 0xEE}));
@@ -150,7 +150,7 @@ TEST(ProtocolNode, WithFeedbackCompletesOnResult) {
   };
   Result<Message> got = Result<Message>::Fail("none");
   ASSERT_TRUE(static_cast<bool>(
-      p.a->RequestWithResult(P({6}), [&](Result<Message> rr) { got = std::move(rr); })));
+      p.a->RequestWithResult(0x10, P({6}), [&](Result<Message> rr) { got = std::move(rr); })));
   ASSERT_TRUE(static_cast<bool>(got));
   EXPECT_EQ(got.value.frm_type, FrameType::kResult);
   EXPECT_EQ(got.value.payload, (std::vector<uint8_t>{6, 0xCC}));
@@ -175,7 +175,7 @@ TEST(ProtocolNode, NeedFeedbackResponseThenResultThenAck) {
   (void)b->Open(); (void)a->Open();
   ta->sent.clear();  // 丢弃 Open 期间无关字节,只看请求后的出站
   ASSERT_TRUE(static_cast<bool>(a->RequestNeedFeedback(
-      P({7}),
+      0x10, P({7}),
       [&](Result<Message> rr) { if (rr) { resp = rr.value.payload; resp_at = ++order; } },
       [&](Result<Message> rr) { if (rr) { res = rr.value.payload; res_at = ++order; } })));
   EXPECT_EQ(resp, (std::vector<uint8_t>{0x01}));   // 中间 RESPONSE
@@ -210,7 +210,7 @@ TEST(ProtocolNode, NeedFeedbackCloseAfterResponseNoDoubleInvoke) {
   int resp_calls = 0, result_calls = 0;
   std::string result_err;
   ASSERT_TRUE(static_cast<bool>(p.a->RequestNeedFeedback(
-      P({8}),
+      0x10, P({8}),
       [&](Result<Message> rr) { (void)rr; ++resp_calls; },
       [&](Result<Message> rr) { ++result_calls; if (!rr) result_err = rr.error; })));
   EXPECT_EQ(resp_calls, 1);     // 中间 RESPONSE 已触发一次
@@ -223,7 +223,7 @@ TEST(ProtocolNode, NeedFeedbackCloseAfterResponseNoDoubleInvoke) {
 
 TEST(ProtocolNode, RepeatingSendsPeriodicallyUntilStopped) {
   Pair p; p.Open();
-  uint32_t h = p.a->StartRepeating(P({0xAB}), 100);
+  uint32_t h = p.a->StartRepeating(0x10, P({0xAB}), 100);
   EXPECT_EQ(p.b->commands, 1);   // 起始即发一帧 STATE
   p.exa->FireAll(); EXPECT_EQ(p.b->commands, 2);  // 到点再发
   p.exa->FireAll(); EXPECT_EQ(p.b->commands, 3);
@@ -234,7 +234,7 @@ TEST(ProtocolNode, RepeatingSendsPeriodicallyUntilStopped) {
 
 TEST(ProtocolNode, RepeatingZeroIntervalRejected) {
   Pair p; p.Open();
-  uint32_t h = p.a->StartRepeating(P({0xAB}), 0);
+  uint32_t h = p.a->StartRepeating(0x10, P({0xAB}), 0);
   EXPECT_EQ(h, 0u);              // 0 间隔被拒,返回无效句柄 0
   EXPECT_EQ(p.b->commands, 0);   // 未发任何 STATE 帧
   p.Close();
@@ -244,8 +244,8 @@ TEST(ProtocolNode, HeartbeatPeriodic) {
   ProtocolConfig ca = Cfg(); ca.heartbeat_interval_ms = 100;  // a 周期发心跳
   Pair p(ca, Cfg());
   p.Open();
-  EXPECT_EQ(p.b->heartbeats, 0);   // 尚未到点
-  p.exa->FireAll();                // a 的心跳定时器触发 → 发 HEARTBEAT → b 收
-  EXPECT_GE(p.b->heartbeats, 1);   // b 的 OnHeartbeat 被调
+  EXPECT_EQ(p.b->heartbeats, 1);   // StartPeriodic 立即发一帧 HEARTBEAT → b 收
+  p.exa->FireAll();                // a 的心跳定时器到点 → 再发 HEARTBEAT → b 收
+  EXPECT_GE(p.b->heartbeats, 2);   // b 的 OnHeartbeat 周期性被调
   p.Close();
 }

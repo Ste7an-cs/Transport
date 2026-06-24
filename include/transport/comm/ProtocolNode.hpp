@@ -1,18 +1,13 @@
 #pragma once
 
-// ProtocolNode.hpp — 外部协议交互节点。复用 ITransport + ICodec(默认 SystemCodec)+ IExecutor。
-// io 线程 Decode → executor.Post → 单 worker 串行 Dispatch(按 frm_type)。匹配键 (session_id, message_id)。
-// 须以 shared_ptr 持有。Task 2:noresponse/needresponse/重发/接收角色;Task 3/4 续加其余模式。
+// ProtocolNode.hpp — 外部协议节点(薄壳)。持 InteractionEngine + ProtocolPolicy;
+// 命名模式翻译成引擎原语 + frm_type 常量。须以 shared_ptr 持有。
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "transport/ICodec.hpp"
@@ -20,54 +15,50 @@
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
 #include "transport/comm/IExecutor.hpp"
+#include "transport/comm/InteractionEngine.hpp"
 
 namespace transport {
 
 struct ProtocolConfig {
-  uint8_t  protocol_id = 0;             // 出站帧的外部系统 id
-  uint32_t response_timeout_ms = 1000;  // 等待回应/结果超时
-  uint32_t max_retries = 3;             // 超时重发上限(超过即失败)
-  uint32_t heartbeat_interval_ms = 0;   // 0 = 关闭心跳
+  uint8_t  protocol_id = 0;
+  uint32_t response_timeout_ms = 1000;
+  uint32_t max_retries = 3;
+  uint32_t heartbeat_interval_ms = 0;
 };
 
 class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
  public:
   using ReplyFn = std::function<void(Result<Message>)>;
 
-  // 接收角色应答句柄:回填该请求 (session_id, message_id)。
-  // 嵌套于 ProtocolNode,避免与 CommNode 的同名 transport::Responder 冲突(ODR)。
   class Responder {
    public:
-    Status Response(std::vector<uint8_t> payload);  // 发 RESPONSE
-    Status Result(std::vector<uint8_t> payload);     // 发 RESULT
-
+    Status Response(std::vector<uint8_t> payload);
+    Status Result(std::vector<uint8_t> payload);
    private:
     friend class ProtocolNode;
-    Responder(std::weak_ptr<ProtocolNode> node, uint8_t session, uint16_t message)
-        : node_(std::move(node)), session_(session), message_(message) {}
-    std::weak_ptr<ProtocolNode> node_;
-    uint8_t session_;
-    uint16_t message_;
+    Responder(std::weak_ptr<InteractionEngine> engine, Message request)
+        : engine_(std::move(engine)), request_(std::move(request)) {}
+    std::weak_ptr<InteractionEngine> engine_;
+    Message request_;
   };
 
   ProtocolNode(std::shared_ptr<ITransport> transport,
-               std::unique_ptr<ICodec> codec,            // null → SystemCodec(DefaultCrc16)
+               std::unique_ptr<ICodec> codec,          // null → SystemCodec
                ProtocolConfig config,
-               std::unique_ptr<IExecutor> executor = nullptr,  // null → ThreadExecutor
+               std::unique_ptr<IExecutor> executor = nullptr,
                std::size_t queue_capacity = 1024);
   virtual ~ProtocolNode();
 
   Status Open();
   void   Close();
-  bool   IsOpen() const { return open_.load(); }
+  bool   IsOpen() const;
 
-  Status SendNoResponse(std::vector<uint8_t> payload);          // noresponse
-  Status Request(std::vector<uint8_t> payload, ReplyFn on_response);  // needresponse
-  Status RequestWithResult(std::vector<uint8_t> payload, ReplyFn on_result);          // withfeedback
-  Status RequestNeedFeedback(std::vector<uint8_t> payload,
-                             ReplyFn on_response, ReplyFn on_result);                  // needfeedback
-
-  uint32_t StartRepeating(std::vector<uint8_t> payload, uint32_t interval_ms);
+  Status SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload);
+  Status Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response);
+  Status RequestWithResult(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_result);
+  Status RequestNeedFeedback(uint16_t cmd, std::vector<uint8_t> payload,
+                             ReplyFn on_response, ReplyFn on_result);
+  uint32_t StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms);
   void     StopRepeating(uint32_t handle);
 
  protected:
@@ -76,47 +67,10 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   virtual void OnError(const std::string& error) {}
 
  private:
-  enum class Mode { kNeedResponse, kWithResult, kNeedFeedback };
-  struct Pending {
-    Mode mode;
-    std::vector<uint8_t> payload;      // 重发用
-    uint8_t session; uint16_t message;
-    ReplyFn on_response;
-    ReplyFn on_result;
-    uint32_t retries = 0;
-    IExecutor::TimerId timer = 0;
-    bool got_response = false;
-  };
-
-  Status SendFrame(FrameType type, uint8_t session, uint16_t message,
-                   const std::vector<uint8_t>& payload);
-  std::pair<uint8_t, uint16_t> NextId();
-  static uint32_t Key(uint8_t s, uint16_t m) {
-    return (static_cast<uint32_t>(s) << 16) | m;
-  }
-  void Dispatch(Message msg);
-  void OnTimeout(uint32_t key);
-  void HandleDisconnect(const std::string& reason);
-  Status RequestImpl(Mode mode, std::vector<uint8_t> payload,
-                     ReplyFn on_response, ReplyFn on_result);
-  void ScheduleHeartbeat();
-  void FireRepeat(uint32_t handle);
-
-  std::shared_ptr<ITransport> transport_;
-  std::unique_ptr<ICodec> codec_;
-  std::unique_ptr<IExecutor> executor_;
+  void WireHandlers();
+  std::shared_ptr<InteractionEngine> engine_;
   ProtocolConfig config_;
-  std::atomic<bool> open_{false};
-  std::atomic<bool> closing_{false};
-  std::mutex mu_;
-  std::map<uint32_t, Pending> pending_;
-  uint8_t session_ctr_ = 0;
-  uint16_t message_ctr_ = 0;
-
-  struct Repeat { std::vector<uint8_t> payload; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
-  std::map<uint32_t, Repeat> repeats_;
-  uint32_t repeat_next_ = 1;
-  IExecutor::TimerId heartbeat_timer_ = 0;
+  uint32_t heartbeat_handle_ = 0;
 };
 
 }  // namespace transport
