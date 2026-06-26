@@ -49,6 +49,11 @@ class FakeTransport : public transport::ITransport,
     disconnect_cb_ = std::move(cb);
   }
 
+  // 测试用:把原始字节直接喂给本端 OnBytes(模拟对端发来,绕过编码)。
+  void InjectBytes(std::vector<uint8_t> bytes) {
+    if (bytes_cb_) bytes_cb_(transport::Result<std::vector<uint8_t>>::Success(std::move(bytes)), "inject");
+  }
+
  private:
   std::weak_ptr<FakeTransport> peer_;
   std::atomic<bool> open_{false};

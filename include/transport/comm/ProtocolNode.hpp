@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "transport/ICodec.hpp"
+#include "transport/ITraceSink.hpp"
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
@@ -52,6 +53,8 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   Status Open();
   void   Close();
   bool   IsOpen() const;
+
+  void SetTrace(std::shared_ptr<ITraceSink> t) { engine_->SetTrace(std::move(t)); }
 
   Status SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload);
   Status Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response);
