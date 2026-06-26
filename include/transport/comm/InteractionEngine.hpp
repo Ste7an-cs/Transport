@@ -19,6 +19,7 @@
 #include "transport/Result.hpp"
 #include "transport/comm/IExecutor.hpp"
 #include "transport/comm/InteractionPolicy.hpp"
+#include "transport/ITraceSink.hpp"
 
 namespace transport {
 
@@ -38,6 +39,9 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
   void OnInboundRequest(std::function<void(const Message&)> cb) { on_request_ = std::move(cb); }
   void OnInboundDeliver(std::function<void(const Message&)> cb) { on_deliver_ = std::move(cb); }
   void OnError(std::function<void(const std::string&)> cb) { on_error_ = std::move(cb); }
+
+  // 须在 Open() 前调用;Open 后埋点只读 trace_,设置期单线程,无竞争。
+  void SetTrace(std::shared_ptr<ITraceSink> t) { trace_ = std::move(t); }
 
   Status   Fire(Message out, FrameTag tag, const Endpoint& to = Endpoint::Default());
   Status   RequestAwait(Message out, RequestSpec spec, const Endpoint& to = Endpoint::Default());
@@ -59,6 +63,7 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
   void OnTimeout(Key key);
   void HandleDisconnect(const std::string& reason);
   void FirePeriodic(uint32_t handle);
+  void Trace(const TraceEvent& ev) const { if (trace_) trace_->OnTrace(ev); }
 
   std::shared_ptr<ITransport> transport_;
   std::unique_ptr<ICodec> codec_;
@@ -73,6 +78,7 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
   std::function<void(const Message&)> on_request_;
   std::function<void(const Message&)> on_deliver_;
   std::function<void(const std::string&)> on_error_;
+  std::shared_ptr<ITraceSink> trace_;
 };
 
 }  // namespace transport

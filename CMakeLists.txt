@@ -79,6 +79,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/comm/dds_node_test.cpp
     tests/comm/interaction_engine_test.cpp
     tests/comm/trace_sink_test.cpp
+    tests/comm/interaction_trace_test.cpp
     tests/comm/protocol_node_test.cpp
   )
   target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
