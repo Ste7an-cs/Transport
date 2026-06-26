@@ -8,7 +8,15 @@
 
 ## [Unreleased]
 
-> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象 → ITraceSink 可观测。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象 → ITraceSink 可观测 → 外部协议 UDP 1:多。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+
+### 特性:外部协议跑 UDP(`SystemDatagramCodec` + 1:多寻址)— 2026-06-26(PR #9)
+> 外部协议(`SystemCodec` 帧)此前只配 TCP/串口(有状态流式切帧)。让它正确跑 UDP 1:多——UDP 是报文边界语义,有状态滚动缓冲在多对端会串台、半截报文污染下一报文。**纯加性,默认值使 TCP/串口/流式路径逐字不变。**
+- **新增** `SystemDatagramCodec`(header-only,无状态报文版外部帧):每 `Decode` 只解一个 datagram、残留丢弃、不跨报文(多对端不串台);与流式 `SystemCodec` **共用帧核** `EncodeSystemFrame`/`ScanSystemFrames`(抽出、不复制),编码字节一致。`SystemCodec` 重构为调用共享核,行为不变。
+- **新增** `ProtocolConfig.reply_to_source`(默认 false):置 true 时 `ProtocolPolicy.ReplyTo` 经 `std::from_chars` 解析入站 `Message.source`(按最后一个 `:` 切,兼容 IPv4 与 `::1`)→ `Endpoint::Net`;**一个开关覆盖服务端 `Responder` 回应 + 客户端 `needfeedback` 自动 ack**(都回到入站来源)。
+- **变更** `ProtocolNode` 5 个发送方法加可选尾参 `const Endpoint& to = Default()`(转发引擎原语):客户端经一个 UDP socket 向多设备分别发,重发回同一 `Pending.to`。默认 `Default` → 旧调用点/TCP/串口零改动。
+- **示例** `examples/protocol_udp_demo.cpp`:1 控制器对 2 设备的 UDP 1:多 req-resp。
+- **验证** 干净构建零告警,111/111(新增 `system_datagram_codec_test` 6 + `protocol_policy_test` 4 + 发送目的地透传 1);`system_codec_test` 不变即证明共享核重构行为保持。
 
 ### 特性:可插拔结构化 Trace(`ITraceSink`)— 2026-06-26(PR #8)
 > 此前全库零日志,唯一可观测点是引擎的 `on_error_(string)`。给交互层加一套**观测-only、近零开销**的 trace,让分发/超时/重发/auto-ack/periodic/收发/关闭全程可见。

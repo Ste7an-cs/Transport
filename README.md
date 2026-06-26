@@ -17,7 +17,7 @@
 | 层 | 接口 | 内置实现 |
 |---|---|---|
 | **Transport** 纯字节管道 | `ITransport`(`Open/Close/Send(bytes[,Endpoint])/OnBytes/OnConnect/OnDisconnect`) | `UdpTransport`、`TcpClientTransport`/`TcpConnection`/`TcpServerTransport`、`SerialTransport`、`DdsTransport`(`IDdsTransport`+`Subscribe`,经 `IDdsProvider`/Fake/FastDDS) |
-| **ICodec** 线缆格式 | `ICodec`(`Encode(Message)→bytes` / `Decode(bytes)→0..N Message`) | `SystemCodec`(外部协议帧)、`DdsCodec`(无状态,带交互元数据)、`LengthFieldCodec`、`DatagramCodec` |
+| **ICodec** 线缆格式 | `ICodec`(`Encode(Message)→bytes` / `Decode(bytes)→0..N Message`) | `SystemCodec`(外部协议帧/流式 TCP·串口)、`SystemDatagramCodec`(同帧/无状态报文 UDP)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec` |
 | **Comm** 交互层 | `IExecutor`(线程模型缝)+ `InteractionEngine`(机制)+ `InteractionPolicy`(声明式策略)+ `ITraceSink`(可观测缝) | `ThreadExecutor`;`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈)—— 各为 `InteractionEngine`+对应 policy 的薄壳;`OstreamTraceSink`/`CapturingTraceSink` |
 
 > **用户面定位:** **Comm 层节点是编程主入口** —— 继承 `DdsNode`/`ProtocolNode`(各为引擎+policy 薄壳)重写交互钩子。`ITransport` **不是直接收发面**(对比 0.1.0),而是 ① **装配缝**(你实例化一个具体 transport 注入节点构造,换协议只换 transport)+ ② **裸字节逃生口**(只要字节管道时直接持 `shared_ptr<ITransport>` 用 `OnBytes`/`Send`,如下方 UDP 例)。它保持公共干净接口,是分层、可测(`FakeTransport`)、可替换的支点。
@@ -125,11 +125,23 @@ link->StopRepeating(h);
 
 > **接入前需替换的外部常量**:`SystemCodec` 的 `CrcFn`(真实 CRC16 算法,构造注入)与 `FrameType` 六类的真实字节值(枚举占位)。两端一致即可。
 
-> **完整可运行 demo**:[`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备两个 `ProtocolNode` 经 TCP 对接(SystemCodec 是有状态流式切帧,与 TCP/串口字节流匹配;不用 UDP——见 demo 头注),覆盖 5 种发送模式 + 应答 + 周期 STATE + 心跳 + 超时重发 + trace。运行:
+> **UDP(1:多)**:UDP 是报文边界语义,用**无状态报文版** `SystemDatagramCodec`(而非流式 `SystemCodec`),并按需开两个开关:
+> ```cpp
+> ProtocolConfig pc; pc.protocol_id = 1; pc.reply_to_source = true;   // 应答/ack 回到入站来源 ip:port
+> auto node = std::make_shared<MyNode>(
+>     std::make_shared<UdpTransport>(udp_cfg),
+>     std::make_unique<SystemDatagramCodec>(), pc);                   // 报文版 codec
+> node->Request(cmd, payload, cb, Endpoint::Net(device_ip, device_port));  // 经一个 socket 发指定设备
+> ```
+> `reply_to_source` 覆盖服务端 `Responder` 回应与客户端 `needfeedback` 自动 ack;发送方法尾参 `Endpoint::Net` 让一个 socket 对多设备。TCP/串口用流式 `SystemCodec`、留 `reply_to_source=false`。
+
+> **完整可运行 demo**:
+> - [`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备经 **TCP** 对接,5 种发送模式 + 应答 + 周期 + 心跳 + 超时重发 + trace(SystemCodec 有状态流式,配字节流;头注解释为何不用 UDP)。
+> - [`examples/protocol_udp_demo.cpp`](examples/protocol_udp_demo.cpp) —— **UDP 1:多**:1 控制器(:7000)向 2 设备(:7001/:7002)发命令,`SystemDatagramCodec` + `reply_to_source` + 每发 `Endpoint::Net`,应答经来源回到控制器。
 > ```bash
 > cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
-> cmake --build build -j --target protocol_node_demo
-> ./build/protocol_node_demo
+> cmake --build build -j --target protocol_node_demo protocol_udp_demo
+> ./build/protocol_node_demo   # TCP;  ./build/protocol_udp_demo   # UDP 1:多
 > ```
 
 ### TCP 服务端(每连接独立节点)
@@ -173,7 +185,8 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 ## 状态(0.2.0 开发线)
 
 - [x] **Transport 层**:UDP、TCP(client/connection/server)、串口、DDS(纯字节 pub-sub + provider 抽象 / Fake / 可选 FastDDS)
-- [x] **Codec 层**:`SystemCodec`(外部协议帧)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec`
+- [x] **Codec 层**:`SystemCodec`(外部协议帧,流式)、`SystemDatagramCodec`(同帧无状态报文版,配 UDP)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec`
+- [x] **外部协议 UDP 1:多**:`SystemDatagramCodec` + `reply_to_source`(应答回送来源)+ 发送可指定 `Endpoint`(主动多发)
 - [x] **Comm 层**:`IExecutor`/`ThreadExecutor`、**`InteractionEngine`(机制一份)+ `InteractionPolicy`(声明式策略)**、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈:5 模式 + 重发 + repeating + 心跳 + 双角色)——节点为薄壳
 - [x] **可观测性**:可插拔结构化 trace `ITraceSink`(引擎咽喉点;`OstreamTraceSink`/`CapturingTraceSink`;观测-only、近零开销)
 - [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、codec/transport trace 采用、正式发布 0.2.0
