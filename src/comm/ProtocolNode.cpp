@@ -31,7 +31,7 @@ ProtocolNode::ProtocolNode(std::shared_ptr<ITransport> transport, std::unique_pt
     : engine_(std::make_shared<InteractionEngine>(
           std::move(transport),
           codec ? std::move(codec) : std::unique_ptr<ICodec>(new SystemCodec()),
-          std::unique_ptr<InteractionPolicy>(new ProtocolPolicy(config.protocol_id)),
+          std::unique_ptr<InteractionPolicy>(new ProtocolPolicy(config.protocol_id, config.reply_to_source)),
           std::move(executor), queue_capacity)),
       config_(config) {}
 

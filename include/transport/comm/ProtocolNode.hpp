@@ -25,6 +25,7 @@ struct ProtocolConfig {
   uint32_t response_timeout_ms = 1000;
   uint32_t max_retries = 3;
   uint32_t heartbeat_interval_ms = 0;
+  bool     reply_to_source = false;    // 1:多 UDP 置 true:应答/ack 回到入站来源 ip:port
 };
 
 class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {

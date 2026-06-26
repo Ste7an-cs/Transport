@@ -83,6 +83,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/comm/trace_sink_test.cpp
     tests/comm/interaction_trace_test.cpp
     tests/comm/protocol_node_test.cpp
+    tests/comm/protocol_policy_test.cpp
   )
   target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
