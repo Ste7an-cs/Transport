@@ -196,6 +196,8 @@ void InteractionEngine::Dispatch(Message msg) {
   bool matched = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    // 仅按 Key 配对,不校验回应来源。1:多 UDP 下注意:并发挂起请求受 Key 空间限制
+    // (ProtocolPolicy 为 session 0–255,≤256 并发),且来源不符的回应若 Key 偶合也会被接受。
     auto it = pending_.find(key);
     if (it != pending_.end()) {
       matched = true;
