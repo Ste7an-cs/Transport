@@ -289,14 +289,13 @@ void InteractionEngine::FirePeriodic(uint32_t handle) {
 }
 
 void InteractionEngine::StopPeriodic(uint32_t handle) {
-  IExecutor::TimerId t = 0;
+  IExecutor::TimerId t = 0; FrameTag tg = 0; bool found = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = periodics_.find(handle);
-    if (it != periodics_.end()) { t = it->second.timer;
-      Trace({TraceLevel::kTrace, "periodic", "stop", "", "", "", it->second.tag, kNoNum, -1});
-      periodics_.erase(it); }
+    if (it != periodics_.end()) { t = it->second.timer; tg = it->second.tag; periodics_.erase(it); found = true; }
   }
+  if (found) Trace({TraceLevel::kTrace, "periodic", "stop", "", "", "", tg, kNoNum, -1});
   if (t) executor_->Cancel(t);
 }
 
