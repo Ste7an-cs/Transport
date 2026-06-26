@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "transport/ICodec.hpp"
+#include "transport/ITraceSink.hpp"
 #include "transport/Message.hpp"
 #include "transport/Result.hpp"
 #include "transport/comm/IExecutor.hpp"
@@ -46,6 +47,8 @@ class DdsNode : public std::enable_shared_from_this<DdsNode> {
   Status Open();
   void   Close();
   bool   IsOpen() const;
+
+  void SetTrace(std::shared_ptr<ITraceSink> t) { engine_->SetTrace(std::move(t)); }
 
   Status Subscribe(const std::string& topic);
   Status Unsubscribe(const std::string& topic);

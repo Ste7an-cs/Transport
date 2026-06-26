@@ -3,6 +3,7 @@
 #include "fake_transport.hpp"
 #include "inline_executor.hpp"
 
+#include "transport/ITraceSink.hpp"
 #include "transport/codec/SystemCodec.hpp"
 
 #include <functional>
@@ -237,6 +238,18 @@ TEST(ProtocolNode, RepeatingZeroIntervalRejected) {
   uint32_t h = p.a->StartRepeating(0x10, P({0xAB}), 0);
   EXPECT_EQ(h, 0u);              // 0 间隔被拒,返回无效句柄 0
   EXPECT_EQ(p.b->commands, 0);   // 未发任何 STATE 帧
+  p.Close();
+}
+
+TEST(ProtocolNode, SetTraceForwardsToEngine) {
+  Pair p;
+  auto cap = std::make_shared<transport::CapturingTraceSink>();
+  p.a->SetTrace(cap);               // 节点透传 → 引擎 SetTrace
+  p.Open();
+  (void)p.a->SendNoResponse(/*cmd=*/0x10, P({1}));
+  bool sawSend = false;
+  for (const auto& r : cap->Records()) if (r.category == "send") sawSend = true;
+  EXPECT_TRUE(sawSend);              // 引擎在发起端发了 trace,证明透传生效
   p.Close();
 }
 
