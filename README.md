@@ -125,7 +125,7 @@ link->StopRepeating(h);
 
 > **接入前需替换的外部常量**:`SystemCodec` 的 `CrcFn`(真实 CRC16 算法,构造注入)与 `FrameType` 六类的真实字节值(枚举占位)。两端一致即可。
 
-> **完整可运行 demo**:[`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备两个 `ProtocolNode` 经 UDP 回环对接,覆盖 5 种发送模式 + 应答 + 周期 STATE + 心跳 + 超时重发 + trace。运行:
+> **完整可运行 demo**:[`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备两个 `ProtocolNode` 经 TCP 对接(SystemCodec 是有状态流式切帧,与 TCP/串口字节流匹配;不用 UDP——见 demo 头注),覆盖 5 种发送模式 + 应答 + 周期 STATE + 心跳 + 超时重发 + trace。运行:
 > ```bash
 > cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
 > cmake --build build -j --target protocol_node_demo

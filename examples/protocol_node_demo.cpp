@@ -1,8 +1,8 @@
 // =============================================================================
 // protocol_node_demo.cpp — ProtocolNode 完整用法演示
 //
-// 演示「控制器(controller)」与「设备(device)」两个 ProtocolNode 经 UDP 回环
-// 对接外部协议(SystemCodec 帧),覆盖 ProtocolNode 的全部用法:
+// 演示「控制器(controller)」与「设备(device)」两个 ProtocolNode 经 TCP 对接外部
+// 协议(SystemCodec 帧),覆盖 ProtocolNode 的全部用法:
 //
 //   1. 构造与生命周期         —— ctor(transport, codec=null→SystemCodec, config) / Open / Close
 //   2. 接收角色钩子           —— 继承 OnCommand / OnHeartbeat / OnError
@@ -16,9 +16,22 @@
 //   5. 周期心跳               —— config.heartbeat_interval_ms > 0,对端 OnHeartbeat
 //   6. 可观测 trace           —— SetTrace(OstreamTraceSink) 打印全量交互流
 //
-// 关键语义:message_id = 命令码(每个命令固定值,发送方法首参 cmd);(session_id,
-// message_id) 是请求-应答匹配键,session_id 由引擎滚动。两端用同一份默认 SystemCodec
-// (同 CrcFn / 同 frm_type 占位值)即可互通;真实对接时换成外部系统的 CRC 算法与帧类型字节值。
+// ── 为什么用 TCP(而不是 UDP)? ────────────────────────────────────────────
+//   SystemCodec 是【有状态的流式 codec】:内部维护滚动缓冲 buffer_,每次 Decode 把新
+//   字节 append 进去,扫描 AA BB CC DD 同步头,取出能凑齐的完整帧,半截帧留到下次。
+//   这套「跨多次读拼帧 + 坏帧 resync」正是为【字节流】(TCP / 串口)设计的——一次 read
+//   可能只到半个帧、也可能含多个帧,靠滚动缓冲与同步头/CRC 切分。TCP 与它天然匹配。
+//
+//   UDP 是【报文边界】语义(一次收 = 一个完整 datagram),把有状态流式 codec 套在 UDP 上
+//   是语义错配,且有真实隐患:
+//     · 多对端:设备一个 UDP socket 收多个控制器 → 各家 datagram 混进【同一个】buffer_,
+//       无法按对端区分 → 帧被拼接污染。(流式 codec 没有「按来源分缓冲」的概念。)
+//     · 半截/截断报文:某个 datagram 不是整帧(frm_len 异常等)→ 残留字节滞留 buffer_,
+//       被【拼到下一个本来正常的 datagram 前面】→ 污染,需 resync 才(可能)恢复。
+//   仅当「单一对端 + 每个 datagram 恰好整帧 + 不乱序丢半截」时它才碰巧能跑(回环即如此)。
+//   若确需 UDP,应让每个 datagram 承载整帧并配【无状态】codec(按报文独立解码),而不是
+//   SystemCodec。本 demo 因此用 TCP——让有状态切帧真正发挥作用,不教易错的用法。
+//   (同一套 ProtocolNode/SystemCodec 也适用串口,串口同为字节流,与 TCP 同理。)
 //
 // 构建运行(需 -DTRANSPORT_BUILD_EXAMPLES=ON):
 //   cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
@@ -36,18 +49,23 @@
 
 #include "transport/ITraceSink.hpp"
 #include "transport/comm/ProtocolNode.hpp"
-#include "transport/udp/UdpConfig.hpp"
-#include "transport/udp/UdpTransport.hpp"
+#include "transport/tcp/TcpClientConfig.hpp"
+#include "transport/tcp/TcpClientTransport.hpp"
+#include "transport/tcp/TcpServerConfig.hpp"
+#include "transport/tcp/TcpServerTransport.hpp"
 
+using transport::ITransport;
 using transport::Message;
 using transport::OstreamTraceSink;
 using transport::ProtocolConfig;
 using transport::ProtocolNode;
 using transport::Result;
 using transport::Status;
+using transport::TcpClientConfig;
+using transport::TcpClientTransport;
+using transport::TcpServerConfig;
+using transport::TcpServerTransport;
 using transport::TraceLevel;
-using transport::UdpConfig;
-using transport::UdpTransport;
 
 // ---- 命令码(message_id):每个命令一个固定值,不自增 ----
 namespace cmd {
@@ -127,22 +145,36 @@ class Controller : public ProtocolNode {
   void OnError(const std::string& e) override { log("controller", "OnError: " + e); }
 };
 
+// 设备节点在 server 的 OnAccept 回调里(accept 线程)创建,需在外层持住保活。
+std::mutex g_dev_mu;
+std::shared_ptr<Device> g_device;
+
 int main() {
   using namespace std::chrono_literals;
 
-  // ---- 1. 建两端的 UDP 回环传输 ----
-  // device 绑 6001、默认发往 6000;controller 绑 6000、默认发往 6001。
-  UdpConfig dev_cfg;
-  dev_cfg.local_addr = "127.0.0.1"; dev_cfg.local_port = 6001;
-  dev_cfg.remote_addr = "127.0.0.1"; dev_cfg.remote_port = 6000;
+  // ---- 1. 设备端:TCP 服务端监听 127.0.0.1:6000;每接受一个连接,在该连接上建一个 Device ----
+  TcpServerConfig srv_cfg;
+  srv_cfg.bind_addr = "127.0.0.1";
+  srv_cfg.port = 6000;
+  auto server = std::make_shared<TcpServerTransport>(srv_cfg);
 
-  UdpConfig ctl_cfg;
-  ctl_cfg.local_addr = "127.0.0.1"; ctl_cfg.local_port = 6000;
-  ctl_cfg.remote_addr = "127.0.0.1"; ctl_cfg.remote_port = 6001;
-
-  // ---- 2. 建两个 ProtocolNode(codec 传 nullptr → 默认 SystemCodec) ----
   ProtocolConfig dev_pc;
   dev_pc.protocol_id = 1;
+
+  server->OnAccept([dev_pc](std::shared_ptr<ITransport> conn) {
+    // conn 是独立 ITransport(一条 TCP 连接,字节流);在其上建设备节点(默认 SystemCodec)。
+    auto dev = std::make_shared<Device>(conn, /*codec=*/nullptr, dev_pc);
+    (void)dev->Open();
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    g_device = dev;                       // 持住保活
+    log("device", "已接受连接并 Open");
+  });
+  if (Status s = server->Open(); !s) { std::cerr << "server open: " << s.error << "\n"; return 1; }
+
+  // ---- 2. 控制器端:TCP 客户端连接设备 ----
+  TcpClientConfig cli_cfg;
+  cli_cfg.host = "127.0.0.1";
+  cli_cfg.port = 6000;
 
   ProtocolConfig ctl_pc;
   ctl_pc.protocol_id = 1;
@@ -150,19 +182,16 @@ int main() {
   ctl_pc.max_retries = 3;               // 超时重发上限(达上限仍无回应 → timeout: 失败)
   ctl_pc.heartbeat_interval_ms = 1000;  // >0 → Open 后每 1s 自动发 HEARTBEAT 给对端
 
-  auto device = std::make_shared<Device>(
-      std::make_shared<UdpTransport>(dev_cfg), /*codec=*/nullptr, dev_pc);
   auto controller = std::make_shared<Controller>(
-      std::make_shared<UdpTransport>(ctl_cfg), /*codec=*/nullptr, ctl_pc);
+      std::make_shared<TcpClientTransport>(cli_cfg), /*codec=*/nullptr, ctl_pc);
 
   // ---- 3. 可观测:给控制器挂一个打印 sink,看全量交互流(send/request/dispatch/retransmit/...) ----
   controller->SetTrace(std::make_shared<OstreamTraceSink>(std::cerr, TraceLevel::kDebug));
 
-  // ---- 4. Open(先开设备,再开控制器) ----
-  if (Status s = device->Open(); !s)     { std::cerr << "device open: "     << s.error << "\n"; return 1; }
+  // ---- 4. Open 控制器(发起连接)。等连接建立 + 设备节点就绪。 ----
   if (Status s = controller->Open(); !s) { std::cerr << "controller open: " << s.error << "\n"; return 1; }
-  log("main", "两端已 Open(controller 心跳已启动)");
-  std::this_thread::sleep_for(100ms);
+  std::this_thread::sleep_for(300ms);
+  log("main", "已连接(controller 心跳已启动)");
 
   // ---- 5. 五种发送交互模式 ----
 
@@ -199,7 +228,7 @@ int main() {
       });
   std::this_thread::sleep_for(200ms);
 
-  // (e) 周期发送:每 300ms 发一帧 STATE,发 3 拍后停。
+  // (e) 周期发送:每 300ms 发一帧 STATE,发几拍后停。
   log("main", "[e] StartRepeating(TELEMETRY, 300ms)");
   uint32_t h = controller->StartRepeating(cmd::kTelemetry, {0xEE}, /*interval_ms=*/300);
   std::this_thread::sleep_for(1000ms);   // 期间约 3~4 拍 STATE + 1 次心跳
@@ -216,6 +245,10 @@ int main() {
   // ---- 7. Close(幂等;终结所有挂起请求、停定时器、停执行器、关传输) ----
   log("main", "Close");
   controller->Close();
-  device->Close();
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    if (g_device) g_device->Close();
+  }
+  server->Close();
   return 0;
 }
