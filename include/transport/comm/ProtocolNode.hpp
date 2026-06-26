@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "transport/Endpoint.hpp"
 #include "transport/ICodec.hpp"
 #include "transport/ITraceSink.hpp"
 #include "transport/ITransport.hpp"
@@ -57,12 +58,17 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
 
   void SetTrace(std::shared_ptr<ITraceSink> t) { engine_->SetTrace(std::move(t)); }
 
-  Status SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload);
-  Status Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response);
-  Status RequestWithResult(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_result);
+  Status SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload,
+                        const Endpoint& to = Endpoint::Default());
+  Status Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response,
+                 const Endpoint& to = Endpoint::Default());
+  Status RequestWithResult(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_result,
+                           const Endpoint& to = Endpoint::Default());
   Status RequestNeedFeedback(uint16_t cmd, std::vector<uint8_t> payload,
-                             ReplyFn on_response, ReplyFn on_result);
-  uint32_t StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms);
+                             ReplyFn on_response, ReplyFn on_result,
+                             const Endpoint& to = Endpoint::Default());
+  uint32_t StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms,
+                          const Endpoint& to = Endpoint::Default());
   void     StopRepeating(uint32_t handle);
 
  protected:

@@ -64,34 +64,37 @@ Status ProtocolNode::Open() {
 void ProtocolNode::Close() { engine_->Close(); }
 bool ProtocolNode::IsOpen() const { return engine_->IsOpen(); }
 
-Status ProtocolNode::SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload) {
-  return engine_->Fire(Cmd(cmd, std::move(payload)), Tag(FrameType::kCommand));
+Status ProtocolNode::SendNoResponse(uint16_t cmd, std::vector<uint8_t> payload, const Endpoint& to) {
+  return engine_->Fire(Cmd(cmd, std::move(payload)), Tag(FrameType::kCommand), to);
 }
 
-Status ProtocolNode::Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response) {
+Status ProtocolNode::Request(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_response,
+                             const Endpoint& to) {
   RequestSpec s; s.request_tag = Tag(FrameType::kCommand); s.terminal_tag = Tag(FrameType::kResponse);
   s.on_terminal = std::move(on_response); s.timeout_ms = config_.response_timeout_ms; s.max_retries = config_.max_retries;
-  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s));
+  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s), to);
 }
 
-Status ProtocolNode::RequestWithResult(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_result) {
+Status ProtocolNode::RequestWithResult(uint16_t cmd, std::vector<uint8_t> payload, ReplyFn on_result,
+                                       const Endpoint& to) {
   RequestSpec s; s.request_tag = Tag(FrameType::kCommand); s.terminal_tag = Tag(FrameType::kResult);
   s.on_terminal = std::move(on_result); s.timeout_ms = config_.response_timeout_ms; s.max_retries = config_.max_retries;
-  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s));
+  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s), to);
 }
 
 Status ProtocolNode::RequestNeedFeedback(uint16_t cmd, std::vector<uint8_t> payload,
-                                         ReplyFn on_response, ReplyFn on_result) {
+                                         ReplyFn on_response, ReplyFn on_result, const Endpoint& to) {
   RequestSpec s; s.request_tag = Tag(FrameType::kCommand);
   s.intermediate_tag = Tag(FrameType::kResponse); s.terminal_tag = Tag(FrameType::kResult);
   s.auto_ack_tag = Tag(FrameType::kResponse);
   s.on_intermediate = [cb = std::move(on_response)](const Message& m) { if (cb) cb(Result<Message>::Success(m)); };
   s.on_terminal = std::move(on_result); s.timeout_ms = config_.response_timeout_ms; s.max_retries = config_.max_retries;
-  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s));
+  return engine_->RequestAwait(Cmd(cmd, std::move(payload)), std::move(s), to);
 }
 
-uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms) {
-  return engine_->StartPeriodic(Cmd(cmd, std::move(payload)), Tag(FrameType::kState), interval_ms);
+uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms,
+                                      const Endpoint& to) {
+  return engine_->StartPeriodic(Cmd(cmd, std::move(payload)), Tag(FrameType::kState), interval_ms, to);
 }
 
 void ProtocolNode::StopRepeating(uint32_t handle) { engine_->StopPeriodic(handle); }
