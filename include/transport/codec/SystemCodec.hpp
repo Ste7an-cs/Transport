@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "transport/ICodec.hpp"
+#include "transport/Message.hpp"
 #include "transport/Result.hpp"
 
 namespace transport {
@@ -20,6 +21,12 @@ using CrcFn = std::function<uint16_t(const uint8_t* body, std::size_t len)>;
 // 默认占位 CRC16-CCITT(poly 0x1021, init 0xFFFF);真实算法实现前经构造注入替换。
 uint16_t DefaultCrc16(const uint8_t* body, std::size_t len);
 
+// 共享帧核:SystemCodec(流式)与 SystemDatagramCodec(报文)共用,逻辑不复制。
+Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc);
+// 从 data[0..len) 扫描尽可能多的完整帧 push 进 out,返回已消费字节数(剩余为未完成/残留)。
+std::size_t ScanSystemFrames(const uint8_t* data, std::size_t len, const CrcFn& crc,
+                             std::vector<Message>& out);
+
 class SystemCodec : public ICodec {
  public:
   explicit SystemCodec(CrcFn crc = DefaultCrc16);
@@ -28,8 +35,6 @@ class SystemCodec : public ICodec {
   Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override;
 
  private:
-  static constexpr std::size_t kHeaderLen = 15;
-  static constexpr std::size_t kMaxBody = 65535;
   CrcFn crc_;
   std::vector<uint8_t> buffer_;
 };

@@ -9,6 +9,8 @@ namespace transport {
 
 namespace {
 constexpr std::array<uint8_t, 4> kHeadFlag{0xAA, 0xBB, 0xCC, 0xDD};
+constexpr std::size_t kHeaderLen = 15;
+constexpr std::size_t kMaxBody = 65535;
 
 void PutU16LE(std::vector<uint8_t>& out, uint16_t v) {
   out.push_back(static_cast<uint8_t>(v & 0xFF));
@@ -36,7 +38,7 @@ uint16_t DefaultCrc16(const uint8_t* body, std::size_t len) {
 
 SystemCodec::SystemCodec(CrcFn crc) : crc_(std::move(crc)) {}
 
-Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
+Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
   using R = Result<std::vector<uint8_t>>;
   if (msg.payload.size() + 2 > kMaxBody) return R::Fail("frame: payload too long");
 
@@ -44,50 +46,50 @@ Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
   body.reserve(2 + msg.payload.size());
   PutU16LE(body, msg.message_id);
   body.insert(body.end(), msg.payload.begin(), msg.payload.end());
-  const uint16_t crc = crc_(body.data(), body.size());
+  const uint16_t crc_v = crc(body.data(), body.size());
 
   std::vector<uint8_t> out;
   out.reserve(kHeaderLen + body.size());
-  out.insert(out.end(), kHeadFlag.begin(), kHeadFlag.end());          // head_flag
-  out.push_back(static_cast<uint8_t>(msg.frm_type));                  // frm_type
-  out.push_back(msg.protocol_id);                                    // protocol_id
-  out.push_back(msg.session_id);                                     // session_id
-  out.insert(out.end(), {0, 0, 0, 0});                               // reserve
-  PutU16LE(out, crc);                                                // crc
-  PutU16LE(out, static_cast<uint16_t>(body.size()));                 // frm_len
-  out.insert(out.end(), body.begin(), body.end());                   // frm_body
+  out.insert(out.end(), kHeadFlag.begin(), kHeadFlag.end());
+  out.push_back(static_cast<uint8_t>(msg.frm_type));
+  out.push_back(msg.protocol_id);
+  out.push_back(msg.session_id);
+  out.insert(out.end(), {0, 0, 0, 0});
+  PutU16LE(out, crc_v);
+  PutU16LE(out, static_cast<uint16_t>(body.size()));
+  out.insert(out.end(), body.begin(), body.end());
   return R::Success(std::move(out));
 }
 
-Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
-  using R = Result<std::vector<Message>>;
-  buffer_.insert(buffer_.end(), data, data + len);
-  std::vector<Message> out;
-  std::size_t off = 0;
+Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
+  return EncodeSystemFrame(msg, crc_);
+}
 
+std::size_t ScanSystemFrames(const uint8_t* data, std::size_t len, const CrcFn& crc,
+                             std::vector<Message>& out) {
+  std::size_t off = 0;
   while (true) {
-    // 1. 同步:从 off 起找 head_flag。
     std::size_t flag = off;
     bool found = false;
-    while (flag + 4 <= buffer_.size()) {
-      if (MatchFlag(buffer_.data() + flag)) { found = true; break; }
+    while (flag + 4 <= len) {
+      if (MatchFlag(data + flag)) { found = true; break; }
       ++flag;
     }
-    if (!found) { off = flag; break; }   // 保留末尾 ≤3 字节(可能半个同步头)
+    if (!found) { off = flag; break; }
     off = flag;
 
-    if (buffer_.size() - off < kHeaderLen) break;                 // 头不全,等
-    const uint8_t* h = buffer_.data() + off;
+    if (len - off < kHeaderLen) break;
+    const uint8_t* h = data + off;
     const uint16_t crc_in = GetU16LE(h + 11);
     const uint16_t frm_len = GetU16LE(h + 13);
-    if (buffer_.size() - off - kHeaderLen < frm_len) break;       // body 不全,等
+    if (len - off - kHeaderLen < frm_len) break;
 
     const uint8_t* bd = h + kHeaderLen;
-    if (crc_(bd, frm_len) != crc_in) { off += 1; continue; }      // CRC 不符 → resync
+    if (crc(bd, frm_len) != crc_in) { off += 1; continue; }
 
     Message m;
     m.frm_type = static_cast<FrameType>(h[4]);
-    switch (m.frm_type) {                                         // 未知字节 → kUnknown
+    switch (m.frm_type) {
       case FrameType::kUnknown: case FrameType::kCommand: case FrameType::kResponse:
       case FrameType::kResult: case FrameType::kState: case FrameType::kHeartbeat: break;
       default: m.frm_type = FrameType::kUnknown;
@@ -101,9 +103,15 @@ Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_
     out.push_back(std::move(m));
     off += kHeaderLen + frm_len;
   }
+  return off;
+}
 
-  if (off > 0) buffer_.erase(buffer_.begin(), buffer_.begin() + off);
-  return R::Success(std::move(out));
+Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
+  buffer_.insert(buffer_.end(), data, data + len);
+  std::vector<Message> out;
+  const std::size_t consumed = ScanSystemFrames(buffer_.data(), buffer_.size(), crc_, out);
+  if (consumed > 0) buffer_.erase(buffer_.begin(), buffer_.begin() + consumed);
+  return Result<std::vector<Message>>::Success(std::move(out));
 }
 
 }  // namespace transport

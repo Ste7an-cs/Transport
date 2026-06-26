@@ -3,6 +3,7 @@
 #include "fake_transport.hpp"
 #include "inline_executor.hpp"
 
+#include "transport/Endpoint.hpp"
 #include "transport/ITraceSink.hpp"
 #include "transport/codec/SystemCodec.hpp"
 
@@ -33,6 +34,16 @@ class RecordingTransport : public FakeTransport {
   std::vector<std::vector<uint8_t>> sent;
   transport::Status Send(const std::vector<uint8_t>& bytes) override {
     sent.push_back(bytes);
+    return FakeTransport::Send(bytes);
+  }
+};
+
+// 记录最近一次带 Endpoint 的 Send 的目的地(用于验证发送方法透传 to)。
+class DestRecorder : public FakeTransport {
+ public:
+  transport::Endpoint last_to;
+  transport::Status Send(const std::vector<uint8_t>& bytes, const transport::Endpoint& to) override {
+    last_to = to;
     return FakeTransport::Send(bytes);
   }
 };
@@ -261,4 +272,17 @@ TEST(ProtocolNode, HeartbeatPeriodic) {
   p.exa->FireAll();                // a 的心跳定时器到点 → 再发 HEARTBEAT → b 收
   EXPECT_GE(p.b->heartbeats, 2);   // b 的 OnHeartbeat 周期性被调
   p.Close();
+}
+
+TEST(ProtocolNode, SendForwardsDestinationEndpoint) {
+  auto rec = std::make_shared<DestRecorder>();
+  auto peer = std::make_shared<FakeTransport>();
+  FakeTransport::Link(rec, peer);
+  auto node = std::make_shared<TestNode>(rec, nullptr, Cfg(), std::make_unique<InlineExecutor>());
+  (void)node->Open();
+  (void)node->SendNoResponse(0x10, P({1}), transport::Endpoint::Net("9.9.9.9", 1234));
+  EXPECT_EQ(rec->last_to.kind, transport::Endpoint::Kind::kNet);
+  EXPECT_EQ(rec->last_to.host, "9.9.9.9");
+  EXPECT_EQ(rec->last_to.port, 1234);
+  node->Close();
 }
