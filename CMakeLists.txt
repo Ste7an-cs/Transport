@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
+option(TRANSPORT_BUILD_EXAMPLES "Build example programs" OFF)
 
 add_library(transport STATIC
   src/core/version.cpp
@@ -89,4 +90,9 @@ if(TRANSPORT_BUILD_TESTS)
     target_sources(transport_tests PRIVATE tests/dds/fastdds_provider_test.cpp)
   endif()
   gtest_discover_tests(transport_tests)
+endif()
+
+if(TRANSPORT_BUILD_EXAMPLES)
+  add_executable(protocol_node_demo examples/protocol_node_demo.cpp)
+  target_link_libraries(protocol_node_demo PRIVATE transport Threads::Threads)
 endif()
