@@ -181,3 +181,43 @@ TEST(InteractionTrace, DecodeFailEmitsWarn) {
   EXPECT_EQ(Count(*cap, "decode", "decode-fail"), 1u);
   e->Close();
 }
+
+TEST(InteractionTrace, DecodeSuccessEmitsCount) {
+  Net n;
+  n.a->OnInboundDeliver([](const Message&) {});
+  n.Open();
+  ASSERT_TRUE(static_cast<bool>(n.b->Fire(Pay({1, 2, 3}), T(MessageKind::kOneway))));
+  bool found = false;
+  for (const auto& r : n.cap->Records())
+    if (r.category == "decode" && r.message.empty()) { found = true; EXPECT_GE(r.size, 1); }
+  EXPECT_TRUE(found);
+  n.Close();
+}
+
+TEST(InteractionTrace, ReplyTraced) {
+  Net n;
+  auto capB = std::make_shared<CapturingTraceSink>();
+  n.b->SetTrace(capB);
+  n.b->OnInboundRequest([&](const Message& req) {
+    (void)n.b->SendReply(req, T(MessageKind::kReply), {7});
+  });
+  n.Open();
+  RequestSpec s; s.request_tag = T(MessageKind::kRequest); s.terminal_tag = T(MessageKind::kReply);
+  s.on_terminal = [](Result<Message>) {};
+  ASSERT_TRUE(static_cast<bool>(n.a->RequestAwait(Pay({5}), s)));
+  EXPECT_EQ(Count(*capB, "reply"), 1u);
+  n.Close();
+}
+
+TEST(InteractionTrace, PeriodicStartFireStopTraced) {
+  Net n;
+  n.b->OnInboundDeliver([](const Message&) {});
+  n.Open();
+  uint32_t h = n.a->StartPeriodic(Pay({1}), T(MessageKind::kNotify), /*interval_ms=*/50);
+  n.exa->FireAll();              // 驱动一次 periodic fire
+  n.a->StopPeriodic(h);
+  EXPECT_EQ(Count(*n.cap, "periodic", "start"), 1u);
+  EXPECT_GE(Count(*n.cap, "periodic", "fire"), 1u);
+  EXPECT_EQ(Count(*n.cap, "periodic", "stop"), 1u);
+  n.Close();
+}

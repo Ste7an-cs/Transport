@@ -3,7 +3,6 @@
 // ITraceSink.hpp — 可插拔结构化 trace。层中立:放 transport 根,供任意层(当前仅
 // InteractionEngine)注入。事件为零分配视图结构;sink 实现须线程安全。
 
-#include <cstddef>
 #include <iostream>
 #include <mutex>
 #include <ostream>
@@ -45,6 +44,9 @@ class OstreamTraceSink : public ITraceSink {
   explicit OstreamTraceSink(std::ostream& os = std::cerr, TraceLevel min = TraceLevel::kDebug)
       : os_(os), min_(min) {}
 
+  OstreamTraceSink(const OstreamTraceSink&) = delete;
+  OstreamTraceSink& operator=(const OstreamTraceSink&) = delete;
+
   void OnTrace(const TraceEvent& ev) override {
     if (static_cast<int>(ev.level) < static_cast<int>(min_)) return;
     std::lock_guard<std::mutex> lk(mu_);
@@ -83,6 +85,10 @@ class CapturingTraceSink : public ITraceSink {
     std::string category, message, key, endpoint, error;
     int tag; long size; int attempt;
   };
+
+  CapturingTraceSink() = default;
+  CapturingTraceSink(const CapturingTraceSink&) = delete;
+  CapturingTraceSink& operator=(const CapturingTraceSink&) = delete;
 
   void OnTrace(const TraceEvent& ev) override {
     std::lock_guard<std::mutex> lk(mu_);

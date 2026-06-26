@@ -58,6 +58,7 @@ Status InteractionEngine::Open() {
       s->Trace({TraceLevel::kWarn, "decode", "decode-fail", "", "", e, kNoTag, kNoNum, -1});
       return;
     }
+    s->Trace({TraceLevel::kTrace, "decode", "", "", "", "", kNoTag, static_cast<long>(msgs.value.size()), -1});
     for (auto& m : msgs.value) {
       m.source = from;
       if (m.topic.empty()) m.topic = from;
