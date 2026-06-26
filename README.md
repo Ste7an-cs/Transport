@@ -18,7 +18,7 @@
 |---|---|---|
 | **Transport** 纯字节管道 | `ITransport`(`Open/Close/Send(bytes[,Endpoint])/OnBytes/OnConnect/OnDisconnect`) | `UdpTransport`、`TcpClientTransport`/`TcpConnection`/`TcpServerTransport`、`SerialTransport`、`DdsTransport`(`IDdsTransport`+`Subscribe`,经 `IDdsProvider`/Fake/FastDDS) |
 | **ICodec** 线缆格式 | `ICodec`(`Encode(Message)→bytes` / `Decode(bytes)→0..N Message`) | `SystemCodec`(外部协议帧)、`DdsCodec`(无状态,带交互元数据)、`LengthFieldCodec`、`DatagramCodec` |
-| **Comm** 交互层 | `IExecutor`(线程模型缝)+ `InteractionEngine`(机制)+ `InteractionPolicy`(声明式策略) | `ThreadExecutor`;`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈)—— 各为 `InteractionEngine`+对应 policy 的薄壳 |
+| **Comm** 交互层 | `IExecutor`(线程模型缝)+ `InteractionEngine`(机制)+ `InteractionPolicy`(声明式策略)+ `ITraceSink`(可观测缝) | `ThreadExecutor`;`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈)—— 各为 `InteractionEngine`+对应 policy 的薄壳;`OstreamTraceSink`/`CapturingTraceSink` |
 
 > **用户面定位:** **Comm 层节点是编程主入口** —— 继承 `DdsNode`/`ProtocolNode`(各为引擎+policy 薄壳)重写交互钩子。`ITransport` **不是直接收发面**(对比 0.1.0),而是 ① **装配缝**(你实例化一个具体 transport 注入节点构造,换协议只换 transport)+ ② **裸字节逃生口**(只要字节管道时直接持 `shared_ptr<ITransport>` 用 `OnBytes`/`Send`,如下方 UDP 例)。它保持公共干净接口,是分层、可测(`FakeTransport`)、可替换的支点。
 
@@ -50,6 +50,12 @@ ctest --test-dir build --output-on-failure
 ### 交互层心智:引擎 + 策略
 
 内置两个节点开箱即用 —— `DdsNode`(DDS)与 `ProtocolNode`(外部协议),各是 **`InteractionEngine`**(通用机制:挂起表/超时/重发/分发/periodic/并发纪律,只写一处)+ 一个声明式 **`InteractionPolicy`**(协议差异:匹配键 `Key`、判别符 `FrameTag`、应答寻址、无主路由)的薄壳。**接一套新协议 = 写一个新 `InteractionPolicy`**(7 个纯函数 + `RequestSpec` 配置),复用同一引擎,不再碰并发代码。下面是两个内置节点的用法。
+
+> **调试可观测(`ITraceSink`):** 任一节点 `Open()` 前 `node->SetTrace(...)` 即可看全量交互流(收发/分发/超时/重发/periodic/关闭)。开发用一行挂到 stderr:
+> ```cpp
+> node->SetTrace(std::make_shared<OstreamTraceSink>(std::cerr, TraceLevel::kTrace));
+> ```
+> 集成时实现 `ITraceSink` 接自有日志后端;测试用 `CapturingTraceSink` 断言事件序列。**观测-only、不挂 sink 时近零开销**,字节流逐字不变。
 
 ### DDS 发布-订阅 + 多路请求-应答(`DdsNode`)
 
@@ -162,7 +168,8 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 - [x] **Transport 层**:UDP、TCP(client/connection/server)、串口、DDS(纯字节 pub-sub + provider 抽象 / Fake / 可选 FastDDS)
 - [x] **Codec 层**:`SystemCodec`(外部协议帧)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec`
 - [x] **Comm 层**:`IExecutor`/`ThreadExecutor`、**`InteractionEngine`(机制一份)+ `InteractionPolicy`(声明式策略)**、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈:5 模式 + 重发 + repeating + 心跳 + 双角色)——节点为薄壳
-- [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、正式发布 0.2.0
+- [x] **可观测性**:可插拔结构化 trace `ITraceSink`(引擎咽喉点;`OstreamTraceSink`/`CapturingTraceSink`;观测-only、近零开销)
+- [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、codec/transport trace 采用、正式发布 0.2.0
 
 ---
 

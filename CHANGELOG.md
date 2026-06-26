@@ -8,7 +8,16 @@
 
 ## [Unreleased]
 
-> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+> **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象 → ITraceSink 可观测。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
+
+### 特性:可插拔结构化 Trace(`ITraceSink`)— 2026-06-26(PR #8)
+> 此前全库零日志,唯一可观测点是引擎的 `on_error_(string)`。给交互层加一套**观测-only、近零开销**的 trace,让分发/超时/重发/auto-ack/periodic/收发/关闭全程可见。
+- **新增** `ITraceSink`(层中立 `include/transport/ITraceSink.hpp`,header-only):`TraceLevel{kTrace,kDebug,kInfo,kWarn,kError}` + 零分配 `TraceEvent`(`string_view`+`int` 视图)+ 两个内置 sink `OstreamTraceSink`(→ ostream,默认 stderr)/`CapturingTraceSink`(深拷贝,测试用)。
+- **新增** `InteractionEngine::SetTrace`(Open 前注入)+ 全咽喉点埋点:`open`/`close`/`conn`/`send`/`request`/`reply`/`recv`/`decode`(成功=条数 / `decode-fail`)/`dispatch`(match-terminal·match-intermediate·auto-ack)/`unmatched`/`retransmit`/`timeout`/`periodic`(start·fire·stop)/`error`。
+- **新增** `DdsNode`/`ProtocolNode` 透传 `SetTrace`。
+- **观测-only**:无 sink 时单分支、字节流逐字不变;所有 trace 在 `mu_` 外发(不在锁内回调用户 sink → 杜绝慢 sink 阻塞/重入死锁);sink 须线程安全。
+- **预留**:`ITraceSink` 层中立 + 保留 category(`resync`/`frame-drop`/`io`/`reconnect`),后续 codec/transport 加可选 sink 参数即接,接口零改。
+- **验证** 干净构建零告警,100/100(新增 trace_sink + interaction_trace + 节点透传);评审抓出并修掉「StopPeriodic 锁内回调 sink」与「缺 spec §5 decode 成功事件」。
 
 ### 重构:交互机制抽象(`InteractionEngine` + `InteractionPolicy`)— 2026-06-24(PR #7)
 > `CommNode` 与 `ProtocolNode` 曾各自重写同一套交互机制(且各被评审抓出过一个并发 Critical)。三个真实交互节点 = 足够样本,合并机制为一份、最难写对的并发生命周期只写一处。**纯内部重构,DDS/协议行为保持。**
