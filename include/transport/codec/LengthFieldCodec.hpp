@@ -14,12 +14,13 @@
 namespace transport {
 
 struct LengthFieldCodecConfig {
-  std::size_t header_size = 0;
-  std::size_t length_offset = 0;
-  std::size_t length_size = 4;            // 2 / 4 / 8
-  bool big_endian = true;
-  bool length_includes_header = false;
-  std::size_t max_frame_size = 16 * 1024 * 1024;
+  // 帧布局:[header(含一个长度字段)][body]。
+  std::size_t header_size = 0;             // header 总字节数(必须 >0)
+  std::size_t length_offset = 0;           // 长度字段在 header 内的偏移
+  std::size_t length_size = 4;             // 长度字段宽度:2 / 4 / 8 字节
+  bool big_endian = true;                  // 长度字段字节序
+  bool length_includes_header = false;     // 长度值是否含 header(false=仅 body 长)
+  std::size_t max_frame_size = 16 * 1024 * 1024;  // 帧上限(超出 → frame: 错,防恶意超长)
 };
 
 class LengthFieldCodec : public ICodec {

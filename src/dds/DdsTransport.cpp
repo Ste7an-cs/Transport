@@ -33,11 +33,13 @@ void RegisterBuiltinProviders() {
 }
 }  // namespace
 
+// provider 可注入(测试用 FakeDdsProvider(bus));不注入则 Open 时按 config_.provider 名从注册表建。
 DdsTransport::DdsTransport(DdsConfig config, std::unique_ptr<IDdsProvider> provider)
     : config_(std::move(config)), provider_(std::move(provider)) {}
 
 DdsTransport::~DdsTransport() { Close(); }
 
+// Open:确保有 provider(没有则按名 "fake"/"fastdds" 创建)→ provider->Init → 回 OnConnect。
 Status DdsTransport::Open() {
   if (open_.load()) return Ok();
   if (!provider_) {
@@ -80,11 +82,13 @@ Status DdsTransport::Send(const std::vector<uint8_t>& bytes, const Endpoint& to)
   return Status::Fail("config: unknown endpoint kind");
 }
 
+// Subscribe:向 provider 订阅 topic;样本到达时(在 provider 的 listener 线程上)经 OnBytes 交付,
+// from=该 topic。回调捕获 weak_ptr 防引用环(provider→sink→transport,transport→provider)。
 Status DdsTransport::Subscribe(const std::string& topic) {
   if (!open_.load()) return Status::Fail("config: dds not open");
   std::weak_ptr<DdsTransport> wself = weak_from_this();
   auto st = provider_->Subscribe(
-      topic, [wself, topic](const std::vector<uint8_t>& bytes) {
+      topic, [wself, topic](const std::vector<uint8_t>& bytes) {  // ← 在 provider listener 线程跑
         auto s = wself.lock();
         if (!s) return;
         if (s->bytes_cb_)
