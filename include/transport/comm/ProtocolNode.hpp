@@ -72,6 +72,9 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
                              const Endpoint& to = Endpoint::Default());
   uint32_t StartRepeating(uint16_t cmd, std::vector<uint8_t> payload, uint32_t interval_ms,
                           const Endpoint& to = Endpoint::Default());
+  uint32_t StartRepeating(uint16_t cmd, std::function<std::vector<uint8_t>()> state_fn,
+                          uint32_t interval_ms, const Endpoint& to = Endpoint::Default());
+  bool     UpdateRepeating(uint32_t handle, uint16_t cmd, std::vector<uint8_t> payload);
   void     StopRepeating(uint32_t handle);
 
  protected:

@@ -97,6 +97,17 @@ uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::vector<uint8_t> payload
   return engine_->StartPeriodic(Cmd(cmd, std::move(payload)), Tag(FrameType::kState), interval_ms, to);
 }
 
+uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::function<std::vector<uint8_t>()> state_fn,
+                                      uint32_t interval_ms, const Endpoint& to) {
+  return engine_->StartPeriodic(
+      [cmd, fn = std::move(state_fn)]() { return Cmd(cmd, fn()); },
+      Tag(FrameType::kState), interval_ms, to);
+}
+
+bool ProtocolNode::UpdateRepeating(uint32_t handle, uint16_t cmd, std::vector<uint8_t> payload) {
+  return engine_->UpdatePeriodic(handle, Cmd(cmd, std::move(payload)));
+}
+
 void ProtocolNode::StopRepeating(uint32_t handle) { engine_->StopPeriodic(handle); }
 
 }  // namespace transport
