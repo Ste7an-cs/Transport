@@ -211,6 +211,40 @@ TEST(DdsNode, DuplicateReplyIgnored) {
   a->Close(); b->Close();
 }
 
+TEST(DdsNode, PublishingPullSendsLatestSample) {
+  Net net; InlineExecutor* exa = nullptr;
+  auto a = net.Make("A_in", &exa);   // 发布者
+  auto b = net.Make("B_in", nullptr); // 订阅者
+  ASSERT_TRUE(static_cast<bool>(a->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Subscribe("T")));
+  int ctr = 0;
+  uint32_t h = a->StartPublishing(
+      [&ctr] { return Msg({static_cast<uint8_t>(ctr++)}); }, /*interval_ms=*/50, Endpoint::Topic("T"));
+  exa->FireAll();   // 第 2 拍
+  a->StopPublishing(h);
+  ASSERT_GE(b->messages.size(), 2u);
+  EXPECT_EQ(b->messages[0].payload, (std::vector<uint8_t>{0}));   // 立即一帧
+  EXPECT_EQ(b->messages[1].payload, (std::vector<uint8_t>{1}));   // 每拍取最新
+  a->Close(); b->Close();
+}
+
+TEST(DdsNode, UpdatePublishingChangesSample) {
+  Net net; InlineExecutor* exa = nullptr;
+  auto a = net.Make("A_in", &exa);
+  auto b = net.Make("B_in", nullptr);
+  ASSERT_TRUE(static_cast<bool>(a->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Open()));
+  ASSERT_TRUE(static_cast<bool>(b->Subscribe("T")));
+  uint32_t h = a->StartPublishing(Msg({1}), /*interval_ms=*/50, Endpoint::Topic("T"));
+  ASSERT_EQ(b->messages.size(), 1u); EXPECT_EQ(b->messages[0].payload, (std::vector<uint8_t>{1}));
+  EXPECT_TRUE(a->UpdatePublishing(h, Msg({2})));
+  exa->FireAll();
+  ASSERT_EQ(b->messages.size(), 2u); EXPECT_EQ(b->messages[1].payload, (std::vector<uint8_t>{2}));
+  EXPECT_FALSE(a->UpdatePublishing(9999, Msg({3})));
+  a->StopPublishing(h); a->Close(); b->Close();
+}
+
 // 执行器可换性 + 真实并发:默认 ThreadExecutor,future 等回。
 TEST(DdsNode, WorksWithThreadExecutor) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();

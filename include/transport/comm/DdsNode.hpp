@@ -4,6 +4,7 @@
 // 另持 IDdsTransport 供 Subscribe;Open 自动订阅 inbox。须以 shared_ptr 持有。
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
@@ -60,6 +61,11 @@ class DdsNode : public std::enable_shared_from_this<DdsNode> {
                  const Endpoint& to = Endpoint::Default());
   std::future<Result<Message>> Request(Message msg, uint32_t timeout_ms,
                                        const Endpoint& to = Endpoint::Default());
+
+  uint32_t StartPublishing(Message msg, uint32_t interval_ms, const Endpoint& to);
+  uint32_t StartPublishing(std::function<Message()> sample_fn, uint32_t interval_ms, const Endpoint& to);
+  bool     UpdatePublishing(uint32_t handle, Message msg);
+  void     StopPublishing(uint32_t handle);
 
  protected:
   virtual void OnMessage(const Message& /*msg*/) {}

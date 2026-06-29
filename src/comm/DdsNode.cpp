@@ -65,6 +65,17 @@ Status DdsNode::Send(Message msg, const Endpoint& to) {
   return engine_->Fire(std::move(msg), Tag(MessageKind::kNotify), to);
 }
 
+uint32_t DdsNode::StartPublishing(Message msg, uint32_t interval_ms, const Endpoint& to) {
+  return engine_->StartPeriodic(std::move(msg), Tag(MessageKind::kNotify), interval_ms, to);
+}
+uint32_t DdsNode::StartPublishing(std::function<Message()> sample_fn, uint32_t interval_ms, const Endpoint& to) {
+  return engine_->StartPeriodic(std::move(sample_fn), Tag(MessageKind::kNotify), interval_ms, to);
+}
+bool DdsNode::UpdatePublishing(uint32_t handle, Message msg) {
+  return engine_->UpdatePeriodic(handle, std::move(msg));
+}
+void DdsNode::StopPublishing(uint32_t handle) { engine_->StopPeriodic(handle); }
+
 Status DdsNode::Request(Message msg, ReplyFn on_reply, uint32_t timeout_ms, const Endpoint& to) {
   RequestSpec s; s.request_tag = Tag(MessageKind::kRequest); s.terminal_tag = Tag(MessageKind::kReply);
   s.on_terminal = std::move(on_reply); s.timeout_ms = timeout_ms; s.max_retries = 0;
