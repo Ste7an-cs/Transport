@@ -62,8 +62,8 @@ class DdsNode : public std::enable_shared_from_this<DdsNode> {
                                        const Endpoint& to = Endpoint::Default());
 
  protected:
-  virtual void OnMessage(const Message& msg) {}
-  virtual void OnRequest(const Message& req, Responder responder) {}
+  virtual void OnMessage(const Message& /*msg*/) {}
+  virtual void OnRequest(const Message& /*req*/, Responder /*responder*/) {}
 
  private:
   void WireHandlers();

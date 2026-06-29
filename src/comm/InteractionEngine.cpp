@@ -232,10 +232,12 @@ void InteractionEngine::Dispatch(Message msg) {
   switch (policy_->RouteUnmatched(msg)) {
     case InteractionPolicy::Route::kInboundRequest:
       Trace({TraceLevel::kTrace, "unmatched", "request", key, "", "", tag, kNoNum, -1});
-      if (on_request_) on_request_(msg); break;
+      if (on_request_) on_request_(msg);
+      break;
     case InteractionPolicy::Route::kDeliver:
       Trace({TraceLevel::kTrace, "unmatched", "deliver", key, "", "", tag, kNoNum, -1});
-      if (on_deliver_) on_deliver_(msg); break;
+      if (on_deliver_) on_deliver_(msg);
+      break;
     case InteractionPolicy::Route::kDrop:
       Trace({TraceLevel::kTrace, "unmatched", "drop", key, "", "", tag, kNoNum, -1});
       break;

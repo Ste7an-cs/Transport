@@ -75,9 +75,9 @@ class ProtocolNode : public std::enable_shared_from_this<ProtocolNode> {
   void     StopRepeating(uint32_t handle);
 
  protected:
-  virtual void OnCommand(const Message& cmd, Responder responder) {}
-  virtual void OnHeartbeat(const Message& hb) {}
-  virtual void OnError(const std::string& error) {}
+  virtual void OnCommand(const Message& /*cmd*/, Responder /*responder*/) {}
+  virtual void OnHeartbeat(const Message& /*hb*/) {}
+  virtual void OnError(const std::string& /*error*/) {}
 
  private:
   void WireHandlers();
