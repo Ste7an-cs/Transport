@@ -3,7 +3,10 @@
 #include <utility>
 #include <variant>
 
-// SerialTransport.cpp — 见 .hpp。读到的字节切片经 OnBytes 直接交付(无分帧)。
+// SerialTransport.cpp — 串口字节管道(ITransport 实现)。
+// 结构与 TcpConnection 同构(自有 io_context + strand + 读循环 + 写队列):串口也是字节流,
+// 读到的切片经 OnBytes 直接交付(无分帧,切帧归上层 ICodec);from=设备路径。
+// 唯一额外活计:Open 里按 SerialConfig 设波特率/数据位/停止位/校验等串口参数。
 
 namespace transport {
 
@@ -17,6 +20,7 @@ SerialTransport::SerialTransport(SerialConfig config)
 
 SerialTransport::~SerialTransport() { Close(); }
 
+// Open:打开设备 → 逐项设串口参数(任一失败则关端口、返回 config: 错误)→ 起读循环 + 回 OnConnect。
 Status SerialTransport::Open() {
   asio::error_code ec;
   port_.open(config_.device, ec);
@@ -61,6 +65,7 @@ Status SerialTransport::Open() {
   return Status::Success(std::monostate{});
 }
 
+// StartRead:读循环(同 TcpConnection)。串口读错误即视为连接级断开(HandleDisconnect)。
 void SerialTransport::StartRead() {
   auto self = shared_from_this();
   port_.async_read_some(
@@ -68,7 +73,7 @@ void SerialTransport::StartRead() {
       asio::bind_executor(
           strand_, [this, self](asio::error_code ec, std::size_t n) {
             if (ec) {
-              HandleDisconnect("conn: " + ec.message());
+              HandleDisconnect("conn: " + ec.message());  // 含主动 Close 引发的 aborted
               return;
             }
             if (bytes_cb_) {
