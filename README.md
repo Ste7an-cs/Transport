@@ -195,7 +195,9 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 - [x] **外部协议 UDP 1:多**:`SystemDatagramCodec` + `reply_to_source`(应答回送来源)+ 发送可指定 `Endpoint`(主动多发)
 - [x] **Comm 层**:`IExecutor`/`ThreadExecutor`、**`InteractionEngine`(机制一份)+ `InteractionPolicy`(声明式策略)**、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈:5 模式 + 重发 + repeating + 心跳 + 双角色)——节点为薄壳
 - [x] **可观测性**:可插拔结构化 trace `ITraceSink`(引擎咽喉点;`OstreamTraceSink`/`CapturingTraceSink`;观测-only、近零开销)
-- [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、codec/transport trace 采用、正式发布 0.2.0
+- [x] **可运行示例**:`protocol_node_demo`(TCP 外部协议 5 模式)、`protocol_udp_demo`(UDP 1:多)、`dds_node_demo`(DDS 发布-订阅扇出 + 多路 req-resp)——`-DTRANSPORT_BUILD_EXAMPLES=ON`
+- [x] **发布 `v0.2.0`**(2026-06-29;`v0.1.0` 标签保留旧实现)
+- [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、codec/transport trace 采用、应答来源校验硬化
 
 ---
 
