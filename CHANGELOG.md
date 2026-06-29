@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### 特性:周期发送取最新状态(消息工厂 + 推送更新)— 2026-06-29(PR #10)
+> 周期发送此前把 payload 冻结在启动时刻;现支持每帧**发送前取最新状态**。纯加性,固定/心跳路径逐字不变。
+- **变更** 引擎 `Periodic` 载体由固定 `Message` 改为 `std::function<Message()>` 工厂;`FirePeriodic` 每拍**锁外**调 `make()` 取最新。`StartPeriodic` 加工厂重载;固定版包装、行为不变;新增 `UpdatePeriodic(handle, Message)`(推送换值)。空工厂 → 返回 0(不崩)。
+- **新增** `ProtocolNode::StartRepeating(cmd, state_fn, …)`(拉)+ `UpdateRepeating(handle, cmd, payload)`(推)。
+- **新增** `DdsNode` 周期发布(此前无):`StartPublishing`(固定/`sample_fn` 工厂)+ `UpdatePublishing`/`StopPublishing`(tag `kNotify`)。
+- **契约** `state_fn`/`sample_fn`/`make` 在 executor 线程、每拍发送前调用,须线程安全、非阻塞、不抛;`Update*` 下一拍生效、会把 pull 周期转为固定。
+- **示例** `protocol_node_demo` 周期段改用 `state_fn` 演示每拍拉最新温度。
+- **验证** 119/119,零告警;`-Wall -Wextra` 清洁。
+
 - **示例** `examples/dds_node_demo.cpp`:`DdsNode` 完整 demo —— 进程内 DDS 总线上发布-订阅扇出 + 多路请求-应答(reply_to 各回各家 inbox)+ 反馈/终结。
 
 ## [0.2.0] - 2026-06-29

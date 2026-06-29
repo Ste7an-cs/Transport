@@ -12,7 +12,7 @@
 //        Request               需回应:等 1 个 RESPONSE
 //        RequestWithResult     需结果:等 1 个 RESULT
 //        RequestNeedFeedback   收 RESPONSE(中间) → 收 RESULT(终结),引擎自动回 ack
-//        StartRepeating/Stop   周期发 STATE
+//        StartRepeating/Stop   周期发 STATE(可传 state_fn 每拍拉最新状态)
 //   5. 周期心跳               —— config.heartbeat_interval_ms > 0,对端 OnHeartbeat
 //   6. 可观测 trace           —— SetTrace(OstreamTraceSink) 打印全量交互流
 //
@@ -39,6 +39,7 @@
 //   ./build/protocol_node_demo
 // =============================================================================
 
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -228,10 +229,18 @@ int main() {
       });
   std::this_thread::sleep_for(200ms);
 
-  // (e) 周期发送:每 300ms 发一帧 STATE,发几拍后停。
-  log("main", "[e] StartRepeating(TELEMETRY, 300ms)");
-  uint32_t h = controller->StartRepeating(cmd::kTelemetry, {0xEE}, /*interval_ms=*/300);
-  std::this_thread::sleep_for(1000ms);   // 期间约 3~4 拍 STATE + 1 次心跳
+  // (e) 周期发送 —— 拉最新状态(pull):每 300ms 发一帧 STATE,引擎【发送前】调 state_fn
+  //     取最新值,所以每拍发的是实时状态,而非启动时的快照。
+  std::atomic<int> temperature{20};      // 模拟一个会变的传感器读数
+  log("main", "[e] StartRepeating(TELEMETRY, state_fn, 300ms) —— 每拍拉最新温度");
+  uint32_t h = controller->StartRepeating(cmd::kTelemetry,
+      [&temperature] { return std::vector<uint8_t>{static_cast<uint8_t>(temperature.load())}; },
+      /*interval_ms=*/300);
+  for (int i = 0; i < 3; ++i) {          // 让"传感器"持续变化,设备收到的 STATE 随之改变
+    std::this_thread::sleep_for(300ms);
+    temperature.fetch_add(1);
+  }
+  std::this_thread::sleep_for(100ms);
   controller->StopRepeating(h);
   log("main", "StopRepeating");
 

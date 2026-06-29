@@ -125,8 +125,11 @@ auto link = std::make_shared<Link>(
 (void)link->RequestWithResult(/*cmd=*/0x12, {0x03}, [](Result<Message> r){/*RESULT*/});  // 需结果
 (void)link->RequestNeedFeedback(/*cmd=*/0x13, {0x04},
     [](Result<Message> r){/*RESPONSE*/}, [](Result<Message> r){/*RESULT,自动回 ack*/});
-uint32_t h = link->StartRepeating(/*cmd=*/0x14, {0x05}, /*interval_ms=*/500);  // 定时发 STATE
+uint32_t h = link->StartRepeating(/*cmd=*/0x14, {0x05}, /*interval_ms=*/500);  // 定时发 STATE(固定快照)
 link->StopRepeating(h);
+// 取最新状态:传 state_fn —— 引擎每拍【发送前】调它,发的是实时值而非启动快照
+link->StartRepeating(/*cmd=*/0x14, [&]{ return sensor.Read(); }, /*interval_ms=*/500);  // 拉(pull)
+// 或事件驱动推送:link->UpdateRepeating(h, /*cmd=*/0x14, latest);                       // 推(push)
 ```
 
 > **接入前需替换的外部常量**:`SystemCodec` 的 `CrcFn`(真实 CRC16 算法,构造注入)与 `FrameType` 六类的真实字节值(枚举占位)。两端一致即可。
@@ -142,7 +145,7 @@ link->StopRepeating(h);
 > `reply_to_source` 覆盖服务端 `Responder` 回应与客户端 `needfeedback` 自动 ack;发送方法尾参 `Endpoint::Net` 让一个 socket 对多设备。TCP/串口用流式 `SystemCodec`、留 `reply_to_source=false`。
 
 > **完整可运行 demo**:
-> - [`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备经 **TCP** 对接,5 种发送模式 + 应答 + 周期 + 心跳 + 超时重发 + trace(SystemCodec 有状态流式,配字节流;头注解释为何不用 UDP)。
+> - [`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备经 **TCP** 对接,5 种发送模式 + 应答 + 周期(含 **state_fn 每拍拉最新状态**) + 心跳 + 超时重发 + trace(SystemCodec 有状态流式,配字节流;头注解释为何不用 UDP)。
 > - [`examples/protocol_udp_demo.cpp`](examples/protocol_udp_demo.cpp) —— **UDP 1:多**:1 控制器(:7000)向 2 设备(:7001/:7002)发命令,`SystemDatagramCodec` + `reply_to_source` + 每发 `Endpoint::Net`,应答经来源回到控制器。
 > ```bash
 > cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
@@ -194,6 +197,7 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 - [x] **Codec 层**:`SystemCodec`(外部协议帧,流式)、`SystemDatagramCodec`(同帧无状态报文版,配 UDP)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec`
 - [x] **外部协议 UDP 1:多**:`SystemDatagramCodec` + `reply_to_source`(应答回送来源)+ 发送可指定 `Endpoint`(主动多发)
 - [x] **Comm 层**:`IExecutor`/`ThreadExecutor`、**`InteractionEngine`(机制一份)+ `InteractionPolicy`(声明式策略)**、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈:5 模式 + 重发 + repeating + 心跳 + 双角色)——节点为薄壳
+- [x] **周期发送取最新状态**:`StartRepeating(state_fn)`/`StartPublishing(sample_fn)` 每拍拉最新 + `UpdateRepeating`/`UpdatePublishing` 推送(`DdsNode` 新增周期发布)
 - [x] **可观测性**:可插拔结构化 trace `ITraceSink`(引擎咽喉点;`OstreamTraceSink`/`CapturingTraceSink`;观测-only、近零开销)
 - [x] **可运行示例**:`protocol_node_demo`(TCP 外部协议 5 模式)、`protocol_udp_demo`(UDP 1:多)、`dds_node_demo`(DDS 发布-订阅扇出 + 多路 req-resp)——`-DTRANSPORT_BUILD_EXAMPLES=ON`
 - [x] **发布 `v0.2.0`**(2026-06-29;`v0.1.0` 标签保留旧实现)
