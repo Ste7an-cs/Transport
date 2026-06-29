@@ -99,6 +99,7 @@ uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::vector<uint8_t> payload
 
 uint32_t ProtocolNode::StartRepeating(uint16_t cmd, std::function<std::vector<uint8_t>()> state_fn,
                                       uint32_t interval_ms, const Endpoint& to) {
+  if (!state_fn) return 0;
   return engine_->StartPeriodic(
       [cmd, fn = std::move(state_fn)]() { return Cmd(cmd, fn()); },
       Tag(FrameType::kState), interval_ms, to);

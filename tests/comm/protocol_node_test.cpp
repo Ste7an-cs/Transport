@@ -313,5 +313,12 @@ TEST(ProtocolNode, UpdateRepeatingChangesState) {
   EXPECT_TRUE(p.a->UpdateRepeating(h, /*cmd=*/0x14, P({2})));
   p.exa->FireAll();
   ASSERT_EQ(got.size(), 2u); EXPECT_EQ(got[1], P({2}));
+  EXPECT_FALSE(p.a->UpdateRepeating(99999, 0x14, P({0})));   // 未知 handle → false
   p.a->StopRepeating(h); p.Close();
+}
+
+TEST(ProtocolNode, StartRepeatingNullStateFnReturnsZero) {
+  Pair p; p.Open();
+  EXPECT_EQ(p.a->StartRepeating(0x14, std::function<std::vector<uint8_t>()>{}, 50), 0u);  // 空 state_fn 拒绝
+  p.Close();
 }

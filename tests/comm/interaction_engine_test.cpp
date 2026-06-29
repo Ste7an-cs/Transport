@@ -154,6 +154,12 @@ TEST(InteractionEngine, PeriodicSendsUntilStopped) {
   n.Close();
 }
 
+TEST(InteractionEngine, StartPeriodicNullFactoryReturnsZero) {
+  Net n; n.Open();
+  EXPECT_EQ(n.a->StartPeriodic(std::function<transport::Message()>{}, T(MessageKind::kNotify), 50), 0u);  // 空工厂拒绝,不崩
+  n.Close();
+}
+
 TEST(InteractionEngine, CloseFinalizesPendingNoDoubleInvoke) {
   Net n; int term = 0;
   n.b->OnInboundRequest([&](const Message& req) { (void)n.b->SendReply(req, T(MessageKind::kFeedback), {0x01}); });  // 只中间,不终结

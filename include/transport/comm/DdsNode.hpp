@@ -63,6 +63,8 @@ class DdsNode : public std::enable_shared_from_this<DdsNode> {
                                        const Endpoint& to = Endpoint::Default());
 
   uint32_t StartPublishing(Message msg, uint32_t interval_ms, const Endpoint& to);
+  // sample_fn() 在执行器线程上、每次发送前(含立即首拍)被调用;须线程安全、非阻塞、不抛。
+  // null sample_fn → 返回 0(不启动)。
   uint32_t StartPublishing(std::function<Message()> sample_fn, uint32_t interval_ms, const Endpoint& to);
   bool     UpdatePublishing(uint32_t handle, Message msg);
   void     StopPublishing(uint32_t handle);

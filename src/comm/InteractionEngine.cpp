@@ -256,7 +256,7 @@ Status InteractionEngine::SendReply(const Message& request, FrameTag tag, std::v
 
 uint32_t InteractionEngine::StartPeriodic(std::function<Message()> make, FrameTag tag,
                                           uint32_t interval_ms, const Endpoint& to) {
-  if (interval_ms == 0) return 0;
+  if (interval_ms == 0 || !make) return 0;
   uint32_t handle;
   {
     std::lock_guard<std::mutex> lk(mu_);
