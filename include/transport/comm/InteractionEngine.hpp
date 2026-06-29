@@ -45,8 +45,15 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
 
   Status   Fire(Message out, FrameTag tag, const Endpoint& to = Endpoint::Default());
   Status   RequestAwait(Message out, RequestSpec spec, const Endpoint& to = Endpoint::Default());
+  // make() 在执行器线程上、每次发送前(含立即首拍)被调用,直到 StopPeriodic/Close;
+  // 须线程安全、非阻塞、快、不抛。null make → 返回 0(不启动 periodic)。
+  uint32_t StartPeriodic(std::function<Message()> make, FrameTag tag, uint32_t interval_ms,
+                         const Endpoint& to = Endpoint::Default());
   uint32_t StartPeriodic(Message out, FrameTag tag, uint32_t interval_ms,
                          const Endpoint& to = Endpoint::Default());
+  // 下一拍起生效(已在途的一拍可能再发一帧旧的);替换工厂——对 make 启动的 periodic
+  // 调用此法会永久转为固定消息。handle 未知 → 返回 false。
+  bool     UpdatePeriodic(uint32_t handle, Message out);
   void     StopPeriodic(uint32_t handle);
 
   Status   SendReply(const Message& request, FrameTag tag, std::vector<uint8_t> payload);
@@ -56,7 +63,7 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
     RequestSpec spec; Message out; Endpoint to;
     uint32_t retries = 0; IExecutor::TimerId timer = 0; bool advanced = false;
   };
-  struct Periodic { Message out; FrameTag tag; Endpoint to; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
+  struct Periodic { std::function<Message()> make; FrameTag tag; Endpoint to; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
 
   Status SendMessage(Message& m, const Endpoint& to);
   void Dispatch(Message msg);

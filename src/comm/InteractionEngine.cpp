@@ -254,16 +254,18 @@ Status InteractionEngine::SendReply(const Message& request, FrameTag tag, std::v
   return SendMessage(m, to);
 }
 
-uint32_t InteractionEngine::StartPeriodic(Message out, FrameTag tag, uint32_t interval_ms, const Endpoint& to) {
-  if (interval_ms == 0) return 0;
+uint32_t InteractionEngine::StartPeriodic(std::function<Message()> make, FrameTag tag,
+                                          uint32_t interval_ms, const Endpoint& to) {
+  if (interval_ms == 0 || !make) return 0;
   uint32_t handle;
   {
     std::lock_guard<std::mutex> lk(mu_);
     handle = periodic_next_++;
-    periodics_[handle] = Periodic{out, tag, to, interval_ms, 0};
+    periodics_[handle] = Periodic{make, tag, to, interval_ms, 0};
   }
   Trace({TraceLevel::kTrace, "periodic", "start", "", "", "", tag, kNoNum, -1});
-  (void)Fire(out, tag, to);  // 立即一帧
+  Message out = make();        // 锁外:立即一帧 = 最新
+  (void)Fire(out, tag, to);
   std::weak_ptr<InteractionEngine> wself = weak_from_this();
   std::lock_guard<std::mutex> lk(mu_);
   auto it = periodics_.find(handle);
@@ -274,15 +276,30 @@ uint32_t InteractionEngine::StartPeriodic(Message out, FrameTag tag, uint32_t in
   return handle;
 }
 
+uint32_t InteractionEngine::StartPeriodic(Message out, FrameTag tag, uint32_t interval_ms,
+                                          const Endpoint& to) {
+  return StartPeriodic(std::function<Message()>([m = std::move(out)]() { return m; }),
+                       tag, interval_ms, to);
+}
+
+bool InteractionEngine::UpdatePeriodic(uint32_t handle, Message out) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = periodics_.find(handle);
+  if (it == periodics_.end()) return false;
+  it->second.make = [m = std::move(out)]() { return m; };
+  return true;
+}
+
 void InteractionEngine::FirePeriodic(uint32_t handle) {
-  Message out; FrameTag tag = 0; Endpoint to; uint32_t interval = 0; bool alive = false;
+  std::function<Message()> make; FrameTag tag = 0; Endpoint to; uint32_t interval = 0; bool alive = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = periodics_.find(handle);
-    if (it != periodics_.end()) { out = it->second.out; tag = it->second.tag; to = it->second.to; interval = it->second.interval_ms; alive = true; }
+    if (it != periodics_.end()) { make = it->second.make; tag = it->second.tag; to = it->second.to; interval = it->second.interval_ms; alive = true; }
   }
   if (!alive || !open_.load()) return;
   Trace({TraceLevel::kTrace, "periodic", "fire", "", "", "", tag, kNoNum, -1});
+  Message out = make();        // 锁外:每拍取最新
   (void)Fire(out, tag, to);
   std::weak_ptr<InteractionEngine> wself = weak_from_this();
   std::lock_guard<std::mutex> lk(mu_);

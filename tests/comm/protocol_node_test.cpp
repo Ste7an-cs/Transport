@@ -286,3 +286,39 @@ TEST(ProtocolNode, SendForwardsDestinationEndpoint) {
   EXPECT_EQ(rec->last_to.port, 1234);
   node->Close();
 }
+
+TEST(ProtocolNode, RepeatingPullSendsLatestState) {
+  Pair p; std::vector<std::vector<uint8_t>> got;
+  p.b->on_cmd = [&](const Message& m, Responder) { got.push_back(m.payload); };
+  p.Open();
+  int ctr = 0;
+  uint32_t h = p.a->StartRepeating(/*cmd=*/0x14,
+      [&ctr] { return P({static_cast<uint8_t>(ctr++)}); }, /*interval_ms=*/50);
+  p.exa->FireAll();   // 第 2 拍
+  p.exa->FireAll();   // 第 3 拍
+  p.a->StopRepeating(h);
+  ASSERT_GE(got.size(), 3u);
+  EXPECT_EQ(got[0], P({0}));
+  EXPECT_EQ(got[1], P({1}));
+  EXPECT_EQ(got[2], P({2}));
+  p.Close();
+}
+
+TEST(ProtocolNode, UpdateRepeatingChangesState) {
+  Pair p; std::vector<std::vector<uint8_t>> got;
+  p.b->on_cmd = [&](const Message& m, Responder) { got.push_back(m.payload); };
+  p.Open();
+  uint32_t h = p.a->StartRepeating(/*cmd=*/0x14, P({1}), /*interval_ms=*/50);
+  ASSERT_EQ(got.size(), 1u); EXPECT_EQ(got[0], P({1}));
+  EXPECT_TRUE(p.a->UpdateRepeating(h, /*cmd=*/0x14, P({2})));
+  p.exa->FireAll();
+  ASSERT_EQ(got.size(), 2u); EXPECT_EQ(got[1], P({2}));
+  EXPECT_FALSE(p.a->UpdateRepeating(99999, 0x14, P({0})));   // 未知 handle → false
+  p.a->StopRepeating(h); p.Close();
+}
+
+TEST(ProtocolNode, StartRepeatingNullStateFnReturnsZero) {
+  Pair p; p.Open();
+  EXPECT_EQ(p.a->StartRepeating(0x14, std::function<std::vector<uint8_t>()>{}, 50), 0u);  // 空 state_fn 拒绝
+  p.Close();
+}
