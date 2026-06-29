@@ -87,6 +87,12 @@ Message req; req.payload = {9};
     [](Result<Message> r) { /* ... */ }, 1000, Endpoint::Topic("svc"));
 ```
 
+> **完整可运行 demo**:[`examples/dds_node_demo.cpp`](examples/dds_node_demo.cpp) —— 3 节点经进程内 DDS 总线(`FakeDdsProvider`,零 FastDDS 依赖):发布-订阅**扇出**(一发两收)+ **多路请求-应答**(两客户端打同一服务 topic,应答经 `reply_to` 各回各家 inbox)+ 反馈/终结。运行:
+> ```bash
+> cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
+> cmake --build build -j --target dds_node_demo && ./build/dds_node_demo
+> ```
+
 ### 对接外部系统(`ProtocolNode` + `SystemCodec` 协议帧)
 
 帧格式 `[head_flag:4=AA BB CC DD][frm_type:1][protocol_id:1][session_id:1][reserve:4][crc:2][frm_len:2][message_id:2|payload]`(小端);CRC 经 `CrcFn` 注入,匹配键 (session_id, message_id)。

@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+- **示例** `examples/dds_node_demo.cpp`:`DdsNode` 完整 demo —— 进程内 DDS 总线上发布-订阅扇出 + 多路请求-应答(reply_to 各回各家 inbox)+ 反馈/终结。
+
 ## [0.2.0] - 2026-06-29
 
 > **0.2.0 开发线 —— 三层架构(Transport 纯管道 / ICodec 线缆格式 / Comm 交互层)。** 自 2026-06-15 的两层解耦起,逐 PR 自底向上补齐:TCP 服务端 → DDS 底层 → CommNode 交互层 → DdsNode → 外部协议栈 ProtocolNode → InteractionEngine 抽象 → ITraceSink 可观测 → 外部协议 UDP 1:多。`v0.1.0` 标签保留完整旧实现(`TransportCore`/三模式接收/`TransportFactory`/`RawMessage` 等)备查;0.2.0 与 0.1.0 **不 API 兼容**。
