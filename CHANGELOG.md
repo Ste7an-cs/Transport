@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-29
+
 ### 特性:周期发送取最新状态(消息工厂 + 推送更新)— 2026-06-29(PR #10)
 > 周期发送此前把 payload 冻结在启动时刻;现支持每帧**发送前取最新状态**。纯加性,固定/心跳路径逐字不变。
 - **变更** 引擎 `Periodic` 载体由固定 `Message` 改为 `std::function<Message()>` 工厂;`FirePeriodic` 每拍**锁外**调 `make()` 取最新。`StartPeriodic` 加工厂重载;固定版包装、行为不变;新增 `UpdatePeriodic(handle, Message)`(推送换值)。空工厂 → 返回 0(不崩)。
