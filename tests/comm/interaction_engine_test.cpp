@@ -199,3 +199,34 @@ TEST(InteractionEngine, CloseFromWorkerNoSelfJoinCrash) {
   EXPECT_FALSE(a->IsOpen());
   b->Close();
 }
+
+TEST(InteractionEngine, PeriodicFactoryFiresLatestEachTick) {
+  Net n; std::vector<std::vector<uint8_t>> got;
+  n.b->OnInboundDeliver([&](const Message& m) { got.push_back(m.payload); });
+  n.Open();
+  int ctr = 0;
+  uint32_t h = n.a->StartPeriodic(
+      [&ctr] { Message m; m.payload = {static_cast<uint8_t>(ctr++)}; return m; },
+      T(MessageKind::kNotify), /*interval_ms=*/50);
+  n.exa->FireAll();   // 第 2 拍
+  n.exa->FireAll();   // 第 3 拍
+  n.a->StopPeriodic(h);
+  ASSERT_GE(got.size(), 3u);
+  EXPECT_EQ(got[0], (std::vector<uint8_t>{0}));   // 立即一帧 = 最新
+  EXPECT_EQ(got[1], (std::vector<uint8_t>{1}));   // 每拍重新 make()
+  EXPECT_EQ(got[2], (std::vector<uint8_t>{2}));
+  n.Close();
+}
+
+TEST(InteractionEngine, UpdatePeriodicChangesSubsequentFrames) {
+  Net n; std::vector<std::vector<uint8_t>> got;
+  n.b->OnInboundDeliver([&](const Message& m) { got.push_back(m.payload); });
+  n.Open();
+  uint32_t h = n.a->StartPeriodic(Pay({1}), T(MessageKind::kNotify), /*interval_ms=*/50);
+  ASSERT_EQ(got.size(), 1u); EXPECT_EQ(got[0], (std::vector<uint8_t>{1}));  // 固定版立即一帧
+  EXPECT_TRUE(n.a->UpdatePeriodic(h, Pay({2})));
+  n.exa->FireAll();
+  ASSERT_EQ(got.size(), 2u); EXPECT_EQ(got[1], (std::vector<uint8_t>{2}));   // 后续帧用新值
+  EXPECT_FALSE(n.a->UpdatePeriodic(9999, Pay({3})));                          // 未知 handle → false
+  n.a->StopPeriodic(h); n.Close();
+}

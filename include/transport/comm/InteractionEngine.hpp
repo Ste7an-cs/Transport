@@ -45,8 +45,11 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
 
   Status   Fire(Message out, FrameTag tag, const Endpoint& to = Endpoint::Default());
   Status   RequestAwait(Message out, RequestSpec spec, const Endpoint& to = Endpoint::Default());
+  uint32_t StartPeriodic(std::function<Message()> make, FrameTag tag, uint32_t interval_ms,
+                         const Endpoint& to = Endpoint::Default());
   uint32_t StartPeriodic(Message out, FrameTag tag, uint32_t interval_ms,
                          const Endpoint& to = Endpoint::Default());
+  bool     UpdatePeriodic(uint32_t handle, Message out);
   void     StopPeriodic(uint32_t handle);
 
   Status   SendReply(const Message& request, FrameTag tag, std::vector<uint8_t> payload);
@@ -56,7 +59,7 @@ class InteractionEngine : public std::enable_shared_from_this<InteractionEngine>
     RequestSpec spec; Message out; Endpoint to;
     uint32_t retries = 0; IExecutor::TimerId timer = 0; bool advanced = false;
   };
-  struct Periodic { Message out; FrameTag tag; Endpoint to; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
+  struct Periodic { std::function<Message()> make; FrameTag tag; Endpoint to; uint32_t interval_ms; IExecutor::TimerId timer = 0; };
 
   Status SendMessage(Message& m, const Endpoint& to);
   void Dispatch(Message msg);
