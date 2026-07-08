@@ -21,6 +21,14 @@ Status TcpClientTransport::Open() {
   connect_timer_ = std::make_unique<QTimer>();  connect_timer_->setSingleShot(true);
   reconnect_timer_ = std::make_unique<QTimer>(); reconnect_timer_->setSingleShot(true);
   QObject::connect(reconnect_timer_.get(), &QTimer::timeout, [this] { startConnect(); });
+  // connect_timer_ 的 timeout 只连一次(在这里),否则每次 startConnect 重连会累积重复 slot,
+  // 一次超时触发全部累积 lambda → 退避被乘性推进。sock_ 是成员,重连换 socket 不影响本连接。
+  QObject::connect(connect_timer_.get(), &QTimer::timeout, [this] {
+    if (sock_ && sock_->state() != QAbstractSocket::ConnectedState) {
+      sock_->abort();
+      onDisconnected("timeout: connect timed out");
+    }
+  });
   open_ = true;
   startConnect();
   return Status::Success(std::monostate{});  // 连接结果经 OnConnect/OnDisconnect 上报
@@ -36,12 +44,6 @@ void TcpClientTransport::startConnect() {
   QObject::connect(sock_.get(),
                    QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::errorOccurred),
                    [this] { onDisconnected("conn: " + sock_->errorString().toStdString()); });
-  QObject::connect(connect_timer_.get(), &QTimer::timeout, [this] {
-    if (sock_ && sock_->state() != QAbstractSocket::ConnectedState) {
-      sock_->abort();
-      onDisconnected("timeout: connect timed out");
-    }
-  });
   connect_timer_->start(int(config_.connect_timeout_ms));
   sock_->connectToHost(QString::fromStdString(config_.host), config_.port);
 }
