@@ -31,6 +31,9 @@ target_compile_features(transport PUBLIC cxx_std_17)
 
 find_package(Threads REQUIRED)
 
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Network SerialPort)
+target_link_libraries(transport PUBLIC Qt5::Core Qt5::Network Qt5::SerialPort)
+
 # asio (standalone, header-only) —— vendored
 add_library(asio_standalone INTERFACE)
 target_include_directories(asio_standalone INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio/include)
@@ -60,6 +63,7 @@ if(TRANSPORT_BUILD_TESTS)
   include(GoogleTest)
 
   add_executable(transport_tests
+    tests/test_main.cpp
     tests/version_test.cpp
     tests/result_test.cpp
     tests/codec/message_test.cpp
@@ -86,7 +90,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/comm/protocol_policy_test.cpp
   )
   target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
-  target_link_libraries(transport_tests PRIVATE transport GTest::gtest_main)
+  target_link_libraries(transport_tests PRIVATE transport GTest::gtest)
   target_link_libraries(transport_tests PRIVATE util)
   if(TRANSPORT_HAS_FASTDDS)
     target_sources(transport_tests PRIVATE tests/dds/fastdds_provider_test.cpp)
