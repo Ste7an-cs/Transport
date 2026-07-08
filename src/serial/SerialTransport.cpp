@@ -10,6 +10,7 @@ SerialTransport::SerialTransport(SerialConfig config) : config_(std::move(config
 SerialTransport::~SerialTransport() { Close(); }
 
 Status SerialTransport::Open() {
+  disconnected_ = false;  // 支持 Close 后再 Open(重置一次性断连闸)
   port_ = std::make_unique<QSerialPort>();
   port_->setPortName(QString::fromStdString(config_.device));
   if (!port_->open(QIODevice::ReadWrite))

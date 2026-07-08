@@ -43,6 +43,14 @@ Status UdpTransport::Open() {
 
   local_port_ = sock_->localPort();
   QObject::connect(sock_.get(), &QUdpSocket::readyRead, [this] { onReadyRead(); });
+  // UDP I/O 错误经 OnBytes 投 Fail(不致命,契约见 ITransport):无连接可断,故不走 OnDisconnect。
+  QObject::connect(sock_.get(),
+                   QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::errorOccurred),
+                   [this](QAbstractSocket::SocketError) {
+                     if (bytes_cb_)
+                       bytes_cb_(Result<std::vector<uint8_t>>::Fail(
+                                     "io: " + sock_->errorString().toStdString()), "");
+                   });
   open_ = true;
   if (connect_cb_) connect_cb_();  // UDP 无连接,Open 成功即视作已连
   return Status::Success(std::monostate{});

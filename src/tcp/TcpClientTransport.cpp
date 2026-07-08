@@ -18,6 +18,7 @@ TcpClientTransport::TcpClientTransport(TcpClientConfig config,
 TcpClientTransport::~TcpClientTransport() { Close(); }
 
 Status TcpClientTransport::Open() {
+  closing_ = false;  // 支持 Close 后再 Open(重置一次性关闭闸)
   connect_timer_ = std::make_unique<QTimer>();  connect_timer_->setSingleShot(true);
   reconnect_timer_ = std::make_unique<QTimer>(); reconnect_timer_->setSingleShot(true);
   QObject::connect(reconnect_timer_.get(), &QTimer::timeout, [this] { startConnect(); });
