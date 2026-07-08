@@ -34,13 +34,7 @@ find_package(Threads REQUIRED)
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Network SerialPort)
 target_link_libraries(transport PUBLIC Qt5::Core Qt5::Network Qt5::SerialPort)
 
-# asio (standalone, header-only) —— vendored
-add_library(asio_standalone INTERFACE)
-target_include_directories(asio_standalone INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio/include)
-target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
-target_link_libraries(asio_standalone INTERFACE Threads::Threads)
-target_link_libraries(transport PUBLIC asio_standalone)
-target_link_libraries(transport PUBLIC Threads::Threads)
+target_link_libraries(transport PUBLIC Threads::Threads)  # ThreadExecutor 仍用线程
 
 find_package(fastcdr QUIET)
 find_package(fastrtps QUIET)

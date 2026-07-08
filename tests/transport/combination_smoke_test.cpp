@@ -1,52 +1,44 @@
-#include "transport/codec/DdsCodec.hpp"
 #include "transport/udp/UdpTransport.hpp"
+#include "transport/codec/SystemDatagramCodec.hpp"
 #include "qt_test_util.hpp"
-
 #include <memory>
-
 #include <gtest/gtest.h>
 
 using transport::Endpoint;
+using transport::FrameType;
 using transport::Message;
-using transport::MessageKind;
 using transport::Result;
-using transport::DdsCodec;
+using transport::SystemDatagramCodec;
 using transport::UdpConfig;
+using transport::UdpMode;
 using transport::UdpTransport;
 using qtutil::pumpUntil;
 
-TEST(CombinationSmoke, UdpBytesThroughSystemCodecRoundtrip) {
-  auto rx_codec = std::make_shared<DdsCodec>();
-  std::vector<Message> got;
-
-  UdpConfig rxc; rxc.local_addr = "127.0.0.1"; rxc.local_port = 0;
-  auto rx = std::make_shared<UdpTransport>(rxc);
-  rx->OnBytes([&](Result<std::vector<uint8_t>> r, const std::string&) {
-    if (!r) return;
-    auto msgs = rx_codec->Decode(r.value.data(), r.value.size());
-    if (!msgs) return;
-    for (auto& mm : msgs.value) got.push_back(std::move(mm));
+// 冒烟:UDP(QtNetwork)+ SystemDatagramCodec 一条帧 encode→send→recv→decode 往返。
+TEST(CombinationSmoke, UdpSystemDatagramRoundtrip) {
+  UdpConfig ra; ra.mode = UdpMode::kUnicast; ra.local_addr = "127.0.0.1"; ra.local_port = 0;
+  auto recv = std::make_shared<UdpTransport>(ra);
+  SystemDatagramCodec codec;
+  std::vector<Message> decoded;
+  recv->OnBytes([&](Result<std::vector<uint8_t>> r, const std::string&){
+    if (r) { auto m = codec.Decode(r.value.data(), r.value.size()); if (m) decoded = m.value; }
   });
-  ASSERT_TRUE(static_cast<bool>(rx->Open()));
-  const uint16_t rx_port = rx->LocalPort();
+  ASSERT_TRUE(static_cast<bool>(recv->Open()));
 
-  DdsCodec tx_codec;
-  Message out; out.kind = MessageKind::kRequest; out.correlation_id = "x-1";
-  out.topic = "calc"; out.payload = {4, 5, 6};
-  auto bytes = tx_codec.Encode(out);
+  UdpConfig sa; sa.mode = UdpMode::kUnicast; sa.local_addr = "127.0.0.1"; sa.local_port = 0;
+  sa.remote_addr = "127.0.0.1"; sa.remote_port = recv->LocalPort();
+  auto send = std::make_shared<UdpTransport>(sa);
+  ASSERT_TRUE(static_cast<bool>(send->Open()));
+
+  Message m; m.frm_type = FrameType::kCommand; m.protocol_id = 1; m.session_id = 5;
+  m.message_id = 0x0042; m.payload = {0xAA, 0xBB};
+  auto bytes = codec.Encode(m);
   ASSERT_TRUE(static_cast<bool>(bytes));
+  ASSERT_TRUE(static_cast<bool>(send->Send(bytes.value)));
 
-  UdpConfig txc; txc.local_addr = "127.0.0.1"; txc.local_port = 0;
-  auto tx = std::make_shared<UdpTransport>(txc);
-  ASSERT_TRUE(static_cast<bool>(tx->Open()));
-  ASSERT_TRUE(static_cast<bool>(
-      tx->Send(bytes.value, Endpoint::Net("127.0.0.1", rx_port))));
-
-  ASSERT_TRUE(pumpUntil([&] { return !got.empty(); }));
-  ASSERT_EQ(got.size(), 1u);
-  EXPECT_EQ(got[0].kind, MessageKind::kRequest);
-  EXPECT_EQ(got[0].correlation_id, "x-1");
-  EXPECT_EQ(got[0].payload, (std::vector<uint8_t>{4, 5, 6}));
-
-  tx->Close(); rx->Close();
+  EXPECT_TRUE(pumpUntil([&]{ return !decoded.empty(); }));
+  ASSERT_EQ(decoded.size(), 1u);
+  EXPECT_EQ(decoded[0].message_id, 0x0042);
+  EXPECT_EQ(decoded[0].payload, (std::vector<uint8_t>{0xAA, 0xBB}));
+  recv->Close(); send->Close();
 }
