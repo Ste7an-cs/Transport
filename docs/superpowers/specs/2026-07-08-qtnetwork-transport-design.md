@@ -24,7 +24,7 @@
 | 决策 | 选择 |
 |---|---|
 | Qt 版本 | **Qt5**(系统 5.15.3;对齐 AsyncTask ≥5.12)。组件 Core/Network/SerialPort |
-| **前置依赖** | **QtSerialPort 未安装** → 串口传输前需 `sudo apt install libqt5serialport5-dev`(见 §7 风险) |
+| **前置依赖** | 安装 `libqt5serialport5-dev`(QtSerialPort,串口传输编译前提)+ `socat`(串口回环测试用)——`sudo apt-get install -y libqt5serialport5-dev socat` |
 | 线程模型 | 传输**不自持 io 线程**,活在**宿主 Qt 事件循环线程**上;`OnBytes`/`OnConnect`/`OnDisconnect` 经 Qt 信号在该线程触发。**宿主须运行 Qt 事件循环**(测试里用 `QCoreApplication`+事件泵提供) |
 | Qt 对象连接 | 用 **functor `connect`**(lambda 捕获 `this`),传输类**不加 `Q_OBJECT`** → 无需 moc/AUTOMOC |
 | 生命周期 | socket 作为传输成员(`std::unique_ptr<Q*>`),析构即断开所有 `connect` → `this` 捕获安全,**去掉 asio 版的 `shared_from_this`/`weak_ptr` 内部纪律**(简化) |
@@ -78,11 +78,12 @@
 - 改写:`udp_transport_test` / `tcp_transport_test` / `tcp_connection_test` / `tcp_server_test` / `serial_transport_test` / `combination_smoke_test`。
 - **自定义 test main**:`QCoreApplication app(argc,argv); InitGoogleTest(&argc,argv); return RUN_ALL_TESTS();`(取代 `GTest::gtest_main`——异步 I/O 需事件循环)。
 - **事件泵助手** `pumpUntil(pred, timeout_ms)`:循环 `app.processEvents()` 直到 `pred()` 为真或超时,供断言"字节已到达/已连接/已断开"。
-- 用例覆盖:UDP 单播回环收发、TCP client↔server 回环收发 + 断连、串口(见 §7 风险)、寻址错误(`Topic` → config)、组播/广播(best-effort)。
+- **串口回环用 socat**:测试 setUp 里 `socat -d -d pty,raw,echo=0 pty,raw,echo=0` 起一对虚拟串口(解析其 stderr 得两个 `/dev/pts/N` 设备路径),两端各开一个 `SerialTransport` 对接收发;tearDown 杀 socat 进程。若 socat 不可用则该用例 `GTEST_SKIP()`(环境相关,不算失败)。
+- 用例覆盖:UDP 单播回环收发、TCP client↔server 回环收发 + 断连、串口(socat 回环)、寻址错误(`Topic` → config)、组播/广播(best-effort)。
 
 ## 7. 风险与待办
-1. **QtSerialPort 未装** → 实现前 `sudo apt install libqt5serialport5-dev`,否则串口传输不能编译。**阻塞项。**
-2. **串口测试**:现测试用 `openpty` 造虚拟串口对。`QSerialPort` 在 pty 上设波特率可能失败(pty 非真实 tty)。缓解:串口测试改为"open/配置/错误路径 + best-effort 回环(socat pty 对)",或标注为环境相关跳过。实现期定夺。
+1. **QtSerialPort + socat 安装**:实现前 `sudo apt-get install -y libqt5serialport5-dev socat`(用户已同意安装)。QtSerialPort 是串口传输编译前提,socat 供回环测试。
+2. **串口测试用 socat 回环**(已定,见 §6):socat 造一对 pty 虚拟串口,两 `SerialTransport` 对接。`SerialTransport` 的配置校验**保持严格**(波特率等设置失败即 `config:` 错,真实设备不放水);测试用标准波特率(115200)——pty 经 termios 通常接受。若在本环境该项确失败/ socat 不可用,则该用例 `GTEST_SKIP()`(环境相关,不计失败)。
 3. **TcpServer backlog 语义**:asio listen backlog vs Qt `setMaxPendingConnections`,语义不同,注释说明,行为对齐"默认即可"。
 4. **破坏性**:整仓构建从此需 Qt5;所有传输不再自持线程 → 用它们的宿主须运行 Qt 事件循环(含现有异步 `ProtocolNode` 走这些传输时)。下一个版本按破坏性(0.3.0)。
 
