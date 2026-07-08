@@ -1,93 +1,64 @@
 #include "transport/serial/SerialTransport.hpp"
 
-#include <utility>
 #include <variant>
 
-// SerialTransport.cpp — 串口字节管道(ITransport 实现)。
-// 结构与 TcpConnection 同构(自有 io_context + strand + 读循环 + 写队列):串口也是字节流,
-// 读到的切片经 OnBytes 直接交付(无分帧,切帧归上层 ICodec);from=设备路径。
-// 唯一额外活计:Open 里按 SerialConfig 设波特率/数据位/停止位/校验等串口参数。
+#include <QSerialPort>
 
 namespace transport {
 
-SerialTransport::SerialTransport(SerialConfig config)
-    : config_(std::move(config)),
-      guard_(ctx_.get_executor()),
-      strand_(ctx_.get_executor()),
-      port_(ctx_) {
-  io_thread_ = std::thread([this] { ctx_.run(); });
-}
-
+SerialTransport::SerialTransport(SerialConfig config) : config_(std::move(config)) {}
 SerialTransport::~SerialTransport() { Close(); }
 
-// Open:打开设备 → 逐项设串口参数(任一失败则关端口、返回 config: 错误)→ 起读循环 + 回 OnConnect。
 Status SerialTransport::Open() {
-  asio::error_code ec;
-  port_.open(config_.device, ec);
-  if (ec) return Status::Fail("config: open " + config_.device + ": " + ec.message());
+  port_ = std::make_unique<QSerialPort>();
+  port_->setPortName(QString::fromStdString(config_.device));
+  if (!port_->open(QIODevice::ReadWrite))
+    return Status::Fail("config: open " + config_.device + ": " + port_->errorString().toStdString());
 
-  auto fail = [&](const std::string& msg) {
-    asio::error_code ig; port_.close(ig);
-    return Status::Fail(msg);
-  };
-  using sb = asio::serial_port_base;
-  port_.set_option(sb::baud_rate(config_.baud_rate), ec);
-  if (ec) return fail("config: baud_rate: " + ec.message());
-  port_.set_option(sb::character_size(config_.data_bits), ec);
-  if (ec) return fail("config: data_bits: " + ec.message());
+  auto fail = [this](const std::string& m) { port_->close(); return Status::Fail(m); };
+  if (!port_->setBaudRate(int(config_.baud_rate))) return fail("config: baud_rate");
+  if (!port_->setDataBits(static_cast<QSerialPort::DataBits>(config_.data_bits)))
+    return fail("config: data_bits");
+  QSerialPort::StopBits sb = (config_.stop_bits == 2) ? QSerialPort::TwoStop
+                           : (config_.stop_bits == 1) ? QSerialPort::OneStop
+                           : QSerialPort::UnknownStopBits;
+  if (sb == QSerialPort::UnknownStopBits) return fail("config: stop_bits must be 1 or 2");
+  if (!port_->setStopBits(sb)) return fail("config: stop_bits");
+  QSerialPort::Parity par = (config_.parity == 'N') ? QSerialPort::NoParity
+                          : (config_.parity == 'E') ? QSerialPort::EvenParity
+                          : (config_.parity == 'O') ? QSerialPort::OddParity
+                          : QSerialPort::UnknownParity;
+  if (par == QSerialPort::UnknownParity) return fail("config: parity must be N/E/O");
+  if (!port_->setParity(par)) return fail("config: parity");
+  port_->setFlowControl(QSerialPort::NoFlowControl);
 
-  sb::stop_bits::type sbits;
-  if (config_.stop_bits == 1) sbits = sb::stop_bits::one;
-  else if (config_.stop_bits == 2) sbits = sb::stop_bits::two;
-  else return fail("config: stop_bits must be 1 or 2");
-  port_.set_option(sb::stop_bits(sbits), ec);
-  if (ec) return fail("config: stop_bits: " + ec.message());
-
-  sb::parity::type par;
-  switch (config_.parity) {
-    case 'N': par = sb::parity::none; break;
-    case 'E': par = sb::parity::even; break;
-    case 'O': par = sb::parity::odd; break;
-    default: return fail("config: parity must be N/E/O");
-  }
-  port_.set_option(sb::parity(par), ec);
-  if (ec) return fail("config: parity: " + ec.message());
-
-  asio::error_code fc_ec;
-  port_.set_option(sb::flow_control(sb::flow_control::none), fc_ec);  // best-effort
-
-  open_.store(true);
-  auto self = shared_from_this();
-  asio::post(strand_, [this, self]() {
-    if (connect_cb_) connect_cb_();
-    StartRead();
-  });
+  QObject::connect(port_.get(), &QSerialPort::readyRead, [this] { onReadyRead(); });
+  QObject::connect(port_.get(),
+                   QOverload<QSerialPort::SerialPortError>::of(&QSerialPort::errorOccurred),
+                   [this](QSerialPort::SerialPortError e) {
+                     if (e == QSerialPort::NoError || disconnected_) return;
+                     if (e == QSerialPort::ResourceError || e == QSerialPort::PermissionError) {
+                       disconnected_ = true; open_ = false;
+                       if (disconnect_cb_) disconnect_cb_("conn: " + port_->errorString().toStdString());
+                     }
+                   });
+  open_ = true;
+  if (connect_cb_) connect_cb_();
   return Status::Success(std::monostate{});
 }
 
-// StartRead:读循环(同 TcpConnection)。串口读错误即视为连接级断开(HandleDisconnect)。
-void SerialTransport::StartRead() {
-  auto self = shared_from_this();
-  port_.async_read_some(
-      asio::buffer(read_buf_),
-      asio::bind_executor(
-          strand_, [this, self](asio::error_code ec, std::size_t n) {
-            if (ec) {
-              HandleDisconnect("conn: " + ec.message());  // 含主动 Close 引发的 aborted
-              return;
-            }
-            if (bytes_cb_) {
-              std::vector<uint8_t> chunk(read_buf_.begin(), read_buf_.begin() + n);
-              bytes_cb_(Result<std::vector<uint8_t>>::Success(std::move(chunk)),
-                        config_.device);
-            }
-            StartRead();
-          }));
+void SerialTransport::onReadyRead() {
+  if (!port_) return;
+  QByteArray d = port_->readAll();
+  if (d.isEmpty()) return;
+  std::vector<uint8_t> bytes(d.begin(), d.end());
+  if (bytes_cb_) bytes_cb_(Result<std::vector<uint8_t>>::Success(std::move(bytes)), config_.device);
 }
 
 Status SerialTransport::Send(const std::vector<uint8_t>& bytes) {
-  if (!open_.load()) return Status::Fail("config: serial not open");
-  EnqueueWrite(bytes);
+  if (!open_ || !port_) return Status::Fail("config: serial not open");
+  if (port_->write(reinterpret_cast<const char*>(bytes.data()), qint64(bytes.size())) < 0)
+    return Status::Fail("io: write: " + port_->errorString().toStdString());
   return Status::Success(std::monostate{});
 }
 
@@ -97,49 +68,10 @@ Status SerialTransport::Send(const std::vector<uint8_t>& bytes, const Endpoint& 
   return Send(bytes);
 }
 
-void SerialTransport::EnqueueWrite(std::vector<uint8_t> bytes) {
-  auto buf = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
-  auto self = shared_from_this();
-  asio::post(strand_, [this, self, buf]() {
-    write_queue_.push_back(std::move(*buf));
-    if (!writing_) DoWrite();
-  });
-}
-
-void SerialTransport::DoWrite() {
-  writing_ = true;
-  auto self = shared_from_this();
-  asio::async_write(
-      port_, asio::buffer(write_queue_.front()),
-      asio::bind_executor(
-          strand_, [this, self](asio::error_code ec, std::size_t) {
-            if (ec) {
-              writing_ = false;
-              HandleDisconnect("conn: " + ec.message());
-              return;
-            }
-            write_queue_.pop_front();
-            if (!write_queue_.empty()) DoWrite();
-            else writing_ = false;
-          }));
-}
-
-void SerialTransport::HandleDisconnect(const std::string& reason) {
-  if (disconnected_.exchange(true)) return;
-  open_.store(false);
-  asio::error_code ig; port_.close(ig);
-  if (disconnect_cb_) disconnect_cb_(reason);
-}
-
 void SerialTransport::Close() {
-  if (closing_.exchange(true)) return;
-  open_.store(false);
-  asio::post(strand_, [this]() {
-    asio::error_code ig; port_.close(ig);
-  });
-  guard_.reset();
-  ctx_.stop();
-  if (io_thread_.joinable()) io_thread_.join();
+  disconnected_ = true;
+  open_ = false;
+  if (port_) { port_->close(); port_.reset(); }
 }
 
 }  // namespace transport
