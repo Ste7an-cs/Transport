@@ -100,3 +100,50 @@ if(TRANSPORT_BUILD_EXAMPLES)
   add_executable(dds_node_demo examples/dds_node_demo.cpp)
   target_link_libraries(dds_node_demo PRIVATE transport Threads::Threads)
 endif()
+
+# ---------------------------------------------------------------------------
+# 协程栈(第二期):AsyncTask + boost.fiber。纯加性,可关。
+# ---------------------------------------------------------------------------
+option(TRANSPORT_BUILD_CORO "Build coroutine InteractionEngine (AsyncTask/boost.fiber)" ON)
+if(TRANSPORT_BUILD_CORO)
+  set(ASYNCTASK_DIR "/home/david/zpj/Framework-dev/AsyncTask" CACHE PATH "AsyncTask coroutine lib root")
+  set(BOOST_LOCAL_ROOT "/usr/local" CACHE PATH "boost prefix with compiled fiber/context/thread/chrono")
+
+  # 已编译 boost 静态库(顺序:fiber 依赖 context)。
+  add_library(boost_fiber_local INTERFACE)
+  target_include_directories(boost_fiber_local INTERFACE ${BOOST_LOCAL_ROOT}/include)
+  target_link_libraries(boost_fiber_local INTERFACE
+    ${BOOST_LOCAL_ROOT}/lib/libboost_fiber.a
+    ${BOOST_LOCAL_ROOT}/lib/libboost_context.a
+    ${BOOST_LOCAL_ROOT}/lib/libboost_thread.a
+    ${BOOST_LOCAL_ROOT}/lib/libboost_chrono.a
+    Threads::Threads)
+
+  # AsyncTask 编译单元(含 Qt QObject → 需 AUTOMOC)。
+  add_library(asynctask STATIC
+    ${ASYNCTASK_DIR}/coro/executor/qtfiberthread.cpp
+    ${ASYNCTASK_DIR}/coro/executor/fiberpool.cpp
+    ${ASYNCTASK_DIR}/coro/detail/asyncdefine.cpp
+    ${ASYNCTASK_DIR}/coro/task/fiberapplication.cpp
+    ${ASYNCTASK_DIR}/coro/task/fibertask.cpp
+    ${ASYNCTASK_DIR}/coro/executor/scheduler/fibertaskqueue.cpp
+    ${ASYNCTASK_DIR}/coro/executor/scheduler/qtlocalfiberscheduler.cpp
+    ${ASYNCTASK_DIR}/coro/executor/scheduler/fiberscheduler.cpp
+    ${ASYNCTASK_DIR}/coro/executor/scheduler/qtfiberscheduler.cpp
+    ${ASYNCTASK_DIR}/coro/executor/scheduler/fiberthreadblock.cpp)
+  set_target_properties(asynctask PROPERTIES AUTOMOC ON)
+  target_include_directories(asynctask PUBLIC ${ASYNCTASK_DIR}/coro)
+  target_compile_definitions(asynctask PUBLIC ASYNC_HAS_QTCORE)
+  target_compile_features(asynctask PUBLIC cxx_std_17)
+  target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
+
+  if(TRANSPORT_BUILD_TESTS)
+    add_executable(transport_coro_tests
+      tests/coro/coro_test_main.cpp
+      tests/coro/coro_harness_test.cpp)
+    target_include_directories(transport_coro_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests/coro)
+    target_link_libraries(transport_coro_tests PRIVATE asynctask GTest::gtest Qt5::Core)
+    add_test(NAME transport_coro_tests COMMAND transport_coro_tests)
+  endif()
+endif()
