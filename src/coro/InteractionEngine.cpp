@@ -42,8 +42,9 @@ Result<Message> InteractionEngine::Request(Message out, FrameTag tag,
                                            std::chrono::milliseconds timeout,
                                            const Endpoint& to) {
   using R = Result<Message>;
-  Key k = policy_->NewCorrelation(out);          // 滚 session_id、盖 protocol_id;返回挂起键
+  policy_->NewCorrelation(out);                  // 仍滚 session_id、盖 protocol_id(副作用)
   policy_->SetTag(out, tag);
+  Key k = key_fn_(out);                           // 挂起键与入站键同源(默认=policy.KeyOf;可被 SetKeyFn 覆盖)
   Coro::Awaitable<Message> aw;
   auto ch = aw.channel();
   pending_[k] = ch;                              // 登记挂起(单线程,无锁)
