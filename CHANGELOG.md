@@ -8,6 +8,29 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-09
+
+> **⚠️ 破坏性次版本 —— 传输层从 standalone Asio 迁至 QtNetwork(去 asio、需 Qt5);并新增协程原生交互引擎(第二期)。** 与 0.2.x **不构建兼容**:整仓构建从此需 Qt5,所有传输不再自持 io 线程 → 用它们的宿主须运行 Qt 事件循环。
+
+### ⚠️ 特性:UDP/TCP/串口传输迁移至 QtNetwork(去 asio)— 2026-07-09(PR #12)
+> `ITransport` 接口与回调契约**不变**;仅把 5 个具体传输的底层实现从 standalone Asio 换成 QtNetwork,**整仓移除 asio**。为第二期协程原生引擎(跑在 Qt 事件循环线程)铺路。
+- **变更** `UdpTransport`→`QUdpSocket`、`TcpConnection`→`QTcpSocket`、`TcpServerTransport`→`QTcpServer`、`TcpClientTransport`→`QTcpSocket`+`QTimer`(连接超时/指数退避重连)、`SerialTransport`→`QSerialPort`。用 functor `connect`(lambda 捕获 `this`),传输类**不加 `Q_OBJECT`**(无需 moc)。
+- **⚠️ 线程模型变更** 传输**不再自持 io 线程/strand**;活在**宿主 Qt 事件循环线程**上,`OnBytes`/`OnConnect`/`OnDisconnect` 经 Qt 信号在该线程串行触发。宿主须运行 Qt 事件循环(测试用 `QCoreApplication`+事件泵)。报文/流式语义照旧(UDP 一 datagram 一回调;TCP/串口一次 read 切片一回调),断连语义照旧(主动 `Close` 不报 `OnDisconnect`,真断报一次)。
+- **⚠️ 移除** vendored `third_party/asio`;CMake 删 `asio_standalone`(保留 `Threads::Threads`,`ThreadExecutor` 仍用)。
+- **构建** `find_package(Qt5 5.12 REQUIRED COMPONENTS Core Network SerialPort)`;`transport` 库链接 `Qt5::Core/Network/SerialPort`。前置依赖:`libqt5serialport5-dev`(串口编译前提)+ `socat`(串口回环测试)。测试改自定义 `QCoreApplication` main + 事件泵助手 `qtutil::pumpUntil`。
+- **DDS 不动** 异步 `InteractionEngine`/`IExecutor`/`ThreadExecutor`/`DdsNode`/`DdsTransport`/`DdsCodec` 全保留(DDS 不走 QtNetwork)。
+- **验证** 全新构建零告警,118/118(TCP 用例合并后总数微调);串口 socat pty 回环实跑通过。终审 1 Important(客户端 `connect_timer_` 每次重连累积 timeout slot → 退避被乘性推进)+ 3 Minor(再 Open 安全 / UDP 错误经 `OnBytes(Fail)` 上报契约 / 广播冒烟)已修。
+
+### 特性:协程原生交互引擎(`coro::InteractionEngine` + `coro::ProtocolNode`)— 2026-07-09(PR #13)
+> 交互层协程原生化第二期(核心)。把请求-应答从异步状态机变成线性的 `send(); r = await_for(timeout);`。基于 **AsyncTask**(boost.fiber,不加修改),复用 QtNetwork `ITransport`。**纯加性**,异步栈/`ITransport`/第一期传输不动。
+- **新增** `transport::coro::InteractionEngine`(`include/transport/coro/`,通用机制,协议差异仍外包给 `InteractionPolicy`):`Request(out, tag, timeout, to)→Result<Message>`(`NewCorrelation`→按 `key_fn_(out)` 登记 `Coro::Awaitable`→`Send`→`await_for`,仅挂起**当前 fiber**,消除挂起表/ScheduleAt/Cancel/OnTimeout/IExecutor)、`Fire`(单向)、demux(`OnBytes`→`Decode`→`KeyOf`→命中且终结则唤醒 fiber)、`OnInboundDeliver`、**可插拔关联键 `SetKeyFn`**(默认逐字 `(session_id, message_id)`)。`conn:` vs `timeout:` 由 `channel->is_closed()` 区分。
+- **新增** `transport::coro::ProtocolNode`:薄壳,`Start`/`Stop`/`Request(cmd, payload, timeout)`。
+- **新增** `InteractionPolicy::IsTerminal(FrameType)`(非纯虚,默认 `== kResult`;异步引擎从不调用它 → 纯加性)。
+- **线程模型** 宿主 `Coro::installFiberApplication()`+`exec()`,fiber 调度器**同时推进 fiber 与 Qt 事件**;传输 `OnBytes`、demux、等待 fiber 全在这条线程,协作式无锁。`Request` **须在 fiber(固定于传输 I/O 线程)内调用**。
+- **构建** 新增 `option(TRANSPORT_BUILD_CORO)`(默认 ON):`asynctask` 静态库(AsyncTask 编译单元 + `ASYNC_HAS_QTCORE` + AUTOMOC)+ 已编译 boost `fiber/context/thread/chrono`;新 `transport_coro` 库 + `transport_coro_tests`。缓存变量 `ASYNCTASK_DIR`/`BOOST_LOCAL_ROOT`(当前为机器绝对路径,可 `-D` 覆盖;后续改可移植发现)。
+- **验证** 119/119 零告警;含真 UDP 回环冒烟(协程节点经两个真 `UdpTransport` 线性 `Request` 拿应答 ~2ms,验证 fiber↔Qt↔UDP 端到端)。终审 Ready-to-merge,2 Important(独立/复用引擎场景潜在隐患,当前无在用调用触达:`Close` 摘传输回调防 UAF、`Request` fiber 亲和注记)+ 1 Minor 已修。
+- **待办(本期外)** 服务端 responder/`SendReply`、周期 `StartPeriodic`、心跳、ack;DDS 搬到协程引擎(listener→fiber 线程桥);构建路径可移植化。
+
 ## [0.2.1] - 2026-06-29
 
 ### 特性:周期发送取最新状态(消息工厂 + 推送更新)— 2026-06-29(PR #10)

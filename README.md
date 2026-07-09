@@ -8,7 +8,9 @@
 
 > **非目标：** 不解析/解释 payload 语义,不是消息代理或路由守护进程。
 
-> **架构基线（0.2.0 开发线）：** 当前为三层解耦架构,取代 0.1.0 的富 `ITransport` + `TransportCore` + 三模式接收 + `IFramer` + topic 路由 + `TransportFactory`。`v0.1.0` 标签保留旧实现;0.2.0 与 0.1.0 **不 API 兼容**。
+> **架构基线（0.3.0）：** 三层解耦架构,取代 0.1.0 的富 `ITransport` + `TransportCore` + 三模式接收 + `IFramer` + topic 路由 + `TransportFactory`。`v0.1.0` 标签保留旧实现;0.2.0 与 0.1.0 **不 API 兼容**。
+>
+> **0.3.0 变更（破坏性）：** UDP/TCP/串口传输底层由 standalone Asio 迁至 **QtNetwork**(去 asio、**构建需 Qt5**);传输不再自持 io 线程,活在**宿主 Qt 事件循环线程**。并新增**协程原生交互引擎** `transport::coro::InteractionEngine` + `coro::ProtocolNode`(基于 AsyncTask/boost.fiber,请求-应答线性 `await`;可选 `TRANSPORT_BUILD_CORO`)。异步栈(DDS + 异步 `InteractionEngine`/`IExecutor`)与协程栈并存。
 
 ---
 
@@ -25,7 +27,7 @@
 - **统一寻址 `Endpoint`**:发布即 `Send(msg, Endpoint::Topic(t))`、UDP 寻址即 `Send(bytes, Endpoint::Net(ip,port))`,基类句柄即可寻址,无形态不一的 `SendTo`。
 - **不抛异常**:所有可失败操作返回 `Result<T>`(标 `[[nodiscard]]`,忽略错误返回值即编译期告警),错误串前缀分类 `timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`。
 - **可换线程模型**:`IExecutor` 缝使同一交互逻辑在确定性 `InlineExecutor`(测试)与真实 `ThreadExecutor` 下都跑,未来 `CoroExecutor`(自研协程)即插即换。
-- **接口层零第三方依赖**:`include/transport/` 只含纯接口 + 数据结构;asio / Fast DDS / termios 关在实现层。
+- **纯抽象核零第三方依赖**:`ITransport`/`ICodec`/`Message`/`Result`/`InteractionPolicy` 只含纯接口 + 数据结构;QtNetwork / QtSerialPort / Fast DDS 关在实现层(注:0.3.0 起具体传输头引入 Qt 类型,协程引擎头 `transport/coro/` 引入 AsyncTask)。
 
 ---
 
@@ -37,7 +39,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-**离线自包含**:Standalone Asio 1.30.2、nlohmann/json 3.11.3、GoogleTest 1.14.0 已 vendored 到 `third_party/`,CMake **不联网拉取**,`git clone` 后即可构建。C++17。
+**前置依赖(0.3.0)**:构建需 **Qt5**(Core/Network/SerialPort,系统安装,如 `libqt5serialport5-dev`);串口回环测试需 `socat`。nlohmann/json 3.11.3、GoogleTest 1.14.0 仍 vendored 到 `third_party/`(asio 已随 QtNetwork 迁移移除)。C++17。
+
+**协程引擎(可选,`-DTRANSPORT_BUILD_CORO=ON`,默认开)**:另需 **AsyncTask**(boost.fiber 协程库)+ 已编译 boost `fiber/context/thread/chrono`;经缓存变量 `ASYNCTASK_DIR`/`BOOST_LOCAL_ROOT` 指定(当前为绝对路径默认,可 `-D` 覆盖)。不需要协程栈可 `-DTRANSPORT_BUILD_CORO=OFF` 关闭。
 
 **唯一可选外部依赖 Fast DDS 2.13.x**:未装时自动跳过 `FastDdsProvider` 及其真实互通测试(DDS 逻辑仍可用 `FakeDdsProvider` 全测);装后 `find_package` 自动启用。详见 [`third_party/README.md`](third_party/README.md)。
 
@@ -219,9 +223,9 @@ udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ..
 
 - **三层解耦**:Transport 不依赖 Message/ICodec;ICodec 不依赖具体 transport;Comm 节点只依赖 `ITransport`/`ICodec`/`IExecutor` 接口(+ 同层默认 `SystemCodec`/`ThreadExecutor`)。〔SRS NFR-2、SDD §2.2〕
 - **不抛异常**:`Result<T>`/`Status`(`[[nodiscard]]`),错误前缀分类。〔SRS FR-13、SDD §11〕
-- **回调式交付 + 单 worker 串行**:Transport 经 `OnBytes` 回调交付(io 线程,非阻塞);Comm 层 io 线程内联 `Decode` → `executor.Post` → 单 worker 串行业务回调,背压在 `Post`。〔SRS FR-1.2/NFR-3、SDD §10〕
+- **回调式交付**:QtNetwork 传输经 `OnBytes` 在**宿主 Qt 事件循环线程**串行交付(非阻塞;不再自持 io 线程);DDS 样本在 provider listener 线程交付。异步 Comm 层内联 `Decode` → `executor.Post` → 单 worker 串行业务回调(背压在 `Post`);**协程栈**则请求 fiber 线性 `await`(demux 在同一 fiber 调度=Qt 事件循环线程,无 executor)。〔SRS FR-1.2/NFR-3、SDD §10〕
 - **线程模型可换**:经 `IExecutor` 缝换线程/协程/确定性测试而不改节点逻辑。〔SRS FR-4/NFR-4、SDD §7.1〕
 - **统一寻址 `Endpoint`**:发布=`Send(Topic)`、UDP 寻址=`Send(Net)`,基类句柄即可寻址。〔SRS FR-2、SDD §4.3〕
 - **节点以 shared_ptr 持有**:`enable_shared_from_this` + weak_ptr 保活;`Close` 先终结挂起/取消定时器再停执行器再关传输。〔SRS NFR-3、SDD §10〕
-- **离线自包含构建**:第三方依赖 vendored;Fast DDS 为唯一可选外部依赖,`find_package` 自动探测。〔SRS NFR-7/NFR-8、SDD §12〕
+- **构建依赖(0.3.0)**:需 Qt5(Core/Network/SerialPort);json/gtest vendored;Fast DDS 可选(`find_package` 探测);协程栈(可选)需 AsyncTask + boost.fiber。〔SRS NFR-7/NFR-8、SDD §12〕
 - **外部协议常量注入**:`SystemCodec` 的 CRC(`CrcFn` 注入)与 `frm_type` 真值(枚举占位)接入前替换,不改结构。〔SRS FR-12、SDD §8〕
