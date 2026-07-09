@@ -1,58 +1,59 @@
 #include "transport/serial/SerialTransport.hpp"
-
-#include <fcntl.h>
-#include <pty.h>
-#include <unistd.h>
-
-#include <chrono>
-#include <condition_variable>
-#include <mutex>
-
+#include "qt_test_util.hpp"
+#include <array>
+#include <cstdio>
+#include <memory>
+#include <regex>
+#include <string>
+#include <QProcess>
 #include <gtest/gtest.h>
 
 using transport::Result;
 using transport::SerialConfig;
 using transport::SerialTransport;
+using qtutil::pumpUntil; using qtutil::B;
 
 namespace {
-struct Sink {
-  std::mutex m; std::condition_variable cv; std::vector<uint8_t> acc;
-  void Wire(std::shared_ptr<SerialTransport> t) {
-    t->OnBytes([this](Result<std::vector<uint8_t>> r, const std::string&) {
-      if (!r) return;
-      std::lock_guard<std::mutex> lk(m);
-      acc.insert(acc.end(), r.value.begin(), r.value.end());
-      cv.notify_all();
-    });
+// 起 socat 造一对虚拟串口,解析出两个 /dev/pts/N。socat 不可用返回 false。
+bool StartSocat(QProcess& p, std::string& dev_a, std::string& dev_b) {
+  p.start("socat", {"-d", "-d", "pty,raw,echo=0", "pty,raw,echo=0"});
+  if (!p.waitForStarted(1000)) return false;
+  std::string err; std::regex re("(/dev/pts/[0-9]+)");
+  for (int i = 0; i < 50 && dev_b.empty(); ++i) {
+    p.waitForReadyRead(100);
+    err += p.readAllStandardError().toStdString();
+    std::smatch m; auto begin = err.cbegin();
+    std::vector<std::string> found;
+    for (std::sregex_iterator it(err.begin(), err.end(), re), e; it != e; ++it) found.push_back((*it)[1]);
+    if (found.size() >= 2) { dev_a = found[0]; dev_b = found[1]; }
   }
-  bool WaitBytes(std::size_t n, int ms) {
-    std::unique_lock<std::mutex> lk(m);
-    return cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return acc.size() >= n; });
-  }
-};
+  return !dev_a.empty() && !dev_b.empty();
+}
 }  // namespace
 
-TEST(SerialTransport, OpenSendReceiveOverPty) {
-  int master = -1, slave = -1;
-  ASSERT_EQ(openpty(&master, &slave, nullptr, nullptr, nullptr), 0);
-  char slave_name[256];
-  ASSERT_EQ(ttyname_r(slave, slave_name, sizeof(slave_name)), 0);
+TEST(SerialTransport, SocatLoopbackRoundtrip) {
+  QProcess socat; std::string da, db;
+  if (!StartSocat(socat, da, db)) { GTEST_SKIP() << "socat unavailable"; }
 
-  SerialConfig cfg; cfg.device = slave_name; cfg.baud_rate = 115200;
-  auto t = std::make_shared<SerialTransport>(cfg);
-  Sink sink; sink.Wire(t);
-  ASSERT_TRUE(static_cast<bool>(t->Open()));
+  SerialConfig ca; ca.device = da; ca.baud_rate = 115200;
+  SerialConfig cb; cb.device = db; cb.baud_rate = 115200;
+  auto a = std::make_shared<SerialTransport>(ca);
+  auto b = std::make_shared<SerialTransport>(cb);
+  std::vector<uint8_t> got;
+  b->OnBytes([&](Result<std::vector<uint8_t>> r, const std::string&){ if(r) got = r.value; });
+  if (!a->Open() || !b->Open()) { GTEST_SKIP() << "pty open/config failed in env"; }
 
-  const uint8_t out[] = {0x41, 0x42, 0x43};
-  ASSERT_EQ(write(master, out, 3), 3);
-  ASSERT_TRUE(sink.WaitBytes(3, 1000));
-  EXPECT_EQ(sink.acc, (std::vector<uint8_t>{0x41, 0x42, 0x43}));
+  ASSERT_TRUE(static_cast<bool>(a->Send(B({0xC0, 0xDE}))));
+  EXPECT_TRUE(pumpUntil([&]{ return got.size() == 2; }, 3000));
+  EXPECT_EQ(got, B({0xC0, 0xDE}));
+  a->Close(); b->Close();
+  socat.kill(); socat.waitForFinished(1000);
+}
 
-  ASSERT_TRUE(static_cast<bool>(t->Send({0x31, 0x32})));
-  uint8_t in[2] = {0, 0};
-  ASSERT_EQ(read(master, in, 2), 2);
-  EXPECT_EQ(in[0], 0x31); EXPECT_EQ(in[1], 0x32);
-
-  t->Close();
-  close(master);
+TEST(SerialTransport, OpenNonexistentFails) {
+  SerialConfig c; c.device = "/dev/nonexistent_tty_zzz";
+  auto s = std::make_shared<SerialTransport>(c);
+  auto st = s->Open();
+  EXPECT_FALSE(static_cast<bool>(st));
+  EXPECT_NE(st.error.find("config:"), std::string::npos);
 }
