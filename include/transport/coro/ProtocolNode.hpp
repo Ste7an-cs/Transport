@@ -25,6 +25,9 @@ class ProtocolNode {
   void   Stop();   // engine.Close() + transport->Close()
 
   // Request:发命令码 cmd + payload,等终结应答(或 timeout:/conn:)。须在 fiber 内调。
+  // 亲和契约:须在“固定到传输 I/O 线程”的 fiber 上调用(installFiberApplication 主/调度线程);
+  // .then() 续体默认 shared 亲和,可能落到工作线程而与 demux 竞争引擎的无锁 pending_,故禁止在其中调用
+  //(需调用时显式用 fixed 亲和)。详见 InteractionEngine::Request。
   Result<Message> Request(uint16_t cmd, std::vector<uint8_t> payload,
                           std::chrono::milliseconds timeout);
 

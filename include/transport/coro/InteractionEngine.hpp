@@ -35,6 +35,13 @@ class InteractionEngine {
   Status Fire(Message out, FrameTag tag, const Endpoint& to = Endpoint::Default());
   // Request:发 out(tag)并按 key 挂起,await_for(timeout)。仅挂起【当前 fiber】。
   //   返回:应答(终结帧)/ "timeout:" / "conn:"(Close 或断连)。
+  //
+  // 线程亲和契约(必读):pending_ 是无锁 map,由 Request(writer)与 demux onBytes(writer)
+  // 共写,唯一安全前提是二者同线程执行。因此 Request 必须在“固定到传输 I/O 线程”的 fiber 上调用
+  // ——即 installFiberApplication 的主/调度线程(Qt 事件循环 / OnBytes 所在线程)。
+  // makeTask(...) 的 fiber 默认 Affinity::fixed(当前线程)→ 安全;但 FiberTask::then(...) 续体
+  // 默认 Affinity::shared() → 可能落到 FibersPool 工作线程,与 demux 竞争 pending_。
+  // 故 .then() 续体(默认 shared 亲和)禁止调用 Request;需调用时请显式用 fixed 亲和。
   Result<Message> Request(Message out, FrameTag tag, std::chrono::milliseconds timeout,
                           const Endpoint& to = Endpoint::Default());
 

@@ -18,9 +18,9 @@ ProtocolNode::ProtocolNode(std::shared_ptr<ITransport> transport, uint8_t protoc
 }
 
 Status ProtocolNode::Start() {
-  auto st = transport_->Open();
+  auto st = engine_->Open();          // 先接回调(OnBytes/OnDisconnect)
   if (!st) return st;
-  return engine_->Open();
+  return transport_->Open();          // 再开传输,避免漏早到数据
 }
 
 void ProtocolNode::Stop() {

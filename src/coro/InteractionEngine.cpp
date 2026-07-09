@@ -29,6 +29,13 @@ void InteractionEngine::Close() {
   closing_ = true;
   for (auto& kv : pending_) kv.second->close();  // 唤醒等待者(await_for 返回错误 → Request 判 conn:)
   pending_.clear();
+  // 摘掉捕获 this 的传输回调:引擎持 shared_ptr<ITransport>,传输可比引擎活得久;
+  // 若不摘,晚到的数据报会在已析构的引擎上触发 this-捕获 lambda → use-after-free。
+  // 顺序:必须在唤醒/清空 pending 之后,以保证 Close 仍能把在途 Request 唤成 conn:。
+  if (transport_) {
+    transport_->OnBytes(nullptr);
+    transport_->OnDisconnect(nullptr);
+  }
 }
 
 Status InteractionEngine::Fire(Message out, FrameTag tag, const Endpoint& to) {
