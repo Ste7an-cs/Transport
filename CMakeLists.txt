@@ -106,8 +106,12 @@ endif()
 # ---------------------------------------------------------------------------
 option(TRANSPORT_BUILD_CORO "Build coroutine InteractionEngine (AsyncTask/boost.fiber)" ON)
 if(TRANSPORT_BUILD_CORO)
-  set(ASYNCTASK_DIR "/home/david/zpj/Framework-dev/AsyncTask" CACHE PATH "AsyncTask coroutine lib root")
+  # AsyncTask 为 git 子模块(third_party/AsyncTask);首次构建前 `git submodule update --init`。
+  set(ASYNCTASK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/AsyncTask" CACHE PATH "AsyncTask coroutine lib root (git submodule)")
   set(BOOST_LOCAL_ROOT "/usr/local" CACHE PATH "boost prefix with compiled fiber/context/thread/chrono")
+  if(NOT EXISTS "${ASYNCTASK_DIR}/coro/all.hpp")
+    message(FATAL_ERROR "AsyncTask 子模块未初始化:请运行 `git submodule update --init third_party/AsyncTask`(或 -DTRANSPORT_BUILD_CORO=OFF)。")
+  endif()
 
   # 已编译 boost 静态库(顺序:fiber 依赖 context)。
   add_library(boost_fiber_local INTERFACE)

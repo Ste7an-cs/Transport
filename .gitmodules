@@ -1,0 +1,3 @@
+[submodule "third_party/AsyncTask"]
+	path = third_party/AsyncTask
+	url = git@github.com:Ste7an-cs/AsyncTask.git
