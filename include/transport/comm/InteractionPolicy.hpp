@@ -78,6 +78,10 @@ class InteractionPolicy {
     kDrop             // 丢弃(如外部协议里无主的 RESPONSE/RESULT、未知帧)
   };
   virtual Route RouteUnmatched(const Message& in) = 0;
+
+  // IsTerminal:该 frm_type 是否【终结】一个请求(协程引擎 Request 用;异步引擎不调它)。
+  // 默认 RESULT 终结;需要别的终结规则的 policy 可覆写。纯加性,不影响异步引擎行为。
+  virtual bool IsTerminal(FrameType t) const { return t == FrameType::kResult; }
 };
 
 // request-await(发请求并等待回应)的一次性配置。由节点按交互模式填好,传给
