@@ -23,7 +23,7 @@ namespace coro {
 
 class InteractionEngine {
  public:
-  InteractionEngine(std::shared_ptr<ITransport> transport,
+  InteractionEngine(std::shared_ptr<::transport::ITransport> transport,
                     std::unique_ptr<ICodec> codec,
                     std::unique_ptr<InteractionPolicy> policy);
   ~InteractionEngine();
@@ -54,7 +54,7 @@ class InteractionEngine {
   void onBytes(Result<std::vector<uint8_t>> r, const std::string& from);
   void onDisconnect(const std::string& reason);
 
-  std::shared_ptr<ITransport> transport_;
+  std::shared_ptr<::transport::ITransport> transport_;
   std::unique_ptr<ICodec> codec_;
   std::unique_ptr<InteractionPolicy> policy_;
   std::function<Key(const Message&)> key_fn_;

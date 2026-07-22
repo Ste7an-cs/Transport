@@ -3,4 +3,6 @@
 *.a
 compile_commands.json
 /.claude/
+/.superpowers/
+/.worktrees/
 *.swp

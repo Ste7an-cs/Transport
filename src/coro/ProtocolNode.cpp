@@ -9,7 +9,7 @@
 namespace transport {
 namespace coro {
 
-ProtocolNode::ProtocolNode(std::shared_ptr<ITransport> transport, uint8_t protocol_id,
+ProtocolNode::ProtocolNode(std::shared_ptr<::transport::ITransport> transport, uint8_t protocol_id,
                            bool reply_to_source)
     : transport_(transport) {
   engine_ = std::make_unique<InteractionEngine>(

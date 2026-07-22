@@ -56,12 +56,12 @@ as-built v0.3.0 的交互层是**异步栈**:`IExecutor`/`ThreadExecutor`(单 wo
 
 - **D21（SRS 量化基线）：** 性能验收同时包含内存 Fake 框架基线和真实介质集成；目标参考机为 FT-2000/4 四核 2.2 GHz、8 GiB，实际部署峰值 20 节点×100 Hz，并以 30 节点×100 Hz 作暂定容量余量。时延、CPU、内存、稳定性和关闭时延的暂定值记录在 SRS，待软件环境固化后复核。
 
-**事实修正（F1）：** AsyncTask 的 `corosocket`(`CoroAbstractSocket`)只提供**流式 `readAll`**、**无 `receiveDatagram`/`senderAddress`**,也无专门 UDP 协程封装。故 `UdpTransport::Read()` **自桥 `QUdpSocket::readyRead → receiveDatagram()`**(datagram-aware,取一 datagram + 来源),**不**薄包 corosocket;TCP/串口仍薄包 `corosocket`/`coroiodevice`。
+**事实修正（F1，2026-07-21 再修订）：** AsyncTask `67b71a7` 已提供专门的 `CoroUdpSocket::receiveDatagram()`，返回保留 payload、发送方/目标地址和端口 metadata 的 `QNetworkDatagram` 流，并具备确定性关闭语义。故目标 `UdpTransport::Read()` 应复用该 awaitable，不再自建通用 Qt signal→fiber 桥；TCP/串口分别复用 `corosocket`/`coroiodevice`。DDS provider listener 的非 Qt 线程交接仍按 D4 单独设计。
 
 ## 影响（Consequences）
 
 - **正面:** 危险的挂起-应答纪律只写一处(`PendingTable`),避免重蹈当年双并发 Critical;协议语义清晰归各 node;内部 `ITransport` 抽象保留分层与可测性；M:N 运行时允许 node 间并行，而 node 内串行语义控制状态复杂度；连接代际使重连和热更新的迟到事件可隔离。
-- **代价/风险:** UDP 需自建报文级协程读；DDS 本地交接仍需关闭容量/溢出策略 TBD；服务端"每连接一 node"要管好 per-connection node 生命周期；严格串行业务处理意味着慢 handler 会形成队列压力，必须依靠有界队列与观测暴露。
+- **代价/风险:** AsyncTask socket awaitable 的超时不会取消底层操作，Transport 必须显式管理来源生命周期；DDS 本地交接仍需关闭容量/溢出策略 TBD；服务端"每连接一 node"要管好 per-connection node 生命周期；严格串行业务处理意味着慢 handler 会形成队列压力，必须依靠有界队列与观测暴露。
 - **可逆性:** D1/D2(基座边界)与 D6(用户面)相对可逆;D3(拓扑)、D4(桥策略)、D5(Close 纪律)是行为契约,较难改。
 - **SRS 落点:** `RT_CORO_RUNTIME`、`RT_TRANSPORT`、`RT_CODEC`、`RT_REQUEST`、`RT_HANDLER`、`RT_LIFECYCLE`、`RT_TCP_RECONNECT`、`RT_TCP_RECONFIG`、`RT_NODE`、`RT_ERROR_TRACE`、§3.3 和 §3.5。
 

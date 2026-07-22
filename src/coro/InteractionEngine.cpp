@@ -6,7 +6,7 @@
 namespace transport {
 namespace coro {
 
-InteractionEngine::InteractionEngine(std::shared_ptr<ITransport> transport,
+InteractionEngine::InteractionEngine(std::shared_ptr<::transport::ITransport> transport,
                                      std::unique_ptr<ICodec> codec,
                                      std::unique_ptr<InteractionPolicy> policy)
     : transport_(std::move(transport)), codec_(std::move(codec)), policy_(std::move(policy)) {
