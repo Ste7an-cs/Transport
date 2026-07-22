@@ -141,7 +141,10 @@ if(TRANSPORT_BUILD_CORO)
   target_compile_features(asynctask PUBLIC cxx_std_17)
   target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
 
-  add_library(transport_coro STATIC src/coro/InteractionEngine.cpp src/coro/ProtocolNode.cpp)
+  add_library(transport_coro STATIC
+    src/coro/Error.cpp
+    src/coro/InteractionEngine.cpp
+    src/coro/ProtocolNode.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(transport_coro PUBLIC cxx_std_17)
   target_link_libraries(transport_coro PUBLIC transport asynctask)
@@ -157,6 +160,7 @@ if(TRANSPORT_BUILD_CORO)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_request_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_keyfn_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/protocol_node_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/coro/error_test.cpp)
     add_test(NAME transport_coro_tests COMMAND transport_coro_tests)
   endif()
 endif()
