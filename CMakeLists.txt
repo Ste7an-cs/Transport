@@ -143,6 +143,7 @@ if(TRANSPORT_BUILD_CORO)
 
   add_library(transport_coro STATIC
     src/coro/Error.cpp
+    src/coro/Cancellation.cpp
     src/coro/InteractionEngine.cpp
     src/coro/ProtocolNode.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -161,6 +162,7 @@ if(TRANSPORT_BUILD_CORO)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_keyfn_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/protocol_node_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/error_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/coro/cancellation_test.cpp)
     add_test(NAME transport_coro_tests COMMAND transport_coro_tests)
   endif()
 endif()
