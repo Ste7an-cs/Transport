@@ -38,6 +38,8 @@ struct CopyProbe {
 
 static_assert(std::is_default_constructible_v<SharedCompletion<CopyProbe>>,
               "copy-constructible values must be supported");
+static_assert(std::is_default_constructible_v<SharedCompletion<void>>,
+              "void completion must be supported");
 
 }  // namespace
 
@@ -50,6 +52,17 @@ TEST(CoroSharedCompletion, FirstCompletionWinsAndLateWaitSeesIt) {
   auto result = completion.Wait();
   ASSERT_TRUE(result);
   EXPECT_EQ(result.value(), 7);
+}
+
+TEST(CoroSharedCompletion, VoidFirstCompletionWinsAndLateWaitSucceeds) {
+  SharedCompletion<void> completion;
+
+  EXPECT_TRUE(completion.Complete(transport::coro::Status{}));
+  EXPECT_FALSE(completion.Complete(
+      transport::coro::Status{make_error_code(TransportErrc::kInternal)}));
+
+  auto result = completion.Wait();
+  EXPECT_TRUE(result);
 }
 
 TEST(CoroSharedCompletion, LateWaitCopiesValueOutsideStateMutex) {

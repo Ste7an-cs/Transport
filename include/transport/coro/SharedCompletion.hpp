@@ -18,9 +18,10 @@ namespace transport::coro {
 
 template <typename T>
 class SharedCompletion {
-  static_assert(std::is_copy_constructible_v<T>,
-                "SharedCompletion<T> requires copy-constructible T because "
-                "each waiter receives its own Result<T>");
+  static_assert(std::is_void_v<T> || std::is_copy_constructible_v<T>,
+                "SharedCompletion<T> requires T to be void or "
+                "copy-constructible because each waiter receives its own "
+                "Result<T>");
 
  private:
   using StoredResult = std::shared_ptr<const Result<T>>;
