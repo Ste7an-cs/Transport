@@ -33,7 +33,7 @@
 - **连接状态观察器** —— **[target]** 观察 TCP 物理连接状态变化的应用能力，不承载入站业务处理。
 - **连接代际** —— **[target]** 每次成功建立 TCP 物理连接后形成的隔离标识；旧代际的迟到数据和事件不得影响新代际。
 - **配置版本** —— **[target]** 宿主提交的单调 TCP 连接管理配置快照版本；与连接代际是两个独立概念。
-- **coro socket** —— **[target]** AsyncTask 封装的协程 I/O:`corosocket`(QAbstractSocket,**仅流式 readAll**)、`coroiodevice`(QIODevice,串口)、`corotcpserver`(accept)。**UDP 报文语义 corosocket 不支持** → `UdpTransport` 自桥 `receiveDatagram`。
+- **coro socket** —— **[target]** AsyncTask 封装的协程 I/O:`corosocket`(QAbstractSocket 流式读写)、`coroiodevice`(QIODevice/串口)、`corotcpserver`(accept)、`coroudpsocket`(保持边界和地址 metadata 的 UDP datagram)。目标 Transport 复用这些 awaitable；DDS provider 的非 Qt listener 仍需单独的线程交接边界。
 - **DDS provider 交接边界** —— **[target]** DDS provider listener 样本安全进入节点所属执行域的行为边界；必须有界、非阻塞 listener、同 topic 保持框架接受顺序。它不要求存在名为 `DdsBridge` 的组件；具体投递机制、容量和溢出策略属于设计说明及尚未关闭的需求项。本地已经丢弃的样本不能由 DDS Reliable 自动恢复。
 - **provider** —— DDS 底层库的抽象适配(`IDdsProvider`):Fast DDS / 进程内 `FakeDdsProvider`。
 
