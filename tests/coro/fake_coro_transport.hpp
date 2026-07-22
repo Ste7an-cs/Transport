@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -36,6 +37,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
     std::optional<std::pair<std::error_code, bool>> next_write_error;
+    std::function<void()> before_timeout_arbitration;
     std::vector<SendUnit> sent;
     transport::coro::SharedCompletion<void> closed;
   };
@@ -101,9 +103,15 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     if (!notification &&
         notification.error() ==
             std::make_error_code(std::errc::timed_out)) {
-      CloseReadWaiter(
-          state, waiter,
-          transport::coro::make_error_code(TransportErrc::kTimeout));
+      auto before_arbitration = TakeBeforeTimeoutArbitration(state);
+      if (before_arbitration) {
+        before_arbitration();
+      }
+      if (!CloseReadWaiter(
+              state, waiter,
+              transport::coro::make_error_code(TransportErrc::kTimeout))) {
+        notification = Coro::await(waiter);
+      }
     }
     registration.Reset();
     FinishRead(state, waiter);
@@ -236,6 +244,12 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     state->next_write_error = std::make_pair(error, partial);
   }
 
+  void SetBeforeTimeoutArbitration(std::function<void()> hook) {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->before_timeout_arbitration = std::move(hook);
+  }
+
   bool ActiveRead() const {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -354,7 +368,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     }
   }
 
-  static void CloseReadWaiter(
+  static bool CloseReadWaiter(
       const std::shared_ptr<State>& state,
       const std::shared_ptr<Coro::Awaitable<Datagram>>& waiter,
       std::error_code error) {
@@ -369,6 +383,17 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     if (claimed) {
       waiter->close(error);
     }
+    return claimed;
+  }
+
+  static std::function<void()> TakeBeforeTimeoutArbitration(
+      const std::shared_ptr<State>& state) {
+    std::function<void()> hook;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      hook = std::move(state->before_timeout_arbitration);
+    }
+    return hook;
   }
 
   std::shared_ptr<State> state_;

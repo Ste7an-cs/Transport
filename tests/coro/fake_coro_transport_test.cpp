@@ -126,6 +126,66 @@ TEST(CoroFakeTransport, InjectionAfterCancellationIsPreservedForNextRead) {
   EXPECT_EQ(next.value().bytes, (std::vector<std::uint8_t>{7}));
 }
 
+TEST(CoroFakeTransport, InjectionWinsAfterAwaitTimeoutBeforeStateArbitration) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  fake.SetBeforeTimeoutArbitration([&] {
+    fake.Inject(Datagram{{8}, Endpoint::Topic("timeout-winner")});
+  });
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+
+  const auto result = fake.Read(options);
+
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.value().bytes, (std::vector<std::uint8_t>{8}));
+  EXPECT_EQ(result.value().source.topic, "timeout-winner");
+}
+
+TEST(CoroFakeTransport, InjectedErrorWinsAfterAwaitTimeoutBeforeArbitration) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  fake.SetBeforeTimeoutArbitration([&] {
+    fake.InjectError(make_error_code(TransportErrc::kConnection));
+  });
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+
+  const auto result = fake.Read(options);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), make_error_code(TransportErrc::kConnection));
+}
+
+TEST(CoroFakeTransport, CloseWinsAfterAwaitTimeoutBeforeStateArbitration) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  fake.SetBeforeTimeoutArbitration([&] { EXPECT_TRUE(fake.RequestClose()); });
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+
+  const auto result = fake.Read(options);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), make_error_code(TransportErrc::kClosed));
+  EXPECT_TRUE(fake.WaitClosed());
+}
+
+TEST(CoroFakeTransport, CancellationWinsAfterAwaitTimeoutBeforeArbitration) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  CancellationSource source;
+  fake.SetBeforeTimeoutArbitration([&] { EXPECT_TRUE(source.Cancel()); });
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+  options.cancellation = source.token();
+
+  const auto result = fake.Read(options);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), make_error_code(TransportErrc::kCancelled));
+}
+
 TEST(CoroFakeTransport, ConcurrentReadReturnsInvalidState) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
