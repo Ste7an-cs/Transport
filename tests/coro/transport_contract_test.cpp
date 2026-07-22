@@ -24,6 +24,8 @@ TEST(CoroTransportContract, DataUnitsOwnBytesAndAddressing) {
 }
 
 TEST(CoroTransportContract, OptionsUseSteadyClockDeadline) {
+  static_assert(std::is_same_v<OperationOptions::Clock, std::chrono::steady_clock>);
+
   OperationOptions options;
   options.deadline = OperationOptions::Clock::now() + std::chrono::seconds(1);
   EXPECT_TRUE(options.deadline.has_value());
@@ -32,5 +34,15 @@ TEST(CoroTransportContract, OptionsUseSteadyClockDeadline) {
 
 TEST(CoroTransportContract, InterfaceIsInternalPolymorphicSeam) {
   static_assert(std::has_virtual_destructor_v<ITransport>);
+  static_assert(std::is_same_v<decltype(&ITransport::Start),
+                               transport::coro::Status (ITransport::*)()>);
+  static_assert(std::is_same_v<decltype(&ITransport::Read),
+                               transport::coro::Result<Datagram> (ITransport::*)(OperationOptions)>);
+  static_assert(std::is_same_v<decltype(&ITransport::Write),
+                               transport::coro::Status (ITransport::*)(SendUnit)>);
+  static_assert(std::is_same_v<decltype(&ITransport::RequestClose),
+                               transport::coro::Status (ITransport::*)()>);
+  static_assert(std::is_same_v<decltype(&ITransport::WaitClosed),
+                               transport::coro::Status (ITransport::*)(OperationOptions)>);
   EXPECT_NE(LifecycleState::kCreated, LifecycleState::kClosed);
 }

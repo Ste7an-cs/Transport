@@ -18,7 +18,7 @@ namespace coro {
 
 class ProtocolNode {
  public:
-  ProtocolNode(std::shared_ptr<ITransport> transport, uint8_t protocol_id,
+  ProtocolNode(std::shared_ptr<::transport::ITransport> transport, uint8_t protocol_id,
                bool reply_to_source = false);
 
   Status Start();  // transport->Open() + engine.Open()
@@ -32,7 +32,7 @@ class ProtocolNode {
                           std::chrono::milliseconds timeout);
 
  private:
-  std::shared_ptr<ITransport> transport_;
+  std::shared_ptr<::transport::ITransport> transport_;
   std::unique_ptr<InteractionEngine> engine_;
 };
 
