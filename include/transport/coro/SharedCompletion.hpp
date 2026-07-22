@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,10 @@ namespace transport::coro {
 
 template <typename T>
 class SharedCompletion {
+  static_assert(std::is_copy_constructible_v<T>,
+                "SharedCompletion<T> requires copy-constructible T because "
+                "each waiter receives its own Result<T>");
+
  private:
   using StoredResult = std::shared_ptr<const Result<T>>;
   using Waiter = Coro::Awaitable<StoredResult>;
@@ -60,14 +65,19 @@ class SharedCompletion {
   Result<T> Wait(OperationOptions options = {}) const {
     auto state = state_;
     auto waiter = std::make_shared<Waiter>();
+    StoredResult completed;
     std::size_t waiter_id = 0;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->completion) {
-        return *state->completion;
+        completed = state->completion;
+      } else {
+        waiter_id = state->next_waiter_id++;
+        state->waiters.emplace(waiter_id, waiter);
       }
-      waiter_id = state->next_waiter_id++;
-      state->waiters.emplace(waiter_id, waiter);
+    }
+    if (completed) {
+      return *completed;
     }
 
     auto registration = options.cancellation.Register([waiter] {

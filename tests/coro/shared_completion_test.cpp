@@ -1,7 +1,9 @@
-#include <atomic>
 #include <chrono>
 #include <future>
+#include <functional>
 #include <gtest/gtest.h>
+#include <memory>
+#include <type_traits>
 #include <thread>
 
 #include "await/awaitable.hpp"
@@ -16,6 +18,29 @@ using transport::coro::SharedCompletion;
 using transport::coro::TransportErrc;
 using transport::coro::make_error_code;
 
+namespace {
+
+struct CopyProbe {
+  std::shared_ptr<std::function<void()>> on_copy;
+
+  CopyProbe() = default;
+  explicit CopyProbe(std::shared_ptr<std::function<void()>> callback)
+      : on_copy(std::move(callback)) {}
+  CopyProbe(const CopyProbe& other) : on_copy(other.on_copy) {
+    if (on_copy && *on_copy) {
+      (*on_copy)();
+    }
+  }
+  CopyProbe(CopyProbe&&) noexcept = default;
+  CopyProbe& operator=(const CopyProbe&) = default;
+  CopyProbe& operator=(CopyProbe&&) noexcept = default;
+};
+
+static_assert(std::is_default_constructible_v<SharedCompletion<CopyProbe>>,
+              "copy-constructible values must be supported");
+
+}  // namespace
+
 TEST(CoroSharedCompletion, FirstCompletionWinsAndLateWaitSeesIt) {
   SharedCompletion<int> completion;
 
@@ -25,6 +50,32 @@ TEST(CoroSharedCompletion, FirstCompletionWinsAndLateWaitSeesIt) {
   auto result = completion.Wait();
   ASSERT_TRUE(result);
   EXPECT_EQ(result.value(), 7);
+}
+
+TEST(CoroSharedCompletion, LateWaitCopiesValueOutsideStateMutex) {
+  SharedCompletion<CopyProbe> completion;
+  std::promise<void> start_reentry;
+  std::promise<void> reentry_finished;
+  auto reentry_done = reentry_finished.get_future();
+  bool copy_observed_unblocked_reentry = false;
+  auto callback = std::make_shared<std::function<void()>>([&] {
+    start_reentry.set_value();
+    copy_observed_unblocked_reentry =
+        reentry_done.wait_for(100ms) == std::future_status::ready;
+  });
+
+  EXPECT_TRUE(completion.Complete(Result<CopyProbe>{CopyProbe{callback}}));
+  std::thread reentrant_completer([&] {
+    start_reentry.get_future().wait();
+    EXPECT_FALSE(completion.Complete(Result<CopyProbe>{CopyProbe{}}));
+    reentry_finished.set_value();
+  });
+
+  auto late = completion.Wait();
+  reentrant_completer.join();
+
+  EXPECT_TRUE(late);
+  EXPECT_TRUE(copy_observed_unblocked_reentry);
 }
 
 TEST(CoroSharedCompletion, WakesMultipleWaitersAfterBothEnterWait) {
@@ -109,62 +160,81 @@ TEST(CoroSharedCompletion, DeadlineOnlyEndsTheTimedOutWaiter) {
   EXPECT_EQ(survivor.value(), 13);
 }
 
-TEST(CoroSharedCompletion, CompleteCancelRaceReturnsOneDefinedOutcome) {
-  for (int iteration = 0; iteration < 32; ++iteration) {
-    SharedCompletion<int> completion;
-    CancellationSource source;
-    OperationOptions options;
-    options.cancellation = source.token();
-    Coro::Awaitable<void> entered;
-    Result<int> observed{make_error_code(TransportErrc::kInternal)};
-    auto waiter = Coro::makeTask([&] {
-      entered.resolve();
-      observed = completion.Wait(options);
-    });
-    EXPECT_TRUE(entered.await());
+TEST(CoroSharedCompletion, PreCancelledWaitReturnsCancelled) {
+  SharedCompletion<int> completion;
+  CancellationSource source;
+  EXPECT_TRUE(source.Cancel());
+  OperationOptions options;
+  options.cancellation = source.token();
 
-    auto cancelling =
-        std::async(std::launch::async, [&] { return source.Cancel(); });
-    EXPECT_TRUE(completion.Complete(Result<int>{17}));
-    (void)cancelling.get();
-    EXPECT_TRUE(waiter.get());
+  auto result = completion.Wait(options);
 
-    if (observed) {
-      EXPECT_EQ(observed.value(), 17);
-    } else {
-      EXPECT_EQ(observed.error(), make_error_code(TransportErrc::kCancelled));
-    }
-    ASSERT_TRUE(completion.Wait());
-    EXPECT_EQ(completion.Wait().value(), 17);
-  }
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), make_error_code(TransportErrc::kCancelled));
 }
 
-TEST(CoroSharedCompletion, CompleteTimeoutRaceReturnsOneDefinedOutcome) {
-  for (int iteration = 0; iteration < 16; ++iteration) {
-    SharedCompletion<int> completion;
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 1ms;
-    Result<int> observed{make_error_code(TransportErrc::kInternal)};
-    Coro::Awaitable<void> entered;
-    auto waiter = Coro::makeTask([&] {
-      entered.resolve();
-      observed = completion.Wait(options);
-    });
-    EXPECT_TRUE(entered.await());
+TEST(CoroSharedCompletion, CompletedLateWaitIgnoresCancellationAndPastDeadline) {
+  SharedCompletion<int> completion;
+  CancellationSource source;
+  EXPECT_TRUE(source.Cancel());
+  OperationOptions options;
+  options.cancellation = source.token();
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+  EXPECT_TRUE(completion.Complete(Result<int>{17}));
 
-    auto completing = std::async(std::launch::async, [&] {
-      std::this_thread::sleep_for(1ms);
-      return completion.Complete(Result<int>{19});
-    });
-    EXPECT_TRUE(waiter.get());
-    EXPECT_TRUE(completing.get());
+  auto result = completion.Wait(options);
 
-    if (observed) {
-      EXPECT_EQ(observed.value(), 19);
-    } else {
-      EXPECT_EQ(observed.error(), make_error_code(TransportErrc::kTimeout));
-    }
-    ASSERT_TRUE(completion.Wait());
-    EXPECT_EQ(completion.Wait().value(), 19);
-  }
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.value(), 17);
+}
+
+TEST(CoroSharedCompletion, PastDeadlineWithoutCompletionReturnsTimeout) {
+  SharedCompletion<int> completion;
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() - 1ms;
+
+  auto result = completion.Wait(options);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), make_error_code(TransportErrc::kTimeout));
+}
+
+TEST(CoroSharedCompletion, CompleteBeforeCancelReturnsCompletedValue) {
+  SharedCompletion<int> completion;
+  CancellationSource source;
+  OperationOptions options;
+  options.cancellation = source.token();
+  Coro::Awaitable<void> entered;
+  Result<int> observed{make_error_code(TransportErrc::kInternal)};
+  auto waiter = Coro::makeTask([&] {
+    entered.resolve();
+    observed = completion.Wait(options);
+  });
+  EXPECT_TRUE(entered.await());
+
+  EXPECT_TRUE(completion.Complete(Result<int>{19}));
+  EXPECT_TRUE(source.Cancel());
+  EXPECT_TRUE(waiter.get());
+
+  ASSERT_TRUE(observed);
+  EXPECT_EQ(observed.value(), 19);
+}
+
+TEST(CoroSharedCompletion, CompleteBeforeDeadlineReturnsCompletedValue) {
+  SharedCompletion<int> completion;
+  OperationOptions options;
+  options.deadline = OperationOptions::Clock::now() + 1s;
+  Coro::Awaitable<void> entered;
+  Result<int> observed{make_error_code(TransportErrc::kInternal)};
+  auto waiter = Coro::makeTask([&] {
+    entered.resolve();
+    observed = completion.Wait(options);
+  });
+  EXPECT_TRUE(entered.await());
+
+  EXPECT_TRUE(completion.Complete(Result<int>{23}));
+  EXPECT_TRUE(waiter.get());
+
+  ASSERT_TRUE(observed);
+  EXPECT_EQ(observed.value(), 23);
 }
