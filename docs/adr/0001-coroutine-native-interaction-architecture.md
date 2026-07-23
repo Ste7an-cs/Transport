@@ -70,6 +70,6 @@ as-built v0.3.0 的交互层是**异步栈**:`IExecutor`/`ThreadExecutor`(单 wo
 - 迁移分期(每期可测边界)——留待 writing-plans。
 - 桥"跨线程唤醒 fiber"的具体机制(裸 boost fiber channel 从外线程 push 是否安全 / 锁队列 + 往调度线程 post)——留待设计。
 - `PendingTable` 是否需支持一键多待(同 key 并发)——目前 `(session_id,message_id)` 键空间约束下不需要。
-- DDS provider 本地交接容量与溢出策略。
-- 多线程/多 fiber 并发发送的跨调用方顺序。
+- ~~DDS provider 本地交接容量与溢出策略。~~ **已由 ADR-0002 D4 关闭**（有界 + tail-drop，默认 1024 样本/16 MiB 可配）。
+- ~~多线程/多 fiber 并发发送的跨调用方顺序。~~ **已由 ADR-0002 D1 关闭**（= 节点执行域到达顺序）。
 - 五种外部协议交互状态机、正式帧类型值和 CRC 契约。

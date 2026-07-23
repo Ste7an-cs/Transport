@@ -36,6 +36,9 @@
 - **coro socket** —— **[target]** AsyncTask 封装的协程 I/O:`corosocket`(QAbstractSocket 流式读写)、`coroiodevice`(QIODevice/串口)、`corotcpserver`(accept)、`coroudpsocket`(保持边界和地址 metadata 的 UDP datagram)。目标 Transport 复用这些 awaitable；DDS provider 的非 Qt listener 仍需单独的线程交接边界。
 - **DDS provider 交接边界** —— **[target]** DDS provider listener 样本安全进入节点所属执行域的行为边界；必须有界、非阻塞 listener、同 topic 保持框架接受顺序。它不要求存在名为 `DdsBridge` 的组件；具体投递机制、容量和溢出策略属于设计说明及尚未关闭的需求项。本地已经丢弃的样本不能由 DDS Reliable 自动恢复。
 - **provider** —— DDS 底层库的抽象适配(`IDdsProvider`):Fast DDS / 进程内 `FakeDdsProvider`。
+- **发送完成语义** —— **[target]** 一次发送以"该帧字节全部离开框架/Qt 用户态发送缓冲、进入操作系统发送缓冲"为完成判据(非"对端已收")。由此每连接用户态写缓冲至多驻留一个在写帧,背压经协程 `await` 传导回发起方;**不采用 fire-and-forget**(写入即返回、无界缓冲吸收)。见 SRS RT_TRANSPORT_008。
+- **发送排序** —— **[target]** = **节点执行域到达顺序**:单 fiber 程序序必被保持;跨 fiber 并发发送取得某个一致全序,但不可由调用方墙钟时序预测。非"跨调用方全局 FIFO"。见 RT_TRANSPORT_007。
+- **丢弃归因** —— 框架每一次本地丢弃/重复抑制都归因到**恰好一个命名且计数的原因**(业务队列溢出、DDS 交接溢出、坏帧、迟到/重复/无匹配响应、关闭丢弃、连接代际隔离丢弃),无静默丢失。"框架丢失/重复 = 0"的可验证判据:无外部故障 + 负载 ≤ 容量时损失类计数器全 0。迟到/重复/坏帧属**过滤非丢失**。
 
 ## 边界与非目标
 

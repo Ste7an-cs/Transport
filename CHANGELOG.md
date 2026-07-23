@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+> 面向**协程原生目标架构**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/需求规格说明书-协程原生.md`)的文档与地基工作;尚未构成发布版本,as-built 交互层仍为 0.3.0 的异步栈 + 第二期 `coro::InteractionEngine`。目标与 as-built 的差异在本节、迁移计划与测试追溯矩阵中维护。
+
+### 文档:协程原生 SRS v2→v3 —— grilling 收敛 + ADR-0002 — 2026-07-22
+> 经 `/grill-with-docs` 逐条盘问,把 SRS v2 的多处可验收性缺口收敛为可验证需求,关闭 TBD-002 与 TBD-006;决策记入新建 ADR-0002 并回指 SRS 需求号。
+- **新增** `RT_TRANSPORT_007` 定义并发发送排序 = **节点执行域到达顺序**(单 fiber 程序序保持;跨 fiber 取得某个一致全序,但不保证可由调用方墙钟时序预测),**关闭 TBD-002**;`RT_TRANSPORT_008` 定义**发送完成 = 帧字节全部离开框架用户态发送缓冲(进内核)+ 协程背压**,否决 fire-and-forget(经 corosocket 代码核对:用现有 `write()`+`waitForBytesWritten()` 循环可实现,不改 AsyncTask、不暴露 corosocket 给用户)。
+- **新增** `RT_NODE_006`(无连接介质判活归协议/交互层,transport 只暴露最近收发时间戳/计数/单操作错误等 I/O 事实)、`RT_NODE_007`(DDS provider 交接有界队列 + 满时丢最新 tail-drop,默认 1024 样本/16 MiB 可配),**关闭 TBD-006 的 DDS 部分**;`RT_LIFECYCLE_002` 补「连接状态是 TCP 客户端在 `Running` 内的子状态,非对等第二生命周期;非重连节点致命错误→`Closing→Closed`,无 `Reconnecting`」。
+- **变更** 业务队列字节上限可配范围定为 **64 KiB~256 MiB**(默认 16 MiB)+ 聚合内存(Σ 业务队列+DDS 交接)归宿主保证落在 RSS 预算,**关闭 TBD-006 剩余部分**;3.6.2 把「框架导致丢失/重复 = 0」改为**容量内可验证判据 + 逐因归因**(每次本地丢弃归因到恰好一个命名计数原因,Σ 命名原因计数 = 总丢弃,无静默丢失;迟到/重复/坏帧属正确过滤而非丢失),RT_DATA_BUFFER/RT_TESTABILITY 同步。
+- **新增** `docs/adr/0002-send-completion-drop-attribution-and-lifecycle-refinements.md`(决策 D1–D6 + corosocket 可行性核对 F1);`docs/adr/0001-*` 的「尚未解决」标注 DDS 交接容量/溢出、并发发送排序两项已由 ADR-0002 关闭;`CONTEXT.md` 增术语 **发送完成语义 / 发送排序 / 丢弃归因**。
+- **说明** 本节为**目标需求**收敛,不含实现;SRS 版本 v2→v3。
+
+### 地基:协程传输契约 + 协作取消 + 结构化错误 + 共享完成原语 — 2026-07-21 ~ 07-22(PR #17)
+> 协程原生传输层的地基件,尚未接入节点。AsyncTask 以 `third_party/AsyncTask` **git 子模块**纳入并补充 socket awaitable(新增 `CoroUdpSocket::receiveDatagram()` 保留 datagram 边界与地址 metadata 等)。
+- **新增** 协程传输契约(`ITransport` 协程 await 式定义 + 契约消歧)、**结构化传输错误**、**协作取消**(含取消竞态加固)、**共享完成原语 `SharedCompletion`**(支持 `void`、值拷贝前释放完成锁)。
+- **新增** 确定性 **Fake 传输**测试替身 + fake 读超时仲裁(用 AsyncTask `await_for`)。
+- **构建/杂项** AsyncTask 转 git 子模块并更新 socket awaitables;忽略本地 worktree 与 subagent 进度账本。
+- **设计** `docs/` 增协程传输地基的 plan/design 文档。
+
+### 文档:协程原生架构 SRS(GJB 精简模板)+ agent-skills 配置 — 2026-07-17 ~ 07-21(PR #15/#16)
+- **新增** 目标架构 SRS `docs/需求规格说明书-协程原生.md`(GJB 精简模板,标识前缀 `RT`);ADR-0001(协程原生交互架构,多轮 grilling 决策 D1–D21 + 事实修正)。
+- **新增** agent-skills 配置:issue tracker(GitHub / `gh`)与 domain docs(single-context)约定,落 `docs/agents/`、`CLAUDE.md`/`AGENTS.md` 的 `## Agent skills`。
+- **变更** SRS v1→v2「完善协程原生需求规格」;`CONTEXT.md` 术语表标注 [as-built]/[target]。
+
 ## [0.3.0] - 2026-07-09
 
 > **⚠️ 破坏性次版本 —— 传输层从 standalone Asio 迁至 QtNetwork(去 asio、需 Qt5);并新增协程原生交互引擎(第二期)。** 与 0.2.x **不构建兼容**:整仓构建从此需 Qt5,所有传输不再自持 io 线程 → 用它们的宿主须运行 Qt 事件循环。
@@ -180,5 +202,8 @@
 
 ---
 
-[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.3.0
+[0.2.1]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.2.1
+[0.2.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.1.0
