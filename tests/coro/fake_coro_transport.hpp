@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -38,6 +39,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
     std::optional<std::pair<std::error_code, bool>> next_write_error;
     std::function<void()> before_timeout_arbitration;
+    std::size_t send_waiters{0};
     std::vector<SendUnit> sent;
     transport::coro::SharedCompletion<void> closed;
   };
@@ -145,6 +147,9 @@ class FakeCoroTransport final : public transport::coro::ITransport {
         return transport::coro::make_error_code(TransportErrc::kInvalidState);
       }
       state->active_write = true;
+      // 发送等待者:已获取有效写、正等待帧刷完(进入操作系统发送缓冲)的 fiber。
+      // 单写约束下至多一个,是发送侧背压是否积压的可观测事实(3.4.4)。
+      state->send_waiters += 1;
       if (state->hold_writes) {
         gate = std::make_shared<Coro::Awaitable<void>>();
         state->write_gate = gate;
@@ -274,6 +279,13 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     return state->sent;
   }
 
+  // 发送等待者深度:当前正等待帧刷完的发送 fiber 数(供上层判活/背压观测)。
+  std::size_t SendWaiterDepth() const {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->send_waiters;
+  }
+
  private:
   static void FinishRead(
       const std::shared_ptr<State>& state,
@@ -301,6 +313,9 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->active_write = false;
+      if (state->send_waiters > 0) {
+        state->send_waiters -= 1;
+      }
       state->write_gate.reset();
       if (state->lifecycle == LifecycleState::kClosing &&
           !state->active_read) {
