@@ -156,22 +156,34 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
     socket = state->socket;
   }
 
-  auto reader = Coro::coro(socket.data()).readAll();
-  auto registration = options.cancellation.Register(
-      [reader] { reader->close(make_error_code(TransportErrc::kCancelled)); });
-  Coro::Result<QByteArray, std::error_code> notification =
-      options.deadline
-          ? Coro::await_for(reader, *options.deadline - Clock::now())
-          : Coro::await(reader);
-  registration.Reset();
-
+  // 读路径按本 spec 只需最小能力(供发送侧回环验证)。若 Qt 读缓冲已有字节则
+  // 直接取,否则用单发的 waitForReadyRead 等一次到达——避免 readAll 的持久订阅在
+  // 逐次 Read 间残留、把后续到达的字节截走。
   Result<Datagram> result{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void, std::error_code> notification{};
+  if (socket && socket->bytesAvailable() > 0) {
+    notification = Coro::Result<void, std::error_code>{};
+  } else if (!socket) {
+    notification = make_error_code(TransportErrc::kClosed);
+  } else {
+    auto ready = Coro::coro(socket.data()).waitForReadyRead();
+    auto registration = options.cancellation.Register(
+        [ready] { ready->close(make_error_code(TransportErrc::kCancelled)); });
+    notification = options.deadline
+                       ? Coro::await_for(ready, *options.deadline - Clock::now())
+                       : Coro::await(ready);
+    registration.Reset();
+  }
+
   if (notification) {
-    const QByteArray& bytes = notification.value();
     Datagram datagram;
-    datagram.bytes.assign(
-        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
-        reinterpret_cast<const std::uint8_t*>(bytes.constData()) + bytes.size());
+    if (socket && socket->bytesAvailable() > 0) {
+      const QByteArray bytes = socket->readAll();
+      datagram.bytes.assign(
+          reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+          reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
+              bytes.size());
+    }
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_recv = Clock::now();

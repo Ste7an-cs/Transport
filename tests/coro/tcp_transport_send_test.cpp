@@ -2,6 +2,7 @@
 // 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证:Write 刷完即完成、
 // 慢读取端下的背压且内存有界、并发一致顺序、对端 reset → Io/Connection + 关连接、
 // 写入已开始后超时 → Timeout 且帧不被截断。连接建立由测试夹具完成(非本类职责)。
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <vector>
@@ -61,6 +62,25 @@ SendUnit Frame(std::vector<std::uint8_t> bytes) {
   return SendUnit{std::move(bytes), Endpoint::Default()};
 }
 
+// 收紧内核收发缓冲,让慢读取端能确定性地把内核发送缓冲填满(制造背压)。
+void Throttle(QTcpSocket* client, QTcpSocket* accepted, int bytes = 16384) {
+  client->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, bytes);
+  accepted->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption,
+                            bytes);
+}
+
+// 单写约束下的重试发送:并发违规写返回 InvalidState,让出后重试直到上线。
+void WriteWithRetry(TcpTransport& t, std::vector<std::uint8_t> bytes) {
+  for (;;) {
+    auto status = t.Write(Frame(bytes));
+    if (status) {
+      return;
+    }
+    ASSERT_EQ(status.error(), make_error_code(TransportErrc::kInvalidState));
+    boost::this_fiber::yield();
+  }
+}
+
 // 从流式传输读满 n 字节(读路径按本 spec 只需最小能力)。
 std::vector<std::uint8_t> ReadExact(TcpTransport& t, std::size_t n,
                                     int budget_ms = 3000) {
@@ -101,4 +121,157 @@ TEST(CoroTcpTransport, WriteFlushesFrameAndPeerReceivesIt) {
   const auto received = ReadExact(receiver, frame.size());
   EXPECT_EQ(received, frame);
   EXPECT_TRUE(receiver.LastReceiveTime().has_value());
+}
+
+// RT_TRANSPORT_008:慢读取端填满内核发送缓冲 → 生产者 Write 挂起(背压),且框架
+// 用户态发送缓冲至多驻留一个在写帧(第二个并发写被拒 → 内存有界)。排空后完成。
+TEST(CoroTcpTransport, SlowReaderAppliesBackpressureAndBoundsInFlightFrames) {
+  QTcpServer server;
+  QTcpSocket* client = nullptr;
+  QTcpSocket* accepted = nullptr;
+  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
+  Throttle(client, accepted);
+  TcpTransport sender(client);
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(sender.Start());
+  ASSERT_TRUE(receiver.Start());
+
+  const std::vector<std::uint8_t> big(256u * 1024u, 0x33);  // 256 KiB,远超收紧后的缓冲。
+  Status write_status{make_error_code(TransportErrc::kInternal)};
+  auto writer = Coro::makeTask([&] { write_status = sender.Write(Frame(big)); });
+
+  // 内核发送缓冲填满 → Write 在刷完循环中挂起,发送等待者深度为 1。
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 1; }));
+  // 读取端不读:背压持续,Write 不完成。
+  boost::this_fiber::sleep_for(80ms);
+  EXPECT_EQ(sender.SendWaiterDepth(), 1U);
+  EXPECT_FALSE(sender.LastSendTime().has_value());
+  // 至多一个在写帧:并发第二写被拒 → 用户态发送缓冲有界。
+  const auto second = sender.Write(Frame({0x99}));
+  ASSERT_FALSE(second);
+  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kInvalidState));
+
+  // 排空接收端 → 背压释放,Write 完成、整帧上线。
+  const auto received = ReadExact(receiver, big.size(), 8000);
+  EXPECT_TRUE(writer.get());
+  EXPECT_TRUE(write_status);
+  EXPECT_EQ(sender.SendWaiterDepth(), 0U);
+  EXPECT_TRUE(sender.LastSendTime().has_value());
+  ASSERT_EQ(received.size(), big.size());
+  EXPECT_EQ(received, big);
+}
+
+// RT_TRANSPORT_007/004:并发发送者被串行化为一致全序,单帧不交错(先获取有效写者
+// 先整帧上线,对端绝不看到两帧交错的半截字节)。
+TEST(CoroTcpTransport, ConcurrentSendersProduceConsistentUninterleavedOrder) {
+  QTcpServer server;
+  QTcpSocket* client = nullptr;
+  QTcpSocket* accepted = nullptr;
+  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
+  Throttle(client, accepted);
+  TcpTransport sender(client);
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(sender.Start());
+  ASSERT_TRUE(receiver.Start());
+
+  constexpr std::size_t kFrame = 128u * 1024u;
+  const std::vector<std::uint8_t> frame_a(kFrame, 0xAA);
+  const std::vector<std::uint8_t> frame_b(kFrame, 0xBB);
+
+  auto first = Coro::makeTask([&] { WriteWithRetry(sender, frame_a); });
+  // 先让第一帧进入刷完(持有有效写),第二帧并发进入必被串行化到其后。
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 1; }));
+  auto second = Coro::makeTask([&] { WriteWithRetry(sender, frame_b); });
+
+  const auto received = ReadExact(receiver, 2 * kFrame, 8000);
+  EXPECT_TRUE(first.get());
+  EXPECT_TRUE(second.get());
+
+  ASSERT_EQ(received.size(), 2 * kFrame);
+  // 恰好一次值跳变 = 两帧各自连续、互不交错;先持有有效写的 A 先上线。
+  std::size_t transitions = 0;
+  for (std::size_t i = 1; i < received.size(); ++i) {
+    if (received[i] != received[i - 1]) {
+      ++transitions;
+    }
+  }
+  EXPECT_EQ(transitions, 1U);
+  EXPECT_EQ(received.front(), 0xAA);
+  EXPECT_EQ(received.back(), 0xBB);
+  EXPECT_EQ(std::count(received.begin(), received.end(), 0xAA), kFrame);
+  EXPECT_EQ(std::count(received.begin(), received.end(), 0xBB), kFrame);
+}
+
+// RT_TRANSPORT_004.4:刷完途中对端 reset → 本次 Write 返回 Io/Connection,本物理
+// 连接关闭,不在其上继续发送、不重发残缺帧。
+TEST(CoroTcpTransport, PeerResetDuringFlushFailsWriteAndClosesConnection) {
+  QTcpServer server;
+  QTcpSocket* client = nullptr;
+  QTcpSocket* accepted = nullptr;
+  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
+  Throttle(client, accepted);
+  TcpTransport sender(client);
+  ASSERT_TRUE(sender.Start());
+
+  const std::vector<std::uint8_t> big(256u * 1024u, 0x44);
+  Status write_status{make_error_code(TransportErrc::kInternal)};
+  auto writer = Coro::makeTask([&] { write_status = sender.Write(Frame(big)); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 1; }));
+
+  accepted->abort();  // 对端强制断开(reset),刷完中途失败。
+  EXPECT_TRUE(writer.get());
+  ASSERT_FALSE(write_status);
+  const auto err = write_status.error();
+  EXPECT_TRUE(err == make_error_code(TransportErrc::kConnection) ||
+              err == make_error_code(TransportErrc::kIo))
+      << "unexpected: " << err.message();
+  // 本物理连接被关闭。
+  EXPECT_TRUE(sender.WaitClosed());
+  EXPECT_NE(sender.LastError(), std::error_code{});
+  // 关闭后不得继续发送。
+  const auto after = sender.Write(Frame({1}));
+  ASSERT_FALSE(after);
+  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+
+  accepted->deleteLater();
+}
+
+// RT_REQUEST_004.4:写入已开始后总超时——发起方本地返回 Timeout,而底层尽力把帧
+// 写完(健康连接不截断),对端最终完整收到该帧。
+TEST(CoroTcpTransport, TimeoutAfterWriteStartedDoesNotTruncateHealthyFrame) {
+  QTcpServer server;
+  QTcpSocket* client = nullptr;
+  QTcpSocket* accepted = nullptr;
+  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
+  Throttle(client, accepted);
+  TcpTransport sender(client);
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(sender.Start());
+  ASSERT_TRUE(receiver.Start());
+
+  const std::vector<std::uint8_t> big(256u * 1024u, 0x77);
+  Status write_status{make_error_code(TransportErrc::kInternal)};
+  Coro::Awaitable<void> completion;
+  auto writer = Coro::makeTask([&] {
+    write_status = sender.Write(Frame(big));
+    completion.resolve();
+  });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 1; }));
+
+  // 发起方(请求层)总超时:本地立即判 Timeout,不撕连接、不截断在写帧。
+  const auto waited = completion.await_for(120ms);
+  ASSERT_FALSE(waited);
+  EXPECT_EQ(waited.error(), std::make_error_code(std::errc::timed_out));
+  EXPECT_EQ(sender.SendWaiterDepth(), 1U);  // 底层仍在尽力刷完。
+
+  // 排空接收端:帧未被截断,对端完整收到,且底层刷完最终成功。
+  const auto received = ReadExact(receiver, big.size(), 8000);
+  EXPECT_TRUE(writer.get());
+  EXPECT_TRUE(write_status);
+  ASSERT_EQ(received.size(), big.size());
+  EXPECT_EQ(received, big);
 }
