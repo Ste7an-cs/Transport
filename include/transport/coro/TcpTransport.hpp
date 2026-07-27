@@ -16,9 +16,14 @@ class QAbstractSocket;
 
 namespace transport::coro {
 
-// 协程原生 TCP 传输——只覆盖已建立连接上的收发语义。
-//
-// 发送路径遵守 ITransport 契约的可观察发送完成语义:
+/**
+ * @brief 协程原生 TCP 传输——只覆盖已建立连接上的字节收发与发送完成语义。
+ *
+ * 连接建立、自动重连、运行时重配置不在本类职责(见连接管理 spec);构造时接管一个
+ * 已连接的 QAbstractSocket,客户端与服务端已接受连接共享本实现,不向用户暴露
+ * corosocket。发送路径遵守 ITransport 契约的可观察发送完成语义。
+ */
+// 发送路径可观察语义细则:
 //   * RT_TRANSPORT_008 一次发送在帧字节全部离开框架用户态发送缓冲、进入操作系统
 //     发送缓冲后才报告成功;背压经协程 await 自然传导回发起方,不 fire-and-forget。
 //   * RT_TRANSPORT_007 同一 fiber 的先后发送按程序序上线;跨 fiber 并发发送被
@@ -29,9 +34,6 @@ namespace transport::coro {
 //     不自动重发残缺帧。
 //   * RT_REQUEST_004.4 写入已开始后被取消/超时,底层尽力把帧写完(健康连接不
 //     截断);取消/超时的本地返回码由发起方(请求层)裁决,不由本类截断连接。
-//
-// 连接建立、自动重连、运行时重配置不在本类职责:构造时接管一个已连接的
-// QAbstractSocket。客户端与服务端已接受连接共享本实现。不向用户暴露 corosocket。
 class TcpTransport final : public ITransport {
  public:
   using Clock = OperationOptions::Clock;

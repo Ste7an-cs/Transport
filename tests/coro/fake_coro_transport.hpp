@@ -333,6 +333,8 @@ class FakeCoroTransport final : public transport::coro::ITransport {
 
   // 写槽持有者收尾:回退等待者计数,并把写槽移交队首等待者(FIFO 串行化);关闭中
   // 则唤醒全部排队者以 kClosed 收敛,不再移交。
+  // 注:写槽 FIFO 语义(EnterWrite/ExitWrite/LeaveWriteQueue/BeginClose)与生产
+  // TcpTransport 的同名逻辑对齐——改串行化行为需同步两处。
   static void ExitWrite(const std::shared_ptr<State>& state) {
     std::shared_ptr<Coro::Awaitable<void>> next_gate;
     std::deque<std::shared_ptr<Coro::Awaitable<void>>> closed_gates;

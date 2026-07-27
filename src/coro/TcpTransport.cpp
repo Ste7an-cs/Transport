@@ -206,15 +206,14 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
     return make_error_code(TransportErrc::kInternal);
   }
 
-  // 复用持有的 readAll 流:每次 Read await 下一片。await_for 超时不停止流(可再次
-  // Read);取消则关流(终止读取)。流按 channel FIFO 保序、单发自清理(AutoDisconnect)。
-  auto registration = options.cancellation.Register(
-      [stream] { stream->close(make_error_code(TransportErrc::kCancelled)); });
+  // 复用持有的 readAll 流:每次 Read await 下一片(channel FIFO 保序、单发自清理)。
+  // 读侧为最小能力(见 spec out-of-scope):以 deadline 界定单次读;要中断在途 Read
+  // 请关闭传输(RequestClose→关流→Read 返回 Closed)。不逐次响应 cancellation token
+  // ——持久单流被逐读取消 close 会永久终止整条读流,与超时(不停流、可再读)不对称。
   Coro::Result<QByteArray, std::error_code> chunk =
       options.deadline
           ? Coro::await_for(stream, *options.deadline - Clock::now())
           : Coro::await(stream);
-  registration.Reset();
 
   Result<Datagram> result{make_error_code(TransportErrc::kInternal)};
   if (chunk) {
@@ -230,8 +229,6 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
     result = Result<Datagram>{std::move(datagram)};
   } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
     result = make_error_code(TransportErrc::kTimeout);
-  } else if (chunk.error() == make_error_code(TransportErrc::kCancelled)) {
-    result = chunk.error();
   } else if (chunk.error().category() == Coro::detail::socket_error_category()) {
     std::error_code mapped = MapSocketError(chunk.error());
     {
