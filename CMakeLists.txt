@@ -6,24 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
-option(TRANSPORT_BUILD_EXAMPLES "Build example programs" OFF)
 
 add_library(transport STATIC
   src/core/version.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
-  src/udp/UdpTransport.cpp
-  src/tcp/TcpClientTransport.cpp
-  src/tcp/TcpConnection.cpp
-  src/tcp/TcpServerTransport.cpp
-  src/serial/SerialTransport.cpp
   src/dds/DdsProviderRegistry.cpp
   src/dds/FakeDdsProvider.cpp
-  src/dds/DdsTransport.cpp
-  src/comm/ThreadExecutor.cpp
-  src/comm/InteractionEngine.cpp
-  src/comm/DdsNode.cpp
-  src/comm/ProtocolNode.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -34,7 +23,7 @@ find_package(Threads REQUIRED)
 find_package(Qt5 5.12 REQUIRED COMPONENTS Core Network SerialPort)
 target_link_libraries(transport PUBLIC Qt5::Core Qt5::Network Qt5::SerialPort)
 
-target_link_libraries(transport PUBLIC Threads::Threads)  # ThreadExecutor 仍用线程
+target_link_libraries(transport PUBLIC Threads::Threads)
 
 find_package(fastcdr QUIET)
 find_package(fastrtps QUIET)
@@ -66,39 +55,11 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp
     tests/codec/dds_codec_test.cpp
-    tests/transport/udp_transport_test.cpp
-    tests/transport/tcp_transport_test.cpp
-    tests/transport/serial_transport_test.cpp
-    tests/transport/tcp_connection_test.cpp
-    tests/transport/tcp_server_test.cpp
-    tests/transport/combination_smoke_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/fake_dds_provider_test.cpp
-    tests/dds/dds_transport_test.cpp
-    tests/comm/thread_executor_test.cpp
-    tests/comm/dds_node_test.cpp
-    tests/comm/interaction_engine_test.cpp
-    tests/comm/trace_sink_test.cpp
-    tests/comm/interaction_trace_test.cpp
-    tests/comm/protocol_node_test.cpp
-    tests/comm/protocol_policy_test.cpp
   )
-  target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/comm)
   target_link_libraries(transport_tests PRIVATE transport GTest::gtest)
-  target_link_libraries(transport_tests PRIVATE util)
-  if(TRANSPORT_HAS_FASTDDS)
-    target_sources(transport_tests PRIVATE tests/dds/fastdds_provider_test.cpp)
-  endif()
   gtest_discover_tests(transport_tests)
-endif()
-
-if(TRANSPORT_BUILD_EXAMPLES)
-  add_executable(protocol_node_demo examples/protocol_node_demo.cpp)
-  target_link_libraries(protocol_node_demo PRIVATE transport Threads::Threads)
-  add_executable(protocol_udp_demo examples/protocol_udp_demo.cpp)
-  target_link_libraries(protocol_udp_demo PRIVATE transport Threads::Threads)
-  add_executable(dds_node_demo examples/dds_node_demo.cpp)
-  target_link_libraries(dds_node_demo PRIVATE transport Threads::Threads)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -144,8 +105,6 @@ if(TRANSPORT_BUILD_CORO)
   add_library(transport_coro STATIC
     src/coro/Error.cpp
     src/coro/Cancellation.cpp
-    src/coro/InteractionEngine.cpp
-    src/coro/ProtocolNode.cpp
     src/coro/TcpTransport.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(transport_coro PUBLIC cxx_std_17)
@@ -158,15 +117,9 @@ if(TRANSPORT_BUILD_CORO)
     target_include_directories(transport_coro_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests/coro)
     target_link_libraries(transport_coro_tests PRIVATE transport_coro asynctask GTest::gtest Qt5::Core Qt5::Network)
-    target_sources(transport_coro_tests PRIVATE tests/coro/engine_fire_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/engine_request_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/engine_keyfn_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/protocol_node_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/error_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/cancellation_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/transport_contract_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/transport_contract_new_first_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/transport_contract_legacy_first_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/shared_completion_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/fake_coro_transport_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/send_semantics_fake_test.cpp)
