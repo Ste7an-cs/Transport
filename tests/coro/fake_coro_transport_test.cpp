@@ -235,27 +235,34 @@ TEST(CoroFakeTransport, ReadDeadlineAndCancellationReleaseReadSlot) {
   EXPECT_FALSE(fake.ActiveRead());
 }
 
-TEST(CoroFakeTransport, ConcurrentPhysicalWriteReturnsInvalidState) {
+TEST(CoroFakeTransport, ConcurrentPhysicalWriteSerializes) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
   Status first{make_error_code(TransportErrc::kInternal)};
+  Status second{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
-  auto writer = Coro::makeTask([&] {
+  auto writer_a = Coro::makeTask([&] {
     entered.resolve();
     first = fake.Write(SendUnit{{1}, Endpoint::Default()});
   });
   ASSERT_TRUE(entered.await());
   ASSERT_TRUE(fake.ActiveWrite());
-  const auto second = fake.Write(SendUnit{{2}, Endpoint::Default()});
-  ASSERT_FALSE(second);
-  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kInvalidState));
+  // 第二个并发写在第一个持有写槽时进入 → 排队(不拒绝),等待者深度升至 2。
+  auto writer_b = Coro::makeTask(
+      [&] { second = fake.Write(SendUnit{{2}, Endpoint::Default()}); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return fake.SendWaiterDepth() == 2; }));
   fake.ReleaseWrite();
-  EXPECT_TRUE(writer.get());
+  EXPECT_TRUE(writer_a.get());
+  EXPECT_TRUE(writer_b.get());
   EXPECT_TRUE(first);
+  EXPECT_TRUE(second);
   EXPECT_FALSE(fake.ActiveWrite());
-  ASSERT_EQ(fake.sent().size(), 1U);
+  // 先取得写槽者先上线;两帧各自完整、串行不交错。
+  ASSERT_EQ(fake.sent().size(), 2U);
   EXPECT_EQ(fake.sent()[0].bytes, (std::vector<std::uint8_t>{1}));
+  EXPECT_EQ(fake.sent()[1].bytes, (std::vector<std::uint8_t>{2}));
 }
 
 TEST(CoroFakeTransport, CompleteWriteFailureReleasesSlotWithoutClosing) {

@@ -145,7 +145,8 @@ if(TRANSPORT_BUILD_CORO)
     src/coro/Error.cpp
     src/coro/Cancellation.cpp
     src/coro/InteractionEngine.cpp
-    src/coro/ProtocolNode.cpp)
+    src/coro/ProtocolNode.cpp
+    src/coro/TcpTransport.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(transport_coro PUBLIC cxx_std_17)
   target_link_libraries(transport_coro PUBLIC transport asynctask)
@@ -156,7 +157,7 @@ if(TRANSPORT_BUILD_CORO)
       tests/coro/coro_harness_test.cpp)
     target_include_directories(transport_coro_tests PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests/coro)
-    target_link_libraries(transport_coro_tests PRIVATE transport_coro asynctask GTest::gtest Qt5::Core)
+    target_link_libraries(transport_coro_tests PRIVATE transport_coro asynctask GTest::gtest Qt5::Core Qt5::Network)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_fire_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_request_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/engine_keyfn_test.cpp)
@@ -168,6 +169,8 @@ if(TRANSPORT_BUILD_CORO)
     target_sources(transport_coro_tests PRIVATE tests/coro/transport_contract_legacy_first_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/shared_completion_test.cpp)
     target_sources(transport_coro_tests PRIVATE tests/coro/fake_coro_transport_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/coro/send_semantics_fake_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/coro/tcp_transport_send_test.cpp)
     add_test(NAME transport_coro_tests COMMAND transport_coro_tests)
   endif()
 endif()
