@@ -1,5 +1,6 @@
 #include "transport/coro/TcpTransport.hpp"
 
+#include <deque>
 #include <mutex>
 #include <utility>
 
@@ -17,7 +18,7 @@ namespace {
 
 // 把 Qt socket 错误映射到传输错误类别:对端主动关闭 / 网络层断裂归 Connection,
 // 其余读写故障归 Io(RT_TRANSPORT_004.4 允许 Io 或 Connection)。
-std::error_code MapFlushError(std::error_code error) {
+std::error_code MapSocketError(std::error_code error) {
   if (error.category() == Coro::detail::socket_error_category()) {
     switch (static_cast<QAbstractSocket::SocketError>(error.value())) {
       case QAbstractSocket::RemoteHostClosedError:
@@ -38,8 +39,10 @@ struct TcpTransport::State {
   QPointer<QAbstractSocket> socket;
   LifecycleState lifecycle{LifecycleState::kCreated};
   bool active_read{false};
-  bool active_write{false};
+  bool active_write{false};  // 写槽是否被占。
   std::size_t send_waiters{0};
+  // 并发写按到达顺序排队等待写槽(RT_TRANSPORT_004/007 串行化,不拒绝)。
+  std::deque<std::shared_ptr<Coro::Awaitable<void>>> write_queue;
   std::optional<Clock::time_point> last_send;
   std::optional<Clock::time_point> last_recv;
   std::error_code last_error;
@@ -52,6 +55,7 @@ namespace {
 // Closed 并完成 closed。有在途操作则由其收尾时(FinishRead/FinishWrite)完成。
 void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
   QPointer<QAbstractSocket> socket;
+  std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
   bool complete = false;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -60,13 +64,17 @@ void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
     }
     state->lifecycle = LifecycleState::kClosing;
     socket = state->socket;
+    queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
     if (!state->active_read && !state->active_write) {
       state->lifecycle = LifecycleState::kClosed;
       complete = true;
     }
   }
   if (socket) {
-    socket->abort();  // 立即唤醒在途 readAll/waitForBytesWritten(以错误收敛)
+    socket->abort();  // 立即唤醒在途 waitForReadyRead/waitForBytesWritten(以错误收敛)
+  }
+  for (const auto& gate : queued_writes) {
+    gate->close(make_error_code(TransportErrc::kClosed));
   }
   if (complete) {
     state->closed.Complete(Status{});
@@ -88,22 +96,48 @@ void FinishRead(const std::shared_ptr<TcpTransport::State>& state) {
   }
 }
 
-// 收尾一次写:释放有效写与发送等待者计数;若正在关闭且无其他在途操作则落 Closed。
-void FinishWrite(const std::shared_ptr<TcpTransport::State>& state) {
+// 写槽持有者收尾:回退等待者计数,并把写槽移交队首等待者(FIFO 串行化);关闭中
+// 则唤醒全部排队者以 kClosed 收敛,不再移交。若正在关闭且无其他在途操作则落 Closed。
+void ExitWrite(const std::shared_ptr<TcpTransport::State>& state) {
+  std::shared_ptr<Coro::Awaitable<void>> next_gate;
+  std::deque<std::shared_ptr<Coro::Awaitable<void>>> closed_gates;
   bool complete = false;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    state->active_write = false;
     if (state->send_waiters > 0) {
       state->send_waiters -= 1;
     }
-    if (state->lifecycle == LifecycleState::kClosing && !state->active_read) {
-      state->lifecycle = LifecycleState::kClosed;
-      complete = true;
+    if (state->lifecycle == LifecycleState::kClosing) {
+      state->active_write = false;
+      closed_gates.swap(state->write_queue);
+      if (!state->active_read) {
+        state->lifecycle = LifecycleState::kClosed;
+        complete = true;
+      }
+    } else if (!state->write_queue.empty()) {
+      next_gate = state->write_queue.front();  // 写槽移交队首,active_write 保持真。
+      state->write_queue.pop_front();
+    } else {
+      state->active_write = false;
     }
+  }
+  for (const auto& gate : closed_gates) {
+    gate->close(make_error_code(TransportErrc::kClosed));
+  }
+  if (next_gate) {
+    next_gate->resolve();
+    next_gate->close();
   }
   if (complete) {
     state->closed.Complete(Status{});
+  }
+}
+
+// 排队等待者在关闭时被唤醒(从未取得写槽):仅回退等待者计数。
+void LeaveWriteQueue(const std::shared_ptr<TcpTransport::State>& state) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->send_waiters > 0) {
+    state->send_waiters -= 1;
   }
 }
 
@@ -157,8 +191,12 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
   }
 
   // 读路径按本 spec 只需最小能力(供发送侧回环验证)。若 Qt 读缓冲已有字节则
-  // 直接取,否则用单发的 waitForReadyRead 等一次到达——避免 readAll 的持久订阅在
-  // 逐次 Read 间残留、把后续到达的字节截走。
+  // 直接取,否则用单发的 waitForReadyRead 等一次到达 + 裸 readAll 排空。
+  //
+  // TODO(Ste7an-cs/AsyncTask#2): 这是对 corosocket 拉模型阻抗不匹配的临时绕过——
+  // corosocket 的 readAll() 是经 generate() 消费的持久订阅,resolve 后不 cleanup,
+  // 逐次 Read 重建会残留 readyRead 处理器、把后续到达字节截走(回环 ~32K 处 stall)。
+  // 待上游提供"单发自清理读原语"后,改回复用 corosocket 提供的接口,不在此手工拼。
   Result<Datagram> result{make_error_code(TransportErrc::kInternal)};
   Coro::Result<void, std::error_code> notification{};
   if (socket && socket->bytesAvailable() > 0) {
@@ -195,7 +233,7 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
              make_error_code(TransportErrc::kCancelled)) {
     result = notification.error();
   } else {
-    std::error_code mapped = MapFlushError(notification.error());
+    std::error_code mapped = MapSocketError(notification.error());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
@@ -208,7 +246,7 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
 
 Status TcpTransport::Write(SendUnit unit) {
   const auto state = state_;
-  QPointer<QAbstractSocket> socket;
+  std::shared_ptr<Coro::Awaitable<void>> slot_gate;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kCreated) {
@@ -217,52 +255,78 @@ Status TcpTransport::Write(SendUnit unit) {
     if (state->lifecycle != LifecycleState::kRunning) {
       return make_error_code(TransportErrc::kClosed);
     }
-    if (state->active_write) {
-      // 单写不交错(RT_TRANSPORT_004):并发违规写立即被拒,绝不与在写帧交错。
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    state->active_write = true;
+    // 发送等待者:自进入 Write 起计数(排队 + 在写),反映发送侧背压积压(3.4.4)。
     state->send_waiters += 1;
+    if (!state->active_write) {
+      state->active_write = true;  // 写槽空闲 → 立即取得。
+    } else {
+      // 写槽被占 → 按到达顺序排队等待(RT_TRANSPORT_004/007 串行化,不拒绝)。
+      slot_gate = std::make_shared<Coro::Awaitable<void>>();
+      state->write_queue.push_back(slot_gate);
+    }
+  }
+
+  if (slot_gate) {
+    if (!Coro::await(slot_gate)) {
+      // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数。
+      LeaveWriteQueue(state);
+      return make_error_code(TransportErrc::kClosed);
+    }
+  }
+
+  // —— 已持有写槽 ——
+  QPointer<QAbstractSocket> socket;
+  bool running = false;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    running = state->lifecycle == LifecycleState::kRunning;
     socket = state->socket;
   }
-
-  // 裸 write 把整帧交给 Qt 用户态发送缓冲(RT_TRANSPORT_008 的"离开框架缓冲"以
-  // 刷入操作系统缓冲为准,下面的刷完循环负责等待其排空)。
-  const qint64 total = static_cast<qint64>(unit.bytes.size());
-  const qint64 written =
-      socket ? socket->write(
-                   reinterpret_cast<const char*>(unit.bytes.data()), total)
-             : -1;
-  if (written < 0) {
-    std::error_code io = make_error_code(TransportErrc::kIo);
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_error = io;
-    }
-    FinishWrite(state);
-    BeginClose(state);  // 写失败即关本物理连接,不自动重发。
-    return io;
+  if (!running) {  // 等待写槽期间已进入关闭。
+    ExitWrite(state);
+    return make_error_code(TransportErrc::kClosed);
   }
 
-  // 刷完循环:守卫 bytesToWrite()>0 为强制——已刷空时 waitForBytesWritten 不会
-  // 再触发信号,若无守卫会挂死。背压在此经 await 传导回发起方。
-  for (;;) {
-    qint64 pending = socket ? socket->bytesToWrite() : 0;
-    if (pending <= 0) {
-      break;  // 整帧字节已进入操作系统发送缓冲 → 发送完成。
+  // 失败即关本物理连接,不自动重发:先进入关闭(排队写等待者以 kClosed 收敛、不
+  // 移交写槽),再释放写槽。
+  auto fail = [&state](std::error_code mapped) -> Status {
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->last_error = mapped;
     }
+    BeginClose(state);
+    ExitWrite(state);
+    return Status{mapped};
+  };
+
+  // 把整帧全部交给 Qt 用户态发送缓冲、并等待其刷入操作系统发送缓冲:只有整帧字节
+  // 全部离开框架用户态缓冲(bytesToWrite()==0)才报告成功(RT_TRANSPORT_008)。
+  // 处理短写:socket->write() 返回 0≤n<total 时循环写剩余字节。背压经 await 传导。
+  const char* data = reinterpret_cast<const char*>(unit.bytes.data());
+  const qint64 total = static_cast<qint64>(unit.bytes.size());
+  qint64 offset = 0;
+  for (;;) {
+    if (!socket) {
+      return fail(make_error_code(TransportErrc::kConnection));
+    }
+    const qint64 remaining = total - offset;
+    if (remaining <= 0 && socket->bytesToWrite() <= 0) {
+      break;  // 整帧字节已全部进入操作系统发送缓冲 → 发送完成。
+    }
+    // waiter 先于本轮 write 创建,避免快速的 bytesWritten 被漏掉(见 AsyncTask
+    // socket_pingpong 示例);已刷空时循环顶部的守卫保证不会空等。
     auto flushed = Coro::coro(socket.data()).waitForBytesWritten();
+    if (remaining > 0) {
+      const qint64 n = socket->write(data + offset, remaining);
+      if (n < 0) {
+        return fail(make_error_code(TransportErrc::kIo));
+      }
+      offset += n;
+    }
     Coro::Result<void, std::error_code> drained = Coro::await(flushed);
     if (!drained) {
       // 刷完途中连接断裂 = 流式部分写失败(RT_TRANSPORT_004.4)。
-      std::error_code mapped = MapFlushError(drained.error());
-      {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->last_error = mapped;
-      }
-      FinishWrite(state);
-      BeginClose(state);  // 关本物理连接,不在此连接继续发送、不重发残缺帧。
-      return mapped;
+      return fail(MapSocketError(drained.error()));
     }
   }
 
@@ -270,7 +334,7 @@ Status TcpTransport::Write(SendUnit unit) {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->last_send = Clock::now();
   }
-  FinishWrite(state);
+  ExitWrite(state);
   return Status{};
 }
 

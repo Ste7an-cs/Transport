@@ -37,6 +37,8 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     std::deque<Result<Datagram>> queued_reads;
     std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
+    // 并发写按到达顺序排队等待写槽(RT_TRANSPORT_004/007 串行化,不拒绝)。
+    std::deque<std::shared_ptr<Coro::Awaitable<void>>> write_queue;
     std::optional<std::pair<std::error_code, bool>> next_write_error;
     std::function<void()> before_timeout_arbitration;
     std::size_t send_waiters{0};
@@ -134,7 +136,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
 
   Status Write(SendUnit unit) override {
     const auto state = state_;
-    std::shared_ptr<Coro::Awaitable<void>> gate;
+    std::shared_ptr<Coro::Awaitable<void>> slot_gate;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle == LifecycleState::kCreated) {
@@ -143,19 +145,39 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       if (state->lifecycle != LifecycleState::kRunning) {
         return transport::coro::make_error_code(TransportErrc::kClosed);
       }
-      if (state->active_write) {
-        return transport::coro::make_error_code(TransportErrc::kInvalidState);
-      }
-      state->active_write = true;
-      // 发送等待者:已获取有效写、正等待帧刷完(进入操作系统发送缓冲)的 fiber。
-      // 单写约束下至多一个,是发送侧背压是否积压的可观测事实(3.4.4)。
+      // 发送等待者:自进入 Write 起计数(排队 + 在写),反映发送侧背压积压(3.4.4)。
       state->send_waiters += 1;
+      if (!state->active_write) {
+        state->active_write = true;  // 写槽空闲 → 立即取得。
+      } else {
+        // 写槽被占 → 按到达顺序排队等待(RT_TRANSPORT_004/007 串行化,不拒绝)。
+        slot_gate = std::make_shared<Coro::Awaitable<void>>();
+        state->write_queue.push_back(slot_gate);
+      }
+    }
+
+    if (slot_gate) {
+      auto acquired = Coro::await(slot_gate);
+      if (!acquired) {
+        // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数,不释放写槽。
+        LeaveWriteQueue(state);
+        return acquired.error().category() ==
+                       transport::coro::transport_error_category()
+                   ? Status{acquired.error()}
+                   : Status{transport::coro::make_error_code(
+                         TransportErrc::kClosed)};
+      }
+    }
+
+    // —— 已持有写槽 ——(hold_writes 模拟帧尚未刷完的在写延迟)
+    std::shared_ptr<Coro::Awaitable<void>> gate;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
       if (state->hold_writes) {
         gate = std::make_shared<Coro::Awaitable<void>>();
         state->write_gate = gate;
       }
     }
-
     if (gate) {
       auto released = Coro::await(gate);
       if (!released) {
@@ -164,7 +186,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
                           ? Status{released.error()}
                           : Status{transport::coro::make_error_code(
                                 TransportErrc::kInternal)};
-        FinishWrite(state);
+        ExitWrite(state);
         return status;
       }
     }
@@ -194,7 +216,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       read_waiter->close(
           transport::coro::make_error_code(TransportErrc::kClosed));
     }
-    FinishWrite(state);
+    ExitWrite(state);
     return result;
   }
 
@@ -279,7 +301,8 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     return state->sent;
   }
 
-  // 发送等待者深度:当前正等待帧刷完的发送 fiber 数(供上层判活/背压观测)。
+  // 发送等待者深度:当前处于 Write 中的 fiber 数(排队 + 在写),并发时可 >1,
+  // 反映发送侧背压积压(供上层判活/背压观测,3.4.4)。
   std::size_t SendWaiterDepth() const {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -308,29 +331,56 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     }
   }
 
-  static void FinishWrite(const std::shared_ptr<State>& state) {
+  // 写槽持有者收尾:回退等待者计数,并把写槽移交队首等待者(FIFO 串行化);关闭中
+  // 则唤醒全部排队者以 kClosed 收敛,不再移交。
+  static void ExitWrite(const std::shared_ptr<State>& state) {
+    std::shared_ptr<Coro::Awaitable<void>> next_gate;
+    std::deque<std::shared_ptr<Coro::Awaitable<void>>> closed_gates;
     bool complete_close = false;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-      state->active_write = false;
       if (state->send_waiters > 0) {
         state->send_waiters -= 1;
       }
       state->write_gate.reset();
-      if (state->lifecycle == LifecycleState::kClosing &&
-          !state->active_read) {
-        state->lifecycle = LifecycleState::kClosed;
-        complete_close = true;
+      if (state->lifecycle == LifecycleState::kClosing) {
+        state->active_write = false;
+        closed_gates.swap(state->write_queue);
+        if (!state->active_read) {
+          state->lifecycle = LifecycleState::kClosed;
+          complete_close = true;
+        }
+      } else if (!state->write_queue.empty()) {
+        next_gate = state->write_queue.front();  // 写槽移交队首,active_write 保持真。
+        state->write_queue.pop_front();
+      } else {
+        state->active_write = false;
       }
+    }
+    for (const auto& gate : closed_gates) {
+      gate->close(transport::coro::make_error_code(TransportErrc::kClosed));
+    }
+    if (next_gate) {
+      next_gate->resolve();
+      next_gate->close();
     }
     if (complete_close) {
       state->closed.Complete(Status{});
     }
   }
 
+  // 排队等待者在关闭时被唤醒(从未取得写槽):仅回退等待者计数。
+  static void LeaveWriteQueue(const std::shared_ptr<State>& state) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->send_waiters > 0) {
+      state->send_waiters -= 1;
+    }
+  }
+
   static void BeginClose(const std::shared_ptr<State>& state) {
     std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
+    std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
     bool complete_close = false;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
@@ -342,6 +392,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       write_gate = state->write_gate;
       state->read_waiter.reset();
       state->write_gate.reset();
+      queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
       if (!state->active_read && !state->active_write) {
         state->lifecycle = LifecycleState::kClosed;
         complete_close = true;
@@ -354,6 +405,9 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     if (write_gate) {
       write_gate->close(
           transport::coro::make_error_code(TransportErrc::kClosed));
+    }
+    for (const auto& gate : queued_writes) {
+      gate->close(transport::coro::make_error_code(TransportErrc::kClosed));
     }
     if (complete_close) {
       state->closed.Complete(Status{});
