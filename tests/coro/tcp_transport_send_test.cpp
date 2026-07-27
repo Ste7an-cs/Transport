@@ -237,6 +237,38 @@ TEST(CoroTcpTransport, PeerResetDuringFlushFailsWriteAndClosesConnection) {
   accepted->deleteLater();
 }
 
+// 读侧:对端正常关闭时在途 Read 以 Connection 收敛(readAll 流对端关闭 ≠ 我方关闭)。
+TEST(CoroTcpTransport, PeerCloseWakesPendingReadWithConnection) {
+  QTcpServer server;
+  QTcpSocket* client = nullptr;
+  QTcpSocket* accepted = nullptr;
+  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(receiver.Start());
+
+  std::error_code read_err;
+  bool read_ok = true;
+  Coro::Awaitable<void> entered;
+  auto reader = Coro::makeTask([&] {
+    entered.resolve();
+    OperationOptions options;
+    options.deadline = OperationOptions::Clock::now() + 3s;
+    auto r = receiver.Read(options);
+    read_ok = static_cast<bool>(r);
+    if (!r) {
+      read_err = r.error();
+    }
+  });
+  ASSERT_TRUE(entered.await());
+  boost::this_fiber::sleep_for(30ms);  // 让 Read 挂起在流上。
+  client->disconnectFromHost();  // 对端正常关闭。
+
+  EXPECT_TRUE(reader.get());
+  EXPECT_FALSE(read_ok);
+  EXPECT_EQ(read_err, make_error_code(TransportErrc::kConnection));
+  client->deleteLater();
+}
+
 // RT_REQUEST_004.4:写入已开始后的总超时是发起方(请求层)语义。ITransport::Write
 // 无取消入口(契约固定签名),故传输侧的刷完 fiber 不会被请求层超时打断——超时只让
 // 一个独立 awaiter 放弃等待,在写帧由构造保证刷完到底、健康连接上绝不截断。本测试

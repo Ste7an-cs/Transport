@@ -37,6 +37,9 @@ std::error_code MapSocketError(std::error_code error) {
 struct TcpTransport::State {
   mutable std::mutex mutex;
   QPointer<QAbstractSocket> socket;
+  // 唯一的 readAll 流(channel 支撑):持有一条、反复 await 取下一片(RT_TRANSPORT_003
+  // 流式一次一切片)。在 Start 建立,复用修好的 corosocket 读原语。
+  std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
   LifecycleState lifecycle{LifecycleState::kCreated};
   bool active_read{false};
   bool active_write{false};  // 写槽是否被占。
@@ -55,6 +58,7 @@ namespace {
 // Closed 并完成 closed。有在途操作则由其收尾时(FinishRead/FinishWrite)完成。
 void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
   QPointer<QAbstractSocket> socket;
+  std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
   std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
   bool complete = false;
   {
@@ -64,6 +68,7 @@ void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
     }
     state->lifecycle = LifecycleState::kClosing;
     socket = state->socket;
+    read_stream = state->read_stream;
     queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
     if (!state->active_read && !state->active_write) {
       state->lifecycle = LifecycleState::kClosed;
@@ -71,7 +76,10 @@ void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
     }
   }
   if (socket) {
-    socket->abort();  // 立即唤醒在途 waitForReadyRead/waitForBytesWritten(以错误收敛)
+    socket->abort();  // 立即唤醒在途读写等待者(以错误收敛)。
+  }
+  if (read_stream) {
+    read_stream->close(make_error_code(TransportErrc::kClosed));  // 唤醒在途 Read。
   }
   for (const auto& gate : queued_writes) {
     gate->close(make_error_code(TransportErrc::kClosed));
@@ -164,6 +172,9 @@ Status TcpTransport::Start() {
       return make_error_code(TransportErrc::kInvalidState);
     }
     state_->lifecycle = LifecycleState::kRunning;
+    // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 会收下订阅前已到达的
+    // 字节,故不丢首片。await_for 超时不停止该流,可再次 Read。
+    state_->read_stream = Coro::coro(state_->socket.data()).readAll();
     return Status{};
   }
   if (state_->lifecycle == LifecycleState::kRunning) {
@@ -174,7 +185,7 @@ Status TcpTransport::Start() {
 
 Result<Datagram> TcpTransport::Read(OperationOptions options) {
   const auto state = state_;
-  QPointer<QAbstractSocket> socket;
+  std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kCreated) {
@@ -183,62 +194,61 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
     if (state->lifecycle != LifecycleState::kRunning) {
       return make_error_code(TransportErrc::kClosed);
     }
-    if (state->active_read) {
+    if (state->active_read) {  // 单读:同一时刻至多一个有效读(RT_TRANSPORT_004)。
       return make_error_code(TransportErrc::kInvalidState);
     }
     state->active_read = true;
-    socket = state->socket;
+    stream = state->read_stream;
   }
 
-  // 读路径按本 spec 只需最小能力(供发送侧回环验证)。若 Qt 读缓冲已有字节则
-  // 直接取,否则用单发的 waitForReadyRead 等一次到达 + 裸 readAll 排空。
-  //
-  // TODO(Ste7an-cs/AsyncTask#2): 这是对 corosocket 拉模型阻抗不匹配的临时绕过——
-  // corosocket 的 readAll() 是经 generate() 消费的持久订阅,resolve 后不 cleanup,
-  // 逐次 Read 重建会残留 readyRead 处理器、把后续到达字节截走(回环 ~32K 处 stall)。
-  // 待上游提供"单发自清理读原语"后,改回复用 corosocket 提供的接口,不在此手工拼。
+  if (!stream) {
+    FinishRead(state);
+    return make_error_code(TransportErrc::kInternal);
+  }
+
+  // 复用持有的 readAll 流:每次 Read await 下一片。await_for 超时不停止流(可再次
+  // Read);取消则关流(终止读取)。流按 channel FIFO 保序、单发自清理(AutoDisconnect)。
+  auto registration = options.cancellation.Register(
+      [stream] { stream->close(make_error_code(TransportErrc::kCancelled)); });
+  Coro::Result<QByteArray, std::error_code> chunk =
+      options.deadline
+          ? Coro::await_for(stream, *options.deadline - Clock::now())
+          : Coro::await(stream);
+  registration.Reset();
+
   Result<Datagram> result{make_error_code(TransportErrc::kInternal)};
-  Coro::Result<void, std::error_code> notification{};
-  if (socket && socket->bytesAvailable() > 0) {
-    notification = Coro::Result<void, std::error_code>{};
-  } else if (!socket) {
-    notification = make_error_code(TransportErrc::kClosed);
-  } else {
-    auto ready = Coro::coro(socket.data()).waitForReadyRead();
-    auto registration = options.cancellation.Register(
-        [ready] { ready->close(make_error_code(TransportErrc::kCancelled)); });
-    notification = options.deadline
-                       ? Coro::await_for(ready, *options.deadline - Clock::now())
-                       : Coro::await(ready);
-    registration.Reset();
-  }
-
-  if (notification) {
+  if (chunk) {
+    const QByteArray& bytes = chunk.value();
     Datagram datagram;
-    if (socket && socket->bytesAvailable() > 0) {
-      const QByteArray bytes = socket->readAll();
-      datagram.bytes.assign(
-          reinterpret_cast<const std::uint8_t*>(bytes.constData()),
-          reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
-              bytes.size());
-    }
+    datagram.bytes.assign(
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()) + bytes.size());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_recv = Clock::now();
     }
     result = Result<Datagram>{std::move(datagram)};
-  } else if (notification.error() == std::make_error_code(std::errc::timed_out)) {
+  } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
     result = make_error_code(TransportErrc::kTimeout);
-  } else if (notification.error() ==
-             make_error_code(TransportErrc::kCancelled)) {
-    result = notification.error();
-  } else {
-    std::error_code mapped = MapSocketError(notification.error());
+  } else if (chunk.error() == make_error_code(TransportErrc::kCancelled)) {
+    result = chunk.error();
+  } else if (chunk.error().category() == Coro::detail::socket_error_category()) {
+    std::error_code mapped = MapSocketError(chunk.error());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
     }
     result = mapped;
+  } else {
+    // channel 无错误关闭(对端正常关闭)或我方关闭:关闭中 → Closed,否则对端断
+    // 开 → Connection。
+    bool closing;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      closing = state->lifecycle != LifecycleState::kRunning;
+    }
+    result = make_error_code(closing ? TransportErrc::kClosed
+                                     : TransportErrc::kConnection);
   }
   FinishRead(state);
   return result;
