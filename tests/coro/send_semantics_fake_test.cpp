@@ -71,62 +71,64 @@ TEST(CoroSendSemantics, SingleFiberWritesLandInProgramOrder) {
 }
 
 // RT_TRANSPORT_007/004:跨 fiber 并发发送被串行化,取得一致全序、单帧不交错。
-// 单写约束下,先到者持有有效写,后到者被拒(InvalidState)并重试,直到刷完后上线。
+// 后到者排队等待写槽(不拒绝),先到者刷完后依序上线。
 TEST(CoroSendSemantics, ConcurrentWritesSerializeIntoConsistentOrderWithoutInterleave) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
 
-  auto write_with_retry = [&](std::vector<std::uint8_t> bytes) {
-    for (;;) {
-      auto status = fake.Write(Frame(bytes));
-      if (status) return;
-      ASSERT_EQ(status.error(), make_error_code(TransportErrc::kInvalidState));
-      boost::this_fiber::yield();
-    }
-  };
-
+  Status a{make_error_code(TransportErrc::kInternal)};
+  Status b{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> a_entered;
   auto first = Coro::makeTask([&] {
     a_entered.resolve();
-    write_with_retry({0x11, 0x11});
+    a = fake.Write(Frame({0x11, 0x11}));
   });
   ASSERT_TRUE(a_entered.await());
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return fake.ActiveWrite(); }));
 
-  // 第二个 fiber 在第一个仍持有有效写时并发进入 → 被拒重试。
-  auto second = Coro::makeTask([&] { write_with_retry({0x22, 0x22}); });
-  boost::this_fiber::yield();
+  // 第二个 fiber 在第一个持有写槽时并发进入 → 排队等待(不拒绝),深度升至 2。
+  auto second = Coro::makeTask([&] { b = fake.Write(Frame({0x22, 0x22})); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return fake.SendWaiterDepth() == 2; }));
 
-  fake.ReleaseWrite();  // 放行第一帧,随后第二帧才能获取有效写并刷完。
+  fake.ReleaseWrite();  // 放行第一帧,第二帧随后取得写槽并刷完。
   EXPECT_TRUE(first.get());
   EXPECT_TRUE(second.get());
+  EXPECT_TRUE(a);
+  EXPECT_TRUE(b);
 
   const auto sent = fake.sent();
   ASSERT_EQ(sent.size(), 2U);
-  // 先获取有效写者先上线;两帧各自完整、互不交错。
+  // 先取得写槽者先上线;两帧各自完整、互不交错。
   EXPECT_EQ(sent[0].bytes, (std::vector<std::uint8_t>{0x11, 0x11}));
   EXPECT_EQ(sent[1].bytes, (std::vector<std::uint8_t>{0x22, 0x22}));
 }
 
-// 3.4.4:发送等待者深度可观测——闸住一帧时深度递增,刷完后回落。
-TEST(CoroSendSemantics, SendWaiterDepthReflectsInFlightSender) {
+// 3.4.4:发送等待者深度反映背压积压——排队 + 在写的 fiber 数,并发时 >1。
+TEST(CoroSendSemantics, SendWaiterDepthReflectsQueuedAndInFlightSenders) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   EXPECT_EQ(fake.SendWaiterDepth(), 0U);
   fake.HoldWrites();
 
-  Coro::Awaitable<void> entered;
-  auto writer = Coro::makeTask([&] {
-    entered.resolve();
+  Coro::Awaitable<void> a_entered;
+  auto a = Coro::makeTask([&] {
+    a_entered.resolve();
     EXPECT_TRUE(fake.Write(Frame({7})));
   });
-  ASSERT_TRUE(entered.await());
+  ASSERT_TRUE(a_entered.await());
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return fake.ActiveWrite(); }));
-  EXPECT_EQ(fake.SendWaiterDepth(), 1U);
+  EXPECT_EQ(fake.SendWaiterDepth(), 1U);  // 一个在写。
+
+  auto b = Coro::makeTask([&] { EXPECT_TRUE(fake.Write(Frame({8}))); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return fake.SendWaiterDepth() == 2; }));
+  EXPECT_EQ(fake.SendWaiterDepth(), 2U);  // 一个在写 + 一个排队 = 积压可见。
 
   fake.ReleaseWrite();
-  EXPECT_TRUE(writer.get());
+  EXPECT_TRUE(a.get());
+  EXPECT_TRUE(b.get());
   EXPECT_EQ(fake.SendWaiterDepth(), 0U);
 }
 
