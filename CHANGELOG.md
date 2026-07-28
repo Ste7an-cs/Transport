@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### 里程碑:P1 首纵切片 —— TCP 上最小请求-响应（协程原生）— 2026-07(路线图 P1)
+> 按 SDD `docs/设计说明书-协程原生.md` §4 P1 打通 TCP 上最小 request-response,**证实"无共享引擎、语义内联各 node"这一最大架构赌注**(RT_DESIGN_003)。纵向薄切片:读侧契约 → PendingTable 薄基座 → 最小 ProtocolNode → 真实 TCP 回环端到端。全量测试 **95→119 全绿**。
+- **新增** `PendingTable<Key,T>` 挂起-应答**协议无关薄基座**(唯一登记 / 恰好一次完成 / `FailAll`+closed latch / 取消纪律;四方仲裁在 `Handle::Wait`,每 entry 复用 `SharedCompletion` 原子首胜;RT_REQUEST/RT_IN_INTERFACE_004,#35)。
+- **新增** 最小 `transport::ProtocolNode`:组合 `ITransport`+`ICodec`+`PendingTable`,内联读-分发循环,交付 needresponse `Request(Message)→Result<Message>` + 基础生命周期(`Start`/`Close`/`WaitClosed`);协议特有语义(键派生 / `frm_type` 盖章 / `session_id` 滚动 / 终结判别 / 未匹配路由)全部内联,PendingTable 保持协议无关(RT_NODE_003 / ADR-0003 D9,#36)。
+- **新增** `CorrelationKeyStrategy` + `DefaultProtocolKeyStrategy(response_marker)`:**node 级可注入 KeyOf**(只开放 KeyOf,`IsTerminal`/`RouteUnmatched` 内联锁死,不塌回 InteractionPolicy);`ProtocolKey=(session_id<<16)|(cmd & ~0x1000)` 归一化(占位 marker 可注入,ADR-0003 D9)。
+- **补完** `TcpTransport` 读侧契约(遗留项 A):`Read` 返回 `Datagram.source` 填对端 `Endpoint::Net(ip,port)`;新增读侧契约测试(source=对端、断连→`Connection`、`RequestClose`→`Closed`、超时→`Timeout`、单读者→`InvalidState`)(#34)。
+- **验证** 真实单机 TCP 回环端到端(真 `ProtocolNode` 请求方 + 裸 `SystemCodec` echo 对端):一次 needresponse 恰好一次完成 + 关联清理 + 乱序/迟到响应丢弃观测 + source=对端 + Close 端到端收敛(#37)。
+- **文档** ADR-0003 增 **D8**(P1 节点交互状态串行化=锁,非 strand/affinity)、**D9**(自定义 key 红线 + `ProtocolKey` 归一化算法);SRS 增 **RT_DESIGN_008**(协议可扩展性:新协议复用协议无关基座 + 内联/节点级注入协议语义,不塌回共享 policy);SDD §4 P1 标记交付、§6 回填 P1 精确签名与执行域绑定落点。
+
 ## [0.4.0] - 2026-07-27
 
 > **协程原生目标架构的清洁重建里程碑**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/adr/0003-*`、`docs/需求规格说明书-协程原生.md`)。0.3.0 as-built → 0.4.0 目标架构重建起点:**功能上是骨架** —— 目标传输发送/读语义(`transport::TcpTransport`)+ 抢救的 codec/DDS provider + 统一 `TransportErrc`;节点、其余介质、连接管理、观测等按 SDD 路线图 P1–P6 逐期恢复。as-built(0.3.0 异步栈 + 第二期 `coro::InteractionEngine`)已从 master 删除,完整实现存档于 git tag `v0.3.0`。
