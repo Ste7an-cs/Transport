@@ -2,7 +2,7 @@
 
 **状态：** Accepted（草案 / 目标架构，尚未实现）
 **日期：** 2026-07-17
-**关联：** `docs/需求规格说明书-协程原生.md`（本架构的 SRS）；as-built 见 `docs/需求规格说明书.md`、`CHANGELOG.md`（v0.3.0）。
+**关联：** `docs/需求规格说明书-协程原生.md`（本架构的 SRS）；as-built 存档于 git tag `v0.3.0`（见 `CHANGELOG.md`）。
 
 ## 背景（Context）
 

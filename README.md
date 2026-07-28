@@ -1,231 +1,90 @@
-# transport — C++ 通信中间件
+# transport — C++ 通信中间件（协程原生目标架构）
 
-一个 C++17 通信中间件库,把**传输**、**编解码**、**交互模式**三层彻底解耦:
+一个 C++17 通信中间件库,把**传输**、**编解码**、**交互**三层彻底解耦,以 **AsyncTask 协程运行时**为强制异步运行环境:
 
-- **Transport（纯字节管道）** —— 跨 TCP / UDP / 串口 / DDS 搬运原始字节,不知 Message/格式/交互。
-- **ICodec（线缆格式）** —— 在收发边界把 `Message` ↔ 线缆字节(分帧 + 序列化 + 承载交互元数据)。
-- **Comm（交互节点）** —— 在前两层之上实现请求-应答 / 结果反馈 / 发布-订阅 / 外部协议等交互模式;**用户继承节点即获得通信能力**。线程模型经 `IExecutor` 可换。
+- **Transport（纯字节管道）** —— 跨 TCP / UDP / 串口 / DDS 搬运原始字节或样本,不解释消息类型、请求关联或 payload 语义。介质无关的协程拉模型:`Read` 一次一片(流式任意切片 / 报文一整报)。
+- **ICodec（线缆格式）** —— 在收发边界把逻辑 `Message` ↔ 线缆字节(分帧 + 序列化 + 校验 + 重同步);流式跨切片拼帧、报文式保边界。**应用可提供并装配的公共扩展点。**
+- **node（交互层）** —— 在前两层之上组合请求关联、入站分发、超时、连接状态与协议交互。**薄壳组合,不共享交互引擎**:协议可观察语义由各 node 自实现,公共只复用协议无关的挂起-应答纪律与生命周期收敛。
 
-> **非目标：** 不解析/解释 payload 语义,不是消息代理或路由守护进程。
-
-> **架构基线（0.3.0）：** 三层解耦架构,取代 0.1.0 的富 `ITransport` + `TransportCore` + 三模式接收 + `IFramer` + topic 路由 + `TransportFactory`。`v0.1.0` 标签保留旧实现;0.2.0 与 0.1.0 **不 API 兼容**。
->
-> **0.3.0 变更（破坏性）：** UDP/TCP/串口传输底层由 standalone Asio 迁至 **QtNetwork**(去 asio、**构建需 Qt5**);传输不再自持 io 线程,活在**宿主 Qt 事件循环线程**。并新增**协程原生交互引擎** `transport::coro::InteractionEngine` + `coro::ProtocolNode`(基于 AsyncTask/boost.fiber,请求-应答线性 `await`;可选 `TRANSPORT_BUILD_CORO`)。异步栈(DDS + 异步 `InteractionEngine`/`IExecutor`)与协程栈并存。
+> **非目标:** 不解析/解释 payload 业务语义,不是消息代理、通用路由守护进程,本版不内建加密/认证/访问控制。
 
 ---
 
-## 三层一览
+## 当前状态（诚实说明）
 
-| 层 | 接口 | 内置实现 |
-|---|---|---|
-| **Transport** 纯字节管道 | `ITransport`(`Open/Close/Send(bytes[,Endpoint])/OnBytes/OnConnect/OnDisconnect`) | `UdpTransport`、`TcpClientTransport`/`TcpConnection`/`TcpServerTransport`、`SerialTransport`、`DdsTransport`(`IDdsTransport`+`Subscribe`,经 `IDdsProvider`/Fake/FastDDS) |
-| **ICodec** 线缆格式 | `ICodec`(`Encode(Message)→bytes` / `Decode(bytes)→0..N Message`) | `SystemCodec`(外部协议帧/流式 TCP·串口)、`SystemDatagramCodec`(同帧/无状态报文 UDP)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec` |
-| **Comm** 交互层 | `IExecutor`(线程模型缝)+ `InteractionEngine`(机制)+ `InteractionPolicy`(声明式策略)+ `ITraceSink`(可观测缝) | `ThreadExecutor`;`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈)—— 各为 `InteractionEngine`+对应 policy 的薄壳;`OstreamTraceSink`/`CapturingTraceSink` |
+本仓库正按 SDD 路线图(`docs/设计说明书-协程原生.md` §4)做**协程原生清洁重建**。
 
-> **用户面定位:** **Comm 层节点是编程主入口** —— 继承 `DdsNode`/`ProtocolNode`(各为引擎+policy 薄壳)重写交互钩子。`ITransport` **不是直接收发面**(对比 0.1.0),而是 ① **装配缝**(你实例化一个具体 transport 注入节点构造,换协议只换 transport)+ ② **裸字节逃生口**(只要字节管道时直接持 `shared_ptr<ITransport>` 用 `OnBytes`/`Send`,如下方 UDP 例)。它保持公共干净接口,是分层、可测(`FakeTransport`)、可替换的支点。
+- **P0 已完成 —— 目标骨架落位:**
+  - `transport::TcpTransport`(已建立连接的 TCP 字节管道):发送完成语义(帧字节全部进内核发送缓冲才报成功 + 协程背压 —— RT_TRANSPORT_008)、并发写按节点执行域到达顺序串行化(RT_TRANSPORT_007)、复用 `readAll` 流的读路径。
+  - 统一的机器可判别错误模型 `transport::TransportErrc`(`InvalidArgument`/`InvalidState`/`Connection`/`Closed`/`Timeout`/`Cancelled`/`Io`/`Frame`/`Codec`/`ResourceExhausted`/`Unsupported`/`Internal` 等 —— RT_ERROR_002/003),不靠解析字符串前缀分类。
+  - 协作取消 `CancellationToken`、共享完成原语 `SharedCompletion`。
+  - 抢救沿用的线缆 **codec**(`transport::codec::` 下 `SystemCodec`/`LengthFieldCodec`/`DatagramCodec`/`SystemDatagramCodec`/`DdsCodec` 的帧布局 / 流式扫描 / 重同步 / 可注入 `CrcFn`)与 **DDS provider 适配**(`transport::dds::` 下 `IDdsProvider` / `FakeDdsProvider` / 可选 `FastDdsProvider`)。
+  - 命名空间统一到 `transport::` 顶层;CMake 合并为**单一 `transport` 库 + 单一测试目标**,AsyncTask 为强制依赖。
 
-- **统一寻址 `Endpoint`**:发布即 `Send(msg, Endpoint::Topic(t))`、UDP 寻址即 `Send(bytes, Endpoint::Net(ip,port))`,基类句柄即可寻址,无形态不一的 `SendTo`。
-- **不抛异常**:所有可失败操作返回 `Result<T>`(标 `[[nodiscard]]`,忽略错误返回值即编译期告警),错误串前缀分类 `timeout:`/`conn:`/`codec:`/`frame:`/`io:`/`config:`。
-- **可换线程模型**:`IExecutor` 缝使同一交互逻辑在确定性 `InlineExecutor`(测试)与真实 `ThreadExecutor` 下都跑,未来 `CoroExecutor`(自研协程)即插即换。
-- **纯抽象核零第三方依赖**:`ITransport`/`ICodec`/`Message`/`Result`/`InteractionPolicy` 只含纯接口 + 数据结构;QtNetwork / QtSerialPort / Fast DDS 关在实现层(注:0.3.0 起具体传输头引入 Qt 类型,协程引擎头 `transport/coro/` 引入 AsyncTask)。
+- **尚未实现(按路线图 P1–P6 推进,勿当作已有):** 交互节点(`ProtocolNode` / `DdsNode`)、内联 `PendingTable` 请求关联、入站有界业务队列、节点生命周期、`TcpClientTransport` 连接管理与自动重连、UDP/串口/DDS 传输、结构化 Trace 与丢弃归因、性能验收。
+
+> **as-built 归档:** 0.3.0 的异步交互栈(`comm/` 引擎/执行器/策略、第二期 `coro::InteractionEngine`、回调式传输)及其文档已在 P0 从 master 删除,完整存档于 git tag **`v0.3.0`**。
+
+---
+
+## 内部传输契约（`ITransport`,内部缝 —— 非用户 API）
+
+`ITransport` 是介质无关的内部缝(RT_IN_INTERFACE_002),协程 await 式拉模型:
+
+```cpp
+class ITransport {
+ public:
+  virtual Status          Start() = 0;
+  virtual Result<Datagram> Read(OperationOptions options = {}) = 0;  // 一次一片
+  virtual Status          Write(SendUnit unit) = 0;                  // 帧进内核才成功
+  virtual Status          RequestClose() = 0;
+  virtual Status          WaitClosed(OperationOptions options = {}) = 0;
+};
+```
+
+- `Read` 返回一片 `Datagram{bytes, source}`;`Write` 收 `SendUnit{bytes, destination}`,并发写在节点执行域串行化,单帧字节不与另一帧交错。
+- 同一实例同一时刻至多一个有效读操作;`OperationOptions` 携带可选 `deadline` 与 `CancellationToken`。
+- 可失败操作一律返回 `Result<T>` / `Status`(标 `[[nodiscard]]`),不抛异常表达预期失败。
+
+> **用户面定位:** 编程主入口将是**交互层 node**(组合装配,P1+ 落地),而非 `ITransport`;codec 是应用可提供的公共扩展点。
 
 ---
 
 ## 构建
 
 ```bash
+git submodule update --init third_party/AsyncTask     # AsyncTask 为强制运行时(git 子模块)
 cmake -S . -B build -DTRANSPORT_BUILD_TESTS=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-**前置依赖(0.3.0)**:构建需 **Qt5**(Core/Network/SerialPort,系统安装,如 `libqt5serialport5-dev`);串口回环测试需 `socat`。nlohmann/json 3.11.3、GoogleTest 1.14.0 仍 vendored 到 `third_party/`(asio 已随 QtNetwork 迁移移除)。C++17。
+**前置依赖:**
 
-**协程引擎(可选,`-DTRANSPORT_BUILD_CORO=ON`,默认开)**:另需 **AsyncTask**(boost.fiber 协程库)+ 已编译 boost `fiber/context/thread/chrono`;经缓存变量 `ASYNCTASK_DIR`/`BOOST_LOCAL_ROOT` 指定(当前为绝对路径默认,可 `-D` 覆盖)。不需要协程栈可 `-DTRANSPORT_BUILD_CORO=OFF` 关闭。
+- **Qt5**(5.12+;Core / Network / SerialPort,系统安装,如 `libqt5serialport5-dev`)。
+- **AsyncTask**(boost.fiber 协程运行时,`third_party/AsyncTask` 子模块)+ 已编译 boost `fiber/context/thread/chrono`;经缓存变量 `ASYNCTASK_DIR` / `BOOST_LOCAL_ROOT` 指定(当前为绝对路径默认,可 `-D` 覆盖)。子模块未初始化时 configure 直接 `FATAL_ERROR`。
+- **Fast DDS 2.13.x(唯一可选外部依赖)**:未装时 `find_package` 自动跳过 `FastDdsProvider`,其余能力照常构建;装后自动启用(编译带 `TRANSPORT_HAS_FASTDDS`)。
 
-**唯一可选外部依赖 Fast DDS 2.13.x**:未装时自动跳过 `FastDdsProvider` 及其真实互通测试(DDS 逻辑仍可用 `FakeDdsProvider` 全测);装后 `find_package` 自动启用。详见 [`third_party/README.md`](third_party/README.md)。
-
----
-
-## 用法
-
-> 所有传输/节点须以 `std::shared_ptr` 持有。
-
-### 交互层心智:引擎 + 策略
-
-内置两个节点开箱即用 —— `DdsNode`(DDS)与 `ProtocolNode`(外部协议),各是 **`InteractionEngine`**(通用机制:挂起表/超时/重发/分发/periodic/并发纪律,只写一处)+ 一个声明式 **`InteractionPolicy`**(协议差异:匹配键 `Key`、判别符 `FrameTag`、应答寻址、无主路由)的薄壳。**接一套新协议 = 写一个新 `InteractionPolicy`**(7 个纯函数 + `RequestSpec` 配置),复用同一引擎,不再碰并发代码。下面是两个内置节点的用法。
-
-> **调试可观测(`ITraceSink`):** 任一节点 `Open()` 前 `node->SetTrace(...)` 即可看全量交互流(收发/分发/超时/重发/periodic/关闭)。开发用一行挂到 stderr:
-> ```cpp
-> node->SetTrace(std::make_shared<OstreamTraceSink>(std::cerr, TraceLevel::kTrace));
-> ```
-> 集成时实现 `ITraceSink` 接自有日志后端;测试用 `CapturingTraceSink` 断言事件序列。**观测-only、不挂 sink 时近零开销**,字节流逐字不变。
-
-### DDS 发布-订阅 + 多路请求-应答(`DdsNode`)
-
-```cpp
-#include "transport/comm/DdsNode.hpp"
-#include "transport/dds/DdsTransport.hpp"
-using namespace transport;
-
-class Svc : public DdsNode {
- public:
-  using DdsNode::DdsNode;
-  void OnMessage(const Message& m) override { /* m.topic = 来源 topic */ }
-  void OnRequest(const Message& req, Responder r) override {
-    Message rep; rep.payload = compute(req.payload);
-    (void)r.Reply(rep);                               // 经 reply_to 精确回送发起方
-  }
-};
-
-DdsConfig cfg; cfg.domain_id = 0; cfg.provider = "fastdds";   // 或默认 "fake"(进程内)
-auto node = std::make_shared<Svc>(
-    std::make_shared<DdsTransport>(cfg), /*inbox_topic=*/"A_in");  // 默认 DdsCodec
-(void)node->Open();                                   // 自动订阅自身 inbox
-(void)node->Subscribe("telemetry");                   // 订阅(可多个)
-Message pub; pub.payload = {1, 2, 3};
-(void)node->Send(pub, Endpoint::Topic("telemetry"));  // 发布
-// 向某服务 topic 发请求,应答经本节点 inbox 回来
-Message req; req.payload = {9};
-(void)node->Request(req,
-    [](Result<Message> r) { /* ... */ }, 1000, Endpoint::Topic("svc"));
-```
-
-> **完整可运行 demo**:[`examples/dds_node_demo.cpp`](examples/dds_node_demo.cpp) —— 3 节点经进程内 DDS 总线(`FakeDdsProvider`,零 FastDDS 依赖):发布-订阅**扇出**(一发两收)+ **多路请求-应答**(两客户端打同一服务 topic,应答经 `reply_to` 各回各家 inbox)+ 反馈/终结。运行:
-> ```bash
-> cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
-> cmake --build build -j --target dds_node_demo && ./build/dds_node_demo
-> ```
-
-### 对接外部系统(`ProtocolNode` + `SystemCodec` 协议帧)
-
-帧格式 `[head_flag:4=AA BB CC DD][frm_type:1][protocol_id:1][session_id:1][reserve:4][crc:2][frm_len:2][message_id:2|payload]`(小端);CRC 经 `CrcFn` 注入,匹配键 (session_id, message_id)。
-
-```cpp
-#include "transport/comm/ProtocolNode.hpp"
-#include "transport/serial/SerialTransport.hpp"
-using namespace transport;
-
-class Link : public ProtocolNode {
- public:
-  using ProtocolNode::ProtocolNode;
-  void OnCommand(const Message& cmd, Responder r) override {   // 接收角色
-    (void)r.Response(ack(cmd.payload));      // 即时回应
-    (void)r.Result(compute(cmd.payload));    // 最终结果
-  }
-  void OnHeartbeat(const Message&) override {}
-};
-
-SerialConfig sc; sc.device = "/dev/ttyUSB0"; sc.baud_rate = 115200;
-ProtocolConfig pc; pc.protocol_id = 1; pc.response_timeout_ms = 200;
-pc.max_retries = 3; pc.heartbeat_interval_ms = 1000;
-auto link = std::make_shared<Link>(
-    std::make_shared<SerialTransport>(sc), /*codec=*/nullptr, pc);  // 默认 SystemCodec
-(void)link->Open();
-
-// 5 种发送交互模式(发起角色)。首参 cmd = message_id 命令码(每命令固定值):
-(void)link->SendNoResponse(/*cmd=*/0x10, {0x01});                          // 不需回应
-(void)link->Request(/*cmd=*/0x11, {0x02}, [](Result<Message> r){/*RESPONSE*/});  // 需回应,超时重发≤3
-(void)link->RequestWithResult(/*cmd=*/0x12, {0x03}, [](Result<Message> r){/*RESULT*/});  // 需结果
-(void)link->RequestNeedFeedback(/*cmd=*/0x13, {0x04},
-    [](Result<Message> r){/*RESPONSE*/}, [](Result<Message> r){/*RESULT,自动回 ack*/});
-uint32_t h = link->StartRepeating(/*cmd=*/0x14, {0x05}, /*interval_ms=*/500);  // 定时发 STATE(固定快照)
-link->StopRepeating(h);
-// 取最新状态:传 state_fn —— 引擎每拍【发送前】调它,发的是实时值而非启动快照
-link->StartRepeating(/*cmd=*/0x14, [&]{ return sensor.Read(); }, /*interval_ms=*/500);  // 拉(pull)
-// 或事件驱动推送:link->UpdateRepeating(h, /*cmd=*/0x14, latest);                       // 推(push)
-```
-
-> **接入前需替换的外部常量**:`SystemCodec` 的 `CrcFn`(真实 CRC16 算法,构造注入)与 `FrameType` 六类的真实字节值(枚举占位)。两端一致即可。
-
-> **UDP(1:多)**:UDP 是报文边界语义,用**无状态报文版** `SystemDatagramCodec`(而非流式 `SystemCodec`),并按需开两个开关:
-> ```cpp
-> ProtocolConfig pc; pc.protocol_id = 1; pc.reply_to_source = true;   // 应答/ack 回到入站来源 ip:port
-> auto node = std::make_shared<MyNode>(
->     std::make_shared<UdpTransport>(udp_cfg),
->     std::make_unique<SystemDatagramCodec>(), pc);                   // 报文版 codec
-> node->Request(cmd, payload, cb, Endpoint::Net(device_ip, device_port));  // 经一个 socket 发指定设备
-> ```
-> `reply_to_source` 覆盖服务端 `Responder` 回应与客户端 `needfeedback` 自动 ack;发送方法尾参 `Endpoint::Net` 让一个 socket 对多设备。TCP/串口用流式 `SystemCodec`、留 `reply_to_source=false`。
-
-> **完整可运行 demo**:
-> - [`examples/protocol_node_demo.cpp`](examples/protocol_node_demo.cpp) —— 控制器/设备经 **TCP** 对接,5 种发送模式 + 应答 + 周期(含 **state_fn 每拍拉最新状态**) + 心跳 + 超时重发 + trace(SystemCodec 有状态流式,配字节流;头注解释为何不用 UDP)。
-> - [`examples/protocol_udp_demo.cpp`](examples/protocol_udp_demo.cpp) —— **UDP 1:多**:1 控制器(:7000)向 2 设备(:7001/:7002)发命令,`SystemDatagramCodec` + `reply_to_source` + 每发 `Endpoint::Net`,应答经来源回到控制器。
-> ```bash
-> cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON
-> cmake --build build -j --target protocol_node_demo protocol_udp_demo
-> ./build/protocol_node_demo   # TCP;  ./build/protocol_udp_demo   # UDP 1:多
-> ```
-
-### TCP 服务端(每连接独立节点)
-
-```cpp
-#include "transport/tcp/TcpServerTransport.hpp"
-using namespace transport;
-
-TcpServerConfig cfg; cfg.bind_addr = "0.0.0.0"; cfg.port = 9000;
-auto server = std::make_shared<TcpServerTransport>(cfg);
-server->OnAccept([](std::shared_ptr<ITransport> conn) {
-  // 每个被接受连接是独立 ITransport:在其上构造一个节点收发
-  // (此处复用上面的 Link : ProtocolNode;裸 TCP 通用交互也可自定义 InteractionEngine+InteractionPolicy)
-  ProtocolConfig pc; pc.protocol_id = 1;
-  auto node = std::make_shared<Link>(conn, /*codec=*/nullptr, pc);  // 默认 SystemCodec
-  (void)node->Open();
-  keep_alive(node);                  // 持有 shared_ptr,勿让其析构
-});
-(void)server->Open();
-```
-
-### UDP(单播 / 组播 / 广播)
-
-```cpp
-#include "transport/udp/UdpTransport.hpp"
-using namespace transport;
-
-UdpConfig cfg; cfg.mode = UdpMode::kUnicast;
-cfg.local_port = 5000; cfg.remote_addr = "127.0.0.1"; cfg.remote_port = 6000;
-auto udp = std::make_shared<UdpTransport>(cfg);          // 纯字节管道(也可套节点)
-udp->OnBytes([](Result<std::vector<uint8_t>> b, const std::string& from) { /* ... */ });
-(void)udp->Open();
-(void)udp->Send({1, 2, 3});                              // 默认目的地
-(void)udp->Send({4, 5, 6}, Endpoint::Net("10.0.0.7", 7000));  // 运行期寻址
-```
-
-`Result<T>` 用法:`if (r) use(r.value); else log(r.error);`(`operator bool` == `r.ok`)。
-
----
-
-## 状态(0.2.0 开发线)
-
-- [x] **Transport 层**:UDP、TCP(client/connection/server)、串口、DDS(纯字节 pub-sub + provider 抽象 / Fake / 可选 FastDDS)
-- [x] **Codec 层**:`SystemCodec`(外部协议帧,流式)、`SystemDatagramCodec`(同帧无状态报文版,配 UDP)、`DdsCodec`、`LengthFieldCodec`、`DatagramCodec`
-- [x] **外部协议 UDP 1:多**:`SystemDatagramCodec` + `reply_to_source`(应答回送来源)+ 发送可指定 `Endpoint`(主动多发)
-- [x] **Comm 层**:`IExecutor`/`ThreadExecutor`、**`InteractionEngine`(机制一份)+ `InteractionPolicy`(声明式策略)**、`DdsNode`(DDS pub-sub + 多路 req-resp)、`ProtocolNode`(外部协议栈:5 模式 + 重发 + repeating + 心跳 + 双角色)——节点为薄壳
-- [x] **周期发送取最新状态**:`StartRepeating(state_fn)`/`StartPublishing(sample_fn)` 每拍拉最新 + `UpdateRepeating`/`UpdatePublishing` 推送(`DdsNode` 新增周期发布)
-- [x] **可观测性**:可插拔结构化 trace `ITraceSink`(引擎咽喉点;`OstreamTraceSink`/`CapturingTraceSink`;观测-only、近零开销)
-- [x] **可运行示例**:`protocol_node_demo`(TCP 外部协议 5 模式)、`protocol_udp_demo`(UDP 1:多)、`dds_node_demo`(DDS 发布-订阅扇出 + 多路 req-resp)——`-DTRANSPORT_BUILD_EXAMPLES=ON`
-- [x] **发布 `v0.2.0`**(2026-06-29;`v0.1.0` 标签保留旧实现)
-- [ ] 后续:自研协程 `CoroExecutor`、外部协议真实 frm_type/CRC 接入、codec/transport trace 采用、应答来源校验硬化
+GoogleTest 仍 vendored 到 `third_party/`。整个仓库合并为**单一 `transport` 静态库**(链接 `asynctask` + Qt + 可选 fastrtps)与**单一 `transport_tests` 可执行文件**(全部 `tests/*` 在 AsyncTask fiber 调度器内跑)。C++17,目标平台 Linux。
 
 ---
 
 ## 文档
 
-权威参考(基于当前实现汇总):
+权威参考(目标架构):
 
-- **需求规格说明书(SRS)**:[`docs/需求规格说明书.md`](docs/需求规格说明书.md) —— 功能需求 FR-1~13 + 非功能需求 + 约束。
-- **设计说明书(SDD)**:[`docs/设计说明书.md`](docs/设计说明书.md) —— 三层架构 / UML / 协议帧格式 / 数据流时序 / 执行器与并发模型 / 设计依据。
-- **架构与运行期协作(UML)**:[`docs/架构与运行期协作.md`](docs/架构与运行期协作.md) —— 整体设计图 / 构件清单 / 依赖类图 / 运行期协作时序图(收发骨架·DDS 多路 req-resp·协议 needfeedback·repeating/心跳·TCP 服务端)。
-- **变更日志**:[`CHANGELOG.md`](CHANGELOG.md) —— 按 PR/里程碑汇总(含破坏性变更标注)。
-- 过程历史(逐特性 spec / plan,备查):`docs/superpowers/specs/`、`docs/superpowers/plans/`。
+- **需求规格说明书(SRS)**:[`docs/需求规格说明书-协程原生.md`](docs/需求规格说明书-协程原生.md) —— 可观察/可验收行为,标识前缀 `RT_`。
+- **设计说明书 + 分期路线图(SDD)**:[`docs/设计说明书-协程原生.md`](docs/设计说明书-协程原生.md) —— 三层与缝、node 组合、线程/执行域模型、P0–P6 路线图。
+- **架构决策记录(ADR)**:[`docs/adr/`](docs/adr/) —— 0001 协程原生架构总纲、0002 发送/丢弃/生命周期、0003 SDD 与路线图。
+- **项目术语(单一权威)**:[`CONTEXT.md`](CONTEXT.md)。
+- **变更日志**:[`CHANGELOG.md`](CHANGELOG.md)。
+- **as-built 存档**:git tag [`v0.3.0`](https://github.com/Ste7an-cs/Transport/releases/tag/v0.3.0) —— 0.3.0 的 as-built SRS/SDD 与实现。
 
-### 关键约束(详见 SRS/SDD)
+### 关键约束（详见 SRS/SDD）
 
-- **三层解耦**:Transport 不依赖 Message/ICodec;ICodec 不依赖具体 transport;Comm 节点只依赖 `ITransport`/`ICodec`/`IExecutor` 接口(+ 同层默认 `SystemCodec`/`ThreadExecutor`)。〔SRS NFR-2、SDD §2.2〕
-- **不抛异常**:`Result<T>`/`Status`(`[[nodiscard]]`),错误前缀分类。〔SRS FR-13、SDD §11〕
-- **回调式交付**:QtNetwork 传输经 `OnBytes` 在**宿主 Qt 事件循环线程**串行交付(非阻塞;不再自持 io 线程);DDS 样本在 provider listener 线程交付。异步 Comm 层内联 `Decode` → `executor.Post` → 单 worker 串行业务回调(背压在 `Post`);**协程栈**则请求 fiber 线性 `await`(demux 在同一 fiber 调度=Qt 事件循环线程,无 executor)。〔SRS FR-1.2/NFR-3、SDD §10〕
-- **线程模型可换**:经 `IExecutor` 缝换线程/协程/确定性测试而不改节点逻辑。〔SRS FR-4/NFR-4、SDD §7.1〕
-- **统一寻址 `Endpoint`**:发布=`Send(Topic)`、UDP 寻址=`Send(Net)`,基类句柄即可寻址。〔SRS FR-2、SDD §4.3〕
-- **节点以 shared_ptr 持有**:`enable_shared_from_this` + weak_ptr 保活;`Close` 先终结挂起/取消定时器再停执行器再关传输。〔SRS NFR-3、SDD §10〕
-- **构建依赖(0.3.0)**:需 Qt5(Core/Network/SerialPort);json/gtest vendored;Fast DDS 可选(`find_package` 探测);协程栈(可选)需 AsyncTask + boost.fiber。〔SRS NFR-7/NFR-8、SDD §12〕
-- **外部协议常量注入**:`SystemCodec` 的 CRC(`CrcFn` 注入)与 `frm_type` 真值(枚举占位)接入前替换,不改结构。〔SRS FR-12、SDD §8〕
+- **三层解耦**:传输不依赖逻辑消息或协议语义;codec 是公共扩展点;node 组合三者。〔RT_IN_INTERFACE_001/002〕
+- **AsyncTask 强制运行时**:不设 `IExecutor`/`ThreadExecutor` 等独立业务调度体系;M:N 协作式,同一节点状态/关联/入站处理串行,不同节点可并行。〔RT_DESIGN_002、RT_CORO_RUNTIME〕
+- **无共享交互引擎**:不设独立 `InteractionEngine`/`InteractionPolicy` 层;协议语义归各 node。〔RT_DESIGN_003、RT_NODE_003〕
+- **不抛异常**:预期失败用 `Result<T>`/`Status`(`[[nodiscard]]`)+ 机器可判别的 `TransportErrc` 类别。〔RT_ERROR_001/002/003〕
+- **发送完成语义 + 背压**:一次发送在帧字节全部离开框架用户态缓冲(进内核)后才报成功,背压经协程等待自然传导;不采用 fire-and-forget。〔RT_TRANSPORT_008〕
+- **底层回调不碰节点状态**:Qt I/O / DDS listener 回调须安全转交节点所属执行域,不在回调线程执行业务处理器。〔RT_HANDLER_002、RT_NODE_004〕
