@@ -2,13 +2,8 @@
 
 #include <map>
 #include <utility>
-#include <variant>
 
 namespace transport {
-
-namespace {
-Status Ok() { return Status::Success(std::monostate{}); }
-}  // namespace
 
 std::shared_ptr<FakeDdsProvider::Bus> FakeDdsProvider::StaticBusForDomain(int domain) {
   static std::mutex m;
@@ -19,9 +14,9 @@ std::shared_ptr<FakeDdsProvider::Bus> FakeDdsProvider::StaticBusForDomain(int do
   return b;
 }
 
-Status FakeDdsProvider::Init(const DdsConfig& config) {
+coro::Status FakeDdsProvider::Init(const DdsConfig& config) {
   if (!bus_) bus_ = StaticBusForDomain(config.domain_id);  // 未注入 → 接入静态 domain 总线
-  return Ok();
+  return coro::Status{};
 }
 
 void FakeDdsProvider::Shutdown() {
@@ -35,22 +30,24 @@ void FakeDdsProvider::Shutdown() {
       for (auto id : kv.second) bus_->Remove(kv.first, id);
 }
 
-Status FakeDdsProvider::Publish(const std::string& topic,
-                                const std::vector<uint8_t>& bytes) {
-  if (!bus_) return Status::Fail("config: dds not initialized");
+coro::Status FakeDdsProvider::Publish(const std::string& topic,
+                                      const std::vector<uint8_t>& bytes) {
+  // 未 Init(无总线)即发布:调用序错误 → kInvalidState。
+  if (!bus_) return coro::make_error_code(coro::TransportErrc::kInvalidState);
   bus_->Dispatch(topic, bytes);
-  return Ok();
+  return coro::Status{};
 }
 
-Status FakeDdsProvider::Subscribe(const std::string& topic, Sink cb) {
-  if (!bus_) return Status::Fail("config: dds not initialized");
+coro::Status FakeDdsProvider::Subscribe(const std::string& topic, Sink cb) {
+  // 未 Init(无总线)即订阅:调用序错误 → kInvalidState。
+  if (!bus_) return coro::make_error_code(coro::TransportErrc::kInvalidState);
   uint64_t id = bus_->Add(topic, std::move(cb));
   std::lock_guard<std::mutex> lk(mine_m_);
   mine_[topic].push_back(id);
-  return Ok();
+  return coro::Status{};
 }
 
-Status FakeDdsProvider::Unsubscribe(const std::string& topic) {
+coro::Status FakeDdsProvider::Unsubscribe(const std::string& topic) {
   std::vector<uint64_t> ids;
   {
     std::lock_guard<std::mutex> lk(mine_m_);
@@ -59,7 +56,7 @@ Status FakeDdsProvider::Unsubscribe(const std::string& topic) {
   }
   if (bus_)
     for (auto id : ids) bus_->Remove(topic, id);
-  return Ok();
+  return coro::Status{};
 }
 
 }  // namespace transport

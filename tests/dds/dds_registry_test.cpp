@@ -1,27 +1,25 @@
 #include "transport/dds/DdsProviderRegistry.hpp"
 
-#include <variant>
-
 #include <gtest/gtest.h>
 
 using transport::DdsConfig;
 using transport::DdsProviderRegistry;
 using transport::IDdsProvider;
-using transport::Status;
+using transport::coro::Status;
 
 namespace {
 class StubProvider : public IDdsProvider {
  public:
-  Status Init(const DdsConfig&) override { return Status::Success(std::monostate{}); }
+  Status Init(const DdsConfig&) override { return Status{}; }
   void   Shutdown() override {}
   Status Publish(const std::string&, const std::vector<uint8_t>&) override {
-    return Status::Success(std::monostate{});
+    return Status{};
   }
   Status Subscribe(const std::string&,
                    std::function<void(const std::vector<uint8_t>&)>) override {
-    return Status::Success(std::monostate{});
+    return Status{};
   }
-  Status Unsubscribe(const std::string&) override { return Status::Success(std::monostate{}); }
+  Status Unsubscribe(const std::string&) override { return Status{}; }
   std::string Name() const override { return "stub"; }
 };
 }  // namespace

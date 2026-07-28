@@ -1,7 +1,6 @@
 #include "FastDdsProvider.hpp"
 
 #include <utility>
-#include <variant>
 
 #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
 #include <fastdds/dds/publisher/qos/DataWriterQos.hpp>
@@ -21,8 +20,6 @@ using eprosima::fastrtps::types::ReturnCode_t;
 using Sink = std::function<void(const std::vector<uint8_t>&)>;
 
 namespace {
-Status Ok() { return Status::Success(std::monostate{}); }
-
 void ApplyQos(const DdsQos& q, dds::DataWriterQos* wqos, dds::DataReaderQos* rqos) {
   const auto rel = (q.reliability == DdsQos::Reliability::kReliable)
                        ? dds::RELIABLE_RELIABILITY_QOS : dds::BEST_EFFORT_RELIABILITY_QOS;
@@ -62,21 +59,21 @@ class FastDdsProvider::ReaderListener : public dds::DataReaderListener {
 FastDdsProvider::FastDdsProvider() = default;
 FastDdsProvider::~FastDdsProvider() { Shutdown(); }
 
-Status FastDdsProvider::Init(const DdsConfig& config) {
+coro::Status FastDdsProvider::Init(const DdsConfig& config) {
   config_ = config;
   auto* factory = dds::DomainParticipantFactory::get_instance();
   participant_ = factory->create_participant(config.domain_id, dds::PARTICIPANT_QOS_DEFAULT);
+  // participant 建不出通常源于 domain_id 等配置不合法 → kConfiguration。
   if (!participant_)
-    return Status::Fail("io: create_participant failed (domain " +
-                        std::to_string(config.domain_id) + ")");
+    return coro::make_error_code(coro::TransportErrc::kConfiguration);
   type_ = dds::TypeSupport(new FastDdsRawType());
   if (type_.register_type(participant_) != ReturnCode_t::RETCODE_OK)
-    return Status::Fail("io: register_type RawBytes failed");
+    return coro::make_error_code(coro::TransportErrc::kIo);
   publisher_ = participant_->create_publisher(dds::PUBLISHER_QOS_DEFAULT);
   subscriber_ = participant_->create_subscriber(dds::SUBSCRIBER_QOS_DEFAULT);
   if (!publisher_ || !subscriber_)
-    return Status::Fail("io: create publisher/subscriber failed");
-  return Ok();
+    return coro::make_error_code(coro::TransportErrc::kIo);
+  return coro::Status{};
 }
 
 dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
@@ -87,8 +84,8 @@ dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
   return t;
 }
 
-Status FastDdsProvider::Publish(const std::string& topic,
-                                const std::vector<uint8_t>& bytes) {
+coro::Status FastDdsProvider::Publish(const std::string& topic,
+                                      const std::vector<uint8_t>& bytes) {
   dds::DataWriter* writer = nullptr;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -97,41 +94,41 @@ Status FastDdsProvider::Publish(const std::string& topic,
       writer = it->second;
     } else {
       dds::Topic* t = GetOrCreateTopic(topic);
-      if (!t) return Status::Fail("io: create_topic failed: " + topic);
+      if (!t) return coro::make_error_code(coro::TransportErrc::kIo);
       dds::DataWriterQos wqos = dds::DATAWRITER_QOS_DEFAULT;
       ApplyQos(config_.qos, &wqos, nullptr);
       writer = publisher_->create_datawriter(t, wqos, nullptr);
-      if (!writer) return Status::Fail("io: create_datawriter failed: " + topic);
+      if (!writer) return coro::make_error_code(coro::TransportErrc::kIo);
       writers_[topic] = writer;
     }
   }
   RawBytes copy; copy.payload = bytes;
   // Fast DDS 2.13.1 的 DataWriter::write(void*) 单参重载返回 bool(成功 true)。
-  if (!writer->write(&copy)) return Status::Fail("io: write failed: " + topic);
-  return Ok();
+  if (!writer->write(&copy)) return coro::make_error_code(coro::TransportErrc::kIo);
+  return coro::Status{};
 }
 
-Status FastDdsProvider::Subscribe(const std::string& topic, Sink cb) {
+coro::Status FastDdsProvider::Subscribe(const std::string& topic, Sink cb) {
   std::lock_guard<std::mutex> lk(mutex_);
-  if (readers_.count(topic)) return Ok();  // 幂等
+  if (readers_.count(topic)) return coro::Status{};  // 幂等
   dds::Topic* t = GetOrCreateTopic(topic);
-  if (!t) return Status::Fail("io: create_topic failed: " + topic);
+  if (!t) return coro::make_error_code(coro::TransportErrc::kIo);
   auto listener = std::make_unique<ReaderListener>(std::move(cb));
   dds::DataReaderQos rqos = dds::DATAREADER_QOS_DEFAULT;
   ApplyQos(config_.qos, nullptr, &rqos);
   dds::DataReader* reader = subscriber_->create_datareader(t, rqos, listener.get());
-  if (!reader) return Status::Fail("io: create_datareader failed: " + topic);
+  if (!reader) return coro::make_error_code(coro::TransportErrc::kIo);
   readers_[topic] = ReaderEntry{reader, std::move(listener)};
-  return Ok();
+  return coro::Status{};
 }
 
-Status FastDdsProvider::Unsubscribe(const std::string& topic) {
+coro::Status FastDdsProvider::Unsubscribe(const std::string& topic) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto it = readers_.find(topic);
-  if (it == readers_.end()) return Ok();
+  if (it == readers_.end()) return coro::Status{};
   subscriber_->delete_datareader(it->second.reader);
   readers_.erase(it);
-  return Ok();
+  return coro::Status{};
 }
 
 void FastDdsProvider::Shutdown() {

@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "transport/Result.hpp"
 #include "transport/dds/IDdsProvider.hpp"
 
 namespace transport {
@@ -52,11 +51,11 @@ class FakeDdsProvider : public IDdsProvider {
   FakeDdsProvider() = default;                                  // 默认:Init 接入静态 domain 总线
   explicit FakeDdsProvider(std::shared_ptr<Bus> bus) : bus_(std::move(bus)) {}  // DI
 
-  Status Init(const DdsConfig& config) override;
-  void   Shutdown() override;
-  Status Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
-  Status Subscribe(const std::string& topic, Sink cb) override;
-  Status Unsubscribe(const std::string& topic) override;
+  coro::Status Init(const DdsConfig& config) override;
+  void         Shutdown() override;
+  coro::Status Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
+  coro::Status Subscribe(const std::string& topic, Sink cb) override;
+  coro::Status Unsubscribe(const std::string& topic) override;
   std::string Name() const override { return "fake"; }
 
  private:
