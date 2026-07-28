@@ -9,6 +9,7 @@ option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
 
 add_library(transport STATIC
   src/core/version.cpp
+  src/coro/Error.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   src/dds/DdsProviderRegistry.cpp
@@ -16,6 +17,9 @@ add_library(transport STATIC
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# codec/ICodec 采用 transport::coro::Result(以 AsyncTask 的 Coro::Result 为底),故基础
+# transport 库需要 AsyncTask 的 coro 头目录(detail/result.hpp 在此)。
+target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/AsyncTask/coro)
 target_compile_features(transport PUBLIC cxx_std_17)
 
 find_package(Threads REQUIRED)
@@ -103,7 +107,6 @@ if(TRANSPORT_BUILD_CORO)
   target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
 
   add_library(transport_coro STATIC
-    src/coro/Error.cpp
     src/coro/Cancellation.cpp
     src/coro/TcpTransport.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
