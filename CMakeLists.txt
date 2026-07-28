@@ -98,6 +98,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/cancellation_test.cpp
     tests/shared_completion_test.cpp
     tests/pending_table_test.cpp
+    tests/bounded_queue_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_tcp_loopback_test.cpp
     tests/transport_contract_test.cpp
