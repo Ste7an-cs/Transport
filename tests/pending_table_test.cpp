@@ -208,6 +208,36 @@ TEST(PendingTable, ResolveWinsOverPendingDeadlineExactlyOnce) {
   EXPECT_FALSE(table.Resolve(20, MakeMessage(8)));
 }
 
+// max_pending(协议无关纯计数上限):达上限 Register → kResourceExhausted;终结释放后
+// 名额可复用。默认 0 = 无限(既有测试已覆盖不设限)。
+TEST(PendingTable, MaxPendingRejectsRegisterBeyondCapacity) {
+  PendingTable<std::uint32_t, Message> table(2);  // 上限 2。
+
+  auto a = table.Register(1);
+  auto b = table.Register(2);
+  ASSERT_TRUE(a);
+  ASSERT_TRUE(b);
+  EXPECT_EQ(table.Size(), 2u);
+
+  // 第 3 个不同 key:达上限 → kResourceExhausted(不登记)。
+  auto c = table.Register(3);
+  ASSERT_FALSE(c);
+  EXPECT_EQ(c.error(), make_error_code(TransportErrc::kResourceExhausted));
+  EXPECT_EQ(table.Size(), 2u);
+
+  // 上限判定先于键语义:已在途 key 满员时也报上限(纯计数,不碰键语义)。
+  auto dup = table.Register(1);
+  ASSERT_FALSE(dup);
+  EXPECT_EQ(dup.error(), make_error_code(TransportErrc::kResourceExhausted));
+
+  // 释放一个在途(Handle 析构兜底摘除)→ 名额回收,可再 Register。
+  { auto evict = std::move(a); }
+  EXPECT_EQ(table.Size(), 1u);
+  auto d = table.Register(4);
+  ASSERT_TRUE(d);
+  EXPECT_EQ(table.Size(), 2u);
+}
+
 // Handle 析构兜底:未 Wait 直接析构 → entry 从表摘除(取消纪律)。
 TEST(PendingTable, HandleDestructorEvictsUnfinishedEntry) {
   PendingTable<std::uint32_t, Message> table;
