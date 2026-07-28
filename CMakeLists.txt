@@ -102,6 +102,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/fake_coro_transport_test.cpp
     tests/send_semantics_fake_test.cpp
     tests/tcp_transport_send_test.cpp
+    tests/tcp_transport_read_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp

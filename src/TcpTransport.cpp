@@ -1,11 +1,14 @@
 #include "transport/TcpTransport.hpp"
 
+#include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include <QAbstractSocket>
 #include <QByteArray>
+#include <QHostAddress>
 #include <QPointer>
 
 #include "await/corosocket.hpp"
@@ -41,6 +44,10 @@ struct TcpTransport::State {
   // 流式一次一切片)。在 Start 建立,复用修好的 corosocket 读原语。
   std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
   LifecycleState lifecycle{LifecycleState::kCreated};
+  // 对端地址,Start 时从已连接 socket 缓存(对已连接 TCP 恒定):Read 返回的
+  // Datagram.source 恒填为对端 Endpoint::Net(TCP from 恒为对端,见 CONTEXT.md)。
+  std::string peer_host;
+  std::uint16_t peer_port{0};
   bool active_read{false};
   bool active_write{false};  // 写槽是否被占。
   std::size_t send_waiters{0};
@@ -172,6 +179,9 @@ Status TcpTransport::Start() {
       return make_error_code(TransportErrc::kInvalidState);
     }
     state_->lifecycle = LifecycleState::kRunning;
+    // 缓存对端地址(已连接 TCP 恒定):Read 返回的 Datagram.source 恒填为对端。
+    state_->peer_host = state_->socket->peerAddress().toString().toStdString();
+    state_->peer_port = state_->socket->peerPort();
     // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 会收下订阅前已到达的
     // 字节,故不丢首片。await_for 超时不停止该流,可再次 Read。
     state_->read_stream = Coro::coro(state_->socket.data()).readAll();
@@ -225,6 +235,8 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_recv = Clock::now();
+      // TCP from 恒为对端:source 填 Start 时缓存的对端地址(CONTEXT.md 读-分发循环)。
+      datagram.source = Endpoint::Net(state->peer_host, state->peer_port);
     }
     result = Result<Datagram>{std::move(datagram)};
   } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
