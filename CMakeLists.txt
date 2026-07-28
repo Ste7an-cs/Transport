@@ -57,6 +57,7 @@ add_library(transport STATIC
   src/core/version.cpp
   src/Error.cpp
   src/Cancellation.cpp
+  src/ProtocolNode.cpp
   src/TcpTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
@@ -97,6 +98,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/cancellation_test.cpp
     tests/shared_completion_test.cpp
     tests/pending_table_test.cpp
+    tests/protocol_node_test.cpp
     tests/transport_contract_test.cpp
     tests/coro_harness_test.cpp
     tests/fake_coro_transport_test.cpp
