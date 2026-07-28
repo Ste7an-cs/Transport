@@ -11,15 +11,15 @@ namespace transport {
 
 namespace {
 coro::Status ValidateConfig(const LengthFieldCodecConfig& c) {
-  // 非法配置参数 → kInvalidArgument;不支持的长度字段宽度 → kUnsupported。
+  // 非法配置参数 → kConfiguration;不支持的长度字段宽度 → kUnsupported。
   if (c.header_size == 0)
-    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
+    return coro::make_error_code(coro::TransportErrc::kConfiguration);
   if (c.length_size != 2 && c.length_size != 4 && c.length_size != 8)
     return coro::make_error_code(coro::TransportErrc::kUnsupported);
   if (c.length_offset + c.length_size > c.header_size)
-    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
+    return coro::make_error_code(coro::TransportErrc::kConfiguration);
   if (c.max_frame_size < c.header_size)
-    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
+    return coro::make_error_code(coro::TransportErrc::kConfiguration);
   return {};
 }
 }  // namespace
