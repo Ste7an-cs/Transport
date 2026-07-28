@@ -2,9 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include "transport/coro/Error.hpp"
+
 using transport::LengthFieldCodec;
 using transport::LengthFieldCodecConfig;
 using transport::Message;
+using transport::coro::TransportErrc;
+using transport::coro::make_error_code;
 
 namespace {
 LengthFieldCodecConfig BeCfg() {
@@ -26,7 +30,7 @@ TEST(LengthFieldCodec, EncodePassesThroughPayload) {
   Message m; m.payload = {1, 2, 3};
   auto r = codec.Encode(m);
   ASSERT_TRUE(static_cast<bool>(r));
-  EXPECT_EQ(r.value, (std::vector<uint8_t>{1, 2, 3}));
+  EXPECT_EQ(r.value(), (std::vector<uint8_t>{1, 2, 3}));
 }
 
 TEST(LengthFieldCodec, DecodeSingleFrame) {
@@ -34,9 +38,9 @@ TEST(LengthFieldCodec, DecodeSingleFrame) {
   auto frame = Frame(3, 0xAB);
   auto r = codec.Decode(frame.data(), frame.size());
   ASSERT_TRUE(static_cast<bool>(r));
-  ASSERT_EQ(r.value.size(), 1u);
-  EXPECT_EQ(r.value[0].payload, frame);
-  EXPECT_EQ(r.value[0].kind, transport::MessageKind::kOneway);
+  ASSERT_EQ(r.value().size(), 1u);
+  EXPECT_EQ(r.value()[0].payload, frame);
+  EXPECT_EQ(r.value()[0].kind, transport::MessageKind::kOneway);
 }
 
 TEST(LengthFieldCodec, DecodeAcrossPartialFeeds) {
@@ -44,11 +48,11 @@ TEST(LengthFieldCodec, DecodeAcrossPartialFeeds) {
   auto frame = Frame(5, 0x11);
   auto r1 = codec.Decode(frame.data(), 6);
   ASSERT_TRUE(static_cast<bool>(r1));
-  EXPECT_TRUE(r1.value.empty());
+  EXPECT_TRUE(r1.value().empty());
   auto r2 = codec.Decode(frame.data() + 6, frame.size() - 6);
   ASSERT_TRUE(static_cast<bool>(r2));
-  ASSERT_EQ(r2.value.size(), 1u);
-  EXPECT_EQ(r2.value[0].payload, frame);
+  ASSERT_EQ(r2.value().size(), 1u);
+  EXPECT_EQ(r2.value()[0].payload, frame);
 }
 
 TEST(LengthFieldCodec, DecodeGluedFrames) {
@@ -57,9 +61,9 @@ TEST(LengthFieldCodec, DecodeGluedFrames) {
   std::vector<uint8_t> glued = a; glued.insert(glued.end(), b.begin(), b.end());
   auto r = codec.Decode(glued.data(), glued.size());
   ASSERT_TRUE(static_cast<bool>(r));
-  ASSERT_EQ(r.value.size(), 2u);
-  EXPECT_EQ(r.value[0].payload, a);
-  EXPECT_EQ(r.value[1].payload, b);
+  ASSERT_EQ(r.value().size(), 2u);
+  EXPECT_EQ(r.value()[0].payload, a);
+  EXPECT_EQ(r.value()[1].payload, b);
 }
 
 TEST(LengthFieldCodec, DecodeOversizeFails) {
@@ -68,5 +72,5 @@ TEST(LengthFieldCodec, DecodeOversizeFails) {
   auto frame = Frame(100, 0x44);
   auto r = codec.Decode(frame.data(), frame.size());
   EXPECT_FALSE(static_cast<bool>(r));
-  EXPECT_EQ(r.error.rfind("frame:", 0), 0u);
+  EXPECT_EQ(r.error(), make_error_code(TransportErrc::kFrame));
 }
