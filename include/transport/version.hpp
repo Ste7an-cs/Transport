@@ -10,9 +10,9 @@
 namespace transport {
 
 inline constexpr int kVersionMajor = 0;
-inline constexpr int kVersionMinor = 3;
+inline constexpr int kVersionMinor = 4;
 inline constexpr int kVersionPatch = 0;
-inline constexpr char kVersion[] = "0.3.0";  // = kVersionMajor.kVersionMinor.kVersionPatch
+inline constexpr char kVersion[] = "0.4.0";  // = kVersionMajor.kVersionMinor.kVersionPatch
 
 std::string LibraryVersion();  // 返回 kVersion
 

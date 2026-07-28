@@ -8,7 +8,9 @@
 
 ## [Unreleased]
 
-> 面向**协程原生目标架构**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/需求规格说明书-协程原生.md`)的清洁重建;尚未构成发布版本。as-built(0.3.0 异步栈 + 第二期 `coro::InteractionEngine`)已在 P0 从 master 删除,存档于 git tag `v0.3.0`。目标与 as-built 的差异在本节、迁移计划与测试追溯矩阵中维护。
+## [0.4.0] - 2026-07-27
+
+> **协程原生目标架构的清洁重建里程碑**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/adr/0003-*`、`docs/需求规格说明书-协程原生.md`)。0.3.0 as-built → 0.4.0 目标架构重建起点:**功能上是骨架** —— 目标传输发送/读语义(`transport::TcpTransport`)+ 抢救的 codec/DDS provider + 统一 `TransportErrc`;节点、其余介质、连接管理、观测等按 SDD 路线图 P1–P6 逐期恢复。as-built(0.3.0 异步栈 + 第二期 `coro::InteractionEngine`)已从 master 删除,完整实现存档于 git tag `v0.3.0`。
 
 ### 清理:P0 清洁重建 —— 目标骨架落位（协程原生）— 2026-07(路线图 P0)
 > 按 SDD 路线图 `docs/设计说明书-协程原生.md` §4 P0 执行清洁重建：删除 as-built 交互引擎 / 回调式传输 / 旧文档,保留并抢救目标件,提升命名空间,合并单一 CMake 目标。as-built 完整实现存档于 tag `v0.3.0`。
@@ -212,7 +214,8 @@
 
 ---
 
-[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.3.0
 [0.2.1]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.2.0
