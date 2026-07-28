@@ -32,8 +32,10 @@ namespace transport {
 /**
  * @brief 挂起-应答登记表:唯一登记的在途请求与其应答信箱的薄基座。
  *
- * @tparam Key 关联键(P1 实例化为 uint32;模板保留供 P4 DDS correlation_id string 键复用)。
- * @tparam T   应答载荷类型(P1 实例化为 Message)。要求可拷贝(每个等待者持有独立 Result)。
+ * @tparam Key 关联键;要求可拷贝且 LessThanComparable(内部以 std::map 索引)。P1 实例化为
+ *             uint32;模板保留供 P4 DDS correlation_id string 键复用。自定义协议键若非天然
+ *             有序,需自备 operator< 或比较器(RT_DESIGN_008 协议可扩展性)。
+ * @tparam T   应答载荷类型;要求可拷贝(每个等待者持有独立 Result)。P1 实例化为 Message。
  */
 template <typename Key, typename T>
 class PendingTable {
