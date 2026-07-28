@@ -145,19 +145,32 @@ class PendingTable {
     bool finalized_{false};
   };
 
-  PendingTable() : shared_(std::make_shared<Shared>()) {}
+  /**
+   * @brief 构造挂起-应答表。
+   *
+   * @param max_pending 在途 entry 的可选纯计数上限(协议无关,RT_DESIGN_008):0 = 无限;
+   *                    >0 时 Register 在 Size() 已达上限时返 kResourceExhausted。此上限只
+   *                    数 entry、不碰键语义,协议特有的容量语义(如 session_id 空间)由
+   *                    调用方 node 另行内联(ADR-0003 D10)。
+   */
+  explicit PendingTable(std::size_t max_pending = 0)
+      : shared_(std::make_shared<Shared>()), max_pending_(max_pending) {}
 
   /**
    * @brief 唯一登记一个在途请求。
    *
    * @param key 关联键。
    * @return 成功返回持有该 entry 的 Handle;key 已在途返 kInvalidState(不发送);
-   *         FailAll 已 latch closed 返 kClosed(堵幽灵在途)。
+   *         在途数已达 max_pending 返 kResourceExhausted(不发送);FailAll 已 latch
+   *         closed 返 kClosed(堵幽灵在途)。
    */
   [[nodiscard]] Result<Handle> Register(const Key& key) {
     std::lock_guard<std::mutex> lock(shared_->mutex);
     if (shared_->closed) {
       return make_error_code(TransportErrc::kClosed);
+    }
+    if (max_pending_ != 0 && shared_->entries.size() >= max_pending_) {
+      return make_error_code(TransportErrc::kResourceExhausted);
     }
     if (shared_->entries.find(key) != shared_->entries.end()) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -231,6 +244,7 @@ class PendingTable {
 
  private:
   std::shared_ptr<Shared> shared_;
+  std::size_t max_pending_{0};  ///< 在途 entry 计数上限;0 = 无限(协议无关)。
 };
 
 }  // namespace transport

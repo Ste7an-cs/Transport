@@ -6,20 +6,27 @@
  *
  * ProtocolNode **组合**(不继承、不共享引擎)`ITransport`(纯字节管道)+ `ICodec`
  * (线缆格式)+ `PendingTable`(挂起-应答薄基座),内联一条读-分发循环,交付一次
- * needresponse 的请求-响应。协议特有语义——键派生、frm_type 盖章、session_id 滚动
- * 分配、终结帧判别(kResponse/kResult)、未匹配路由——**全部内联在本类**;PendingTable
- * 保持协议无关(ADR-0003 D9 红线)。只经 CorrelationKeyStrategy 开放 KeyOf 注入,
- * IsTerminal / RouteUnmatched 内联锁死。
+ * needresponse 的请求-响应。协议特有语义——键派生、frm_type 盖章、session_id 空闲集
+ * LRU 分配、终结帧判别(kResponse/kResult)、未匹配路由——**全部内联在本类**;
+ * PendingTable 保持协议无关(ADR-0003 D9/D10 红线)。只经 CorrelationKeyStrategy 开放
+ * KeyOf 注入,IsTerminal / RouteUnmatched 内联锁死。
  *
- * 交互状态(session_id 分配器、生命周期、观测计数器)由一把 std::mutex 守(D8);单
- * fiber 调度器、无 affinity(D8/Q9)。并发硬化 / 协作取消 / 256 上限留 P2。
+ * session_id 容量:线缆 uint8 硬顶 256 个并发在途。分配器维护 0..255 空闲集,Request
+ * 取最久释放者(FIFO 复用 = 最大退休窗口,RT_REQUEST_005),256 全在途 → 发送前返
+ * kResourceExhausted(RT_REQUEST_006);请求终结后释放回空闲集。session_id 分配器 + 256
+ * 这个值是协议特有、内联本类(D10);PendingTable 的纯计数上限才是协议无关。
+ *
+ * 交互状态(session_id 空闲集、生命周期、观测计数器)由一把 std::mutex 守(D8);单
+ * fiber 调度器、无 affinity(D8/Q9)。
  */
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include "transport/ICodec.hpp"
 #include "transport/ITransport.hpp"
@@ -96,14 +103,16 @@ class ProtocolNode {
   /**
    * @brief 交付一次 needresponse 请求-响应。
    *
-   * 调用方给 payload + message_id;node 盖 frm_type=kCommand、默认 protocol_id、滚动分配
-   * session_id;request_key → PendingTable.Register(重复键 kInvalidState 透传)→ Encode →
-   * transport.Write → Handle::Wait 等唯一响应。总超时经 options.deadline(调用方从接受请求
-   * 起算)。关闭后返 kClosed。
+   * 调用方给 payload + message_id;node 盖 frm_type=kCommand、默认 protocol_id、从空闲集
+   * LRU 分配 session_id;request_key → PendingTable.Register(重复键 kInvalidState 透传)→
+   * Encode → transport.Write → Handle::Wait 等唯一响应,终结后释放 session_id 回空闲集。
+   * 256 个 session_id 全在途时发送前返 kResourceExhausted(不登记、不发送)。总超时经
+   * options.deadline(调用方从接受请求起算)。关闭后返 kClosed。
    *
    * @param req     请求 Message(payload + message_id 由调用方填)。
    * @param options 截止时间与取消令牌。
-   * @return 匹配响应 Message,或机器可判别错误(kClosed / kInvalidState / kTimeout / …)。
+   * @return 匹配响应 Message,或机器可判别错误(kClosed / kResourceExhausted /
+   *         kInvalidState / kTimeout / …)。
    */
   [[nodiscard]] Result<Message> Request(Message req, OperationOptions options = {});
 
@@ -113,11 +122,27 @@ class ProtocolNode {
   /// @brief 观测:业务帧因 P1 无 handler / 无队列而被丢弃的累计次数。
   [[nodiscard]] std::size_t DroppedNoHandlerCount() const;
 
+  /// @brief 观测:当前在途(已登记未终结)请求数(≤256);背压 / 关联清理判据。
+  [[nodiscard]] std::size_t PendingCount() const;
+
  private:
   /// 读-分发循环体(在 spawn 的 fiber 中跑):Read → Decode → 逐条分发。
   void RunReadLoop();
   /// 单条 Message 的分发:响应帧 → Resolve;业务帧 → 丢弃归因。
   void Dispatch(Message msg);
+
+  /**
+   * @brief 从空闲集分配一个 session_id(最久释放者优先 = FIFO / 最大退休窗口)。
+   *
+   * 协议特有语义(uint8=256 空间),内联本类(D10)。可复用:P2-3 noresponse Send 亦
+   * 盖 session_id(盖帧后立即释放、不占在途预算)。自持锁。
+   *
+   * @return 一个空闲 session_id;256 个全在途时返 std::nullopt(调用方据此拒绝发送)。
+   */
+  [[nodiscard]] std::optional<std::uint8_t> AllocateSession();
+
+  /// @brief 归还一个 session_id 回空闲集尾(push_back → 最大化其复用前的退休窗口)。自持锁。
+  void ReleaseSession(std::uint8_t session_id);
 
   std::unique_ptr<ITransport> transport_;
   std::unique_ptr<ICodec> codec_;
@@ -128,7 +153,8 @@ class ProtocolNode {
 
   mutable std::mutex mutex_;  ///< 守交互状态(D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
-  std::uint8_t next_session_{0};  ///< 滚动 session_id 分配器(uint8 单调滚动)。
+  /// session_id 空闲集(构造时填 0..255);pop_front 分配、push_back 释放 = FIFO 复用。
+  std::deque<std::uint8_t> free_sessions_;
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
 };
