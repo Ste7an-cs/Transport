@@ -12,15 +12,15 @@
 
 using namespace std::chrono_literals;
 using transport::Endpoint;
-using transport::coro::CancellationSource;
-using transport::coro::Datagram;
-using transport::coro::LifecycleState;
-using transport::coro::OperationOptions;
-using transport::coro::Result;
-using transport::coro::SendUnit;
-using transport::coro::Status;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::CancellationSource;
+using transport::Datagram;
+using transport::LifecycleState;
+using transport::OperationOptions;
+using transport::Result;
+using transport::SendUnit;
+using transport::Status;
+using transport::TransportErrc;
+using transport::make_error_code;
 using testutil::FakeCoroTransport;
 
 TEST(CoroFakeTransport, StartIsIdempotentAndClosedCannotRestart) {

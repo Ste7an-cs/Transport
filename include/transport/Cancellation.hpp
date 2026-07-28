@@ -3,9 +3,9 @@
 #include <functional>
 #include <memory>
 
-#include "transport/coro/Result.hpp"
+#include "transport/Result.hpp"
 
-namespace transport::coro {
+namespace transport {
 namespace detail {
 struct CancellationState;
 struct CancellationCallback;
@@ -56,4 +56,4 @@ class CancellationSource {
   std::shared_ptr<detail::CancellationState> state_;
 };
 
-}  // namespace transport::coro
+}  // namespace transport

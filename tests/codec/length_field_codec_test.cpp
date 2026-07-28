@@ -2,13 +2,13 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
 using transport::LengthFieldCodec;
 using transport::LengthFieldCodecConfig;
 using transport::Message;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 namespace {
 LengthFieldCodecConfig BeCfg() {

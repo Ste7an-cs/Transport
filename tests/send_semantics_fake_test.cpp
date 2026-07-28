@@ -13,11 +13,11 @@
 #include "task/fibertask.h"
 
 using transport::Endpoint;
-using transport::coro::LifecycleState;
-using transport::coro::SendUnit;
-using transport::coro::Status;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::LifecycleState;
+using transport::SendUnit;
+using transport::Status;
+using transport::TransportErrc;
+using transport::make_error_code;
 using testutil::FakeCoroTransport;
 
 namespace {

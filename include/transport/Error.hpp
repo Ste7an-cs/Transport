@@ -2,7 +2,7 @@
 
 #include <system_error>
 
-namespace transport::coro {
+namespace transport {
 
 enum class TransportErrc {
   kInvalidArgument = 1,
@@ -23,9 +23,9 @@ enum class TransportErrc {
 const std::error_category& transport_error_category() noexcept;
 std::error_code make_error_code(TransportErrc error) noexcept;
 
-}  // namespace transport::coro
+}  // namespace transport
 
 namespace std {
 template <>
-struct is_error_code_enum<transport::coro::TransportErrc> : true_type {};
+struct is_error_code_enum<transport::TransportErrc> : true_type {};
 }  // namespace std

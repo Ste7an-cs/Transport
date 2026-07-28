@@ -6,9 +6,9 @@
 #include <vector>
 
 #include "transport/Endpoint.hpp"
-#include "transport/coro/Cancellation.hpp"
+#include "transport/Cancellation.hpp"
 
-namespace transport::coro {
+namespace transport {
 
 struct Datagram {
   std::vector<std::uint8_t> bytes;
@@ -28,4 +28,4 @@ struct OperationOptions {
   CancellationToken cancellation;
 };
 
-}  // namespace transport::coro
+}  // namespace transport
