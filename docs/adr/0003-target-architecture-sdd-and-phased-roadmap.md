@@ -24,6 +24,10 @@
 
 - **D7（每期验收门槛）：** 功能期（P1–P4）= Fake 确定性契约 + **单机真实介质回环** + 每条原子 RT_* 追溯到测试；两机集成/性能/24h 稳定性集中在 P6；命名丢弃计数器各期就地埋、loss=0 harness 在 P5。沿用 #19 的"Fake 契约 + 真实回环双实现"范式。
 
+- **D9（自定义关联键 = node 级可注入,只开放 `KeyOf`,不塌回 InteractionPolicy）：** 外部协议请求与响应的 `message_id` 不相等（占位规则:响应码 = 请求码 | `kResponseMarker`,占位 `0x1000`;`session_id` 对端原样回带），故匹配键需把响应码**归一化回请求码**:`ProtocolKey = (session_id<<16) | (cmd & ~kResponseMarker)`。用户可自定义该键派生,但必须落成**安全形态**,守两条判据:(1) `PendingTable<ProtocolKey,Message>` 永远只见**不透明键、从不回调用户代码**（D2 薄基座保持）;(2) 自定义是**单个 node 的构造参数**（`ProtocolNodeConfig` 持 `CorrelationKeyStrategy{request_key, response_key}`,缺省 = `DefaultProtocolKeyStrategy(0x1000)`），**非框架级共享 policy 注册表**,不驱动多 node、不形成公共架构层（RT_NODE_003 保持——node 本就各自实现协议语义）。分两档:常量级（改 `response_marker`）与函数级（整对换 `request_key`/`response_key`）。`Key` 类型 P1 固定 `uint32`（`session_id:8+命令码:16`=24 位够用;命令码有效域 `0x000–0xFFF`,高位留 marker）;DDS 的 `correlation_id` 字符串键由 P4 `DdsNode` 各自实例化 `PendingTable`。**红线纪律:P1 只开放 `KeyOf` 一个点,`IsTerminal`(哪种 frm_type 算响应)与 `RouteUnmatched`(未匹配帧处置)保持内联固定;三者一旦都可注入 = 重建 InteractionPolicy(RT_NODE_003 禁止),放开须专门评审 + ADR。**
+
+- **D8（P1 节点交互状态串行化 = 锁,不是 strand/affinity）：** 同一 node 的交互状态（PendingTable 的 map、`session_id` 分配器、生命周期状态、丢弃计数器）被**读-分发循环 fiber、请求发起 fiber(可几百在途)、关闭控制**三类 fiber 结构性并发访问——这不是偶发而是架构必然（读循环独立跑却与请求 fiber 共享挂起表）。不串行会得到:发号丢更新→关联键相撞→响应交错/永等（违反 RT_REQUEST_001/002）；`std::map` 并发 find/insert/erase→容器撕裂或 entry use-after-free；`Register` 抢在 `FailAll` 扫表之后落表→幽灵在途请求永不终结→`WaitClosed` 永挂（违反 RT_LIFECYCLE_006）；计数丢更新→破坏 `丢弃归因` 可审计判据。D2/ADR-0001-D2 允许"锁 / strand / affinity"三选一满足 CONTEXT.md 的 `节点所属执行域` 串行要求；**P1 选 `std::mutex`**（复用 `SharedCompletion` 已验证的锁模型，跨线程 M:N 下也正确），因为 strand/affinity 依赖的**执行域转交管道尚未落地**（RT_IN_INTERFACE_005，见「尚未解决」）。注:P1 单线程协作调度器上,`Register`/`Resolve`/erase 均**不 `await`**、本已天然串行,锁的价值在为将来 M:N 跨线程兜底。运行时(AsyncTask `await`)**只出现在 `PendingTable::Handle::Wait` 的挂起点**,表结构操作是普通同步临界区。
+
 ## 影响（Consequences）
 
 - **正面：** 有了单一权威的整体设计 + 有序路线图，`/to-tickets` 可逐期拆票、票带清晰验收；纵向薄切片让最大架构风险（无引擎内联 node）在 P1 即被证实；最大化复用避免重写 CRC/扫描、FastDDS CDR-bypass 等难写对的纯逻辑；命名提升让公共 API 干净。
@@ -34,6 +38,6 @@
 ## 尚未解决
 
 - 目标 `Message`/`ICodec`/`ITraceSink` 改造后精确签名（P0/P1 定）。
-- socket QThread ↔ 节点执行域绑定机制（RT_IN_INTERFACE_005，P1）。
+- socket QThread ↔ 节点执行域绑定机制（RT_IN_INTERFACE_005）；P1 以 `std::mutex` 串行化交互状态（D8）绕过,strand/affinity 限域待执行域转交管道落地后再评估。
 - DDS 交接投递机制/容量与 QoS 一致性（P4）。
 - `PendingTable` 同 key 并发多待（当前键空间不需要）。
