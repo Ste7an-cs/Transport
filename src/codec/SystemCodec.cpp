@@ -3,7 +3,7 @@
 #include <array>
 #include <utility>
 
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
 // SystemCodec.cpp — 见 .hpp。小端;坏帧 resync;CRC 注入。
 
@@ -40,10 +40,10 @@ uint16_t DefaultCrc16(const uint8_t* body, std::size_t len) {
 
 SystemCodec::SystemCodec(CrcFn crc) : crc_(std::move(crc)) {}
 
-coro::Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
+Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
   // 整帧 body 超 16 位长度字段可表达上限 → 分帧上限,kFrame。
   if (msg.payload.size() + 2 > kMaxBody)
-    return coro::make_error_code(coro::TransportErrc::kFrame);
+    return make_error_code(TransportErrc::kFrame);
 
   std::vector<uint8_t> body;
   body.reserve(2 + msg.payload.size());
@@ -64,7 +64,7 @@ coro::Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const C
   return out;
 }
 
-coro::Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
+Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
   return EncodeSystemFrame(msg, crc_);
 }
 
@@ -109,7 +109,7 @@ std::size_t ScanSystemFrames(const uint8_t* data, std::size_t len, const CrcFn& 
   return off;
 }
 
-coro::Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
+Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
   buffer_.insert(buffer_.end(), data, data + len);
   std::vector<Message> out;
   const std::size_t consumed = ScanSystemFrames(buffer_.data(), buffer_.size(), crc_, out);

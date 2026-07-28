@@ -10,11 +10,11 @@
 #include <optional>
 #include <system_error>
 
-#include "transport/coro/ITransport.hpp"
+#include "transport/ITransport.hpp"
 
 class QAbstractSocket;
 
-namespace transport::coro {
+namespace transport {
 
 /**
  * @brief 协程原生 TCP 传输——只覆盖已建立连接上的字节收发与发送完成语义。
@@ -86,4 +86,4 @@ class TcpTransport final : public ITransport {
   std::shared_ptr<State> state_;
 };
 
-}  // namespace transport::coro
+}  // namespace transport

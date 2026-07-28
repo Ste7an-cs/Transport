@@ -5,7 +5,7 @@
 using transport::DdsConfig;
 using transport::DdsProviderRegistry;
 using transport::IDdsProvider;
-using transport::coro::Status;
+using transport::Status;
 
 namespace {
 class StubProvider : public IDdsProvider {

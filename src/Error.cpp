@@ -1,8 +1,8 @@
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
 #include <string>
 
-namespace transport::coro {
+namespace transport {
 namespace {
 
 class TransportErrorCategory final : public std::error_category {
@@ -40,4 +40,4 @@ std::error_code make_error_code(TransportErrc error) noexcept {
   return {static_cast<int>(error), transport_error_category()};
 }
 
-}  // namespace transport::coro
+}  // namespace transport

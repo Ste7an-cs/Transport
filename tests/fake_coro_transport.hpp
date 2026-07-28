@@ -11,22 +11,22 @@
 #include <vector>
 
 #include "await/awaitable.hpp"
-#include "transport/coro/Error.hpp"
-#include "transport/coro/ITransport.hpp"
-#include "transport/coro/SharedCompletion.hpp"
+#include "transport/Error.hpp"
+#include "transport/ITransport.hpp"
+#include "transport/SharedCompletion.hpp"
 
 namespace testutil {
 
-class FakeCoroTransport final : public transport::coro::ITransport {
+class FakeCoroTransport final : public transport::ITransport {
  private:
-  using Datagram = transport::coro::Datagram;
-  using LifecycleState = transport::coro::LifecycleState;
-  using OperationOptions = transport::coro::OperationOptions;
+  using Datagram = transport::Datagram;
+  using LifecycleState = transport::LifecycleState;
+  using OperationOptions = transport::OperationOptions;
   template <typename T>
-  using Result = transport::coro::Result<T>;
-  using SendUnit = transport::coro::SendUnit;
-  using Status = transport::coro::Status;
-  using TransportErrc = transport::coro::TransportErrc;
+  using Result = transport::Result<T>;
+  using SendUnit = transport::SendUnit;
+  using Status = transport::Status;
+  using TransportErrc = transport::TransportErrc;
 
   struct State {
     std::mutex mutex;
@@ -43,7 +43,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     std::function<void()> before_timeout_arbitration;
     std::size_t send_waiters{0};
     std::vector<SendUnit> sent;
-    transport::coro::SharedCompletion<void> closed;
+    transport::SharedCompletion<void> closed;
   };
 
  public:
@@ -60,7 +60,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     if (state->lifecycle == LifecycleState::kRunning) {
       return Status{};
     }
-    return transport::coro::make_error_code(TransportErrc::kInvalidState);
+    return transport::make_error_code(TransportErrc::kInvalidState);
   }
 
   Result<Datagram> Read(OperationOptions options = {}) override {
@@ -70,13 +70,13 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle == LifecycleState::kCreated) {
-        return transport::coro::make_error_code(TransportErrc::kInvalidState);
+        return transport::make_error_code(TransportErrc::kInvalidState);
       }
       if (state->lifecycle != LifecycleState::kRunning) {
-        return transport::coro::make_error_code(TransportErrc::kClosed);
+        return transport::make_error_code(TransportErrc::kClosed);
       }
       if (state->active_read) {
-        return transport::coro::make_error_code(TransportErrc::kInvalidState);
+        return transport::make_error_code(TransportErrc::kInvalidState);
       }
       state->active_read = true;
       if (!state->queued_reads.empty()) {
@@ -97,7 +97,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     auto registration = options.cancellation.Register([state, waiter] {
       CloseReadWaiter(
           state, waiter,
-          transport::coro::make_error_code(TransportErrc::kCancelled));
+          transport::make_error_code(TransportErrc::kCancelled));
     });
     Result<Datagram> notification =
         options.deadline
@@ -113,7 +113,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       }
       if (!CloseReadWaiter(
               state, waiter,
-              transport::coro::make_error_code(TransportErrc::kTimeout))) {
+              transport::make_error_code(TransportErrc::kTimeout))) {
         notification = Coro::await(waiter);
       }
     }
@@ -125,13 +125,13 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     }
     if (notification.error() ==
         std::make_error_code(std::errc::timed_out)) {
-      return transport::coro::make_error_code(TransportErrc::kTimeout);
+      return transport::make_error_code(TransportErrc::kTimeout);
     }
     if (notification.error().category() ==
-        transport::coro::transport_error_category()) {
+        transport::transport_error_category()) {
       return notification.error();
     }
-    return transport::coro::make_error_code(TransportErrc::kInternal);
+    return transport::make_error_code(TransportErrc::kInternal);
   }
 
   Status Write(SendUnit unit) override {
@@ -140,10 +140,10 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle == LifecycleState::kCreated) {
-        return transport::coro::make_error_code(TransportErrc::kInvalidState);
+        return transport::make_error_code(TransportErrc::kInvalidState);
       }
       if (state->lifecycle != LifecycleState::kRunning) {
-        return transport::coro::make_error_code(TransportErrc::kClosed);
+        return transport::make_error_code(TransportErrc::kClosed);
       }
       // 发送等待者:自进入 Write 起计数(排队 + 在写),反映发送侧背压积压(3.4.4)。
       state->send_waiters += 1;
@@ -162,9 +162,9 @@ class FakeCoroTransport final : public transport::coro::ITransport {
         // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数,不释放写槽。
         LeaveWriteQueue(state);
         return acquired.error().category() ==
-                       transport::coro::transport_error_category()
+                       transport::transport_error_category()
                    ? Status{acquired.error()}
-                   : Status{transport::coro::make_error_code(
+                   : Status{transport::make_error_code(
                          TransportErrc::kClosed)};
       }
     }
@@ -182,9 +182,9 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       auto released = Coro::await(gate);
       if (!released) {
         auto status = released.error().category() ==
-                              transport::coro::transport_error_category()
+                              transport::transport_error_category()
                           ? Status{released.error()}
-                          : Status{transport::coro::make_error_code(
+                          : Status{transport::make_error_code(
                                 TransportErrc::kInternal)};
         ExitWrite(state);
         return status;
@@ -198,7 +198,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle != LifecycleState::kRunning) {
         result = Status{
-            transport::coro::make_error_code(TransportErrc::kClosed)};
+            transport::make_error_code(TransportErrc::kClosed)};
       } else if (state->next_write_error) {
         result = Status{state->next_write_error->first};
         partial_failure = state->next_write_error->second;
@@ -214,7 +214,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     }
     if (read_waiter) {
       read_waiter->close(
-          transport::coro::make_error_code(TransportErrc::kClosed));
+          transport::make_error_code(TransportErrc::kClosed));
     }
     ExitWrite(state);
     return result;
@@ -230,7 +230,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle == LifecycleState::kCreated) {
-        return transport::coro::make_error_code(TransportErrc::kInvalidState);
+        return transport::make_error_code(TransportErrc::kInvalidState);
       }
     }
     return state->closed.Wait(std::move(options));
@@ -360,7 +360,7 @@ class FakeCoroTransport final : public transport::coro::ITransport {
       }
     }
     for (const auto& gate : closed_gates) {
-      gate->close(transport::coro::make_error_code(TransportErrc::kClosed));
+      gate->close(transport::make_error_code(TransportErrc::kClosed));
     }
     if (next_gate) {
       next_gate->resolve();
@@ -402,14 +402,14 @@ class FakeCoroTransport final : public transport::coro::ITransport {
     }
     if (read_waiter) {
       read_waiter->close(
-          transport::coro::make_error_code(TransportErrc::kClosed));
+          transport::make_error_code(TransportErrc::kClosed));
     }
     if (write_gate) {
       write_gate->close(
-          transport::coro::make_error_code(TransportErrc::kClosed));
+          transport::make_error_code(TransportErrc::kClosed));
     }
     for (const auto& gate : queued_writes) {
-      gate->close(transport::coro::make_error_code(TransportErrc::kClosed));
+      gate->close(transport::make_error_code(TransportErrc::kClosed));
     }
     if (complete_close) {
       state->closed.Complete(Status{});

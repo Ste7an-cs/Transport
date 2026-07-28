@@ -2,7 +2,7 @@
 
 #include <utility>
 
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
 // LengthFieldCodec.cpp — 见 LengthFieldCodec.hpp。
 // Decode:把字节追加进滚动缓冲,循环按 header 内长度字段切出完整帧。
@@ -10,16 +10,16 @@
 namespace transport {
 
 namespace {
-coro::Status ValidateConfig(const LengthFieldCodecConfig& c) {
+Status ValidateConfig(const LengthFieldCodecConfig& c) {
   // 非法配置参数 → kConfiguration;不支持的长度字段宽度 → kUnsupported。
   if (c.header_size == 0)
-    return coro::make_error_code(coro::TransportErrc::kConfiguration);
+    return make_error_code(TransportErrc::kConfiguration);
   if (c.length_size != 2 && c.length_size != 4 && c.length_size != 8)
-    return coro::make_error_code(coro::TransportErrc::kUnsupported);
+    return make_error_code(TransportErrc::kUnsupported);
   if (c.length_offset + c.length_size > c.header_size)
-    return coro::make_error_code(coro::TransportErrc::kConfiguration);
+    return make_error_code(TransportErrc::kConfiguration);
   if (c.max_frame_size < c.header_size)
-    return coro::make_error_code(coro::TransportErrc::kConfiguration);
+    return make_error_code(TransportErrc::kConfiguration);
   return {};
 }
 }  // namespace
@@ -27,11 +27,11 @@ coro::Status ValidateConfig(const LengthFieldCodecConfig& c) {
 LengthFieldCodec::LengthFieldCodec(LengthFieldCodecConfig config)
     : config_(config) {}
 
-coro::Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
+Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
   return msg.payload;  // 透传
 }
 
-coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
+Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
                                                             std::size_t len) {
   if (auto v = ValidateConfig(config_); !v) return v.error();
 
@@ -52,9 +52,9 @@ coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
         config_.length_includes_header ? value : config_.header_size + value;
     // 声明帧长小于 header,或超过最大帧长 → 分帧错误,kFrame。
     if (frame_size < config_.header_size)
-      return coro::make_error_code(coro::TransportErrc::kFrame);
+      return make_error_code(TransportErrc::kFrame);
     if (frame_size > config_.max_frame_size)
-      return coro::make_error_code(coro::TransportErrc::kFrame);
+      return make_error_code(TransportErrc::kFrame);
     if (buffer_.size() - offset < frame_size) break;
 
     Message m;

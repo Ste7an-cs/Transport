@@ -9,7 +9,7 @@ option(TRANSPORT_BUILD_TESTS "Build unit tests" ON)
 
 add_library(transport STATIC
   src/core/version.cpp
-  src/coro/Error.cpp
+  src/Error.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   src/dds/DdsProviderRegistry.cpp
@@ -17,7 +17,7 @@ add_library(transport STATIC
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-# codec/ICodec 采用 transport::coro::Result(以 AsyncTask 的 Coro::Result 为底),故基础
+# codec/ICodec 采用 transport::Result(以 AsyncTask 的 Coro::Result 为底),故基础
 # transport 库需要 AsyncTask 的 coro 头目录(detail/result.hpp 在此)。
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/AsyncTask/coro)
 target_compile_features(transport PUBLIC cxx_std_17)
@@ -106,26 +106,26 @@ if(TRANSPORT_BUILD_CORO)
   target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
 
   add_library(transport_coro STATIC
-    src/coro/Cancellation.cpp
-    src/coro/TcpTransport.cpp)
+    src/Cancellation.cpp
+    src/TcpTransport.cpp)
   target_include_directories(transport_coro PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_compile_features(transport_coro PUBLIC cxx_std_17)
   target_link_libraries(transport_coro PUBLIC transport asynctask)
 
   if(TRANSPORT_BUILD_TESTS)
     add_executable(transport_coro_tests
-      tests/coro/coro_test_main.cpp
-      tests/coro/coro_harness_test.cpp)
+      tests/coro_test_main.cpp
+      tests/coro_harness_test.cpp)
     target_include_directories(transport_coro_tests PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests/coro)
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(transport_coro_tests PRIVATE transport_coro asynctask GTest::gtest Qt5::Core Qt5::Network)
-    target_sources(transport_coro_tests PRIVATE tests/coro/error_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/cancellation_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/transport_contract_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/shared_completion_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/fake_coro_transport_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/send_semantics_fake_test.cpp)
-    target_sources(transport_coro_tests PRIVATE tests/coro/tcp_transport_send_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/error_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/cancellation_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/transport_contract_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/shared_completion_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/fake_coro_transport_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/send_semantics_fake_test.cpp)
+    target_sources(transport_coro_tests PRIVATE tests/tcp_transport_send_test.cpp)
     add_test(NAME transport_coro_tests COMMAND transport_coro_tests)
   endif()
 endif()

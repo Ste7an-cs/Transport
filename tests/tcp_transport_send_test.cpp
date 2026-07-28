@@ -18,18 +18,18 @@
 #include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/coro/Error.hpp"
-#include "transport/coro/TcpTransport.hpp"
+#include "transport/Error.hpp"
+#include "transport/TcpTransport.hpp"
 
 using namespace std::chrono_literals;
 using transport::Endpoint;
-using transport::coro::Datagram;
-using transport::coro::OperationOptions;
-using transport::coro::SendUnit;
-using transport::coro::Status;
-using transport::coro::TcpTransport;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::Datagram;
+using transport::OperationOptions;
+using transport::SendUnit;
+using transport::Status;
+using transport::TcpTransport;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 namespace {
 

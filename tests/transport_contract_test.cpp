@@ -3,14 +3,14 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/coro/ITransport.hpp"
+#include "transport/ITransport.hpp"
 
 using transport::Endpoint;
-using transport::coro::Datagram;
-using transport::coro::ITransport;
-using transport::coro::LifecycleState;
-using transport::coro::OperationOptions;
-using transport::coro::SendUnit;
+using transport::Datagram;
+using transport::ITransport;
+using transport::LifecycleState;
+using transport::OperationOptions;
+using transport::SendUnit;
 
 TEST(CoroTransportContract, DataUnitsOwnBytesAndAddressing) {
   Datagram incoming{{1, 2, 3}, Endpoint::Net("127.0.0.1", 9000)};
@@ -35,14 +35,14 @@ TEST(CoroTransportContract, OptionsUseSteadyClockDeadline) {
 TEST(CoroTransportContract, InterfaceIsInternalPolymorphicSeam) {
   static_assert(std::has_virtual_destructor_v<ITransport>);
   static_assert(std::is_same_v<decltype(&ITransport::Start),
-                               transport::coro::Status (ITransport::*)()>);
+                               transport::Status (ITransport::*)()>);
   static_assert(std::is_same_v<decltype(&ITransport::Read),
-                               transport::coro::Result<Datagram> (ITransport::*)(OperationOptions)>);
+                               transport::Result<Datagram> (ITransport::*)(OperationOptions)>);
   static_assert(std::is_same_v<decltype(&ITransport::Write),
-                               transport::coro::Status (ITransport::*)(SendUnit)>);
+                               transport::Status (ITransport::*)(SendUnit)>);
   static_assert(std::is_same_v<decltype(&ITransport::RequestClose),
-                               transport::coro::Status (ITransport::*)()>);
+                               transport::Status (ITransport::*)()>);
   static_assert(std::is_same_v<decltype(&ITransport::WaitClosed),
-                               transport::coro::Status (ITransport::*)(OperationOptions)>);
+                               transport::Status (ITransport::*)(OperationOptions)>);
   EXPECT_NE(LifecycleState::kCreated, LifecycleState::kClosed);
 }

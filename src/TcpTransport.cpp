@@ -1,4 +1,4 @@
-#include "transport/coro/TcpTransport.hpp"
+#include "transport/TcpTransport.hpp"
 
 #include <deque>
 #include <mutex>
@@ -10,10 +10,10 @@
 
 #include "await/corosocket.hpp"
 #include "await/detail/socketerror.hpp"
-#include "transport/coro/Error.hpp"
-#include "transport/coro/SharedCompletion.hpp"
+#include "transport/Error.hpp"
+#include "transport/SharedCompletion.hpp"
 
-namespace transport::coro {
+namespace transport {
 namespace {
 
 // 把 Qt socket 错误映射到传输错误类别:对端主动关闭 / 网络层断裂归 Connection,
@@ -382,4 +382,4 @@ std::error_code TcpTransport::LastError() const {
   return state_->last_error;
 }
 
-}  // namespace transport::coro
+}  // namespace transport

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "transport/coro/Result.hpp"
-#include "transport/coro/TransportTypes.hpp"
+#include "transport/Result.hpp"
+#include "transport/TransportTypes.hpp"
 
-namespace transport::coro {
+namespace transport {
 
 class ITransport {
  public:
@@ -15,4 +15,4 @@ class ITransport {
   virtual Status WaitClosed(OperationOptions options = {}) = 0;
 };
 
-}  // namespace transport::coro
+}  // namespace transport

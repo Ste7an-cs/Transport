@@ -1,4 +1,4 @@
-#include "transport/coro/Cancellation.hpp"
+#include "transport/Cancellation.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,9 +13,9 @@
 #include <boost/fiber/operations.hpp>
 
 #include "await/awaitable.hpp"
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
-namespace transport::coro::detail {
+namespace transport::detail {
 
 struct CancellationCallback {
   enum class Phase { kActive, kExecuting, kFinished };
@@ -34,9 +34,9 @@ struct CancellationState {
   std::vector<std::shared_ptr<CancellationCallback>> callbacks;
 };
 
-}  // namespace transport::coro::detail
+}  // namespace transport::detail
 
-namespace transport::coro {
+namespace transport {
 namespace {
 
 bool IsExecutingHere(const detail::CancellationCallback& callback) {
@@ -166,4 +166,4 @@ bool CancellationSource::Cancel() noexcept {
   return true;
 }
 
-}  // namespace transport::coro
+}  // namespace transport

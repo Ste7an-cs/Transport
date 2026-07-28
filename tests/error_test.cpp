@@ -2,13 +2,13 @@
 #include <system_error>
 #include <gtest/gtest.h>
 
-#include "transport/coro/Error.hpp"
-#include "transport/coro/Result.hpp"
+#include "transport/Error.hpp"
+#include "transport/Result.hpp"
 
-using transport::coro::Result;
-using transport::coro::Status;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::Result;
+using transport::Status;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 TEST(CoroResult, UsesAsyncTaskValueAndVoidResults) {
   Result<int> value{42};

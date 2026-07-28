@@ -4,11 +4,11 @@
 
 #include "detail/result.hpp"
 
-namespace transport::coro {
+namespace transport {
 
 template <typename T>
 using Result = Coro::Result<T, std::error_code>;
 
 using Status = Result<void>;
 
-}  // namespace transport::coro
+}  // namespace transport

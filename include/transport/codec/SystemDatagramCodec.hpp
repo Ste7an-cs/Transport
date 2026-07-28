@@ -19,10 +19,10 @@ class SystemDatagramCodec : public ICodec {
  public:
   explicit SystemDatagramCodec(CrcFn crc = DefaultCrc16) : crc_(std::move(crc)) {}
 
-  coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+  Result<std::vector<uint8_t>> Encode(const Message& msg) override {
     return EncodeSystemFrame(msg, crc_);
   }
-  coro::Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
+  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
     std::vector<Message> out;
     (void)ScanSystemFrames(data, len, crc_, out);   // 残留丢弃,不跨报文
     return out;

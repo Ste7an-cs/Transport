@@ -5,13 +5,13 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/coro/Error.hpp"
+#include "transport/Error.hpp"
 
 using transport::FrameType;
 using transport::Message;
 using transport::SystemCodec;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 namespace {
 // 确定性注入 CRC:body 字节和(便于字节级断言)。

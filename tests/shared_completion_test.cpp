@@ -8,15 +8,15 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/coro/SharedCompletion.hpp"
+#include "transport/SharedCompletion.hpp"
 
 using namespace std::chrono_literals;
-using transport::coro::CancellationSource;
-using transport::coro::OperationOptions;
-using transport::coro::Result;
-using transport::coro::SharedCompletion;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::CancellationSource;
+using transport::OperationOptions;
+using transport::Result;
+using transport::SharedCompletion;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 namespace {
 
@@ -57,9 +57,9 @@ TEST(CoroSharedCompletion, FirstCompletionWinsAndLateWaitSeesIt) {
 TEST(CoroSharedCompletion, VoidFirstCompletionWinsAndLateWaitSucceeds) {
   SharedCompletion<void> completion;
 
-  EXPECT_TRUE(completion.Complete(transport::coro::Status{}));
+  EXPECT_TRUE(completion.Complete(transport::Status{}));
   EXPECT_FALSE(completion.Complete(
-      transport::coro::Status{make_error_code(TransportErrc::kInternal)}));
+      transport::Status{make_error_code(TransportErrc::kInternal)}));
 
   auto result = completion.Wait();
   EXPECT_TRUE(result);

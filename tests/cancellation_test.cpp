@@ -8,13 +8,13 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/coro/Cancellation.hpp"
-#include "transport/coro/Error.hpp"
+#include "transport/Cancellation.hpp"
+#include "transport/Error.hpp"
 
-using transport::coro::CancellationSource;
-using transport::coro::Status;
-using transport::coro::TransportErrc;
-using transport::coro::make_error_code;
+using transport::CancellationSource;
+using transport::Status;
+using transport::TransportErrc;
+using transport::make_error_code;
 
 TEST(CoroCancellation, CancelIsIdempotentAndRunsNotificationOnce) {
   CancellationSource source;
@@ -74,7 +74,7 @@ TEST(CoroCancellation, ResetWaitsForRunningNotification) {
 TEST(CoroCancellation, NotificationCanResetItself) {
   CancellationSource source;
   int calls = 0;
-  std::optional<transport::coro::CancellationRegistration> registration;
+  std::optional<transport::CancellationRegistration> registration;
   registration.emplace(source.token().Register([&] {
     registration->Reset();
     ++calls;
@@ -159,7 +159,7 @@ TEST(CoroCancellation, WaitAfterCancellationReturnsImmediately) {
 }
 
 TEST(CoroCancellation, EmptyTokenWaitReturnsInvalidState) {
-  transport::coro::CancellationToken token;
+  transport::CancellationToken token;
   const Status result = token.Wait();
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error(), make_error_code(TransportErrc::kInvalidState));

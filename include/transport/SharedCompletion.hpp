@@ -10,11 +10,11 @@
 #include <vector>
 
 #include "await/awaitable.hpp"
-#include "transport/coro/Error.hpp"
-#include "transport/coro/Result.hpp"
-#include "transport/coro/TransportTypes.hpp"
+#include "transport/Error.hpp"
+#include "transport/Result.hpp"
+#include "transport/TransportTypes.hpp"
 
-namespace transport::coro {
+namespace transport {
 
 template <typename T>
 class SharedCompletion {
@@ -121,4 +121,4 @@ class SharedCompletion {
   std::shared_ptr<State> state_;
 };
 
-}  // namespace transport::coro
+}  // namespace transport
