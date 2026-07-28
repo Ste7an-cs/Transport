@@ -2,13 +2,23 @@
 
 本项目的所有重要变更记录于此。格式借鉴 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-权威参考：[需求规格说明书（SRS）](docs/需求规格说明书.md) · [设计说明书（SDD）](docs/设计说明书.md)。
+权威参考：[需求规格说明书（SRS）](docs/需求规格说明书-协程原生.md) · [设计说明书 + 路线图（SDD）](docs/设计说明书-协程原生.md)。as-built（0.3.0）需求/设计文档存档于 git tag `v0.3.0`。
 
 ---
 
 ## [Unreleased]
 
-> 面向**协程原生目标架构**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/需求规格说明书-协程原生.md`)的文档与地基工作;尚未构成发布版本,as-built 交互层仍为 0.3.0 的异步栈 + 第二期 `coro::InteractionEngine`。目标与 as-built 的差异在本节、迁移计划与测试追溯矩阵中维护。
+> 面向**协程原生目标架构**(见 `docs/adr/0001-*`、`docs/adr/0002-*`、`docs/需求规格说明书-协程原生.md`)的清洁重建;尚未构成发布版本。as-built(0.3.0 异步栈 + 第二期 `coro::InteractionEngine`)已在 P0 从 master 删除,存档于 git tag `v0.3.0`。目标与 as-built 的差异在本节、迁移计划与测试追溯矩阵中维护。
+
+### 清理:P0 清洁重建 —— 目标骨架落位（协程原生）— 2026-07(路线图 P0)
+> 按 SDD 路线图 `docs/设计说明书-协程原生.md` §4 P0 执行清洁重建：删除 as-built 交互引擎 / 回调式传输 / 旧文档,保留并抢救目标件,提升命名空间,合并单一 CMake 目标。as-built 完整实现存档于 tag `v0.3.0`。
+- **⚠️ 移除** as-built 交互层(`comm/` 引擎/执行器/策略、第二期 `coro::InteractionEngine`/`ProtocolNode`)、回调式 `ITransport` 及其五介质外壳、as-built SRS/SDD/架构文档与旧示例;均存档于 tag `v0.3.0`。
+- **变更** 统一错误模型为机器可判别的 **`TransportErrc`** 错误类别(`InvalidArgument`/`InvalidState`/`Connection`/`Closed`/`Timeout`/`Cancelled`/`Io`/`Frame`/`Codec`/`ResourceExhausted`/`Unsupported`/`Internal` 等),取代 as-built 的字符串前缀分类(RT_ERROR_002/003)。
+- **变更** 命名空间由 `transport::coro::*` 提升到 `transport::` 顶层(`transport::TcpTransport`/`ITransport`/`Result`/`TransportErrc`;codec→`transport::codec`、DDS provider→`transport::dds`);头/源/测试从 `*/coro/*` 移到顶层。
+- **抢救沿用** 线缆 codec 逻辑(`SystemCodec`/`LengthFieldCodec` 等帧布局/流式扫描/重同步/`CrcFn`)与 DDS provider 适配(`IDdsProvider`/Fake/可选 FastDDS),移植到目标 `ICodec`/`Message`。
+- **构建** CMake 由 `transport`+`transport_coro` 双库合并为**单一 `transport` 库**(直接链接强制依赖 `asynctask` + Qt + 可选 fastrtps);测试目标 `transport_tests`+`transport_coro_tests` 合并为单一可执行文件(在 AsyncTask fiber 调度器内跑全部 `tests/*`)。**移除 `TRANSPORT_BUILD_CORO` 选项**(AsyncTask 现为强制运行时 —— RT_DESIGN_002);保留子模块未初始化的 `FATAL_ERROR` 守卫改为无条件。
+- **文档** SRS 引用表 DOC-2/DOC-3 改指 tag `v0.3.0`(as-built 存档);`README.md` 整篇按当前目标架构现实重写;`CHANGELOG.md` 权威参考指针改指协程原生 SRS/SDD。
+- **验证** 单目标干净重建零告警;全量测试 95/95 通过(含 #19 发送语义、codec、DDS provider 契约),ctest 1/1。
 
 ### 文档:协程原生 SRS v2→v3 —— grilling 收敛 + ADR-0002 — 2026-07-22
 > 经 `/grill-with-docs` 逐条盘问,把 SRS v2 的多处可验收性缺口收敛为可验证需求,关闭 TBD-002 与 TBD-006;决策记入新建 ADR-0002 并回指 SRS 需求号。

@@ -1,6 +1,6 @@
 # transport — C++ 通信中间件
 
-C++17 通信中间件库,三层解耦:**Transport(纯字节管道)/ ICodec(线缆格式)/ Comm(交互节点)**。详见 `README.md`、`docs/需求规格说明书.md`、`docs/设计说明书.md`、`CHANGELOG.md`。
+C++17 通信中间件库,三层解耦:**Transport(纯字节管道)/ ICodec(线缆格式)/ Comm(交互节点)**。详见 `README.md`、`docs/需求规格说明书-协程原生.md`、`docs/设计说明书-协程原生.md`、`CHANGELOG.md`(as-built 文档存档于 tag `v0.3.0`)。
 
 ## Agent skills
 
