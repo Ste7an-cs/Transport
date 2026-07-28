@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-28
+
+> **P1 首纵切片里程碑:TCP 上最小请求-响应**——在 0.4.0 骨架上交付协议无关 `PendingTable` 薄基座 + 最小 `transport::ProtocolNode`(needresponse 请求-响应 + 读-分发循环)+ `TcpTransport` 读侧契约,真实单机 TCP 回环端到端验证,**证实"无共享引擎、语义内联各 node"这一最大架构赌注**(RT_DESIGN_003)。全量测试 95→119 全绿;详见 SDD §4 P1、#34–#37。
+
 ### 里程碑:P1 首纵切片 —— TCP 上最小请求-响应（协程原生）— 2026-07(路线图 P1)
 > 按 SDD `docs/设计说明书-协程原生.md` §4 P1 打通 TCP 上最小 request-response,**证实"无共享引擎、语义内联各 node"这一最大架构赌注**(RT_DESIGN_003)。纵向薄切片:读侧契约 → PendingTable 薄基座 → 最小 ProtocolNode → 真实 TCP 回环端到端。全量测试 **95→119 全绿**。
 - **新增** `PendingTable<Key,T>` 挂起-应答**协议无关薄基座**(唯一登记 / 恰好一次完成 / `FailAll`+closed latch / 取消纪律;四方仲裁在 `Handle::Wait`,每 entry 复用 `SharedCompletion` 原子首胜;RT_REQUEST/RT_IN_INTERFACE_004,#35)。
