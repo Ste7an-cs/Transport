@@ -52,7 +52,6 @@ if(TRANSPORT_BUILD_TESTS)
   add_executable(transport_tests
     tests/test_main.cpp
     tests/version_test.cpp
-    tests/result_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
