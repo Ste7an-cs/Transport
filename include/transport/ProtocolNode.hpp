@@ -28,6 +28,8 @@
 #include <mutex>
 #include <optional>
 
+#include "transport/BoundedQueue.hpp"
+#include "transport/Cancellation.hpp"
 #include "transport/ICodec.hpp"
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
@@ -37,6 +39,47 @@
 #include "transport/TransportTypes.hpp"
 
 namespace transport {
+
+class ProtocolNode;
+
+/**
+ * @brief 入站业务处理器的能力面(RT_HANDLER_001):handler 经它与节点交互,而非裸捕获
+ *        node&。只露三项能力,协议内部状态不外泄。
+ *
+ * 由 ProtocolNode 在消费者 fiber 内构造并按引用传入 handler;handler 不得持有其地址越出
+ * 单次调用(生命周期系于该次分发)。
+ */
+class HandlerContext {
+ public:
+  /// @brief 从本节点 fire-and-forget 发一帧(noresponse);委托到 ProtocolNode::Send。
+  [[nodiscard]] Status Send(Message msg);
+
+  /**
+   * @brief 请求关闭本节点(非阻塞信号):唤醒读循环与消费者收敛。
+   *
+   * 仅发出收敛信号(RequestClose 传输 + Close 业务队列 + 触发 handler 取消),不在 handler
+   * fiber 内阻塞等待终结,避免消费者 fiber 自等自锁。节点生命周期由外部 Close()/析构最终
+   * 收敛到 Closed(handler 内发起 Close 的重入自锁防护与自收敛完善留 P2-4 / #50)。
+   */
+  Status RequestClose();
+
+  /// @brief 节点所属执行域的协作取消令牌(Close 时被触发);handler 可据它提前收手。
+  [[nodiscard]] const CancellationToken& cancellation() const {
+    return cancellation_;
+  }
+
+ private:
+  friend class ProtocolNode;
+  HandlerContext(ProtocolNode* node, CancellationToken cancellation)
+      : node_(node), cancellation_(std::move(cancellation)) {}
+
+  ProtocolNode* node_;
+  CancellationToken cancellation_;
+};
+
+/// 入站业务处理器(组合注入,RT_HANDLER_001):对一条业务帧返回结构化结果(仅记录,
+/// 框架不据此自动应答,避 TBD-001);预期失败用 Status 表达,不抛异常(RT_HANDLER_005)。
+using InboundHandler = std::function<Status(const Message&, HandlerContext&)>;
 
 /// 关联键类型:请求↔响应配对的机器键(P1 为 (session_id<<16)|命令码 的 uint32)。
 using ProtocolKey = std::uint32_t;
@@ -67,10 +110,16 @@ struct CorrelationKeyStrategy {
 CorrelationKeyStrategy DefaultProtocolKeyStrategy(
     std::uint16_t response_marker = kResponseMarker);
 
-/// ProtocolNode 配置:关联键策略 + 默认外部协议 id。
+/// ProtocolNode 配置:关联键策略 + 默认外部协议 id + 可选入站业务处理器 + 业务队列上界。
 struct ProtocolNodeConfig {
   CorrelationKeyStrategy key_strategy = DefaultProtocolKeyStrategy();
   std::uint8_t protocol_id = 0;
+  /// 入站业务处理器(RT_HANDLER_001);为空 = P1 行为(业务帧归因 dropped_no_handler)。
+  InboundHandler handler;
+  /// 业务队列事件数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
+  std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
+  /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
+  std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
 };
 
 /**
@@ -92,8 +141,9 @@ class ProtocolNode {
   Status Start();
 
   /**
-   * @brief 幂等关闭:Closing → RequestClose + PendingTable.FailAll(kClosed) + 等读循环
-   *        退出 → Closed。关闭后 Request 一律 kClosed。
+   * @brief 幂等关闭:Closing → 三方汇合(transport.RequestClose + 业务队列 Close + 触发
+   *        handler 取消)+ PendingTable.FailAll(kClosed) + 等读循环退出且(设 handler 时)
+   *        消费者 fiber 退出 → Closed。关闭后 Request/Send 一律 kClosed。
    */
   Status Close();
 
@@ -116,20 +166,46 @@ class ProtocolNode {
    */
   [[nodiscard]] Result<Message> Request(Message req, OperationOptions options = {});
 
+  /**
+   * @brief noresponse fire-and-forget 出站:盖章 + 编码 + 写出,不期待应答。
+   *
+   * node 盖 frm_type(调用方给的业务类型优先,否则默认 kCommand)、默认 protocol_id、从
+   * 空闲集分配一个 session_id 盖帧后**立即释放**(不登记 PendingTable、不占 256 在途预算)。
+   * 编码后经 transport.Write 上线,遵 RT_TRANSPORT_008 背压。关闭后返 kClosed;256 个
+   * session_id 全在途(无空闲)时返 kResourceExhausted(边界策略:与 Request 一致地拒绝,
+   * 不与在途请求争用 session_id 空间)。
+   *
+   * @param msg 出站 Message(payload + 可选 message_id / frm_type 由调用方填)。
+   * @return 写出结果或机器可判别错误(kClosed / kResourceExhausted / 编码 / 传输错误)。
+   */
+  [[nodiscard]] Status Send(Message msg);
+
   /// @brief 观测:响应帧无匹配在途请求(迟到 / 乱序 / 无匹配)而被丢弃的累计次数。
   [[nodiscard]] std::size_t UnmatchedResponseCount() const;
 
-  /// @brief 观测:业务帧因 P1 无 handler / 无队列而被丢弃的累计次数。
+  /// @brief 观测:业务帧因无 handler / 无队列而被丢弃的累计次数(P1 行为)。
   [[nodiscard]] std::size_t DroppedNoHandlerCount() const;
+
+  /// @brief 观测:业务队列满而 tail-drop 的累计次数(命名归因 business_queue_overflow)。
+  [[nodiscard]] std::size_t BusinessQueueOverflowCount() const;
+
+  /// @brief 观测:handler 逃逸异常被边界兜住、转 kInternal 隔离的累计次数(RT_HANDLER_006)。
+  [[nodiscard]] std::size_t HandlerExceptionCount() const;
 
   /// @brief 观测:当前在途(已登记未终结)请求数(≤256);背压 / 关联清理判据。
   [[nodiscard]] std::size_t PendingCount() const;
 
  private:
+  friend class HandlerContext;
+
   /// 读-分发循环体(在 spawn 的 fiber 中跑):Read → Decode → 逐条分发。
   void RunReadLoop();
-  /// 单条 Message 的分发:响应帧 → Resolve;业务帧 → 丢弃归因。
+  /// 单条 Message 的分发:响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
   void Dispatch(Message msg);
+  /// 单消费者 handler fiber 体:出队一条 → 跑 handler 到完成 → 再出下一条(严格串行)。
+  void RunHandlerLoop();
+  /// @brief 非阻塞收敛信号:RequestClose 传输 + Close 业务队列 + 触发 handler 取消。自持锁外调用。
+  void SignalConvergence();
 
   /**
    * @brief 从空闲集分配一个 session_id(最久释放者优先 = FIFO / 最大退休窗口)。
@@ -148,8 +224,13 @@ class ProtocolNode {
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
   PendingTable<ProtocolKey, Message> pending_;
-  SharedCompletion<void> loop_done_;  ///< 读循环退出通知(Close 等待点)。
-  SharedCompletion<void> closed_;     ///< 节点 Closed 通知(WaitClosed 等待点)。
+  /// 入站业务帧队列(协议无关 D10):设 handler 时读循环 Push、消费者 fiber Pop。
+  BoundedQueue<Message> business_queue_;
+  /// handler 协作取消源:Close 时 Cancel,handler 经 ctx.cancellation() 观测(RT_HANDLER)。
+  CancellationSource handler_cancellation_;
+  SharedCompletion<void> loop_done_;     ///< 读循环退出通知(Close 等待点)。
+  SharedCompletion<void> handler_done_;  ///< 消费者 fiber 退出通知(Close 等待点)。
+  SharedCompletion<void> closed_;        ///< 节点 Closed 通知(WaitClosed 等待点)。
 
   mutable std::mutex mutex_;  ///< 守交互状态(D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
@@ -157,6 +238,7 @@ class ProtocolNode {
   std::deque<std::uint8_t> free_sessions_;
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
+  std::size_t handler_exception_count_{0};
 };
 
 }  // namespace transport
