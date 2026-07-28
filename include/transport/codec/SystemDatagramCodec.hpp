@@ -11,7 +11,6 @@
 
 #include "transport/ICodec.hpp"
 #include "transport/Message.hpp"
-#include "transport/Result.hpp"
 #include "transport/codec/SystemCodec.hpp"   // CrcFn / DefaultCrc16 / EncodeSystemFrame / ScanSystemFrames
 
 namespace transport {
@@ -20,13 +19,13 @@ class SystemDatagramCodec : public ICodec {
  public:
   explicit SystemDatagramCodec(CrcFn crc = DefaultCrc16) : crc_(std::move(crc)) {}
 
-  Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+  coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override {
     return EncodeSystemFrame(msg, crc_);
   }
-  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
+  coro::Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
     std::vector<Message> out;
     (void)ScanSystemFrames(data, len, crc_, out);   // 残留丢弃,不跨报文
-    return Result<std::vector<Message>>::Success(std::move(out));
+    return out;
   }
 
  private:

@@ -2,35 +2,38 @@
 
 #include <utility>
 
+#include "transport/coro/Error.hpp"
+
 // LengthFieldCodec.cpp — 见 LengthFieldCodec.hpp。
 // Decode:把字节追加进滚动缓冲,循环按 header 内长度字段切出完整帧。
 
 namespace transport {
 
 namespace {
-Status ValidateConfig(const LengthFieldCodecConfig& c) {
-  if (c.header_size == 0) return Status::Fail("config: header_size must be > 0");
+coro::Status ValidateConfig(const LengthFieldCodecConfig& c) {
+  // 非法配置参数 → kInvalidArgument;不支持的长度字段宽度 → kUnsupported。
+  if (c.header_size == 0)
+    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
   if (c.length_size != 2 && c.length_size != 4 && c.length_size != 8)
-    return Status::Fail("config: length_size must be 2, 4, or 8");
+    return coro::make_error_code(coro::TransportErrc::kUnsupported);
   if (c.length_offset + c.length_size > c.header_size)
-    return Status::Fail("config: length field exceeds header_size");
+    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
   if (c.max_frame_size < c.header_size)
-    return Status::Fail("config: max_frame_size smaller than header_size");
-  return Status::Success(std::monostate{});
+    return coro::make_error_code(coro::TransportErrc::kInvalidArgument);
+  return {};
 }
 }  // namespace
 
 LengthFieldCodec::LengthFieldCodec(LengthFieldCodecConfig config)
     : config_(config) {}
 
-Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
-  return Result<std::vector<uint8_t>>::Success(msg.payload);  // 透传
+coro::Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
+  return msg.payload;  // 透传
 }
 
-Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
-                                                      std::size_t len) {
-  using R = Result<std::vector<Message>>;
-  if (auto v = ValidateConfig(config_); !v) return R::Fail(v.error);
+coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
+                                                            std::size_t len) {
+  if (auto v = ValidateConfig(config_); !v) return v.error();
 
   buffer_.insert(buffer_.end(), data, data + len);
   std::vector<Message> out;
@@ -47,10 +50,11 @@ Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
 
     const uint64_t frame_size =
         config_.length_includes_header ? value : config_.header_size + value;
+    // 声明帧长小于 header,或超过最大帧长 → 分帧错误,kFrame。
     if (frame_size < config_.header_size)
-      return R::Fail("frame: declared frame size smaller than header");
+      return coro::make_error_code(coro::TransportErrc::kFrame);
     if (frame_size > config_.max_frame_size)
-      return R::Fail("frame: frame size exceeds max_frame_size");
+      return coro::make_error_code(coro::TransportErrc::kFrame);
     if (buffer_.size() - offset < frame_size) break;
 
     Message m;
@@ -60,7 +64,7 @@ Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
     offset += static_cast<std::size_t>(frame_size);
   }
   if (offset > 0) buffer_.erase(buffer_.begin(), buffer_.begin() + offset);
-  return R::Success(std::move(out));
+  return out;
 }
 
 }  // namespace transport

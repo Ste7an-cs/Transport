@@ -12,15 +12,15 @@
 
 #include "transport/ICodec.hpp"
 #include "transport/Message.hpp"
-#include "transport/Result.hpp"
 
 namespace transport {
 
 class DdsCodec : public ICodec {
  public:
-  Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+  coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+    // 字段超 uint16 长度前缀上限:codec 格式无法承载 → kCodec。
     if (msg.correlation_id.size() > 0xFFFF || msg.reply_to.size() > 0xFFFF)
-      return Result<std::vector<uint8_t>>::Fail("codec: dds field too long");
+      return coro::make_error_code(coro::TransportErrc::kCodec);
     std::vector<uint8_t> out;
     out.reserve(1 + 2 + msg.correlation_id.size() + 2 + msg.reply_to.size() +
                 msg.payload.size());
@@ -28,31 +28,29 @@ class DdsCodec : public ICodec {
     PutLenPrefixed(out, msg.correlation_id);
     PutLenPrefixed(out, msg.reply_to);
     out.insert(out.end(), msg.payload.begin(), msg.payload.end());
-    return Result<std::vector<uint8_t>>::Success(std::move(out));
+    return out;
   }
 
-  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
+  coro::Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
     std::vector<Message> out;
-    if (len == 0) return Result<std::vector<Message>>::Success(std::move(out));
+    if (len == 0) return out;
     std::size_t pos = 0;
     Message m;
     m.kind = static_cast<MessageKind>(data[pos]);
     pos += 1;
+    // 坏判别符 / 字段越界:sample 语义损坏 → kCodec。
     if (static_cast<uint8_t>(m.kind) > static_cast<uint8_t>(MessageKind::kNotify))
-      return Fail("codec: dds bad kind");
+      return coro::make_error_code(coro::TransportErrc::kCodec);
     if (!GetLenPrefixed(data, len, pos, m.correlation_id))
-      return Fail("codec: dds truncated corr field");
+      return coro::make_error_code(coro::TransportErrc::kCodec);
     if (!GetLenPrefixed(data, len, pos, m.reply_to))
-      return Fail("codec: dds truncated reply field");
+      return coro::make_error_code(coro::TransportErrc::kCodec);
     m.payload.assign(data + pos, data + len);  // 余下即 payload
     out.push_back(std::move(m));
-    return Result<std::vector<Message>>::Success(std::move(out));
+    return out;
   }
 
  private:
-  static Result<std::vector<Message>> Fail(const std::string& e) {
-    return Result<std::vector<Message>>::Fail(e);
-  }
   static void PutLenPrefixed(std::vector<uint8_t>& out, const std::string& s) {
     const uint16_t n = static_cast<uint16_t>(s.size());
     out.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
