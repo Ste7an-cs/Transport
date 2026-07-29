@@ -55,16 +55,16 @@ target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
 # ---------------------------------------------------------------------------
 add_library(transport STATIC
   src/core/version.cpp
-  src/Error.cpp
-  src/Cancellation.cpp
-  src/ProtocolNode.cpp
-  src/DdsNode.cpp
-  src/TcpTransport.cpp
-  src/UdpTransport.cpp
-  src/TcpClientTransport.cpp
-  src/SerialTransport.cpp
-  src/TcpServer.cpp
-  src/DdsTransport.cpp
+  src/core/Error.cpp
+  src/core/Cancellation.cpp
+  src/node/ProtocolNode.cpp
+  src/node/DdsNode.cpp
+  src/io/TcpTransport.cpp
+  src/io/UdpTransport.cpp
+  src/io/TcpClientTransport.cpp
+  src/io/SerialTransport.cpp
+  src/io/TcpServer.cpp
+  src/io/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   src/dds/DdsProviderRegistry.cpp

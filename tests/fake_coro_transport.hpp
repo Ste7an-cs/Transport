@@ -11,9 +11,9 @@
 #include <vector>
 
 #include "await/awaitable.hpp"
-#include "transport/Error.hpp"
-#include "transport/ITransport.hpp"
-#include "transport/SharedCompletion.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/io/ITransport.hpp"
+#include "transport/core/SharedCompletion.hpp"
 
 namespace testutil {
 

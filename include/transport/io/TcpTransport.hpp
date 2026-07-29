@@ -10,7 +10,7 @@
 #include <optional>
 #include <system_error>
 
-#include "transport/ITransport.hpp"
+#include "transport/io/ITransport.hpp"
 
 class QAbstractSocket;
 

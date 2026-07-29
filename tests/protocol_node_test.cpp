@@ -16,8 +16,8 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/ProtocolNode.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/node/ProtocolNode.hpp"
+#include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemCodec.hpp"
 #include "coro_test_util.hpp"
 #include "fake_coro_transport.hpp"

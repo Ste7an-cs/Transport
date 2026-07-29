@@ -10,9 +10,9 @@
 #include <vector>
 
 #include "await/awaitable.hpp"
-#include "transport/Error.hpp"
-#include "transport/Result.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Result.hpp"
+#include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 

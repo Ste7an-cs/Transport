@@ -1,4 +1,4 @@
-#include "transport/TcpServer.hpp"
+#include "transport/io/TcpServer.hpp"
 
 #include <cstdint>
 #include <map>
@@ -19,10 +19,10 @@
 #include "await/corotcpserver.hpp"
 #include "await/detail/socketerror.hpp"
 #include "task/fibertask.h"
-#include "transport/Error.hpp"
-#include "transport/ProtocolNode.hpp"
-#include "transport/SharedCompletion.hpp"
-#include "transport/TcpTransport.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/node/ProtocolNode.hpp"
+#include "transport/core/SharedCompletion.hpp"
+#include "transport/io/TcpTransport.hpp"
 
 namespace transport {
 

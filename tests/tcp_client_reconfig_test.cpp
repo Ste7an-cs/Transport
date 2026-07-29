@@ -16,8 +16,8 @@
 #include <QTcpSocket>
 
 #include "coro_test_util.hpp"
-#include "transport/Error.hpp"
-#include "transport/TcpClientTransport.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/io/TcpClientTransport.hpp"
 
 using namespace std::chrono_literals;
 using transport::ConnectionState;

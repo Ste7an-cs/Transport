@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 using transport::FrameType;
 using transport::Message;

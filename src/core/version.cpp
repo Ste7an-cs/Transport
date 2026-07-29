@@ -1,4 +1,4 @@
-#include "transport/version.hpp"
+#include "transport/core/version.hpp"
 
 // version.cpp — LibraryVersion 实现（见 version.hpp）。
 

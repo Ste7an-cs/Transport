@@ -1,4 +1,4 @@
-#include "transport/Message.hpp"
+#include "transport/core/Message.hpp"
 
 #include <gtest/gtest.h>
 

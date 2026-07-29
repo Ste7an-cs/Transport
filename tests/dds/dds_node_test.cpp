@@ -14,7 +14,7 @@
 // Request(await)用 makeTask 起独立 fiber。
 // -----------------------------------------------------------------------------
 
-#include "transport/DdsNode.hpp"
+#include "transport/node/DdsNode.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -24,10 +24,10 @@
 #include <gtest/gtest.h>
 
 #include "task/fibertask.h"
-#include "transport/DdsTransport.hpp"
-#include "transport/Endpoint.hpp"
-#include "transport/Error.hpp"
-#include "transport/Message.hpp"
+#include "transport/io/DdsTransport.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Message.hpp"
 #include "transport/codec/DdsCodec.hpp"
 #include "transport/dds/FakeDdsProvider.hpp"
 #include "coro_test_util.hpp"

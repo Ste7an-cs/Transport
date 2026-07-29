@@ -18,7 +18,7 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/BoundedQueue.hpp"
+#include "transport/node/BoundedQueue.hpp"
 #include "coro_test_util.hpp"
 
 using testutil::pumpFiberUntil;

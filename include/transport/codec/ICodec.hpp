@@ -13,9 +13,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "transport/Message.hpp"
-#include "transport/Error.hpp"
-#include "transport/Result.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Result.hpp"
 
 namespace transport {
 

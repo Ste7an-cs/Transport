@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "transport/ICodec.hpp"
+#include "transport/codec/ICodec.hpp"
 
 namespace transport {
 

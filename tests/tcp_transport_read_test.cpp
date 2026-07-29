@@ -21,9 +21,9 @@
 #include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/Endpoint.hpp"
-#include "transport/Error.hpp"
-#include "transport/TcpTransport.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/io/TcpTransport.hpp"
 
 using namespace std::chrono_literals;
 using transport::Datagram;

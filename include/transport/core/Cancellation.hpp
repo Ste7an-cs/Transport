@@ -3,7 +3,7 @@
 #include <functional>
 #include <memory>
 
-#include "transport/Result.hpp"
+#include "transport/core/Result.hpp"
 
 namespace transport {
 namespace detail {

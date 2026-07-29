@@ -1,4 +1,4 @@
-#include "transport/UdpTransport.hpp"
+#include "transport/io/UdpTransport.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -14,8 +14,8 @@
 
 #include "await/coroudpsocket.hpp"
 #include "await/detail/socketerror.hpp"
-#include "transport/Error.hpp"
-#include "transport/SharedCompletion.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/SharedCompletion.hpp"
 
 namespace transport {
 namespace {

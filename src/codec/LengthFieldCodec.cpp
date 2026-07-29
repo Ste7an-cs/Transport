@@ -2,7 +2,7 @@
 
 #include <utility>
 
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 // LengthFieldCodec.cpp — 见 LengthFieldCodec.hpp。
 // Decode:把字节追加进滚动缓冲,循环按 header 内长度字段切出完整帧。

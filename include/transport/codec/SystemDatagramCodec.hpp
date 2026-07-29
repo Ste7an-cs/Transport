@@ -9,8 +9,8 @@
 #include <utility>
 #include <vector>
 
-#include "transport/ICodec.hpp"
-#include "transport/Message.hpp"
+#include "transport/codec/ICodec.hpp"
+#include "transport/core/Message.hpp"
 #include "transport/codec/SystemCodec.hpp"   // CrcFn / DefaultCrc16 / EncodeSystemFrame / ScanSystemFrames
 
 namespace transport {

@@ -25,12 +25,12 @@
 
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/Endpoint.hpp"
-#include "transport/Error.hpp"
-#include "transport/Message.hpp"
-#include "transport/ProtocolNode.hpp"
-#include "transport/UdpTransport.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/node/ProtocolNode.hpp"
+#include "transport/io/UdpTransport.hpp"
+#include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemDatagramCodec.hpp"
 #include "transport/udp/UdpConfig.hpp"
 

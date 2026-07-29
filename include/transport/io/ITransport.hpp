@@ -1,7 +1,7 @@
 #pragma once
 
-#include "transport/Result.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/core/Result.hpp"
+#include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 

@@ -14,9 +14,9 @@
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/Endpoint.hpp"
-#include "transport/Error.hpp"
-#include "transport/UdpTransport.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/io/UdpTransport.hpp"
 #include "transport/codec/DatagramCodec.hpp"
 #include "transport/udp/UdpConfig.hpp"
 

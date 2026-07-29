@@ -14,8 +14,8 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/Message.hpp"
-#include "transport/PendingTable.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/node/PendingTable.hpp"
 #include "coro_test_util.hpp"
 
 using namespace std::chrono_literals;

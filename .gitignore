@@ -6,3 +6,9 @@ compile_commands.json
 /.superpowers/
 /.worktrees/
 *.swp
+
+# IDE / 工具构建目录(补:cmake-build-debug 之前仅全局 gitignore 忽略,不可移植)
+/cmake-build-*/
+/.agents/
+/.codex/
+*.user

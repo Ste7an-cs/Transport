@@ -1,4 +1,4 @@
-#include "transport/SerialTransport.hpp"
+#include "transport/io/SerialTransport.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -12,8 +12,8 @@
 
 #include "await/awaitable.hpp"
 #include "await/coroiodevice.hpp"
-#include "transport/Error.hpp"
-#include "transport/SharedCompletion.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/SharedCompletion.hpp"
 
 namespace transport {
 namespace {

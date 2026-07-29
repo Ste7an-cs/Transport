@@ -2,8 +2,8 @@
 #include <system_error>
 #include <gtest/gtest.h>
 
-#include "transport/Error.hpp"
-#include "transport/Result.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Result.hpp"
 
 using transport::Result;
 using transport::Status;

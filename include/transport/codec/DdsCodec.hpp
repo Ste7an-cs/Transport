@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-#include "transport/ICodec.hpp"
-#include "transport/Message.hpp"
+#include "transport/codec/ICodec.hpp"
+#include "transport/core/Message.hpp"
 
 namespace transport {
 

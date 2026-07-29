@@ -8,7 +8,7 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/SharedCompletion.hpp"
+#include "transport/core/SharedCompletion.hpp"
 
 using namespace std::chrono_literals;
 using transport::CancellationSource;
