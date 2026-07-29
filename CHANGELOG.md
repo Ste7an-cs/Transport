@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-29
+
+> **P3 连接管理里程碑:TCP 客户端自动重连 + 连接代际 + 运行时重配置**——在 0.4.2 交互节点基座上,`TcpClientTransport` 为 TCP 客户端补齐跨重连的稳定收发:自动退避重连、连接代际隔离迟到事件、运行时重配置端点切换,node 观察连接状态但不管理 churn。全量测试 152→180 全绿;详见 SDD §4 P3 / §7 追溯矩阵、#57–#60。
+
 ### 里程碑:P3 连接管理 —— TcpClientTransport 自动重连 + 连接代际 + 运行时重配置(协程原生)— 2026-07(路线图 P3)
 > 按 SDD §4 P3 交付 TCP 客户端连接管理。遵 ADR-0003 **D11** 行为契约:node 观察连接状态但不管理 churn;连接概念不下沉 base ITransport(D3′),连接代际不进 PendingTable(守 RT_DESIGN_008)。全量测试 152→180 全绿。
 - **新增** `TcpClientTransport`(外层 owns socket,实现 `ITransport` + `IConnectionObservable`):状态机(`Disconnected/Connecting/Connected/Reconnecting`)+ corosocket `connectToHost`+`await_for(可配超时)`+超时 `abort()`(摩擦 1)+ 退避重连(1s×2 上限 30s ±20% jitter、稳定 60s 重置、无限重试)+ 连接代际(单调,每次成功物理连接 +1),组合内层 `TcpTransport`(一代际一实例);非 Connected 态 `Write→kConnection`(RT_TCP_RECONNECT_003,#57)。
