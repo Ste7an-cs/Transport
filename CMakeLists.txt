@@ -120,6 +120,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp_transport_read_test.cpp
     tests/serial_transport_test.cpp
     tests/udp_transport_test.cpp
+    tests/protocol_node_udp_test.cpp
     tests/tcp_client_transport_test.cpp
     tests/tcp_client_reconfig_test.cpp
     tests/tcp_client_e2e_test.cpp

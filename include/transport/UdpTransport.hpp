@@ -50,8 +50,10 @@ class UdpTransport final : public ITransport {
   /// @return 一条 Datagram;超时 Timeout、底层致命 Io/Connection、关闭 Closed。
   Result<Datagram> Read(OperationOptions options = {}) override;
 
-  /// @brief 发一条报文到 `unit.destination`(须为 kNet);一次一完整报文。
-  /// @param unit 待发送报文;destination 非 kNet → kInvalidArgument。
+  /// @brief 发一条报文;一次一完整报文。寻址:`kDefault` → 解析为 UdpConfig 默认目的地
+  ///        (remote_addr/multicast_group + remote_port,让 ProtocolNode 等恒发 Default 的
+  ///        传输无关调用方无缝跑在 UDP 上);`kNet` → 按 ip:port;其余(kTopic)非法。
+  /// @param unit 待发送报文;无法解析的 destination / config 未配默认目的地 → kInvalidArgument。
   /// @return 成功;报文过大/地址非法 kInvalidArgument;发送失败 Io;关闭 Closed。
   Status Write(SendUnit unit) override;
 

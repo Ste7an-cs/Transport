@@ -244,8 +244,22 @@ Result<Datagram> UdpTransport::Read(OperationOptions options) {
 
 Status UdpTransport::Write(SendUnit unit) {
   const auto state = state_;
-  // destination 必须是 kNet(UDP 按 ip:port 寻址,发往不同地址,ADR-0003 D12)。
-  if (unit.destination.kind != Endpoint::Kind::kNet) {
+  // 寻址(Endpoint 统一寻址语义):
+  //   kDefault → 解析为 config 默认目的地(Endpoint::kDefault = "用 config 默认目的地";
+  //     UdpConfig.remote_addr / multicast_group + remote_port)。这让传输无关的调用方
+  //     (如 ProtocolNode 恒发 Default)无缝跑在 UDP 上,由 UdpConfig 提供对端地址。
+  //   kNet → 按 ip:port 发往不同地址(ADR-0003 D12)。
+  //   其余(kTopic)→ 非法。
+  if (unit.destination.kind == Endpoint::Kind::kDefault) {
+    const std::string& host = state->config.mode == UdpMode::kMulticast
+                                  ? state->config.multicast_group
+                                  : state->config.remote_addr;
+    if (host.empty() || state->config.remote_port == 0) {
+      // config 未配默认目的地 → 无法解析 Default。
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+    unit.destination = Endpoint::Net(host, state->config.remote_port);
+  } else if (unit.destination.kind != Endpoint::Kind::kNet) {
     return make_error_code(TransportErrc::kInvalidArgument);
   }
 
