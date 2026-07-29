@@ -60,6 +60,7 @@ add_library(transport STATIC
   src/ProtocolNode.cpp
   src/TcpTransport.cpp
   src/TcpClientTransport.cpp
+  src/SerialTransport.cpp
   src/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
@@ -114,6 +115,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/send_semantics_fake_test.cpp
     tests/tcp_transport_send_test.cpp
     tests/tcp_transport_read_test.cpp
+    tests/serial_transport_test.cpp
     tests/tcp_client_transport_test.cpp
     tests/tcp_client_reconfig_test.cpp
     tests/tcp_client_e2e_test.cpp
@@ -129,6 +131,6 @@ if(TRANSPORT_BUILD_TESTS)
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_link_libraries(transport_tests PRIVATE transport asynctask GTest::gtest Qt5::Core Qt5::Network)
+  target_link_libraries(transport_tests PRIVATE transport asynctask GTest::gtest Qt5::Core Qt5::Network util)
   add_test(NAME transport_tests COMMAND transport_tests)
 endif()
