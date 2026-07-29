@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### 里程碑:P3 连接管理 —— TcpClientTransport 自动重连 + 连接代际 + 运行时重配置(协程原生)— 2026-07(路线图 P3)
+> 按 SDD §4 P3 交付 TCP 客户端连接管理。遵 ADR-0003 **D11** 行为契约:node 观察连接状态但不管理 churn;连接概念不下沉 base ITransport(D3′),连接代际不进 PendingTable(守 RT_DESIGN_008)。全量测试 152→180 全绿。
+- **新增** `TcpClientTransport`(外层 owns socket,实现 `ITransport` + `IConnectionObservable`):状态机(`Disconnected/Connecting/Connected/Reconnecting`)+ corosocket `connectToHost`+`await_for(可配超时)`+超时 `abort()`(摩擦 1)+ 退避重连(1s×2 上限 30s ±20% jitter、稳定 60s 重置、无限重试)+ 连接代际(单调,每次成功物理连接 +1),组合内层 `TcpTransport`(一代际一实例);非 Connected 态 `Write→kConnection`(RT_TCP_RECONNECT_003,#57)。
+- **新增** `IConnectionObservable` 可选接口(`State`/`WaitForState`/`WaitStateChange` + 代际/配置版本/最近失败/尝试次数/下次尝试诊断);拉模型多 fiber 条件等待(RT_TCP_RECONNECT_005,不进 base ITransport,#57)。
+- **新增** 节点集成断连:`ProtocolNode` 检测 `IConnectionObservable` → spawn reactor fiber,断连时 `PendingTable.FailAll(kConnection)`(在途请求恰好一次 `Connection`,RT_TCP_RECONNECT_002)+ Drain 旧代际未启动业务计 `GenerationIsolationDropCount`(RT_TCP_RECONNECT_004)+ node 保持 Running;`TcpClientTransport::Read` **透明跨重连**(断连期阻塞等下一代际,读循环永不因断连退出),`PendingTable::FailAll` 加协议无关 `latch_closed` 开关(Close=true / 断连=false,#58)。
+- **新增** 运行时重配置 `TcpClientTransport::ApplyConfig(TcpClientConfig, version)`:单调版本(过期/乱序拒绝、同版同容 no-op)+ 先校验后原子应用(非法→旧配置旧连接不变)+ 端点变化(旧在途 `Connection` + 新代际立即尝试不等退避)vs 仅策略变化(不打断当前尝试/退避、下次用新);配置版本与连接代际两轴独立(RT_TCP_RECONFIG 全,#59)。
+- **验证** 真实单机 TCP 断连-重连回环、代际隔离(旧代际迟到事件不污染新代际)、重连退避时序、重配置端点切换、Close 端到端收敛(#60);全量 **152→180 全绿**,e2e/reconnect/reconfig 用例连跑无 flake。
+- **文档** ADR-0003 增 **D11**(P3 连接管理行为契约);SDD §4 P3 标记交付、§6 回填 P3 精确签名、**新增 §7 需求追溯矩阵(双向)**;README「当前状态」更新至 P0–P3 已交付;seed #20 关闭。
+
 ## [0.4.2] - 2026-07-28
 
 > **P2 节点加厚里程碑:入站处理器 + 有界队列 + 生命周期硬化**——在 0.4.1 请求-响应基座上,`ProtocolNode` 加厚为可处理入站业务、支持背压与并发在途的完整交互节点。全量测试 119→152 全绿;详见 SDD §4 P2、#47–#50。
