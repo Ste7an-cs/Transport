@@ -58,9 +58,12 @@ add_library(transport STATIC
   src/Error.cpp
   src/Cancellation.cpp
   src/ProtocolNode.cpp
+  src/DdsNode.cpp
   src/TcpTransport.cpp
+  src/UdpTransport.cpp
   src/TcpClientTransport.cpp
   src/SerialTransport.cpp
+  src/TcpServer.cpp
   src/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
@@ -116,9 +119,11 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp_transport_send_test.cpp
     tests/tcp_transport_read_test.cpp
     tests/serial_transport_test.cpp
+    tests/udp_transport_test.cpp
     tests/tcp_client_transport_test.cpp
     tests/tcp_client_reconfig_test.cpp
     tests/tcp_client_e2e_test.cpp
+    tests/tcp_server_accept_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
@@ -128,6 +133,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_registry_test.cpp
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_transport_test.cpp
+    tests/dds/dds_node_test.cpp
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
