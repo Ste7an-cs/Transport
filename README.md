@@ -14,7 +14,7 @@
 
 本仓库正按 SDD 路线图(`docs/设计说明书-协程原生.md` §4)做**协程原生清洁重建**。
 
-已交付 **P0–P3**(tag `v0.4.0`/`v0.4.1`/`v0.4.2`,P3 待 tag);全量 180 tests 全绿。逐条 RT_* 追溯见 SDD §7 追溯矩阵。
+已交付 **P0–P4**(tag `v0.4.0`–`v0.4.4`);全量 220 tests 全绿。逐条 RT_* 追溯见 SDD §7 追溯矩阵。
 
 - **P0 —— 目标骨架落位(`v0.4.0`):**
   - `transport::TcpTransport`(已建立连接的 TCP 字节管道):发送完成语义(帧字节全部进内核发送缓冲才报成功 + 协程背压 —— RT_TRANSPORT_008)、并发写按节点执行域到达顺序串行化(RT_TRANSPORT_007)、复用 `readAll` 流的读路径。
@@ -22,9 +22,10 @@
   - 抢救沿用的线缆 **codec**(`transport::codec::`)与 **DDS provider 适配**(`transport::dds::`);命名空间统一 `transport::` 顶层,单一 `transport` 库 + 单一测试目标,AsyncTask 强制依赖。
 - **P1 —— TCP 最小请求-响应(`v0.4.1`):** 协议无关 `PendingTable<Key,T>` 挂起-应答薄基座(唯一登记/恰好一次完成/`FailAll`/取消纪律)、最小 `transport::ProtocolNode`(组合 transport+codec+PendingTable + 读-分发循环 + 可注入 `CorrelationKeyStrategy` + needresponse `Request`)、`TcpTransport` 读侧契约;真实 TCP 回环证实"无共享引擎、语义内联各 node"架构赌注(RT_DESIGN_003)。
 - **P2 —— 节点加厚(`v0.4.2`):** 协议无关 `BoundedQueue<T>`(双上界/tail-drop/命名归因)、入站业务处理器(组合注册/单消费者 fiber 串行/异常隔离 —— RT_HANDLER 全)、`noresponse` `Send`、256 并发在途 + `session_id` LRU 退休、生命周期硬化(并发幂等 Start/多等待者/三方汇合/重入自锁防护 —— RT_LIFECYCLE 全)。
-- **P3 —— 连接管理(待 tag):** `TcpClientTransport`(状态机 + 自动重连退避 + 连接代际 + `IConnectionObservable`,组合 P1 内层)、节点集成断连(reactor fiber + Read 透明跨重连)、运行时重配置(`ApplyConfig` 单调版本/校验原子/端点切换 —— RT_TCP_RECONNECT/RECONFIG 全);真实 TCP 断连-重连回环。
+- **P3 —— 连接管理(`v0.4.3`):** `TcpClientTransport`(状态机 + 自动重连退避 + 连接代际 + `IConnectionObservable`,组合 P1 内层)、节点集成断连(reactor fiber + Read 透明跨重连)、运行时重配置(`ApplyConfig` 单调版本/校验原子/端点切换 —— RT_TCP_RECONNECT/RECONFIG 全);真实 TCP 断连-重连回环。
+- **P4 —— 其余介质(`v0.4.4`):** `UdpTransport`(报文+地址)/`SerialTransport`(串口字节流)/`DdsTransport`(provider 跨线程有界交接,复用 `BoundedQueue`)、`DdsNode`(pub-sub + 多路请求-应答,correlation_id 键)、`TcpServer` accept(每连接一 node)、`NodeRuntime`(ProtocolNode/DdsNode 共享的协议无关机制)。统一寻址靠 `Endpoint`。**D10 复用证实**(DdsNode 复用 PendingTable 仅一行改动)、**跨线程交接闭合 ADR-0001 未决项**。
 
-- **尚未实现(按路线图 P4–P6 推进,勿当作已有):** DDS 节点与 provider 交接边界、UDP/串口/DDS 传输、TCP 服务端 accept 层、五种交互模式精确状态机(TBD-001)、结构化 Trace 与丢弃归因集中出口(P5)、性能/容量/两机验收(P6)。
+- **尚未实现(按路线图 P5–P6 推进,勿当作已有):** 五种交互模式精确状态机与 `kFeedback`(TBD-001)、DDS 动态 Subscribe / 判活 QoS、串口自动重连(TBD-005)、结构化 Trace 与丢弃归因集中出口(P5)、性能/容量/两机验收(P6)。
 
 > **as-built 归档:** 0.3.0 的异步交互栈(`comm/` 引擎/执行器/策略、第二期 `coro::InteractionEngine`、回调式传输)及其文档已在 P0 从 master 删除,完整存档于 git tag **`v0.3.0`**。
 

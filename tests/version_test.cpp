@@ -7,9 +7,9 @@ TEST(Version, ReturnsNonEmpty) {
 }
 
 TEST(Version, MatchesSemanticConstant) {
-  EXPECT_EQ(transport::LibraryVersion(), "0.4.3");
+  EXPECT_EQ(transport::LibraryVersion(), "0.4.4");
   EXPECT_EQ(transport::LibraryVersion(), transport::kVersion);
   EXPECT_EQ(transport::kVersionMajor, 0);
   EXPECT_EQ(transport::kVersionMinor, 4);
-  EXPECT_EQ(transport::kVersionPatch, 3);
+  EXPECT_EQ(transport::kVersionPatch, 4);
 }
