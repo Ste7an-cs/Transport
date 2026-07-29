@@ -11,8 +11,8 @@
 #include <vector>
 
 #include "transport/io/ITransport.hpp"
-#include "transport/dds/DdsConfig.hpp"
-#include "transport/dds/IDdsProvider.hpp"
+#include "transport/io/dds/DdsConfig.hpp"
+#include "transport/io/dds/IDdsProvider.hpp"
 
 namespace transport {
 

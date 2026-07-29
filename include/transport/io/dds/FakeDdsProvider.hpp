@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "transport/dds/IDdsProvider.hpp"
+#include "transport/io/dds/IDdsProvider.hpp"
 
 namespace transport {
 

@@ -12,7 +12,7 @@
 #include <system_error>
 
 #include "transport/io/ITransport.hpp"
-#include "transport/udp/UdpConfig.hpp"
+#include "transport/io/udp/UdpConfig.hpp"
 
 namespace transport {
 

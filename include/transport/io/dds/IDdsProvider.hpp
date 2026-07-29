@@ -10,7 +10,7 @@
 
 #include "transport/core/Error.hpp"
 #include "transport/core/Result.hpp"
-#include "transport/dds/DdsConfig.hpp"
+#include "transport/io/dds/DdsConfig.hpp"
 
 namespace transport {
 

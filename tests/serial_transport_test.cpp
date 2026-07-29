@@ -29,9 +29,9 @@
 #include "transport/core/Error.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
-#include "transport/io/SerialTransport.hpp"
+#include "transport/io/serial/SerialTransport.hpp"
 #include "transport/codec/SystemCodec.hpp"
-#include "transport/serial/SerialConfig.hpp"
+#include "transport/io/serial/SerialConfig.hpp"
 
 using namespace std::chrono_literals;
 using transport::Datagram;

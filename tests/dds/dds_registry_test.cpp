@@ -1,4 +1,4 @@
-#include "transport/dds/DdsProviderRegistry.hpp"
+#include "transport/io/dds/DdsProviderRegistry.hpp"
 
 #include <gtest/gtest.h>
 

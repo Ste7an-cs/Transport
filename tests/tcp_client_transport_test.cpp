@@ -20,7 +20,7 @@
 #include "task/fibertask.h"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/io/TcpClientTransport.hpp"
+#include "transport/io/tcp/TcpClientTransport.hpp"
 
 using namespace std::chrono_literals;
 using transport::ConnectionState;

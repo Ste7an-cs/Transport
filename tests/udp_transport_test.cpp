@@ -16,9 +16,9 @@
 #include "task/fibertask.h"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/io/UdpTransport.hpp"
+#include "transport/io/udp/UdpTransport.hpp"
 #include "transport/codec/DatagramCodec.hpp"
-#include "transport/udp/UdpConfig.hpp"
+#include "transport/io/udp/UdpConfig.hpp"
 
 using namespace std::chrono_literals;
 using transport::DatagramCodec;

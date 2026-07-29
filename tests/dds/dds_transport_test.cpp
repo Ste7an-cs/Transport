@@ -6,7 +6,7 @@
 //   * 发侧:Write → provider.Publish 到 destination.topic;非 topic → kInvalidArgument。
 //   * Unsubscribe/Close 后迟到样本丢弃、不碰已销毁对象。
 //   * ★ 跨线程确证:listener(std::thread)Push、fiber Pop,压测无崩溃/无丢唤醒/无死锁。
-#include "transport/io/DdsTransport.hpp"
+#include "transport/io/dds/DdsTransport.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,7 +21,7 @@
 #include "coro_test_util.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/dds/FakeDdsProvider.hpp"
+#include "transport/io/dds/FakeDdsProvider.hpp"
 
 using namespace std::chrono_literals;
 using transport::Datagram;

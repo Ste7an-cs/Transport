@@ -1,4 +1,4 @@
-#include "transport/io/TcpServer.hpp"
+#include "transport/io/tcp/TcpServer.hpp"
 
 #include <cstdint>
 #include <map>
@@ -22,7 +22,7 @@
 #include "transport/core/Error.hpp"
 #include "transport/node/ProtocolNode.hpp"
 #include "transport/core/SharedCompletion.hpp"
-#include "transport/io/TcpTransport.hpp"
+#include "transport/io/tcp/TcpTransport.hpp"
 
 namespace transport {
 

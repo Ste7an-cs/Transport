@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-#include "transport/dds/IDdsProvider.hpp"
+#include "transport/io/dds/IDdsProvider.hpp"
 
 namespace transport {
 

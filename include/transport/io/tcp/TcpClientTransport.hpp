@@ -13,7 +13,7 @@
 
 #include "transport/io/IConnectionObservable.hpp"
 #include "transport/io/ITransport.hpp"
-#include "transport/tcp/TcpClientConfig.hpp"
+#include "transport/io/tcp/TcpClientConfig.hpp"
 
 namespace transport {
 
