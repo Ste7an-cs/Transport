@@ -1,4 +1,4 @@
-#include "transport/TcpClientTransport.hpp"
+#include "transport/io/TcpClientTransport.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -20,9 +20,9 @@
 #include "await/corosocket.hpp"
 #include "await/detail/socketerror.hpp"
 #include "task/fibertask.h"
-#include "transport/Error.hpp"
-#include "transport/SharedCompletion.hpp"
-#include "transport/TcpTransport.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/SharedCompletion.hpp"
+#include "transport/io/TcpTransport.hpp"
 
 namespace transport {
 

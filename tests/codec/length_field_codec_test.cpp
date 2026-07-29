@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 using transport::LengthFieldCodec;
 using transport::LengthFieldCodecConfig;

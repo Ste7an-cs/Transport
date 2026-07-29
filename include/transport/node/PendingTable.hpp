@@ -22,10 +22,10 @@
 #include <utility>
 #include <vector>
 
-#include "transport/Error.hpp"
-#include "transport/Result.hpp"
-#include "transport/SharedCompletion.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Result.hpp"
+#include "transport/core/SharedCompletion.hpp"
+#include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 

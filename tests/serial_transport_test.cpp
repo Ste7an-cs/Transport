@@ -25,11 +25,11 @@
 #include "task/fibertask.h"
 #include <memory>
 
-#include "transport/Endpoint.hpp"
-#include "transport/Error.hpp"
-#include "transport/Message.hpp"
-#include "transport/ProtocolNode.hpp"
-#include "transport/SerialTransport.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/node/ProtocolNode.hpp"
+#include "transport/io/SerialTransport.hpp"
 #include "transport/codec/SystemCodec.hpp"
 #include "transport/serial/SerialConfig.hpp"
 

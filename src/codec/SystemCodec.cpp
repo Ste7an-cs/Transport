@@ -3,7 +3,7 @@
 #include <array>
 #include <utility>
 
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 // SystemCodec.cpp — 见 .hpp。小端;坏帧 resync;CRC 注入。
 

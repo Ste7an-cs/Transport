@@ -5,8 +5,8 @@
 #include <optional>
 #include <vector>
 
-#include "transport/Endpoint.hpp"
-#include "transport/Cancellation.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Cancellation.hpp"
 
 namespace transport {
 

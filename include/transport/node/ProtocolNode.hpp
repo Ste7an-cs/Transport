@@ -28,17 +28,17 @@
 #include <mutex>
 #include <optional>
 
-#include "transport/BoundedQueue.hpp"
-#include "transport/Cancellation.hpp"
-#include "transport/IConnectionObservable.hpp"
-#include "transport/ICodec.hpp"
-#include "transport/ITransport.hpp"
-#include "transport/Message.hpp"
-#include "transport/NodeRuntime.hpp"
-#include "transport/PendingTable.hpp"
-#include "transport/Result.hpp"
-#include "transport/SharedCompletion.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/node/BoundedQueue.hpp"
+#include "transport/core/Cancellation.hpp"
+#include "transport/io/IConnectionObservable.hpp"
+#include "transport/codec/ICodec.hpp"
+#include "transport/io/ITransport.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/node/NodeRuntime.hpp"
+#include "transport/node/PendingTable.hpp"
+#include "transport/core/Result.hpp"
+#include "transport/core/SharedCompletion.hpp"
+#include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 

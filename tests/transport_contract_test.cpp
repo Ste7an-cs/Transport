@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/ITransport.hpp"
+#include "transport/io/ITransport.hpp"
 
 using transport::Endpoint;
 using transport::Datagram;

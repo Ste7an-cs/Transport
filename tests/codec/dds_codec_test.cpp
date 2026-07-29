@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 using transport::DdsCodec;
 using transport::Message;

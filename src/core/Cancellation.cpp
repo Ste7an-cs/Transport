@@ -1,4 +1,4 @@
-#include "transport/Cancellation.hpp"
+#include "transport/core/Cancellation.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,7 +13,7 @@
 #include <boost/fiber/operations.hpp>
 
 #include "await/awaitable.hpp"
-#include "transport/Error.hpp"
+#include "transport/core/Error.hpp"
 
 namespace transport::detail {
 

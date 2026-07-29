@@ -1,11 +1,11 @@
-#include "transport/DdsTransport.hpp"
+#include "transport/io/DdsTransport.hpp"
 
 #include <mutex>
 #include <utility>
 
-#include "transport/BoundedQueue.hpp"
-#include "transport/Error.hpp"
-#include "transport/SharedCompletion.hpp"
+#include "transport/node/BoundedQueue.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/SharedCompletion.hpp"
 
 namespace transport {
 

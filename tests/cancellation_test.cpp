@@ -8,8 +8,8 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
-#include "transport/Cancellation.hpp"
-#include "transport/Error.hpp"
+#include "transport/core/Cancellation.hpp"
+#include "transport/core/Error.hpp"
 
 using transport::CancellationSource;
 using transport::Status;

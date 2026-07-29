@@ -39,13 +39,13 @@
 
 #include "task/fibertask.h"  // Coro::makeTask —— 读循环 / handler / finalizer fiber
 
-#include "transport/BoundedQueue.hpp"
-#include "transport/Cancellation.hpp"
-#include "transport/Error.hpp"
-#include "transport/ITransport.hpp"
-#include "transport/Result.hpp"
-#include "transport/SharedCompletion.hpp"
-#include "transport/TransportTypes.hpp"
+#include "transport/node/BoundedQueue.hpp"
+#include "transport/core/Cancellation.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/io/ITransport.hpp"
+#include "transport/core/Result.hpp"
+#include "transport/core/SharedCompletion.hpp"
+#include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 

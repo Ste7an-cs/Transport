@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "transport/ITransport.hpp"
+#include "transport/io/ITransport.hpp"
 #include "transport/dds/DdsConfig.hpp"
 #include "transport/dds/IDdsProvider.hpp"
 

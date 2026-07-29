@@ -1,4 +1,4 @@
-#include "transport/ProtocolNode.hpp"
+#include "transport/node/ProtocolNode.hpp"
 
 #include <utility>
 

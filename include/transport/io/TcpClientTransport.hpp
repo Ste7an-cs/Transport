@@ -11,8 +11,8 @@
 #include <optional>
 #include <system_error>
 
-#include "transport/IConnectionObservable.hpp"
-#include "transport/ITransport.hpp"
+#include "transport/io/IConnectionObservable.hpp"
+#include "transport/io/ITransport.hpp"
 #include "transport/tcp/TcpClientConfig.hpp"
 
 namespace transport {
