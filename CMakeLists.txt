@@ -59,6 +59,7 @@ add_library(transport STATIC
   src/Cancellation.cpp
   src/ProtocolNode.cpp
   src/TcpTransport.cpp
+  src/TcpClientTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   src/dds/DdsProviderRegistry.cpp
@@ -111,6 +112,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/send_semantics_fake_test.cpp
     tests/tcp_transport_send_test.cpp
     tests/tcp_transport_read_test.cpp
+    tests/tcp_client_transport_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
