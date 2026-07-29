@@ -60,6 +60,7 @@ add_library(transport STATIC
   src/ProtocolNode.cpp
   src/TcpTransport.cpp
   src/TcpClientTransport.cpp
+  src/TcpServer.cpp
   src/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
@@ -117,6 +118,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp_client_transport_test.cpp
     tests/tcp_client_reconfig_test.cpp
     tests/tcp_client_e2e_test.cpp
+    tests/tcp_server_accept_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
