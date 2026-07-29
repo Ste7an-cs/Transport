@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-29
+
+> **P4 其余介质里程碑:UDP/串口/DDS 传输 + DdsNode + TCP 服务端 accept**——在 0.4.3 之上补齐三种介质与第二个交互节点,**证实 D10 协议无关机制可复用**(DdsNode 复用 PendingTable 仅一行 Key 改动、BoundedQueue/NodeRuntime 零改动),并**闭合 ADR-0001 跨线程唤醒 fiber 未决项**。全量测试 180→220 全绿;详见 SDD §4 P4 / §7 追溯矩阵、#68–#73。
+
+### 里程碑:P4 其余介质 —— UDP/串口/DDS + DdsNode + TCP accept(协程原生)— 2026-07(路线图 P4)
+> 按 SDD §4 P4 补齐介质与第二节点。遵 ADR-0003 **D12**:DDS 交接边界复用 BoundedQueue、NodeRuntime 收口(D10 兑现)、统一寻址靠 Endpoint。
+- **新增** `NodeRuntime<Event>` —— 从 ProtocolNode 抽出的**协议无关**节点机制(生命周期三方汇合 + 并发幂等 Start + handler 单消费者 + BoundedQueue 集成 + 读-分发循环骨架 `SpawnReadLoop` + `AddFinalizerJoin`),ProtocolNode/DdsNode **组合并驱动**(机制复用语义内联,非 policy 引擎,守 RT_NODE_003);ProtocolNode 重构为组合它、行为不变(D10 收口,#68)。
+- **新增** `DdsTransport` + provider **跨线程交接边界** —— 复用 `BoundedQueue<Sample{bytes,topic}>`,listener 线程非阻塞 Push tail-drop + `dds_handoff_overflow` 计数;`Read`=Pop(source=kTopic)/`Write`=`provider.Publish`;多 topic 订阅、同 topic 保序;**跨线程唤醒经 AsyncTask FiberChannel 确证安全(1000 轮压测),闭合 ADR-0001 未决项**(#71)。
+- **新增** `DdsNode` —— 组合 `NodeRuntime`+`DdsTransport`+`DdsCodec`+`PendingTable<std::string,Message>`;pub-sub(`kNotify`)+ 多路请求-应答(`kRequest`/`kReply` 经 correlation_id + reply_to inbox);`Request(Message, Endpoint target, options)` / `Publish(Message, Endpoint topic)`;无连接(D3′)。**D10 复用实证:PendingTable 一行 Key 改动、BoundedQueue/NodeRuntime 零改动**(#73)。
+- **新增** `UdpTransport`(coroudpsocket,报文+地址,`Datagram.source=kNet`,发往不同地址,非重连,#69)、`SerialTransport`(coroiodevice + QSerialPort,字节流切片,openpty PTY 真实测,断开致命 TBD-005,#70)。
+- **新增** `TcpServer` accept 层 —— corotcpserver `nextConnection` 每连接派生 ProtocolNode(内层 TcpTransport,非重连 D3′,连接生命=节点生命,RT_DESIGN_004);per-connection supervisor fiber 管子 node 生命周期(#72)。
+- **统一寻址**:`SendUnit.destination`/`Datagram.source`(`Endpoint` kNet/kTopic)贯通 UDP 多地址、DDS 多 topic —— 同一 `ITransport::Write` 接口。
+- **验证** 各介质单机真实回环:UDP loopback、串口 PTY(openpty)、进程内 FakeDdsProvider 跨线程交接、真实 TCP accept。全量 **180→220 全绿**。
+- **文档** ADR-0003 增 **D12**(P4 决策);ADR-0001 关闭"跨线程唤醒 fiber"未决项;SDD §4 P4 标记交付、§6 回填 P4 签名、§7 追溯矩阵 DDS/UDP/串口/accept 升 ✅;README 更新至 P0–P4。
+
 ## [0.4.3] - 2026-07-29
 
 > **P3 连接管理里程碑:TCP 客户端自动重连 + 连接代际 + 运行时重配置**——在 0.4.2 交互节点基座上,`TcpClientTransport` 为 TCP 客户端补齐跨重连的稳定收发:自动退避重连、连接代际隔离迟到事件、运行时重配置端点切换,node 观察连接状态但不管理 churn。全量测试 152→180 全绿;详见 SDD §4 P3 / §7 追溯矩阵、#57–#60。
