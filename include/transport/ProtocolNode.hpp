@@ -20,6 +20,8 @@
  * fiber 调度器、无 affinity(D8/Q9)。
  */
 
+#include <boost/fiber/operations.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -55,11 +57,12 @@ class HandlerContext {
   [[nodiscard]] Status Send(Message msg);
 
   /**
-   * @brief 请求关闭本节点(非阻塞信号):唤醒读循环与消费者收敛。
+   * @brief 请求关闭本节点(非阻塞):发起完整收敛拆卸但不自等待(RT_LIFECYCLE_005)。
    *
-   * 仅发出收敛信号(RequestClose 传输 + Close 业务队列 + 触发 handler 取消),不在 handler
-   * fiber 内阻塞等待终结,避免消费者 fiber 自等自锁。节点生命周期由外部 Close()/析构最终
-   * 收敛到 Closed(handler 内发起 Close 的重入自锁防护与自收敛完善留 P2-4 / #50)。
+   * 委托 ProtocolNode::Close;因当前即 handler 消费者 fiber,Close 内的重入自锁防护会
+   * 只发起拆卸(置 Closing + RequestClose 传输 + Close 业务队列 + 触发 handler 取消 +
+   * FailAll + 起 finalizer),跳过对 handler_done_/closed_ 的自等待(等自己 = 自锁),
+   * 立即返回。节点由独立 finalizer fiber 在读循环与 handler 均退出后收敛到 Closed。
    */
   Status RequestClose();
 
@@ -137,13 +140,26 @@ class ProtocolNode {
   ProtocolNode(const ProtocolNode&) = delete;
   ProtocolNode& operator=(const ProtocolNode&) = delete;
 
-  /// @brief 启动底层 transport 并 spawn 读-分发循环 fiber。Created→Running。
+  /**
+   * @brief 并发安全幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
+   *
+   * 首个 Start 先校验 config(队列上界落 [1,65536] / [64KiB,256MiB]、key_strategy 非空)
+   * → 失败返 kConfiguration、停在 Created、允许改配重试;通过则置 starting、做实事(transport
+   * Start + spawn 读循环/handler fiber)、Complete start_done_。初始化期间并发进来的 Start
+   * await 同一 start_done_ 结果、不重复 spawn。已 Running 再启 → 成功;Closing/Closed →
+   * kInvalidState。
+   */
   Status Start();
 
   /**
-   * @brief 幂等关闭:Closing → 三方汇合(transport.RequestClose + 业务队列 Close + 触发
-   *        handler 取消)+ PendingTable.FailAll(kClosed) + 等读循环退出且(设 handler 时)
-   *        消费者 fiber 退出 → Closed。关闭后 Request/Send 一律 kClosed。
+   * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
+   *
+   * 首个关闭者拆卸:Running→Closing(立即拒新 Request/Send)→ 三方汇合(transport.RequestClose
+   * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),再起独立 finalizer
+   * fiber 等读循环退出 +(设 handler 时)消费者 fiber 退出 → Drain 未启动业务归因 close_drop →
+   * 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享 closed_(多等待者);已 Closed
+   * 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只发起拆卸、跳过对 closed_ 的自
+   * 等待(避自锁),节点由 finalizer 收敛。关闭后 Request/Send 一律 kClosed。
    */
   Status Close();
 
@@ -195,8 +211,21 @@ class ProtocolNode {
   /// @brief 观测:当前在途(已登记未终结)请求数(≤256);背压 / 关联清理判据。
   [[nodiscard]] std::size_t PendingCount() const;
 
+  /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
+  [[nodiscard]] std::size_t CloseDropCount() const;
+
+  /// @brief 观测:Close 时 handler 协作取消超 ~500ms 观测阈值(TBD-007)记 kInternal 的累计
+  ///        次数;超时不强杀 fiber、仍等其实际退出(RT_LIFECYCLE_006)。
+  [[nodiscard]] std::size_t HandlerCancelOverrunCount() const;
+
  private:
   friend class HandlerContext;
+
+  /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
+  [[nodiscard]] Status ValidateConfig() const;
+
+  /// @brief 是否当前 fiber 即 handler 消费者 fiber(重入自锁检测)。自持锁调用。
+  [[nodiscard]] bool InHandlerFiberLocked() const;
 
   /// 读-分发循环体(在 spawn 的 fiber 中跑):Read → Decode → 逐条分发。
   void RunReadLoop();
@@ -228,17 +257,27 @@ class ProtocolNode {
   BoundedQueue<Message> business_queue_;
   /// handler 协作取消源:Close 时 Cancel,handler 经 ctx.cancellation() 观测(RT_HANDLER)。
   CancellationSource handler_cancellation_;
-  SharedCompletion<void> loop_done_;     ///< 读循环退出通知(Close 等待点)。
-  SharedCompletion<void> handler_done_;  ///< 消费者 fiber 退出通知(Close 等待点)。
-  SharedCompletion<void> closed_;        ///< 节点 Closed 通知(WaitClosed 等待点)。
+  SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享,RT_LIFECYCLE_003)。
+  SharedCompletion<void> loop_done_;     ///< 读循环退出通知(finalizer 等待点)。
+  SharedCompletion<void> handler_done_;  ///< 消费者 fiber 退出通知(finalizer 等待点)。
+  SharedCompletion<void> closed_;        ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
 
   mutable std::mutex mutex_;  ///< 守交互状态(D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
+  /// 首个 Start 正在初始化(置 starting、尚未 Running):并发 Start 据此 await start_done_
+  /// 而不重复 spawn(RT_LIFECYCLE_003)。lifecycle_ 仍为 kCreated。
+  bool starting_{false};
+  /// handler 消费者 fiber 自身 id(RunHandlerLoop 起点记录);Close/WaitClosed 比对当前 fiber
+  /// id 做重入自锁检测(RT_LIFECYCLE_005)。
+  boost::fibers::fiber::id handler_fiber_id_;
+  bool handler_fiber_id_set_{false};
   /// session_id 空闲集(构造时填 0..255);pop_front 分配、push_back 释放 = FIFO 复用。
   std::deque<std::uint8_t> free_sessions_;
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
   std::size_t handler_exception_count_{0};
+  std::size_t close_drop_count_{0};
+  std::size_t handler_cancel_overrun_count_{0};
 };
 
 }  // namespace transport
