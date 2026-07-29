@@ -213,18 +213,25 @@ class PendingTable {
   }
 
   /**
-   * @brief 全部在途 entry 恰好一次以 error 终结,并 latch closed。
+   * @brief 全部在途 entry 恰好一次以 error 终结;可选是否 latch closed。
    *
-   * 之后 Register 返 kClosed(堵幽灵在途)。已被超时/取消先终结的 entry 保持其原有结果
-   * (Complete 首胜),FailAll 对其为 no-op。
+   * 已被超时/取消先终结的 entry 保持其原有结果(Complete 首胜),FailAll 对其为 no-op。
    *
    * @param error 终结用错误类别(典型 kConnection / kClosed)。
+   * @param latch_closed 是否 latch closed:
+   *        - true(默认,Close 语义):之后 Register 返 kClosed(堵幽灵在途),表永久收敛。
+   *        - false(连接断连语义,ADR-0003 D11 / RT_TCP_RECONNECT_002):只清空当前在途、
+   *          不 latch,表继续可用——新连接代际的请求仍可 Register。靠"FailAll 清空 ⇒ 在途
+   *          恒属当前代际"不变式隔离代际,连接概念不下沉本协议无关基座(守 RT_DESIGN_008)。
+   *          绝不 un-latch:若表已被 latch(Close),本调用不会重开。
    */
-  void FailAll(std::error_code error) {
+  void FailAll(std::error_code error, bool latch_closed = true) {
     std::vector<std::shared_ptr<Entry>> victims;
     {
       std::lock_guard<std::mutex> lock(shared_->mutex);
-      shared_->closed = true;
+      if (latch_closed) {
+        shared_->closed = true;  // 只单向 latch;false 时保持原 closed 值(不 un-latch)。
+      }
       victims.reserve(shared_->entries.size());
       for (auto& item : shared_->entries) {
         victims.push_back(item.second);

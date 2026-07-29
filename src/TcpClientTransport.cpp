@@ -398,28 +398,67 @@ Status TcpClientTransport::Start() {
 
 Result<Datagram> TcpClientTransport::Read(OperationOptions options) {
   const auto s = state_;
+  // 透明跨重连(ADR-0003 D11 Q1①):Connected 期委托当前代际内层;断连/重连期阻塞等下一
+  // 代际连上再委托新代际内层。node 读循环据此永不因 TCP 客户端断连而退出——只 Close 返
+  // kClosed。调用方 deadline/取消只结束本次等待(透传 kTimeout/kCancelled),后台重连继续。
   for (;;) {
     std::shared_ptr<TcpTransport> inner;
+    bool connected = false;
     {
       std::lock_guard<std::mutex> lock(s->mutex);
       if (s->lifecycle == LifecycleState::kCreated) {
         return make_error_code(TransportErrc::kInvalidState);
       }
       if (s->closing || s->lifecycle != LifecycleState::kRunning) {
-        return make_error_code(TransportErrc::kClosed);
+        return make_error_code(TransportErrc::kClosed);  // 唯一退出:Close/RequestClose。
       }
-      if (s->conn == ConnectionState::kConnected) {
-        inner = s->inner;
+      connected = (s->conn == ConnectionState::kConnected);
+      if (connected) {
+        inner = s->inner;  // 拆卸极短窗口内可能已 reset 为空。
       }
     }
     if (inner) {
-      // 委托当前代际内层;断连期内层返 kConnection,完整透明续命由 P3-2 验证。
-      return inner->Read(options);
+      auto r = inner->Read(options);
+      if (r) {
+        return r;  // 拿到当前代际字节。
+      }
+      const auto err = r.error();
+      // 调用方 deadline/取消只结束本次等待,透传(后台重连继续)。
+      if (err == make_error_code(TransportErrc::kTimeout) ||
+          err == make_error_code(TransportErrc::kCancelled)) {
+        return r;
+      }
+      // 其余(kConnection / 内层因代际切换 RequestClose 返 kClosed / 映射 socket 错误)=
+      // 当前代际已死。落到下面等代际推进(不 return kConnection,守透明续命)。
+    } else if (!connected) {
+      // 未连接:阻塞等进入 Connected 再委托(deadline 只界定本次等待,超时/取消透传)。
+      Status waited = WaitForState(ConnectionState::kConnected, options);
+      if (!waited) {
+        return waited.error();  // kClosed(关闭)/ kTimeout / kCancelled。
+      }
+      continue;
     }
-    // 未连接:等待进入 Connected 再委托(deadline 界定本次等待)。
-    Status waited = WaitForState(ConnectionState::kConnected, options);
-    if (!waited) {
-      return waited.error();
+    // 到此:当前代际内层已死(inner 读失败)或拆卸瞬时窗口(Connected 但 inner 尚空)。
+    // 用 WaitStateChange 正确挂起等代际推进(泵事件循环让 connect-loop 察觉断连并跃迁),
+    // 绝不忙等自旋饿死 connect-loop。每次挂起前在锁下复检条件,避免丢失唤醒:仅当"仍 Connected
+    // 且 s->inner 与刚失败者同一(含二者皆空)"时才等下一跃迁,否则回到顶部按新代际重判。
+    for (;;) {
+      bool wait_more = false;
+      {
+        std::lock_guard<std::mutex> lock(s->mutex);
+        if (s->closing || s->lifecycle != LifecycleState::kRunning) {
+          return make_error_code(TransportErrc::kClosed);
+        }
+        wait_more =
+            (s->conn == ConnectionState::kConnected) && (s->inner == inner);
+      }
+      if (!wait_more) {
+        break;  // 已推进(inner 换代 / 离开 Connected)→ 回顶部重判。
+      }
+      Result<ConnectionState> changed = WaitStateChange(options);
+      if (!changed) {
+        return changed.error();  // kTimeout / kCancelled 透传。
+      }
     }
   }
 }

@@ -109,10 +109,16 @@ Status ProtocolNode::Start() {
     start_done_.Complete(started);
     return started;
   }
+  // 传输若为可选连接观察面(=自动重连 TCP 客户端)→ 稍后 spawn 一条 reactor fiber。介质无关:
+  // 非 IConnectionObservable(Fake/UDP/串口/DDS)→ observable 空、不 spawn,行为同 P2。检测在
+  // 置 Running 前完成,has_reactor_ 与 lifecycle_ 同锁置位,令并发 Close 的 finalizer 正确汇合
+  // reactor_done_(不早收敛致 reactor 触碰已析构节点)。
+  auto* observable = dynamic_cast<IConnectionObservable*>(transport_.get());
   {
     std::lock_guard<std::mutex> lock(mutex_);
     lifecycle_ = LifecycleState::kRunning;
     starting_ = false;
+    has_reactor_ = (observable != nullptr);
   }
   // spawn 读-分发循环 fiber;fiber 自持(detach),经 loop_done_ 与 finalizer 汇合。
   Coro::makeTask([this] { RunReadLoop(); });
@@ -120,6 +126,10 @@ Status ProtocolNode::Start() {
   // 与读循环独立,响应匹配 / 关闭不被 handler await 阻塞(RT_HANDLER_004)。
   if (config_.handler) {
     Coro::makeTask([this] { RunHandlerLoop(); });
+  }
+  // reactor fiber:订阅连接状态跃迁,遇代际结束做代际隔离(ADR-0003 D11 Q1③/Q3④)。
+  if (observable) {
+    Coro::makeTask([this, observable] { RunReactorLoop(observable); });
   }
   start_done_.Complete(Status{});  // 唤醒并发 await 者共享成功结果。
   return Status{};
@@ -134,10 +144,12 @@ Status ProtocolNode::Close() {
   bool first_closer = false;
   bool spawn_finalizer = false;
   bool in_handler_fiber = false;
+  bool has_reactor = false;
   const bool has_handler = (config_.handler != nullptr);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     in_handler_fiber = InHandlerFiberLocked();
+    has_reactor = has_reactor_;
     if (lifecycle_ == LifecycleState::kClosed) {
       return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
     }
@@ -159,8 +171,13 @@ Status ProtocolNode::Close() {
       // 独立 finalizer fiber 等三方汇合后收敛到 Closed。放在专门 fiber 内、不在调用者
       // fiber 内自等:天然规避 handler 消费者 fiber 自等待自锁(RT_LIFECYCLE_005),并让
       // 多个 Close/WaitClosed 等待者共享同一 closed_(RT_LIFECYCLE_006)。
-      Coro::makeTask([this, has_handler] {
+      Coro::makeTask([this, has_handler, has_reactor] {
         loop_done_.Wait();  // 读循环 Read 收到 kClosed 后退出并 Complete。
+        if (has_reactor) {
+          // reactor 经 reactor_cancellation_ 取消,WaitStateChange 返 kCancelled 后退出。
+          // 纳入关闭汇合:确保代际隔离不在节点收敛后仍触碰 pending_/business_queue_。
+          reactor_done_.Wait();
+        }
         if (has_handler) {
           // handler 协作取消观测:~500ms 内应返回;超时只记 kInternal(不强杀)仍等实退出。
           OperationOptions observe;
@@ -205,6 +222,7 @@ void ProtocolNode::SignalConvergence() {
   transport_->RequestClose();
   business_queue_.Close();     // 唤醒消费者 Pop 返 kClosed → 消费者 fiber 退出。
   handler_cancellation_.Cancel();  // handler 经 ctx.cancellation() 观测到取消。
+  reactor_cancellation_.Cancel();  // reactor 的 WaitStateChange 返 kCancelled → 干净退出。
 }
 
 Status ProtocolNode::WaitClosed(OperationOptions options) {
@@ -356,6 +374,41 @@ void ProtocolNode::RunHandlerLoop() {
   handler_done_.Complete(Status{});
 }
 
+void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
+  // node "观察连接状态但不管理 churn"(ADR-0003 D11 Q1③/Q3④):拉模型订阅状态跃迁,
+  // 遇代际结束(离开 kConnected)做代际隔离。node 保持 Running(≠Close 终态)。
+  OperationOptions options;
+  options.cancellation = reactor_cancellation_.token();  // Close 时取消 → 干净退出。
+  // 代际不进 PendingTable(守 RT_DESIGN_008):以"是否处于 Connected"边沿甄别代际结束——
+  // P3-1 状态机断连时 Connected→Reconnecting(非 kDisconnected,后者仅终态),故用"曾 Connected
+  // 且现非 Connected"的下降沿触发,恰好一次隔离旧代际,契合 D11「遇代际结束」。
+  bool was_connected = (observable->State() == ConnectionState::kConnected);
+  for (;;) {
+    auto changed = observable->WaitStateChange(options);
+    if (!changed) {
+      break;  // kCancelled(Close)→ 退出;无 deadline 不会 kTimeout。
+    }
+    const bool now_connected = (changed.value() == ConnectionState::kConnected);
+    if (was_connected && !now_connected) {
+      // —— 代际结束:隔离旧代际 ——
+      // 在途请求恰好一次 kConnection(不 latch:node 保持 Running,新代际仍可 Register,
+      // RT_TCP_RECONNECT_002)。断连时释放对应在途 session_id 由 Request 的 FailAll 收敛
+      // 路径(handle.Wait 返回后 ReleaseSession)完成,不泄漏。
+      pending_.FailAll(make_error_code(TransportErrc::kConnection),
+                       /*latch_closed=*/false);
+      // 未启动处理的旧代际排队业务 → Drain 丢弃、归因 连接代际隔离丢弃(RT_TCP_RECONNECT
+      // 3.1.7.4)。正在运行的 handler 让其跑完清理(不强杀);其 ctx.Send 重连期返 Connection。
+      const std::size_t dropped = business_queue_.Drain().size();
+      if (dropped != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        generation_isolation_drop_count_ += dropped;
+      }
+    }
+    was_connected = now_connected;
+  }
+  reactor_done_.Complete(Status{});
+}
+
 Status ProtocolNode::Send(Message msg) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -424,6 +477,11 @@ std::size_t ProtocolNode::CloseDropCount() const {
 std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return handler_cancel_overrun_count_;
+}
+
+std::size_t ProtocolNode::GenerationIsolationDropCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return generation_isolation_drop_count_;
 }
 
 }  // namespace transport

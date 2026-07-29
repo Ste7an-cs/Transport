@@ -32,6 +32,7 @@
 
 #include "transport/BoundedQueue.hpp"
 #include "transport/Cancellation.hpp"
+#include "transport/IConnectionObservable.hpp"
 #include "transport/ICodec.hpp"
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
@@ -218,6 +219,11 @@ class ProtocolNode {
   ///        次数;超时不强杀 fiber、仍等其实际退出(RT_LIFECYCLE_006)。
   [[nodiscard]] std::size_t HandlerCancelOverrunCount() const;
 
+  /// @brief 观测:连接断连时,旧连接代际里尚未启动处理的排队业务事件被 Drain 丢弃、归因
+  ///        `连接代际隔离丢弃` 的累计数(RT_TCP_RECONNECT 3.1.7.4;仅自动重连传输上有
+  ///        reactor 时非零)。区别于 Close 的 close_drop(终态)。
+  [[nodiscard]] std::size_t GenerationIsolationDropCount() const;
+
  private:
   friend class HandlerContext;
 
@@ -233,7 +239,13 @@ class ProtocolNode {
   void Dispatch(Message msg);
   /// 单消费者 handler fiber 体:出队一条 → 跑 handler 到完成 → 再出下一条(严格串行)。
   void RunHandlerLoop();
-  /// @brief 非阻塞收敛信号:RequestClose 传输 + Close 业务队列 + 触发 handler 取消。自持锁外调用。
+  /// @brief reactor fiber 体(仅传输为 IConnectionObservable 时 spawn,ADR-0003 D11 Q1③/Q3④):
+  ///        WaitStateChange 循环订阅连接状态跃迁;每次代际结束(离开 kConnected)执行代际隔离——
+  ///        FailAll(kConnection, 不 latch) 令在途请求恰好一次收敛 + Drain 未启动旧代际业务归因
+  ///        `连接代际隔离丢弃`;正在运行的 handler 让其跑完(不强杀);node 保持 Running。Close 时
+  ///        经 reactor_cancellation_ 取消,WaitStateChange 返 kCancelled → 干净退出、纳入关闭汇合。
+  void RunReactorLoop(IConnectionObservable* observable);
+  /// @brief 非阻塞收敛信号:RequestClose 传输 + Close 业务队列 + 触发 handler / reactor 取消。自持锁外调用。
   void SignalConvergence();
 
   /**
@@ -257,9 +269,12 @@ class ProtocolNode {
   BoundedQueue<Message> business_queue_;
   /// handler 协作取消源:Close 时 Cancel,handler 经 ctx.cancellation() 观测(RT_HANDLER)。
   CancellationSource handler_cancellation_;
+  /// reactor fiber 协作取消源:Close 时 Cancel,令 WaitStateChange 返 kCancelled 退出(D11)。
+  CancellationSource reactor_cancellation_;
   SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享,RT_LIFECYCLE_003)。
   SharedCompletion<void> loop_done_;     ///< 读循环退出通知(finalizer 等待点)。
   SharedCompletion<void> handler_done_;  ///< 消费者 fiber 退出通知(finalizer 等待点)。
+  SharedCompletion<void> reactor_done_;  ///< reactor fiber 退出通知(finalizer 等待点;仅 spawn 时用)。
   SharedCompletion<void> closed_;        ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
 
   mutable std::mutex mutex_;  ///< 守交互状态(D8)。
@@ -278,6 +293,9 @@ class ProtocolNode {
   std::size_t handler_exception_count_{0};
   std::size_t close_drop_count_{0};
   std::size_t handler_cancel_overrun_count_{0};
+  std::size_t generation_isolation_drop_count_{0};
+  /// 是否已 spawn reactor fiber(传输为 IConnectionObservable 时);finalizer 据此汇合 reactor_done_。
+  bool has_reactor_{false};
 };
 
 }  // namespace transport
