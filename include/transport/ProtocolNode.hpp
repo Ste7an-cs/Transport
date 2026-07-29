@@ -20,8 +20,6 @@
  * fiber 调度器、无 affinity(D8/Q9)。
  */
 
-#include <boost/fiber/operations.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -36,6 +34,7 @@
 #include "transport/ICodec.hpp"
 #include "transport/ITransport.hpp"
 #include "transport/Message.hpp"
+#include "transport/NodeRuntime.hpp"
 #include "transport/PendingTable.hpp"
 #include "transport/Result.hpp"
 #include "transport/SharedCompletion.hpp"
@@ -230,23 +229,17 @@ class ProtocolNode {
   /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
   [[nodiscard]] Status ValidateConfig() const;
 
-  /// @brief 是否当前 fiber 即 handler 消费者 fiber(重入自锁检测)。自持锁调用。
-  [[nodiscard]] bool InHandlerFiberLocked() const;
-
-  /// 读-分发循环体(在 spawn 的 fiber 中跑):Read → Decode → 逐条分发。
-  void RunReadLoop();
-  /// 单条 Message 的分发:响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
+  /// @brief 读循环分发回调体(协议特有):Decode 一帧 → 逐条 Dispatch。runtime 骨架 Read
+  ///        成功后调本回调(runtime 不 decode、不分类,守 RT_NODE_003)。
+  void DecodeAndDispatch(Datagram datagram);
+  /// 单条 Message 的分发(协议特有分类):响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
   void Dispatch(Message msg);
-  /// 单消费者 handler fiber 体:出队一条 → 跑 handler 到完成 → 再出下一条(严格串行)。
-  void RunHandlerLoop();
   /// @brief reactor fiber 体(仅传输为 IConnectionObservable 时 spawn,ADR-0003 D11 Q1③/Q3④):
   ///        WaitStateChange 循环订阅连接状态跃迁;每次代际结束(离开 kConnected)执行代际隔离——
   ///        FailAll(kConnection, 不 latch) 令在途请求恰好一次收敛 + Drain 未启动旧代际业务归因
   ///        `连接代际隔离丢弃`;正在运行的 handler 让其跑完(不强杀);node 保持 Running。Close 时
   ///        经 reactor_cancellation_ 取消,WaitStateChange 返 kCancelled → 干净退出、纳入关闭汇合。
   void RunReactorLoop(IConnectionObservable* observable);
-  /// @brief 非阻塞收敛信号:RequestClose 传输 + Close 业务队列 + 触发 handler / reactor 取消。自持锁外调用。
-  void SignalConvergence();
 
   /**
    * @brief 从空闲集分配一个 session_id(最久释放者优先 = FIFO / 最大退休窗口)。
@@ -265,37 +258,20 @@ class ProtocolNode {
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
   PendingTable<ProtocolKey, Message> pending_;
-  /// 入站业务帧队列(协议无关 D10):设 handler 时读循环 Push、消费者 fiber Pop。
-  BoundedQueue<Message> business_queue_;
-  /// handler 协作取消源:Close 时 Cancel,handler 经 ctx.cancellation() 观测(RT_HANDLER)。
-  CancellationSource handler_cancellation_;
+  /// 协议无关运行时机制(组合并驱动,ADR-0003 D10/D12):生命周期状态机 + 三方汇合 +
+  /// handler 消费者 fiber + 业务队列 + 读循环骨架。node 内联协议特有语义驱动它。
+  NodeRuntime<Message> runtime_;
   /// reactor fiber 协作取消源:Close 时 Cancel,令 WaitStateChange 返 kCancelled 退出(D11)。
   CancellationSource reactor_cancellation_;
-  SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享,RT_LIFECYCLE_003)。
-  SharedCompletion<void> loop_done_;     ///< 读循环退出通知(finalizer 等待点)。
-  SharedCompletion<void> handler_done_;  ///< 消费者 fiber 退出通知(finalizer 等待点)。
-  SharedCompletion<void> reactor_done_;  ///< reactor fiber 退出通知(finalizer 等待点;仅 spawn 时用)。
-  SharedCompletion<void> closed_;        ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
+  /// reactor fiber 退出通知(finalizer 追加汇合点;仅传输为 IConnectionObservable 时用)。
+  SharedCompletion<void> reactor_done_;
 
-  mutable std::mutex mutex_;  ///< 守交互状态(D8)。
-  LifecycleState lifecycle_{LifecycleState::kCreated};
-  /// 首个 Start 正在初始化(置 starting、尚未 Running):并发 Start 据此 await start_done_
-  /// 而不重复 spawn(RT_LIFECYCLE_003)。lifecycle_ 仍为 kCreated。
-  bool starting_{false};
-  /// handler 消费者 fiber 自身 id(RunHandlerLoop 起点记录);Close/WaitClosed 比对当前 fiber
-  /// id 做重入自锁检测(RT_LIFECYCLE_005)。
-  boost::fibers::fiber::id handler_fiber_id_;
-  bool handler_fiber_id_set_{false};
+  mutable std::mutex mutex_;  ///< 守协议特有交互状态(session 空闲集、协议计数,D8)。
   /// session_id 空闲集(构造时填 0..255);pop_front 分配、push_back 释放 = FIFO 复用。
   std::deque<std::uint8_t> free_sessions_;
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
-  std::size_t handler_exception_count_{0};
-  std::size_t close_drop_count_{0};
-  std::size_t handler_cancel_overrun_count_{0};
   std::size_t generation_isolation_drop_count_{0};
-  /// 是否已 spawn reactor fiber(传输为 IConnectionObservable 时);finalizer 据此汇合 reactor_done_。
-  bool has_reactor_{false};
 };
 
 }  // namespace transport
