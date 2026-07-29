@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-28
+
+> **P2 节点加厚里程碑:入站处理器 + 有界队列 + 生命周期硬化**——在 0.4.1 请求-响应基座上,`ProtocolNode` 加厚为可处理入站业务、支持背压与并发在途的完整交互节点。全量测试 119→152 全绿;详见 SDD §4 P2、#47–#50。
+
+### 里程碑:P2 节点加厚 —— 入站处理器 + 有界队列 + 生命周期(协程原生)— 2026-07(路线图 P2)
+> 按 SDD §4 P2 把 `ProtocolNode` 从纯客户端加厚为双向交互节点。遵 ADR-0003 D10 结构纪律:协议无关机制建成可复用件、协议特有语义内联。
+- **新增** `BoundedQueue<T>` —— **协议无关**有界业务队列薄件(双上界 事件+字节,可配 1–65536 / 64KiB–256MiB;tail-drop 拒最新 + 命名丢弃计数;注入 `byte_size_of` 保持 `T` 不透明;fiber 唤醒消费)。供 P4 `DdsNode` 复用(RT_HANDLER 3.1.5.4 / ADR-0002 D5 / ADR-0003 D10,#47)。
+- **新增** 入站业务处理器 —— 组合注册 `InboundHandler = Status(const Message&, HandlerContext&)`(不继承);**单消费者 fiber 严格串行**(出队跑完再下一条,含 await);`HandlerContext` 露 `Send`/`RequestClose`/`cancellation()`;handler 逃逸异常经边界 `try/catch(...)` → `kInternal` 隔离当前事件、不自关 node(RT_HANDLER 全 / RT_ERROR_001,#49)。
+- **新增** `ProtocolNode::Send(Message)` —— `noresponse` fire-and-forget(分配 session_id 盖帧但不登记 PendingTable、不占 256 在途预算;遵 RT_TRANSPORT_008 背压,#49)。
+- **新增** 256 并发在途上限 + `session_id` **空闲集 LRU 退休窗口**(=线缆 uint8 硬顶,满→`kResourceExhausted`;绝对防误配随 P3 代际到位);`PendingTable` 加协议无关可选 `max_pending`(RT_REQUEST_005/006,#48)。
+- **新增** 生命周期硬化到 RT_LIFECYCLE 全:并发幂等 Start(共享结果不重复 spawn)、幂等 Close、多等待者 WaitClosed、**三方汇合**(读循环+handler+FailAll,独立 finalizer fiber)、配置校验停 Created、协作取消 + `close_drop` 归因、**重入自锁防护**(比对 `boost::this_fiber::get_id()`,handler 内发起 Close 不自锁,#50)。
+- **验证** Fake 上 256 并发在途 + 乱序恰好一次 + 队列溢出 tail-drop + 关闭协作取消收敛;**真实 TCP 回环冒烟**(handler 收业务帧 + `ctx.Send` 回帧 + 优雅 Close 端到端收敛)。全量 **119→152 全绿**。
+- **文档** ADR-0003 增 **D10**(P2 结构纪律:协议无关机制可复用、协议特有内联,守 RT_NODE_003/RT_DESIGN_008);SDD §4 P2 标记交付、§6 回填 P2 精确签名。
+
 ## [0.4.1] - 2026-07-28
 
 > **P1 首纵切片里程碑:TCP 上最小请求-响应**——在 0.4.0 骨架上交付协议无关 `PendingTable` 薄基座 + 最小 `transport::ProtocolNode`(needresponse 请求-响应 + 读-分发循环)+ `TcpTransport` 读侧契约,真实单机 TCP 回环端到端验证,**证实"无共享引擎、语义内联各 node"这一最大架构赌注**(RT_DESIGN_003)。全量测试 95→119 全绿;详见 SDD §4 P1、#34–#37。
