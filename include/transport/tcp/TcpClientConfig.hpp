@@ -47,4 +47,22 @@ struct TcpClientConfig {
   Duration stable_reset_after{60000};
 };
 
+/// @brief 内容相等:比较全部热更新字段,用于 `ApplyConfig` 同版同容 no-op 判定
+///        (RT_TCP_RECONFIG_004)。
+inline bool operator==(const TcpClientConfig& a, const TcpClientConfig& b) {
+  return a.host == b.host && a.port == b.port &&
+         a.connect_timeout == b.connect_timeout &&
+         a.initial_backoff == b.initial_backoff &&
+         a.max_backoff == b.max_backoff &&
+         a.backoff_multiplier == b.backoff_multiplier &&
+         a.jitter_ratio == b.jitter_ratio &&
+         a.jitter_enabled == b.jitter_enabled &&
+         a.jitter_seed == b.jitter_seed &&
+         a.stable_reset_after == b.stable_reset_after;
+}
+
+inline bool operator!=(const TcpClientConfig& a, const TcpClientConfig& b) {
+  return !(a == b);
+}
+
 }  // namespace transport

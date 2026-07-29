@@ -113,6 +113,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp_transport_send_test.cpp
     tests/tcp_transport_read_test.cpp
     tests/tcp_client_transport_test.cpp
+    tests/tcp_client_reconfig_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
