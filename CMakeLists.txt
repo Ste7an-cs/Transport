@@ -60,6 +60,7 @@ add_library(transport STATIC
   src/ProtocolNode.cpp
   src/TcpTransport.cpp
   src/TcpClientTransport.cpp
+  src/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   src/dds/DdsProviderRegistry.cpp
@@ -124,6 +125,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/dds_codec_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/fake_dds_provider_test.cpp
+    tests/dds/dds_transport_test.cpp
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
