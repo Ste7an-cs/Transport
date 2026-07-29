@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+### 验证 + 修复:ProtocolNode 无缝跑在 UdpTransport 上(#81)
+- **验证** `ITransport` 缝可无缝切换:同一 `ProtocolNode` 只换注入的 transport/codec(`TcpTransport`+`SystemCodec` → `UdpTransport`+`SystemDatagramCodec`),Request/读-分发循环/关联匹配零改动,真实 UDP 回环跑通请求-响应 + 乱序/迟到丢弃观测(断言与 TCP 回环用例一致);新增 `tests/protocol_node_udp_test.cpp`。
+- **修复** `UdpTransport::Write` 寻址:原将 `Endpoint::Default()` 当非法,与 `Endpoint::kDefault`(用 config 默认目的地)+ `UdpConfig.remote_addr` 设计本意冲突,导致恒发 Default 的传输无关调用方在 UDP 上 `kInvalidArgument`;修成 **Default → 解析为 config 默认目的地**(未配 remote 仍 `kInvalidArgument`,向后兼容)。SDD §7 追溯 RT_IF_UDP/RT_IN_INTERFACE_001/RT_DESIGN_006 补 node 端到端。
+
 ## [0.4.4] - 2026-07-29
 
 > **P4 其余介质里程碑:UDP/串口/DDS 传输 + DdsNode + TCP 服务端 accept**——在 0.4.3 之上补齐三种介质与第二个交互节点,**证实 D10 协议无关机制可复用**(DdsNode 复用 PendingTable 仅一行 Key 改动、BoundedQueue/NodeRuntime 零改动),并**闭合 ADR-0001 跨线程唤醒 fiber 未决项**。全量测试 180→220 全绿;详见 SDD §4 P4 / §7 追溯矩阵、#68–#73。
