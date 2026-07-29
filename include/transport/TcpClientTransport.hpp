@@ -51,9 +51,11 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
   ///        (RT_LIFECYCLE 3.1.6.3),状态进 Connecting。重复调用幂等。
   Status Start() override;
 
-  /// @brief 读一片字节:Connected 期委托当前代际内层;未连接则等待进入 Connected
-  ///        再委托(bounded by deadline);关闭返回 Closed。完整透明跨重连续命由
-  ///        P3-2 node 侧验证。
+  /// @brief 读一片字节:**透明跨重连**(RT_TCP_RECONNECT / ADR-0003 D11 Q1①)。
+  ///        Connected 期委托当前代际内层返字节;断连/重连期阻塞等待下一代际连上,再委托
+  ///        新代际内层——读循环永不因 TCP 客户端断连而退出。跨代际切换时重新取当前内层。
+  ///        仅 Close/RequestClose 时返 `kClosed`;调用方 deadline/取消只结束本次等待并透传
+  ///        `kTimeout`/`kCancelled`(后台重连继续)。
   Result<Datagram> Read(OperationOptions options = {}) override;
 
   /// @brief 发送一帧:委托当前代际内层;非 Connected 态立即返 `kConnection`

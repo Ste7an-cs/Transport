@@ -180,6 +180,43 @@ TEST(PendingTable, FailAllLatchesClosedForSubsequentRegister) {
   EXPECT_EQ(rejected.error(), make_error_code(TransportErrc::kClosed));
 }
 
+// 非 latch FailAll(连接断连语义,ADR-0003 D11 / RT_TCP_RECONNECT_002):清空当前在途以
+// kConnection 收敛,但**不** latch closed —— 新连接代际的请求仍可 Register(靠"FailAll 清空
+// ⇒ 在途恒属当前代际"不变式隔离代际,守 RT_DESIGN_008)。
+TEST(PendingTable, FailAllWithoutLatchKeepsTableOpenForNextGeneration) {
+  PendingTable<std::uint32_t, Message> table;
+
+  auto old_gen = table.Register(10);
+  ASSERT_TRUE(old_gen);
+  Result<Message> observed{Message{}};
+  Coro::Awaitable<void> entered;
+  auto waiter = Coro::makeTask([&] {
+    entered.resolve();
+    observed = old_gen.value().Wait();
+  });
+  ASSERT_TRUE(entered.await());
+  EXPECT_EQ(table.Size(), 1u);
+
+  // 代际断连:恰好一次 kConnection、清空,但不 latch。
+  table.FailAll(make_error_code(TransportErrc::kConnection), /*latch_closed=*/false);
+  EXPECT_TRUE(waiter.get());
+  ASSERT_FALSE(observed);
+  EXPECT_EQ(observed.error(), make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(table.Size(), 0u);
+
+  // 新代际请求仍可 Register(表未被 latch)。
+  auto new_gen = table.Register(10);
+  ASSERT_TRUE(new_gen);
+  EXPECT_EQ(table.Size(), 1u);
+  EXPECT_TRUE(table.Resolve(10, Message{}));  // 新代际正常 Resolve。
+
+  // 单向 latch:后续 latch FailAll 仍永久收敛(不被非 latch 变体反悔)。
+  table.FailAll(make_error_code(TransportErrc::kClosed));
+  auto rejected = table.Register(11);
+  ASSERT_FALSE(rejected);
+  EXPECT_EQ(rejected.error(), make_error_code(TransportErrc::kClosed));
+}
+
 // 四方竞争:读循环 fiber 的 Resolve 先胜,超时/析构不改写结果(恰好一次)。
 TEST(PendingTable, ResolveWinsOverPendingDeadlineExactlyOnce) {
   PendingTable<std::uint32_t, Message> table;
