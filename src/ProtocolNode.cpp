@@ -1,17 +1,14 @@
 #include "transport/ProtocolNode.hpp"
 
-#include <chrono>
 #include <utility>
 
-#include "task/fibertask.h"  // Coro::makeTask —— 读循环 / handler / finalizer fiber
+#include "task/fibertask.h"  // Coro::makeTask —— reactor fiber(其余 fiber 由 NodeRuntime 起)
 
-// ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9 红线)。
+// ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
+// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址、reactor 连接观察。协议无关机制
+// (生命周期三方汇合、handler 消费者、业务队列、读循环骨架)组合并驱动 NodeRuntime。
 
 namespace transport {
-
-// handler 协作取消观测阈值(TBD-007):Close 后 handler 应在此内协作返回;超时只记
-// kInternal(handler_cancel_overrun_count_)不强杀,仍等其实际退出(RT_LIFECYCLE_006)。
-constexpr std::chrono::milliseconds kHandlerCancelObservation{500};
 
 CorrelationKeyStrategy DefaultProtocolKeyStrategy(std::uint16_t response_marker) {
   CorrelationKeyStrategy strategy;
@@ -38,10 +35,11 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
       codec_(std::move(codec)),
       config_(std::move(config)),
       pending_(kSessionIdSpace),
-      // 字节计量注入 payload.size()(D10:队列不读 Message 任何其它字段)。
-      business_queue_([](const Message& msg) { return msg.payload.size(); },
-                      config_.business_queue_max_events,
-                      config_.business_queue_max_bytes) {
+      // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
+      // 其它字段);transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
+      runtime_(transport_.get(),
+               [](const Message& msg) { return msg.payload.size(); },
+               config_.business_queue_max_events, config_.business_queue_max_bytes) {
   // 空闲集初值 0..255:分配 pop_front、释放 push_back → FIFO 复用最久释放者(退休窗口
   // 最大化,RT_REQUEST_005)。
   for (std::size_t id = 0; id < kSessionIdSpace; ++id) {
@@ -71,179 +69,61 @@ Status ProtocolNode::ValidateConfig() const {
 }
 
 Status ProtocolNode::Start() {
-  bool do_init = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    switch (lifecycle_) {
-      case LifecycleState::kRunning:
-        return Status{};  // 已 Running 再启 → 幂等成功(RT_LIFECYCLE_003)。
-      case LifecycleState::kClosing:
-      case LifecycleState::kClosed:
-        return make_error_code(TransportErrc::kInvalidState);
-      case LifecycleState::kCreated:
-        if (starting_) {
-          break;  // 已有 Start 在初始化 → 出临界区 await 同一 start_done_,不重复 spawn。
+  // 组合并驱动 NodeRuntime 的幂等 Start:runtime 管状态机 / 共享结果 / 三方汇合骨架;
+  // node 提供协议特有的配置校验与首次 bring-up(transport 启动 + 检测连接观察面 + 置
+  // Running + spawn 读循环/handler 消费者/reactor)。
+  return runtime_.Start(
+      [this] { return ValidateConfig(); },
+      [this]() -> Status {
+        Status started = transport_->Start();
+        if (!started) {
+          return started;  // 传输启动失败:runtime 退回 Created 允许重试。
         }
-        // 首个 Start:先校验 config(失败停 Created、可改配重试,RT_LIFECYCLE_007)。
-        if (auto valid = ValidateConfig(); !valid) {
-          return valid;
+        // 传输若为可选连接观察面(=自动重连 TCP 客户端)→ 稍后 spawn reactor fiber。介质
+        // 无关:非 IConnectionObservable(Fake/UDP/串口/DDS)→ 不 spawn,行为同 P2。检测在
+        // MarkRunning 前完成。
+        auto* observable = dynamic_cast<IConnectionObservable*>(transport_.get());
+        runtime_.MarkRunning();
+        // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + 协议特有分类/寻址。
+        runtime_.SpawnReadLoop(
+            [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); });
+        // 设了 handler → runtime spawn 单消费者 handler fiber(串行消费业务队列);node 在
+        // consume 回调内构造 HandlerContext 并跑业务 handler(协议特有的能力面 + 语义)。
+        if (config_.handler) {
+          runtime_.SpawnHandlerLoop([this](Message&& msg) {
+            HandlerContext ctx(this, runtime_.HandlerCancellationToken());
+            // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 runtime
+            // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
+            (void)config_.handler(msg, ctx);
+          });
         }
-        starting_ = true;
-        do_init = true;
-        break;
-    }
-  }
-  if (!do_init) {
-    // 并发 Start:await 首个 Start 的初始化结果(共享一次结果,不重复创建资源)。
-    return start_done_.Wait();
-  }
-
-  // —— 首个 Start 做实事 ——
-  Status started = transport_->Start();
-  if (!started) {
-    // 传输启动失败:退回 Created 允许重试;并发 await 者共享此失败结果。
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      starting_ = false;
-    }
-    start_done_.Complete(started);
-    return started;
-  }
-  // 传输若为可选连接观察面(=自动重连 TCP 客户端)→ 稍后 spawn 一条 reactor fiber。介质无关:
-  // 非 IConnectionObservable(Fake/UDP/串口/DDS)→ observable 空、不 spawn,行为同 P2。检测在
-  // 置 Running 前完成,has_reactor_ 与 lifecycle_ 同锁置位,令并发 Close 的 finalizer 正确汇合
-  // reactor_done_(不早收敛致 reactor 触碰已析构节点)。
-  auto* observable = dynamic_cast<IConnectionObservable*>(transport_.get());
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    lifecycle_ = LifecycleState::kRunning;
-    starting_ = false;
-    has_reactor_ = (observable != nullptr);
-  }
-  // spawn 读-分发循环 fiber;fiber 自持(detach),经 loop_done_ 与 finalizer 汇合。
-  Coro::makeTask([this] { RunReadLoop(); });
-  // 设了 handler → 另 spawn 单消费者 handler fiber(串行消费业务队列,RT_HANDLER_003);
-  // 与读循环独立,响应匹配 / 关闭不被 handler await 阻塞(RT_HANDLER_004)。
-  if (config_.handler) {
-    Coro::makeTask([this] { RunHandlerLoop(); });
-  }
-  // reactor fiber:订阅连接状态跃迁,遇代际结束做代际隔离(ADR-0003 D11 Q1③/Q3④)。
-  if (observable) {
-    Coro::makeTask([this, observable] { RunReactorLoop(observable); });
-  }
-  start_done_.Complete(Status{});  // 唤醒并发 await 者共享成功结果。
-  return Status{};
-}
-
-bool ProtocolNode::InHandlerFiberLocked() const {
-  return handler_fiber_id_set_ &&
-         boost::this_fiber::get_id() == handler_fiber_id_;
+        // reactor fiber:订阅连接状态跃迁,遇代际结束做代际隔离(ADR-0003 D11 Q1③/Q3④)。
+        // 登记 finalizer 追加汇合点,令关闭时确保 reactor 退出后节点方收敛(不触碰已收敛态)。
+        if (observable) {
+          runtime_.AddFinalizerJoin([this] { reactor_done_.Wait(); });
+          Coro::makeTask([this, observable] { RunReactorLoop(observable); });
+        }
+        return Status{};
+      });
 }
 
 Status ProtocolNode::Close() {
-  bool first_closer = false;
-  bool spawn_finalizer = false;
-  bool in_handler_fiber = false;
-  bool has_reactor = false;
-  const bool has_handler = (config_.handler != nullptr);
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    in_handler_fiber = InHandlerFiberLocked();
-    has_reactor = has_reactor_;
-    if (lifecycle_ == LifecycleState::kClosed) {
-      return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
-    }
-    if (lifecycle_ != LifecycleState::kClosing) {
-      // 首个关闭者:置 Closing 立即拒新 Request/Send。Running 有读循环需汇合;Created /
-      // starting 从未 spawn 读循环 → 无需 finalizer。
-      first_closer = true;
-      spawn_finalizer = (lifecycle_ == LifecycleState::kRunning);
-      lifecycle_ = LifecycleState::kClosing;
-    }
-  }
-
-  if (first_closer) {
-    // 三方汇合信号:唤醒读循环(RequestClose)+ 消费者(队列 Close → Pop 返 kClosed)+
-    // 触发 handler 取消;FailAll 让在途请求恰好一次以 kClosed 收敛。
-    SignalConvergence();
+  // 驱动 runtime 收敛;node 侧协议特有收敛信号:触发 reactor 取消(WaitStateChange 返
+  // kCancelled 干净退出)+ PendingTable.FailAll(kClosed) 令在途请求恰好一次收敛。
+  return runtime_.Close([this] {
+    reactor_cancellation_.Cancel();
     pending_.FailAll(make_error_code(TransportErrc::kClosed));
-    if (spawn_finalizer) {
-      // 独立 finalizer fiber 等三方汇合后收敛到 Closed。放在专门 fiber 内、不在调用者
-      // fiber 内自等:天然规避 handler 消费者 fiber 自等待自锁(RT_LIFECYCLE_005),并让
-      // 多个 Close/WaitClosed 等待者共享同一 closed_(RT_LIFECYCLE_006)。
-      Coro::makeTask([this, has_handler, has_reactor] {
-        loop_done_.Wait();  // 读循环 Read 收到 kClosed 后退出并 Complete。
-        if (has_reactor) {
-          // reactor 经 reactor_cancellation_ 取消,WaitStateChange 返 kCancelled 后退出。
-          // 纳入关闭汇合:确保代际隔离不在节点收敛后仍触碰 pending_/business_queue_。
-          reactor_done_.Wait();
-        }
-        if (has_handler) {
-          // handler 协作取消观测:~500ms 内应返回;超时只记 kInternal(不强杀)仍等实退出。
-          OperationOptions observe;
-          observe.deadline = OperationOptions::Clock::now() + kHandlerCancelObservation;
-          if (auto within = handler_done_.Wait(observe);
-              !within && within.error() == make_error_code(TransportErrc::kTimeout)) {
-            {
-              std::lock_guard<std::mutex> lock(mutex_);
-              ++handler_cancel_overrun_count_;
-            }
-            handler_done_.Wait();  // 仍等 handler 实际退出(RT_LIFECYCLE_006)。
-          }
-        }
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          // 未启动的排队业务归因 close_drop(不排空处理 —— ADR-0001 D5 / 3.1.6.3)。
-          close_drop_count_ += business_queue_.Drain().size();
-          lifecycle_ = LifecycleState::kClosed;
-        }
-        closed_.Complete(Status{});
-      });
-    } else {
-      // 从未 spawn 读循环:直接收敛。残留业务(理论上无)一并 close_drop 归因。
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        close_drop_count_ += business_queue_.Drain().size();
-        lifecycle_ = LifecycleState::kClosed;
-      }
-      closed_.Complete(Status{});
-    }
-  }
-
-  // 重入自锁防护:当前若就是 handler 消费者 fiber,等 closed_/handler_done_ = 等自己退出
-  // = 自锁。只发起(上文已做)不自等,立即返回;节点由 finalizer 收敛(RT_LIFECYCLE_005)。
-  if (in_handler_fiber) {
-    return Status{};
-  }
-  return closed_.Wait();  // 后续关闭者与外部调用者共享同一收敛结果(多等待者)。
-}
-
-void ProtocolNode::SignalConvergence() {
-  transport_->RequestClose();
-  business_queue_.Close();     // 唤醒消费者 Pop 返 kClosed → 消费者 fiber 退出。
-  handler_cancellation_.Cancel();  // handler 经 ctx.cancellation() 观测到取消。
-  reactor_cancellation_.Cancel();  // reactor 的 WaitStateChange 返 kCancelled → 干净退出。
+  });
 }
 
 Status ProtocolNode::WaitClosed(OperationOptions options) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // 重入自锁防护:handler 消费者 fiber 内 WaitClosed = 等自己退出 = 自锁。未 Closed 时
-    // 拒绝(kInvalidState);已 Closed 则如常立即返回(RT_LIFECYCLE_005)。
-    if (InHandlerFiberLocked() && lifecycle_ != LifecycleState::kClosed) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-  }
-  return closed_.Wait(std::move(options));
+  return runtime_.WaitClosed(std::move(options));
 }
 
 Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (lifecycle_ != LifecycleState::kRunning) {
-      // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
-      return make_error_code(TransportErrc::kClosed);
-    }
+  if (!runtime_.IsRunning()) {
+    // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
+    return make_error_code(TransportErrc::kClosed);
   }
 
   // 从空闲集 LRU 分配 session_id;256 个全在途 → 发送前返 kResourceExhausted(不登记、
@@ -300,27 +180,15 @@ void ProtocolNode::ReleaseSession(std::uint8_t session_id) {
   free_sessions_.push_back(session_id);
 }
 
-void ProtocolNode::RunReadLoop() {
-  while (true) {
-    auto datagram = transport_->Read();  // 裸读,无 deadline。
-    if (!datagram) {
-      const auto error = datagram.error();
-      if (error == make_error_code(TransportErrc::kClosed) ||
-          error == make_error_code(TransportErrc::kConnection)) {
-        break;  // 传输终结 → 退出读循环。
-      }
-      continue;  // 其它(如注入的瞬时错误):丢弃继续。
-    }
-    const auto& bytes = datagram.value().bytes;
-    auto decoded = codec_->Decode(bytes.data(), bytes.size());
-    if (!decoded) {
-      continue;  // 坏帧 / codec 错误:丢弃(codec 内部 resync)。
-    }
-    for (auto& msg : decoded.value()) {
-      Dispatch(std::move(msg));
-    }
+void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
+  const auto& bytes = datagram.bytes;
+  auto decoded = codec_->Decode(bytes.data(), bytes.size());
+  if (!decoded) {
+    return;  // 坏帧 / codec 错误:丢弃(codec 内部 resync)。
   }
-  loop_done_.Complete(Status{});
+  for (auto& msg : decoded.value()) {
+    Dispatch(std::move(msg));
+  }
 }
 
 void ProtocolNode::Dispatch(Message msg) {
@@ -334,44 +202,15 @@ void ProtocolNode::Dispatch(Message msg) {
     }
     return;
   }
-  // 非响应业务帧:设了 handler → 入有界队列交单消费者串行处理;满则 tail-drop
-  // (business_queue_overflow,BoundedQueue 内部计数),读循环不阻塞、响应匹配照常
-  // (RT_HANDLER_004)。未设 handler → 维持 P1 行为归因 dropped_no_handler。
+  // 非响应业务帧:设了 handler → 入运行时有界队列交单消费者串行处理;满则 tail-drop
+  // (business_queue_overflow),读循环不阻塞、响应匹配照常(RT_HANDLER_004)。未设 handler
+  // → 维持 P1 行为归因 dropped_no_handler。
   if (config_.handler) {
-    (void)business_queue_.Push(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
+    (void)runtime_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
   ++dropped_no_handler_count_;
-}
-
-void ProtocolNode::RunHandlerLoop() {
-  // 记录本消费者 fiber 自身 id:供 Close/WaitClosed 做重入自锁检测(RT_LIFECYCLE_005)。
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    handler_fiber_id_ = boost::this_fiber::get_id();
-    handler_fiber_id_set_ = true;
-  }
-  // 消费者上下文:节点执行域内(RT_HANDLER_002),露 Send / RequestClose / cancellation。
-  HandlerContext ctx(this, handler_cancellation_.token());
-  for (;;) {
-    auto item = business_queue_.Pop();  // 空则协作 await;Close → kClosed 唤醒退出。
-    if (!item) {
-      break;  // kClosed / kCancelled:队列收敛 → 消费者退出。
-    }
-    const Message msg = std::move(item).value();
-    // 出队一条跑完(含其 await)再出下一条 = 严格串行(RT_HANDLER_003)。
-    try {
-      // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。
-      (void)config_.handler(msg, ctx);
-    } catch (...) {
-      // RT_HANDLER_006 / RT_ERROR_001:边界兜住逃逸异常 → 转 kInternal 隔离当前事件,
-      // 不自关 node,继续下一条。这是框架唯一授权的 catch(框架自身不抛)。
-      std::lock_guard<std::mutex> lock(mutex_);
-      ++handler_exception_count_;
-    }
-  }
-  handler_done_.Complete(Status{});
 }
 
 void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
@@ -398,7 +237,7 @@ void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
                        /*latch_closed=*/false);
       // 未启动处理的旧代际排队业务 → Drain 丢弃、归因 连接代际隔离丢弃(RT_TCP_RECONNECT
       // 3.1.7.4)。正在运行的 handler 让其跑完清理(不强杀);其 ctx.Send 重连期返 Connection。
-      const std::size_t dropped = business_queue_.Drain().size();
+      const std::size_t dropped = runtime_.DrainBusinessQueue().size();
       if (dropped != 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         generation_isolation_drop_count_ += dropped;
@@ -410,11 +249,8 @@ void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
 }
 
 Status ProtocolNode::Send(Message msg) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (lifecycle_ != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);
-    }
+  if (!runtime_.IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);
   }
   // 分配 session_id 盖帧后立即释放:不登记 PendingTable、不占 256 在途预算。全在途无空闲
   // → kResourceExhausted(边界策略:与 Request 一致地拒绝,不与在途请求争 session_id)。
@@ -443,8 +279,8 @@ Status ProtocolNode::Send(Message msg) {
 Status HandlerContext::Send(Message msg) { return node_->Send(std::move(msg)); }
 
 Status HandlerContext::RequestClose() {
-  // 发起完整关闭拆卸;因当前即 handler 消费者 fiber,Close 内重入自锁防护只发起、不自等,
-  // 立即返回(RT_LIFECYCLE_005)。节点由 finalizer fiber 在三方汇合后收敛到 Closed。
+  // 发起完整关闭拆卸;因当前即 handler 消费者 fiber,runtime.Close 内重入自锁防护只发起、
+  // 不自等,立即返回(RT_LIFECYCLE_005)。节点由 finalizer fiber 在三方汇合后收敛到 Closed。
   return node_->Close();
 }
 
@@ -459,24 +295,21 @@ std::size_t ProtocolNode::DroppedNoHandlerCount() const {
 }
 
 std::size_t ProtocolNode::BusinessQueueOverflowCount() const {
-  return business_queue_.DroppedCount();  // BoundedQueue 自守其锁。
+  return runtime_.BusinessQueueOverflowCount();
 }
 
 std::size_t ProtocolNode::HandlerExceptionCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return handler_exception_count_;
+  return runtime_.HandlerExceptionCount();
 }
 
 std::size_t ProtocolNode::PendingCount() const { return pending_.Size(); }
 
 std::size_t ProtocolNode::CloseDropCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return close_drop_count_;
+  return runtime_.CloseDropCount();
 }
 
 std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return handler_cancel_overrun_count_;
+  return runtime_.HandlerCancelOverrunCount();
 }
 
 std::size_t ProtocolNode::GenerationIsolationDropCount() const {
