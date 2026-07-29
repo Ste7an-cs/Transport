@@ -101,8 +101,10 @@ if(TRANSPORT_BUILD_TESTS)
     tests/bounded_queue_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_handler_test.cpp
+    tests/protocol_node_lifecycle_test.cpp
     tests/protocol_node_capacity_test.cpp
     tests/protocol_node_tcp_loopback_test.cpp
+    tests/protocol_node_tcp_smoke_test.cpp
     tests/transport_contract_test.cpp
     tests/coro_harness_test.cpp
     tests/fake_coro_transport_test.cpp
