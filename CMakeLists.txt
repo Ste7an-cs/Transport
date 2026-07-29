@@ -58,6 +58,7 @@ add_library(transport STATIC
   src/Error.cpp
   src/Cancellation.cpp
   src/ProtocolNode.cpp
+  src/DdsNode.cpp
   src/TcpTransport.cpp
   src/TcpClientTransport.cpp
   src/DdsTransport.cpp
@@ -126,6 +127,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/dds_registry_test.cpp
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_transport_test.cpp
+    tests/dds/dds_node_test.cpp
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
