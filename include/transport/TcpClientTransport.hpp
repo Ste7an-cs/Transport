@@ -66,6 +66,28 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
   /// @brief 等待完全关闭(connect-loop 退出;支持多等待者)。
   Status WaitClosed(OperationOptions options = {}) override;
 
+  // -- 运行时重配置(客户端扩展方法,宿主直接调,不经 node;ADR-0003 D11 Q5)--
+
+  /// @brief 提交一份完整配置快照并附单调版本(RT_TCP_RECONFIG)。
+  ///
+  /// 先完整校验后原子应用(RT_TCP_RECONFIG_003):任一字段非法 → 整个失败、旧配置旧
+  /// 连接不变、返 `kConfiguration`。单调版本(RT_TCP_RECONFIG_004):version < 当前 或
+  /// version == 当前但内容不同 → 拒绝(过期/乱序)、返 `kInvalidArgument`、不覆盖;
+  /// version == 当前且内容相同 → 成功 no-op;version > 当前 → 应用。生命周期非法
+  /// (关闭中/已关闭)→ 返 `kInvalidState`。失败类别用不同 `TransportErrc` 区分
+  /// (参数非法 kConfiguration / 版本过期 kInvalidArgument / 生命周期非法 kInvalidState /
+  /// 内部错误 kInternal)。
+  ///
+  /// 端点(host/port)变化(RT_TCP_RECONFIG_005):原子应用后立即掐断当前尝试/连接、
+  /// 切新连接代际、立即尝试新端点(不先等退避);旧连接的在途请求由 node 观察断连驱动
+  /// 以 `kConnection` 终结。仅策略参数(超时/退避)变化:不打断正在进行的连接尝试或已
+  /// 开始的退避等待(用旧快照),下一次连接动作用新参数。热更新范围仅 host/port/超时/
+  /// 退避(RT_TCP_RECONFIG_002)。
+  ///
+  /// @param config 完整配置快照。
+  /// @param version 单调版本(须严格大于当前才应用;等于且同容为 no-op)。
+  Status ApplyConfig(TcpClientConfig config, std::uint64_t version);
+
   // -- IConnectionObservable --
 
   [[nodiscard]] ConnectionState State() const override;
@@ -75,6 +97,11 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
       OperationOptions options = {}) override;
   [[nodiscard]] std::uint64_t Generation() const override;
   [[nodiscard]] std::uint64_t ConfigVersion() const override;
+
+  /// @brief 已发生的规范化配置变更次数(每次非空成功 `ApplyConfig` +1;同版同容 no-op
+  ///        不计,RT_TCP_RECONFIG_006)。与连接代际两轴独立(RT_DATA_STATE)。
+  [[nodiscard]] std::uint64_t ConfigChangeCount() const;
+
   [[nodiscard]] std::error_code LastFailure() const override;
   [[nodiscard]] std::size_t AttemptCount() const override;
   [[nodiscard]] std::optional<Clock::time_point> NextAttemptTime()

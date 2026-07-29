@@ -1,6 +1,7 @@
 #include "transport/TcpClientTransport.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -40,12 +41,17 @@ struct TcpClientTransport::Impl {
   ConnectionState conn{ConnectionState::kDisconnected};
   bool closing{false};
 
-  // 诊断/观察面。
+  // 诊断/观察面。配置版本与连接代际两轴独立递增(RT_DATA_STATE)。
   std::uint64_t generation{0};
   std::uint64_t config_version{1};
+  std::uint64_t config_change_count{0};  // 规范化配置变更次数(RT_TCP_RECONFIG_006)。
   std::error_code last_failure;
   std::size_t attempt_count{0};
   std::optional<Clock::time_point> next_attempt_time;
+
+  // 端点热更新信号:ApplyConfig 检出 host/port 变化时置位并掐断当前相位,connect-loop
+  // 消费后立即以新端点重试(不先等退避,RT_TCP_RECONFIG_005)。
+  bool endpoint_reconfig_pending{false};
 
   // 当前代际内层(纯字节管道);仅 Connected 期非空。
   std::shared_ptr<TcpTransport> inner;
@@ -113,6 +119,47 @@ bool IsClosing(const StatePtr& s) {
   return s->closing;
 }
 
+// 完整校验一份配置快照(RT_TCP_RECONFIG_003):热更新范围内所有字段须自洽,任一非法
+// 则整个更新失败。connect_timeout 落 [100ms,60s](D11 Q4);退避参数须自洽且能推进。
+bool IsConfigValid(const TcpClientConfig& c) {
+  if (c.host.empty()) {
+    return false;  // host 非空。
+  }
+  if (c.port == 0) {
+    return false;  // 端口非 0。
+  }
+  if (c.connect_timeout < std::chrono::milliseconds{100} ||
+      c.connect_timeout > std::chrono::milliseconds{60000}) {
+    return false;  // 连接超时落 100ms–60s。
+  }
+  if (c.initial_backoff <= TcpClientConfig::Duration::zero()) {
+    return false;  // 首次退避为正。
+  }
+  if (c.max_backoff < c.initial_backoff) {
+    return false;  // 退避上限不小于初值。
+  }
+  if (c.backoff_multiplier < 1.0) {
+    return false;  // 倍增因子不缩小退避。
+  }
+  if (c.jitter_ratio < 0.0 || c.jitter_ratio > 1.0) {
+    return false;  // 抖动比例落 [0,1]。
+  }
+  if (c.stable_reset_after <= TcpClientConfig::Duration::zero()) {
+    return false;  // 稳定重置阈值为正。
+  }
+  return true;
+}
+
+// 消费端点热更新信号:置位则清除并返 true(loop 应跳过退避、立即以新端点重试)。
+bool ConsumeEndpointReconfig(const StatePtr& s) {
+  std::lock_guard<std::mutex> lock(s->mutex);
+  if (s->endpoint_reconfig_pending) {
+    s->endpoint_reconfig_pending = false;
+    return true;
+  }
+  return false;
+}
+
 // 对退避基值施加 ±ratio 抖动(令并发客户端错峰);关闭抖动时原样返回。
 Clock::duration ApplyJitter(TcpClientTransport::Impl& s, Clock::duration base) {
   if (!s.config.jitter_enabled || s.config.jitter_ratio <= 0.0) {
@@ -164,10 +211,18 @@ bool BackoffWait(const StatePtr& s) {
 // connect-loop fiber 主体(节点执行域线程):Connecting→Connected→Reconnecting
 // 状态机,无限退避重试直至 RequestClose。socket 在本 fiber 内创建(亲和纪律)。
 void RunConnectLoop(StatePtr s) {
-  const QString host = QString::fromStdString(s->config.host);
-  const quint16 port = s->config.port;
-
   while (!IsClosing(s)) {
+    // 每轮读取当前生效端点/超时(支持 host/port/超时热更新:下一次连接动作用新参数)。
+    QString host;
+    quint16 port;
+    Clock::duration connect_timeout{};
+    {
+      std::lock_guard<std::mutex> lock(s->mutex);
+      host = QString::fromStdString(s->config.host);
+      port = s->config.port;
+      connect_timeout = s->config.connect_timeout;
+    }
+
     SetConnectionState(s, ConnectionState::kConnecting);
 
     // 在本 fiber 内创建 socket(亲和纪律:socket 归属本执行域线程)。
@@ -180,7 +235,7 @@ void RunConnectLoop(StatePtr s) {
 
     auto conn = Coro::coro(sock).connectToHost(host, port);
     Coro::Result<void, std::error_code> r =
-        Coro::await_for(conn, s->config.connect_timeout);
+        Coro::await_for(conn, connect_timeout);
 
     {
       std::lock_guard<std::mutex> lock(s->mutex);
@@ -195,6 +250,10 @@ void RunConnectLoop(StatePtr s) {
       {
         std::lock_guard<std::mutex> lock(s->mutex);
         s->last_failure = ClassifyConnectFailure(r.error());
+      }
+      // 端点热更新(掐断本次 Connecting)→ 立即以新端点重试,不先等退避。
+      if (ConsumeEndpointReconfig(s)) {
+        continue;
       }
       if (!BackoffWait(s)) {
         break;
@@ -248,6 +307,10 @@ void RunConnectLoop(StatePtr s) {
 
     if (IsClosing(s)) {
       break;
+    }
+    // 端点热更新导致的断连 → 立即以新端点重试新代际,不先等退避。
+    if (ConsumeEndpointReconfig(s)) {
+      continue;
     }
     if (!BackoffWait(s)) {
       break;
@@ -424,6 +487,80 @@ Status TcpClientTransport::WaitClosed(OperationOptions options) {
   return state_->closed.Wait(std::move(options));
 }
 
+Status TcpClientTransport::ApplyConfig(TcpClientConfig config,
+                                       std::uint64_t version) {
+  // 端点变化时需在锁外掐断当前尝试/连接的相位句柄(避免持锁重入)。
+  QPointer<QAbstractSocket> connecting;
+  std::shared_ptr<Coro::Awaitable<void>> backoff_gate;
+  std::shared_ptr<TcpTransport> inner;
+  bool endpoint_changed = false;
+  {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+
+    // 生命周期非法:关闭中/已关闭不再接受重配置(可区分类别 kInvalidState)。
+    if (state_->closing || state_->lifecycle == LifecycleState::kClosing ||
+        state_->lifecycle == LifecycleState::kClosed) {
+      return make_error_code(TransportErrc::kInvalidState);
+    }
+
+    // 先完整校验字段(RT_TCP_RECONFIG_003):任一非法 → 整个失败、旧配置旧连接不变、
+    // 返 kConfiguration(参数非法类别)。
+    if (!IsConfigValid(config)) {
+      return make_error_code(TransportErrc::kConfiguration);
+    }
+
+    // 单调版本判定(RT_TCP_RECONFIG_004),失败用 kInvalidArgument(版本过期类别)。
+    if (version < state_->config_version) {
+      return make_error_code(TransportErrc::kInvalidArgument);  // 过期。
+    }
+    if (version == state_->config_version) {
+      if (config == state_->config) {
+        return Status{};  // 同版同容 → 成功 no-op,不产生变更通知。
+      }
+      return make_error_code(TransportErrc::kInvalidArgument);  // 同版异容 → 乱序拒绝。
+    }
+
+    // version > current:原子应用(校验已过,此处不再可失败)。
+    const bool content_changed = (config != state_->config);
+    endpoint_changed = (config.host != state_->config.host) ||
+                       (config.port != state_->config.port);
+
+    state_->config = std::move(config);
+    state_->config_version = version;  // 与连接代际两轴独立递增(RT_DATA_STATE)。
+    if (content_changed) {
+      // 每次非空成功应用产生一次规范化配置变更通知(RT_TCP_RECONFIG_006)。
+      state_->config_change_count += 1;
+    }
+
+    // 仅策略参数(超时/退避)变化:不打断正在进行的连接尝试或已开始的退避等待——它们
+    // 用旧快照,connect-loop 下一轮才读新参数;此处无需掐断。
+    if (endpoint_changed && state_->lifecycle == LifecycleState::kRunning) {
+      // 端点变化(RT_TCP_RECONFIG_005):重置退避级别 + 置位热更新信号,随后掐断当前
+      // 相位,令 connect-loop 立即以新端点重试新代际(不先等退避)。
+      state_->current_backoff = state_->config.initial_backoff;
+      state_->endpoint_reconfig_pending = true;
+      connecting = state_->connecting_socket;
+      backoff_gate = state_->backoff_gate;
+      inner = state_->inner;
+    }
+  }
+
+  // 锁外掐断当前相位(端点变化):abort 连接中 socket / 提前唤醒退避 / 关旧连接。旧连
+  // 接的在途请求终结由 node 观察断连驱动(以 kConnection 终结);本层只触发断连。
+  if (endpoint_changed) {
+    if (connecting) {
+      connecting->abort();
+    }
+    if (backoff_gate) {
+      backoff_gate->close();
+    }
+    if (inner) {
+      inner->RequestClose();  // 停止接受新发送 + 关旧连接。
+    }
+  }
+  return Status{};
+}
+
 ConnectionState TcpClientTransport::State() const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   return state_->conn;
@@ -496,6 +633,11 @@ std::uint64_t TcpClientTransport::Generation() const {
 std::uint64_t TcpClientTransport::ConfigVersion() const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   return state_->config_version;
+}
+
+std::uint64_t TcpClientTransport::ConfigChangeCount() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->config_change_count;
 }
 
 std::error_code TcpClientTransport::LastFailure() const {
