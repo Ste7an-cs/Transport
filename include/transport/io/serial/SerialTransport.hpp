@@ -11,7 +11,7 @@
 #include <system_error>
 
 #include "transport/io/ITransport.hpp"
-#include "transport/serial/SerialConfig.hpp"
+#include "transport/io/serial/SerialConfig.hpp"
 
 class QSerialPort;
 

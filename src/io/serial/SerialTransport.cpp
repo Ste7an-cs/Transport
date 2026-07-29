@@ -1,4 +1,4 @@
-#include "transport/io/SerialTransport.hpp"
+#include "transport/io/serial/SerialTransport.hpp"
 
 #include <cstdint>
 #include <deque>

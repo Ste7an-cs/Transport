@@ -1,4 +1,4 @@
-#include "transport/io/TcpClientTransport.hpp"
+#include "transport/io/tcp/TcpClientTransport.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +22,7 @@
 #include "task/fibertask.h"
 #include "transport/core/Error.hpp"
 #include "transport/core/SharedCompletion.hpp"
-#include "transport/io/TcpTransport.hpp"
+#include "transport/io/tcp/TcpTransport.hpp"
 
 namespace transport {
 

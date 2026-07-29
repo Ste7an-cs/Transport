@@ -59,16 +59,16 @@ add_library(transport STATIC
   src/core/Cancellation.cpp
   src/node/ProtocolNode.cpp
   src/node/DdsNode.cpp
-  src/io/TcpTransport.cpp
-  src/io/UdpTransport.cpp
-  src/io/TcpClientTransport.cpp
-  src/io/SerialTransport.cpp
-  src/io/TcpServer.cpp
-  src/io/DdsTransport.cpp
+  src/io/tcp/TcpTransport.cpp
+  src/io/udp/UdpTransport.cpp
+  src/io/tcp/TcpClientTransport.cpp
+  src/io/serial/SerialTransport.cpp
+  src/io/tcp/TcpServer.cpp
+  src/io/dds/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
-  src/dds/DdsProviderRegistry.cpp
-  src/dds/FakeDdsProvider.cpp
+  src/io/dds/DdsProviderRegistry.cpp
+  src/io/dds/FakeDdsProvider.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -80,7 +80,7 @@ find_package(fastrtps QUIET)
 if(fastrtps_FOUND AND fastcdr_FOUND)
   set(TRANSPORT_HAS_FASTDDS ON)
   message(STATUS "Fast DDS found: enabling FastDdsProvider")
-  target_sources(transport PRIVATE src/dds/FastDdsRawType.cpp src/dds/FastDdsProvider.cpp)
+  target_sources(transport PRIVATE src/io/dds/FastDdsRawType.cpp src/io/dds/FastDdsProvider.cpp)
   target_link_libraries(transport PUBLIC fastrtps fastcdr)
   target_compile_definitions(transport PUBLIC TRANSPORT_HAS_FASTDDS)
 else()

@@ -37,12 +37,12 @@
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
 #include "transport/core/Result.hpp"
-#include "transport/io/TcpClientTransport.hpp"
-#include "transport/io/TcpServer.hpp"
+#include "transport/io/tcp/TcpClientTransport.hpp"
+#include "transport/io/tcp/TcpServer.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemCodec.hpp"
-#include "transport/tcp/TcpClientConfig.hpp"
-#include "transport/tcp/TcpServerConfig.hpp"
+#include "transport/io/tcp/TcpClientConfig.hpp"
+#include "transport/io/tcp/TcpServerConfig.hpp"
 
 using namespace std::chrono_literals;
 using testutil::pumpFiberUntil;

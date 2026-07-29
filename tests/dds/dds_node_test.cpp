@@ -24,12 +24,12 @@
 #include <gtest/gtest.h>
 
 #include "task/fibertask.h"
-#include "transport/io/DdsTransport.hpp"
+#include "transport/io/dds/DdsTransport.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/codec/DdsCodec.hpp"
-#include "transport/dds/FakeDdsProvider.hpp"
+#include "transport/io/dds/FakeDdsProvider.hpp"
 #include "coro_test_util.hpp"
 
 using namespace std::chrono_literals;

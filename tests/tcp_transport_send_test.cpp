@@ -19,7 +19,7 @@
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/core/Error.hpp"
-#include "transport/io/TcpTransport.hpp"
+#include "transport/io/tcp/TcpTransport.hpp"
 
 using namespace std::chrono_literals;
 using transport::Endpoint;

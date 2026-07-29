@@ -33,7 +33,7 @@
 #include "transport/core/Error.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
-#include "transport/io/TcpTransport.hpp"
+#include "transport/io/tcp/TcpTransport.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemCodec.hpp"
 

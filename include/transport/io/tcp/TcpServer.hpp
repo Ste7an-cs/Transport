@@ -14,7 +14,7 @@
 #include <system_error>
 
 #include "transport/io/ITransport.hpp"
-#include "transport/tcp/TcpServerConfig.hpp"
+#include "transport/io/tcp/TcpServerConfig.hpp"
 
 namespace transport {
 

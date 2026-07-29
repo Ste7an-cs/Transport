@@ -29,10 +29,10 @@
 #include "transport/core/Error.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
-#include "transport/io/UdpTransport.hpp"
+#include "transport/io/udp/UdpTransport.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemDatagramCodec.hpp"
-#include "transport/udp/UdpConfig.hpp"
+#include "transport/io/udp/UdpConfig.hpp"
 
 using namespace std::chrono_literals;
 using testutil::pumpFiberUntil;
