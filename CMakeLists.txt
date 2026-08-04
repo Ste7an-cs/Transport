@@ -136,6 +136,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_transport_test.cpp
     tests/dds/dds_node_test.cpp
+    tests/trace_wiring_test.cpp
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)

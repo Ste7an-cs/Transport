@@ -42,6 +42,8 @@
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/Cancellation.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
+#include "transport/core/Observability.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/SharedCompletion.hpp"
@@ -60,6 +62,8 @@ namespace transport {
 template <typename Event>
 class NodeRuntime {
  public:
+  using Clock = OperationOptions::Clock;
+
   /**
    * @brief 构造运行时。
    *
@@ -68,12 +72,16 @@ class NodeRuntime {
    * @param byte_size_of  业务队列的字节计量回调(node 传 payload.size());runtime 不读字段。
    * @param max_events    业务队列事件数上界(越界由 BoundedQueue 钳制)。
    * @param max_bytes     业务队列字节数上界(越界由 BoundedQueue 钳制)。
+   * @param trace_sink    可选 Trace 出口(P5-4);为空则 `RecordEvent` 仅一次判空
+   *                      (RT_TRACE_002),不产生生命周期/handler Trace。
    */
   NodeRuntime(ITransport* transport,
               typename BoundedQueue<Event>::ByteSizeOf byte_size_of,
-              std::size_t max_events, std::size_t max_bytes)
+              std::size_t max_events, std::size_t max_bytes,
+              ITraceSink* trace_sink = nullptr)
       : transport_(transport),
-        business_queue_(std::move(byte_size_of), max_events, max_bytes) {}
+        business_queue_(std::move(byte_size_of), max_events, max_bytes),
+        trace_sink_(trace_sink) {}
 
   NodeRuntime(const NodeRuntime&) = delete;
   NodeRuntime& operator=(const NodeRuntime&) = delete;
@@ -137,9 +145,12 @@ class NodeRuntime {
    *        与 lifecycle_ 同锁置位,令并发 Close 的 finalizer 一致地观察到 Running/汇合点。
    */
   void MarkRunning() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    lifecycle_ = LifecycleState::kRunning;
-    starting_ = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      lifecycle_ = LifecycleState::kRunning;
+      starting_ = false;
+    }
+    RecordEvent("close", trace_sink_, "running");  // 生命周期跃迁(P5-4:Created→Running)。
   }
 
   /**
@@ -183,10 +194,12 @@ class NodeRuntime {
         first_closer = true;
         spawn_finalizer = (lifecycle_ == LifecycleState::kRunning);
         lifecycle_ = LifecycleState::kClosing;
+        close_requested_at_ = Clock::now();  // P5-4:关闭时延起点。
       }
     }
 
     if (first_closer) {
+      RecordEvent("close", trace_sink_, "closing");  // 生命周期跃迁(Running→Closing)。
       // 三方汇合信号(锁外):runtime 侧唤醒读循环 + 消费者 + 触发 handler 取消。
       transport_->RequestClose();
       business_queue_.Close();
@@ -222,21 +235,35 @@ class NodeRuntime {
               handler_done_.Wait();  // 仍等 handler 实际退出(RT_LIFECYCLE_006)。
             }
           }
+          Clock::duration latency{};
           {
             std::lock_guard<std::mutex> lock(mutex_);
             // 未启动的排队业务归因 close_drop(不排空处理)。
             close_drop_count_ += business_queue_.Drain().size();
             lifecycle_ = LifecycleState::kClosed;
+            latency = Clock::now() - close_requested_at_;
+            last_close_latency_ = latency;  // P5-4:关闭时延终点。
           }
+          RecordEvent("close", trace_sink_, "closed", {}, {}, {},
+                      static_cast<long>(std::chrono::duration_cast<
+                                         std::chrono::microseconds>(latency)
+                                             .count()));
           closed_.Complete(Status{});
         });
       } else {
         // 从未 spawn 读循环:直接收敛。残留业务(理论上无)一并 close_drop 归因。
+        Clock::duration latency{};
         {
           std::lock_guard<std::mutex> lock(mutex_);
           close_drop_count_ += business_queue_.Drain().size();
           lifecycle_ = LifecycleState::kClosed;
+          latency = Clock::now() - close_requested_at_;
+          last_close_latency_ = latency;  // P5-4:关闭时延终点。
         }
+        RecordEvent("close", trace_sink_, "closed", {}, {}, {},
+                    static_cast<long>(std::chrono::duration_cast<
+                                       std::chrono::microseconds>(latency)
+                                           .count()));
         closed_.Complete(Status{});
       }
     }
@@ -318,12 +345,25 @@ class NodeRuntime {
           break;  // kClosed / kCancelled:队列收敛 → 消费者退出。
         }
         Event event = std::move(item).value();
+        RecordEvent("handler", trace_sink_, "start");  // P5-4:调用起点。
+        const Clock::time_point started_at = Clock::now();
+        bool threw = false;
         try {
           consume(std::move(event));  // 出队一条跑完再出下一条 = 严格串行。
         } catch (...) {
+          threw = true;
           std::lock_guard<std::mutex> lock(mutex_);
           ++handler_exception_count_;  // RT_HANDLER_006:边界兜住逃逸异常 → kInternal 隔离。
         }
+        const Clock::duration duration = Clock::now() - started_at;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          last_handler_duration_ = duration;  // P5-4:处理器时长(简单存最近值)。
+        }
+        RecordEvent("handler", trace_sink_, threw ? "exception" : "end", {}, {}, {},
+                    static_cast<long>(std::chrono::duration_cast<
+                                       std::chrono::microseconds>(duration)
+                                           .count()));  // P5-4:调用止点。
       }
       handler_done_.Complete(Status{});
     });
@@ -367,6 +407,20 @@ class NodeRuntime {
     return handler_cancel_overrun_count_;
   }
 
+  /// @brief 观测:最近一次 handler 单次调用的处理时长(P5-4,RT_DATA_BUFFER)。尚无已
+  ///        完成调用时为 0。简单存最近值(非直方图,分布分析留 P6)。
+  [[nodiscard]] Clock::duration LastHandlerDuration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_handler_duration_;
+  }
+
+  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
+  ///        关闭完成时为 0。
+  [[nodiscard]] Clock::duration LastCloseLatency() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_close_latency_;
+  }
+
  private:
   /// handler 协作取消观测阈值(TBD-007):Close 后 handler 应在此内协作返回;超时只记
   /// kInternal(不强杀)仍等其实际退出(RT_LIFECYCLE_006)。
@@ -381,6 +435,8 @@ class NodeRuntime {
   ITransport* transport_;             ///< 非拥有字节管道(读循环 Read + 收敛 RequestClose)。
   BoundedQueue<Event> business_queue_;  ///< 入站业务事件队列(协议无关):读循环 Push、消费者 Pop。
   CancellationSource handler_cancellation_;  ///< handler 协作取消源:Close 时 Cancel。
+  ITraceSink* trace_sink_{nullptr};  ///< 可选 Trace 出口(P5-4);写一次(构造)不再变,读不
+                                     ///< 需持锁。
 
   SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享)。
   SharedCompletion<void> loop_done_;     ///< 读循环退出通知(finalizer 等待点)。
@@ -397,6 +453,9 @@ class NodeRuntime {
   std::size_t handler_exception_count_{0};
   std::size_t close_drop_count_{0};
   std::size_t handler_cancel_overrun_count_{0};
+  Clock::time_point close_requested_at_{};  ///< P5-4:Close 首个调用者置 Closing 的时刻。
+  Clock::duration last_close_latency_{};    ///< P5-4:最近一次关闭时延(简单存最近值)。
+  Clock::duration last_handler_duration_{};  ///< P5-4:最近一次 handler 调用时长(简单存最近值)。
 };
 
 }  // namespace transport

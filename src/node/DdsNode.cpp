@@ -3,6 +3,8 @@
 #include <string>
 #include <utility>
 
+#include "transport/core/Observability.hpp"
+
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
 // 终结判别、topic 寻址、reply_to=inbox。协议无关机制(生命周期三方汇合、handler 消费者、
 // 业务队列、读循环骨架)组合并驱动 NodeRuntime;关联复用 PendingTable<std::string,Message>。
@@ -16,13 +18,14 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       config_(std::move(config)),
       // 关联表:correlation_id 无天然容量语义(≠ session_id 的 uint8 硬顶)→ 纯计数无限
       // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
-      pending_(),
+      // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      pending_(/*max_pending=*/0, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它字段);
       // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events,
-               config_.business_queue_max_bytes) {}
+               config_.business_queue_max_bytes, config_.trace_sink) {}
 
 DdsNode::~DdsNode() { Close(); }
 
@@ -99,7 +102,14 @@ Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
   SendUnit unit;
   unit.bytes = std::move(encoded).value();
   unit.destination = std::move(dest);
-  return transport_->Write(std::move(unit));
+  const std::size_t sent_bytes = unit.bytes.size();
+  auto written = transport_->Write(std::move(unit));
+  if (written) {
+    // Write 完成边界(P5-4):Request/Publish/Reply 共用本收口,不逐字节。
+    RecordEvent("send", config_.trace_sink, {}, {}, {}, {},
+                static_cast<long>(sent_bytes));
+  }
+  return written;
 }
 
 Result<Message> DdsNode::Request(Message req, Endpoint target,
@@ -144,12 +154,18 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    return;  // 坏 sample / codec 错误:丢弃。
+    return;  // 坏 sample / codec 错误:丢弃(kBadFrame 已由 P5-3 覆盖,本票不重复)。
   }
+  // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
+  RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
+              static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
     msg.source = datagram.source.topic;
     msg.topic = datagram.source.topic;
+    // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
+    RecordEvent("recv", config_.trace_sink, {}, {}, msg.source, {},
+                static_cast<long>(msg.payload.size()));
     Dispatch(std::move(msg));
   }
 }
@@ -198,6 +214,18 @@ std::size_t DdsNode::HandlerExceptionCount() const {
 std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
 
 std::size_t DdsNode::CloseDropCount() const { return runtime_.CloseDropCount(); }
+
+DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
+  return pending_.LastRequestLatency();
+}
+
+DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
+  return runtime_.LastHandlerDuration();
+}
+
+DdsNode::Clock::duration DdsNode::LastCloseLatency() const {
+  return runtime_.LastCloseLatency();
+}
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————
 
