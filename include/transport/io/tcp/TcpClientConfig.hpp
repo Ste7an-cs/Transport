@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <string>
 
+#include "transport/core/ITraceSink.hpp"
+
 namespace transport {
 
 /**
@@ -45,6 +47,12 @@ struct TcpClientConfig {
 
   /// @brief 连接稳定持续 ≥ 本阈值后,下次断开重置退避级别为 initial_backoff。
   Duration stable_reset_after{60000};
+
+  /// @brief 可选 Trace 出口(P5-4,RT_TRACE_001/002):非空则在连接/代际/重连/生命周期
+  ///        跃迁边界点上报 `connect`/`generation`/`reconnect`/`close` 事件;为空时
+  ///        `RecordEvent` 仅一次判空,不产生任何其它开销。不属于热更新范围,不参与
+  ///        `operator==`/`ApplyConfig` 同版同容判定。
+  ITraceSink* trace_sink = nullptr;
 };
 
 /// @brief 内容相等:比较全部热更新字段,用于 `ApplyConfig` 同版同容 no-op 判定

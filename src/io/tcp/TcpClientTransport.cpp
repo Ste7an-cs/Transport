@@ -8,6 +8,8 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,7 @@
 #include "await/detail/socketerror.hpp"
 #include "task/fibertask.h"
 #include "transport/core/Error.hpp"
+#include "transport/core/Observability.hpp"
 #include "transport/core/SharedCompletion.hpp"
 #include "transport/io/tcp/TcpTransport.hpp"
 
@@ -48,6 +51,10 @@ struct TcpClientTransport::Impl {
   std::error_code last_failure;
   std::size_t attempt_count{0};
   std::optional<Clock::time_point> next_attempt_time;
+
+  // P5-4:关闭时延(RequestClose 首次调用 → Closed 完成)。
+  std::optional<Clock::time_point> close_requested_at;
+  Clock::duration last_close_latency{};
 
   // 端点热更新信号:ApplyConfig 检出 host/port 变化时置位并掐断当前相位,connect-loop
   // 消费后立即以新端点重试(不先等退避,RT_TCP_RECONFIG_005)。
@@ -85,6 +92,21 @@ std::error_code ClassifyConnectFailure(std::error_code error) {
   return make_error_code(TransportErrc::kConnection);
 }
 
+// ConnectionState 的稳定短名,供 "connect" 类别 Trace 的 message 复用(P5-4)。
+std::string_view ConnectionStateName(ConnectionState state) {
+  switch (state) {
+    case ConnectionState::kDisconnected:
+      return "disconnected";
+    case ConnectionState::kConnecting:
+      return "connecting";
+    case ConnectionState::kConnected:
+      return "connected";
+    case ConnectionState::kReconnecting:
+      return "reconnecting";
+  }
+  return "unknown";
+}
+
 // 唤醒并清空全部状态等待者(在锁外 resolve/close,避免重入死锁)。
 void NotifyWaiters(const StatePtr& s) {
   std::vector<std::shared_ptr<Coro::Awaitable<void>>> woken;
@@ -103,13 +125,20 @@ void NotifyWaiters(const StatePtr& s) {
 }
 
 // 记录状态并广播跃迁;同态则无副作用(避免把 loop 中重复的 Connecting 报为跃迁)。
+// "connect" 类别 Trace(P5-4):Connecting/Connected/Reconnecting 三态跃迁边界点上报;
+// 终态 Disconnected 归"close"类别(生命周期终态,非连接管理态),此处不重复。
 void SetConnectionState(const StatePtr& s, ConnectionState next) {
+  ITraceSink* sink = nullptr;
   {
     std::lock_guard<std::mutex> lock(s->mutex);
     if (s->conn == next) {
       return;
     }
     s->conn = next;
+    sink = s->config.trace_sink;
+  }
+  if (next != ConnectionState::kDisconnected) {
+    RecordEvent("connect", sink, ConnectionStateName(next));
   }
   NotifyWaiters(s);
 }
@@ -214,23 +243,31 @@ void RunConnectLoop(StatePtr s) {
   while (!IsClosing(s)) {
     // 每轮读取当前生效端点/超时(支持 host/port/超时热更新:下一次连接动作用新参数)。
     QString host;
+    std::string host_str;
     quint16 port;
     Clock::duration connect_timeout{};
+    ITraceSink* sink = nullptr;
     {
       std::lock_guard<std::mutex> lock(s->mutex);
-      host = QString::fromStdString(s->config.host);
+      host_str = s->config.host;
+      host = QString::fromStdString(host_str);
       port = s->config.port;
       connect_timeout = s->config.connect_timeout;
+      sink = s->config.trace_sink;
     }
+    // "reconnect" 类别 Trace(P5-4)的 endpoint 标识:host:port,不逐字节。
+    const std::string endpoint = host_str + ":" + std::to_string(port);
 
     SetConnectionState(s, ConnectionState::kConnecting);
 
     // 在本 fiber 内创建 socket(亲和纪律:socket 归属本执行域线程)。
     auto* sock = new QTcpSocket();
+    std::size_t attempt_no = 0;
     {
       std::lock_guard<std::mutex> lock(s->mutex);
       s->connecting_socket = sock;
       s->attempt_count += 1;
+      attempt_no = s->attempt_count;
     }
 
     auto conn = Coro::coro(sock).connectToHost(host, port);
@@ -251,6 +288,9 @@ void RunConnectLoop(StatePtr s) {
         std::lock_guard<std::mutex> lock(s->mutex);
         s->last_failure = ClassifyConnectFailure(r.error());
       }
+      // "reconnect" 类别 Trace(P5-4):本次 connect 尝试失败(每次尝试成功/失败均上报)。
+      RecordEvent("reconnect", sink, "attempt-failed", {}, endpoint,
+                  r.error().message(), kNoNum, static_cast<int>(attempt_no));
       // 端点热更新(掐断本次 Connecting)→ 立即以新端点重试,不先等退避。
       if (ConsumeEndpointReconfig(s)) {
         continue;
@@ -276,16 +316,27 @@ void RunConnectLoop(StatePtr s) {
         std::lock_guard<std::mutex> lock(s->mutex);
         s->last_failure = make_error_code(TransportErrc::kInternal);
       }
+      // "reconnect" 类别 Trace(P5-4):物理连接成功但内层启动失败,仍归本次尝试失败。
+      RecordEvent("reconnect", sink, "start-failed", {}, endpoint,
+                  started.error().message(), kNoNum, static_cast<int>(attempt_no));
       if (!BackoffWait(s)) {
         break;
       }
       continue;
     }
+    std::uint64_t new_generation = 0;
     {
       std::lock_guard<std::mutex> lock(s->mutex);
       s->inner = inner;
       s->generation += 1;
+      new_generation = s->generation;
     }
+    // "generation" 类别 Trace(P5-4):新代际建立,与 connect 成功同点;size 载新代际号。
+    RecordEvent("generation", sink, {}, {}, endpoint, {},
+                static_cast<long>(new_generation));
+    // "reconnect" 类别 Trace(P5-4):本次 connect 尝试成功。
+    RecordEvent("reconnect", sink, "attempt-succeeded", {}, endpoint, {}, kNoNum,
+                static_cast<int>(attempt_no));
     const auto connected_at = Clock::now();
     SetConnectionState(s, ConnectionState::kConnected);
 
@@ -318,11 +369,24 @@ void RunConnectLoop(StatePtr s) {
   }
 
   // 终态收敛:弃内层、落 Disconnected、完成 closed(唤醒 WaitClosed)。
+  ITraceSink* closing_sink = nullptr;
+  Clock::duration close_latency{};
   {
     std::lock_guard<std::mutex> lock(s->mutex);
     s->inner.reset();
     s->lifecycle = LifecycleState::kClosed;
+    if (s->close_requested_at) {
+      close_latency = Clock::now() - *s->close_requested_at;
+      s->last_close_latency = close_latency;  // P5-4:关闭时延终点。
+    }
+    closing_sink = s->config.trace_sink;
   }
+  // "close" 类别 Trace(P5-4):生命周期终态 Closed;size 载关闭时延(微秒)。
+  RecordEvent("close", closing_sink, "closed", {}, {}, {},
+              static_cast<long>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      close_latency)
+                      .count()));
   SetConnectionState(s, ConnectionState::kDisconnected);
   s->closed.Complete(Status{});
 }
@@ -379,6 +443,7 @@ TcpClientTransport::~TcpClientTransport() {
 }
 
 Status TcpClientTransport::Start() {
+  ITraceSink* sink = nullptr;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kRunning) {
@@ -389,7 +454,10 @@ Status TcpClientTransport::Start() {
     }
     state_->lifecycle = LifecycleState::kRunning;
     state_->conn = ConnectionState::kConnecting;  // 立即进 Connecting(不等首次连上)。
+    sink = state_->config.trace_sink;
   }
+  // "close" 类别 Trace(P5-4):生命周期跃迁 Created→Running。
+  RecordEvent("close", sink, "running");
   auto s = state_;
   state_->loop_task = std::make_shared<Coro::FiberTask<void>>(
       Coro::makeTask([s] { RunConnectLoop(s); }));
@@ -483,12 +551,17 @@ Status TcpClientTransport::RequestClose() {
   std::shared_ptr<Coro::Awaitable<void>> backoff_gate;
   std::shared_ptr<TcpTransport> inner;
   bool never_started = false;
+  ITraceSink* sink = nullptr;
+  Clock::time_point requested_at{};
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->closing) {
       return Status{};  // 幂等。
     }
     state_->closing = true;
+    requested_at = Clock::now();
+    state_->close_requested_at = requested_at;  // P5-4:关闭时延起点。
+    sink = state_->config.trace_sink;
     if (state_->lifecycle == LifecycleState::kCreated) {
       state_->lifecycle = LifecycleState::kClosed;  // 从未 Start:无 loop 可停。
       never_started = true;
@@ -499,6 +572,8 @@ Status TcpClientTransport::RequestClose() {
     backoff_gate = state_->backoff_gate;
     inner = state_->inner;
   }
+  // "close" 类别 Trace(P5-4):生命周期跃迁 Running→Closing(从未 Start 则直落 Closed)。
+  RecordEvent("close", sink, never_started ? "closed" : "closing");
   // 掐断当前尝试的各相位:abort 连接中 socket、唤醒退避等待、关闭当前内层。
   if (connecting) {
     connecting->abort();
@@ -510,6 +585,10 @@ Status TcpClientTransport::RequestClose() {
     inner->RequestClose();
   }
   if (never_started) {
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->last_close_latency = Clock::now() - requested_at;  // P5-4:关闭时延终点。
+    }
     NotifyWaiters(state_);
     state_->closed.Complete(Status{});
   }
@@ -693,6 +772,12 @@ std::optional<TcpClientTransport::Clock::time_point>
 TcpClientTransport::NextAttemptTime() const {
   std::lock_guard<std::mutex> lock(state_->mutex);
   return state_->next_attempt_time;
+}
+
+TcpClientTransport::Clock::duration
+TcpClientTransport::LastCloseLatency() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->last_close_latency;
 }
 
 std::size_t TcpClientTransport::SendWaiterDepth() const {

@@ -1,8 +1,10 @@
 #include "transport/node/ProtocolNode.hpp"
 
+#include <chrono>
 #include <utility>
 
 #include "task/fibertask.h"  // Coro::makeTask —— reactor fiber(其余 fiber 由 NodeRuntime 起)
+#include "transport/core/Observability.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址、reactor 连接观察。协议无关机制
@@ -34,12 +36,14 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
     : transport_(std::move(transport)),
       codec_(std::move(codec)),
       config_(std::move(config)),
-      pending_(kSessionIdSpace),
+      // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      pending_(kSessionIdSpace, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
       // 其它字段);transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
-               config_.business_queue_max_events, config_.business_queue_max_bytes) {
+               config_.business_queue_max_events, config_.business_queue_max_bytes,
+               config_.trace_sink) {
   // 空闲集初值 0..255:分配 pop_front、释放 push_back → FIFO 复用最久释放者(退休窗口
   // 最大化,RT_REQUEST_005)。
   for (std::size_t id = 0; id < kSessionIdSpace; ++id) {
@@ -154,10 +158,14 @@ Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
   SendUnit unit;
   unit.bytes = std::move(encoded).value();
   unit.destination = Endpoint::Default();
+  const std::size_t sent_bytes = unit.bytes.size();
   if (auto written = transport_->Write(std::move(unit)); !written) {
     ReleaseSession(*session);
     return written.error();
   }
+  // Write 完成边界(P5-4):不逐字节,一次性记本帧大小。
+  RecordEvent("send", config_.trace_sink, "request", {}, {}, {},
+              static_cast<long>(sent_bytes));
 
   // 等唯一响应;请求终结(值/超时/取消/FailAll)后释放 session_id 回空闲集。
   auto outcome = handle.Wait(std::move(options));
@@ -184,9 +192,15 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    return;  // 坏帧 / codec 错误:丢弃(codec 内部 resync)。
+    return;  // 坏帧 / codec 错误:丢弃(kBadFrame 已由 P5-3 覆盖,本票不重复)。
   }
+  // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
+  RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
+              static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
+    // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
+    RecordEvent("recv", config_.trace_sink, {}, {}, {}, {},
+                static_cast<long>(msg.payload.size()));
     Dispatch(std::move(msg));
   }
 }
@@ -273,7 +287,14 @@ Status ProtocolNode::Send(Message msg) {
   SendUnit unit;
   unit.bytes = std::move(encoded).value();
   unit.destination = Endpoint::Default();
-  return transport_->Write(std::move(unit));  // 遵 RT_TRANSPORT_008 背压。
+  const std::size_t sent_bytes = unit.bytes.size();
+  auto written = transport_->Write(std::move(unit));  // 遵 RT_TRANSPORT_008 背压。
+  if (written) {
+    // Write 完成边界(P5-4):不逐字节,一次性记本帧大小。
+    RecordEvent("send", config_.trace_sink, "fire-and-forget", {}, {}, {},
+                static_cast<long>(sent_bytes));
+  }
+  return written;
 }
 
 Status HandlerContext::Send(Message msg) { return node_->Send(std::move(msg)); }
@@ -315,6 +336,18 @@ std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
 std::size_t ProtocolNode::GenerationIsolationDropCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return generation_isolation_drop_count_;
+}
+
+ProtocolNode::Clock::duration ProtocolNode::LastRequestLatency() const {
+  return pending_.LastRequestLatency();
+}
+
+ProtocolNode::Clock::duration ProtocolNode::LastHandlerDuration() const {
+  return runtime_.LastHandlerDuration();
+}
+
+ProtocolNode::Clock::duration ProtocolNode::LastCloseLatency() const {
+  return runtime_.LastCloseLatency();
 }
 
 }  // namespace transport

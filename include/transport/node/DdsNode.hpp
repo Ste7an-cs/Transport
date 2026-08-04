@@ -33,6 +33,7 @@
 #include "transport/core/Cancellation.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/codec/ICodec.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeRuntime.hpp"
@@ -106,6 +107,10 @@ struct DdsNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
+  /// 可选 Trace 出口(P5-4,RT_TRACE_001/002):非空则在 send/recv/decode/match/timeout/
+  /// cancel/handler/close 等边界点上报事件;为空时 `RecordEvent` 仅一次判空,不产生任何
+  /// 其它开销(RT_TRACE_002)。
+  ITraceSink* trace_sink = nullptr;
 };
 
 /**
@@ -117,6 +122,8 @@ struct DdsNodeConfig {
  */
 class DdsNode {
  public:
+  using Clock = OperationOptions::Clock;
+
   DdsNode(std::unique_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
           DdsNodeConfig config);
   ~DdsNode();
@@ -192,6 +199,18 @@ class DdsNode {
 
   /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
   [[nodiscard]] std::size_t CloseDropCount() const;
+
+  /// @brief 观测:最近一次 Request 从 Register 到终结的时延(P5-4,RT_DATA_BUFFER)。尚无
+  ///        已终结请求时为 0。
+  [[nodiscard]] Clock::duration LastRequestLatency() const;
+
+  /// @brief 观测:最近一次 handler 单次调用的处理时长(P5-4,RT_DATA_BUFFER)。尚无已
+  ///        完成调用时为 0。
+  [[nodiscard]] Clock::duration LastHandlerDuration() const;
+
+  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
+  ///        关闭完成时为 0。
+  [[nodiscard]] Clock::duration LastCloseLatency() const;
 
  private:
   friend class DdsHandlerContext;
