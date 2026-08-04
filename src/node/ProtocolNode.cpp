@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "task/fibertask.h"  // Coro::makeTask —— reactor fiber(其余 fiber 由 NodeRuntime 起)
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
@@ -40,6 +41,8 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
       pending_(kSessionIdSpace, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
       // 其它字段);transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
+      // trace_sink 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的
+      // close_drop 批量归因均经它可选上报。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events, config_.business_queue_max_bytes,
@@ -192,7 +195,10 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    return;  // 坏帧 / codec 错误:丢弃(kBadFrame 已由 P5-3 覆盖,本票不重复)。
+    // 坏帧 / codec 错误:丢弃(codec 内部 resync)。归因 kBadFrame(P5-3)。
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordDrop(DropReason::kBadFrame, bad_frame_count_, config_.trace_sink);
+    return;
   }
   // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
   RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
@@ -212,7 +218,8 @@ void ProtocolNode::Dispatch(Message msg) {
     if (!pending_.Resolve(key, std::move(msg))) {
       // RouteUnmatched 内联锁死:无匹配在途请求(迟到 / 乱序 / 无匹配)→ 归因丢弃。
       std::lock_guard<std::mutex> lock(mutex_);
-      ++unmatched_response_count_;
+      RecordDrop(DropReason::kUnmatchedOrLateResponse, unmatched_response_count_,
+                config_.trace_sink);
     }
     return;
   }
@@ -224,7 +231,8 @@ void ProtocolNode::Dispatch(Message msg) {
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  ++dropped_no_handler_count_;
+  RecordDrop(DropReason::kNoHandlerConfigured, dropped_no_handler_count_,
+            config_.trace_sink);
 }
 
 void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
@@ -251,10 +259,14 @@ void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
                        /*latch_closed=*/false);
       // 未启动处理的旧代际排队业务 → Drain 丢弃、归因 连接代际隔离丢弃(RT_TCP_RECONNECT
       // 3.1.7.4)。正在运行的 handler 让其跑完清理(不强杀);其 ctx.Send 重连期返 Connection。
-      const std::size_t dropped = runtime_.DrainBusinessQueue().size();
-      if (dropped != 0) {
+      // 逐条 RecordDrop(P5-3):与原地 += size() 同一临界区宽度,只是把裸算术换成归因原语。
+      auto drained = runtime_.DrainBusinessQueue();
+      if (!drained.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        generation_isolation_drop_count_ += dropped;
+        for (std::size_t i = 0; i < drained.size(); ++i) {
+          RecordDrop(DropReason::kGenerationIsolationDrop,
+                    generation_isolation_drop_count_, config_.trace_sink);
+        }
       }
     }
     was_connected = now_connected;
@@ -336,6 +348,11 @@ std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
 std::size_t ProtocolNode::GenerationIsolationDropCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return generation_isolation_drop_count_;
+}
+
+std::size_t ProtocolNode::BadFrameCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return bad_frame_count_;
 }
 
 ProtocolNode::Clock::duration ProtocolNode::LastRequestLatency() const {

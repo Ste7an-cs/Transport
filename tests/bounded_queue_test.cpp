@@ -18,12 +18,17 @@
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
+#include "transport/core/DropReason.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/node/BoundedQueue.hpp"
 #include "coro_test_util.hpp"
 
 using testutil::pumpFiberUntil;
 using transport::BoundedQueue;
 using transport::CancellationSource;
+using transport::CapturingTraceSink;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::OperationOptions;
 using transport::Result;
 using transport::TransportErrc;
@@ -252,4 +257,56 @@ TEST(BoundedQueue, ConfigClampedToRange) {
   auto dropped = queue.Push(2);  // 事件上界钳到 1 → 第二个丢弃。
   ASSERT_FALSE(dropped);
   EXPECT_EQ(dropped.error(), make_error_code(TransportErrc::kResourceExhausted));
+}
+
+// -----------------------------------------------------------------------------
+// P5-3:tail-drop 归因(构造注入 DropReason + 可选 ITraceSink)。DroppedCount() 语义/
+// 签名不变(见上文既有用例);这里只加验证归因原语接线正确的新用例。
+// -----------------------------------------------------------------------------
+
+// 未传 drop_reason/sink(沿用既有 3 参构造)→ 默认 kBusinessQueueOverflow,行为/计数
+// 与改动前完全一致(RT_TRACE_002:未配 sink 不改变控制流/计数)。
+TEST(BoundedQueue, DefaultDropReasonWithoutSinkBehavesUnchanged) {
+  BoundedQueue<int> queue(UnitBytes(), /*max_events=*/1);
+  EXPECT_TRUE(queue.Push(1));
+  auto dropped = queue.Push(2);
+  ASSERT_FALSE(dropped);
+  EXPECT_EQ(dropped.error(), make_error_code(TransportErrc::kResourceExhausted));
+  EXPECT_EQ(queue.DroppedCount(), 1u);
+}
+
+// 构造注入 drop_reason=kDdsHandoffOverflow + sink → tail-drop 时 DroppedCount 仍恰好
+// +1(getter 契约不变),且 sink 收到一条 category="drop"、message=该原因短名的 TraceEvent。
+TEST(BoundedQueue, TailDropWithSinkEmitsRecordDropForInjectedReason) {
+  CapturingTraceSink sink;
+  BoundedQueue<int> queue(UnitBytes(), /*max_events=*/1,
+                          BoundedQueue<int>::kMaxBytes,
+                          DropReason::kDdsHandoffOverflow, &sink);
+
+  EXPECT_TRUE(queue.Push(1));
+  auto dropped = queue.Push(2);  // 满 → tail-drop。
+  ASSERT_FALSE(dropped);
+  EXPECT_EQ(queue.DroppedCount(), 1u);  // getter 行为不变。
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1u);
+  EXPECT_EQ(records.front().category, "drop");
+  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kDdsHandoffOverflow));
+
+  // 再触发一次:计数与 Trace 事件同步递增。
+  auto dropped2 = queue.Push(3);
+  ASSERT_FALSE(dropped2);
+  EXPECT_EQ(queue.DroppedCount(), 2u);
+  EXPECT_EQ(sink.Records().size(), 2u);
+}
+
+// 注入 sink 但从未溢出:不产生任何 drop 事件(RecordDrop 只在 tail-drop 分支调用)。
+TEST(BoundedQueue, SinkConfiguredButNoOverflowEmitsNothing) {
+  CapturingTraceSink sink;
+  BoundedQueue<int> queue(UnitBytes(), /*max_events=*/4, BoundedQueue<int>::kMaxBytes,
+                          DropReason::kBusinessQueueOverflow, &sink);
+  EXPECT_TRUE(queue.Push(1));
+  EXPECT_TRUE(queue.Push(2));
+  EXPECT_EQ(queue.DroppedCount(), 0u);
+  EXPECT_TRUE(sink.Records().empty());
 }

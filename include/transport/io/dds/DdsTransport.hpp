@@ -15,6 +15,7 @@
 #include "transport/io/ITransport.hpp"
 #include "transport/io/dds/DdsConfig.hpp"
 #include "transport/io/dds/IDdsProvider.hpp"
+#include "transport/core/ITraceSink.hpp"
 
 namespace transport {
 
@@ -65,11 +66,15 @@ class DdsTransport final : public ITransport {
    * @param topics       订阅 topic 集(P4 静态给定;`Start` 时逐一 Subscribe)。
    * @param max_samples  交接边界样本数上限(越界由 BoundedQueue 钳制,默认 1024)。
    * @param max_bytes    交接边界字节上限(越界由 BoundedQueue 钳制,默认 16 MiB)。
+   * @param trace_sink   可选 Trace 出口(P5-3,ADR-0003 D13);非拥有,可为 nullptr
+   *                     (RT_TRACE_002:未配置不改变任何控制流/计数)。传给交接边界,
+   *                     归因 `dds_handoff_overflow`。
    */
   DdsTransport(std::unique_ptr<IDdsProvider> provider, DdsConfig config,
                std::vector<std::string> topics,
                std::size_t max_samples = kDefaultMaxSamples,
-               std::size_t max_bytes = kDefaultMaxBytes);
+               std::size_t max_bytes = kDefaultMaxBytes,
+               ITraceSink* trace_sink = nullptr);
   ~DdsTransport() override;
 
   DdsTransport(const DdsTransport&) = delete;

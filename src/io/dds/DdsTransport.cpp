@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "transport/node/BoundedQueue.hpp"
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/core/SharedCompletion.hpp"
 
@@ -16,12 +17,13 @@ namespace transport {
 struct DdsTransport::State {
   explicit State(std::unique_ptr<IDdsProvider> p, DdsConfig cfg,
                  std::vector<std::string> topics, std::size_t max_samples,
-                 std::size_t max_bytes)
+                 std::size_t max_bytes, ITraceSink* trace_sink)
       : provider(std::move(p)),
         config(std::move(cfg)),
         subscribe_topics(std::move(topics)),
+        // 归因(P5-3):交接边界满 tail-drop 命名 kDdsHandoffOverflow,trace_sink 透传。
         handoff([](const Sample& s) { return s.bytes.size(); }, max_samples,
-                max_bytes) {}
+                max_bytes, DropReason::kDdsHandoffOverflow, trace_sink) {}
 
   mutable std::mutex mutex;
   std::unique_ptr<IDdsProvider> provider;
@@ -77,10 +79,11 @@ void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
 
 DdsTransport::DdsTransport(std::unique_ptr<IDdsProvider> provider,
                            DdsConfig config, std::vector<std::string> topics,
-                           std::size_t max_samples, std::size_t max_bytes)
+                           std::size_t max_samples, std::size_t max_bytes,
+                           ITraceSink* trace_sink)
     : state_(std::make_shared<State>(std::move(provider), std::move(config),
                                      std::move(topics), max_samples,
-                                     max_bytes)) {}
+                                     max_bytes, trace_sink)) {}
 
 DdsTransport::~DdsTransport() { BeginClose(state_); }
 

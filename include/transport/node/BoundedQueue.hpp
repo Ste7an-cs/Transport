@@ -14,11 +14,16 @@
  * T 的任何字段。入队时按回调计量并随元素存档,出队按存档字节精确扣减(计量稳定)。
  *
  * 双上界(D5):事件数 max_events 与字节数 max_bytes,任一达到即"满"。满时 Push 拒绝
- * 正到达的元素(tail-drop),返 kResourceExhausted 并累加 DroppedCount(命名归因
- * business_queue_overflow 由上层 P5 集中出口消费)。Push 不阻塞。
+ * 正到达的元素(tail-drop),返 kResourceExhausted 并经 `RecordDrop`(P5-3)以构造时注入
+ * 的 `drop_reason` 归因原地 +1 DroppedCount(+ 可选 Trace)。Push 不阻塞。
+ *
+ * 归因(P5-3,ADR-0003 D13):`drop_reason`/`sink` 由调用方在构造时注入——本类不知道
+ * "为什么是这个原因"(业务队列满 vs DDS 交接满等语义在调用方),只把裸计数换成
+ * `RecordDrop` 原语;`DroppedCount()` 语义/签名不变,仍是该原因的累计丢弃数。
  *
  * 同步纪律(D8):表结构(deque / 计数 / waiter 队列)由一把 std::mutex 守;运行时
- * await 只出现在 Pop 的消费者挂起点,唤醒回调(resolve/close)在锁外调用。
+ * await 只出现在 Pop 的消费者挂起点,唤醒回调(resolve/close)在锁外调用。RecordDrop
+ * 在 tail-drop 分支内、持锁调用(与原地 `++dropped` 同一临界区,不引入新的锁外时序)。
  */
 
 #include <algorithm>
@@ -33,7 +38,10 @@
 #include <vector>
 
 #include "await/awaitable.hpp"
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
+#include "transport/core/Observability.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/TransportTypes.hpp"
 
@@ -71,14 +79,23 @@ class BoundedQueue {
    * @param byte_size_of 字节计量回调(不透明地测 T 的字节数);为空则字节上界永不触发。
    * @param max_events   事件数上限,越界钳制到 [kMinEvents, kMaxEvents](默认 1024)。
    * @param max_bytes    字节数上限,越界钳制到 [kMinBytes, kMaxBytes](默认 16 MiB)。
+   * @param drop_reason  tail-drop 时的命名归因(P5-3,ADR-0003 D13 Q3);调用方按其归属
+   *                     语义传入(如 `kBusinessQueueOverflow`/`kDdsHandoffOverflow`),
+   *                     默认 `kBusinessQueueOverflow`(最常见的调用方,NodeRuntime 业务队列)。
+   * @param sink         可选 Trace 出口(RT_TRACE_002:为空时行为/计数不受影响,只少一次
+   *                     判空之外的开销)。
    */
   explicit BoundedQueue(ByteSizeOf byte_size_of,
                         std::size_t max_events = kDefaultMaxEvents,
-                        std::size_t max_bytes = kDefaultMaxBytes)
+                        std::size_t max_bytes = kDefaultMaxBytes,
+                        DropReason drop_reason = DropReason::kBusinessQueueOverflow,
+                        ITraceSink* sink = nullptr)
       : shared_(std::make_shared<Shared>()) {
     shared_->byte_size_of = std::move(byte_size_of);
     shared_->max_events = std::min(std::max(max_events, kMinEvents), kMaxEvents);
     shared_->max_bytes = std::min(std::max(max_bytes, kMinBytes), kMaxBytes);
+    shared_->drop_reason = drop_reason;
+    shared_->sink = sink;
   }
 
   /**
@@ -102,7 +119,8 @@ class BoundedQueue {
           shared->byte_size_of ? shared->byte_size_of(value) : 0;
       if (shared->items.size() >= shared->max_events ||
           shared->byte_size + bytes > shared->max_bytes) {
-        shared->dropped += 1;  // 命名归因 business_queue_overflow(上层 P5 出口)。
+        // 归因(P5-3):RecordDrop 原地 +1 dropped(DroppedCount 语义不变)+ 可选 Trace。
+        RecordDrop(shared->drop_reason, shared->dropped, shared->sink);
         return make_error_code(TransportErrc::kResourceExhausted);
       }
       shared->items.push_back(Item{std::move(value), bytes});
@@ -232,7 +250,7 @@ class BoundedQueue {
     return shared_->byte_size;
   }
 
-  /// @brief 累计 tail-drop 丢弃数(命名归因 business_queue_overflow)。
+  /// @brief 累计 tail-drop 丢弃数(命名归因见构造时注入的 `drop_reason`)。
   [[nodiscard]] std::size_t DroppedCount() const {
     std::lock_guard<std::mutex> lock(shared_->mutex);
     return shared_->dropped;
@@ -258,6 +276,8 @@ class BoundedQueue {
     std::size_t max_bytes{kDefaultMaxBytes};
     bool closed{false};
     ByteSizeOf byte_size_of;
+    DropReason drop_reason{DropReason::kBusinessQueueOverflow};  ///< tail-drop 命名归因(P5-3)。
+    ITraceSink* sink{nullptr};  ///< 可选 Trace 出口(非拥有,P5-3)。
   };
 
   /// 从 waiter 队列按身份摘除本消费者的 waiter(超时/取消/唤醒后收尾)。幂等。

@@ -3,6 +3,7 @@
 #include <string>
 #include <utility>
 
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
 
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
@@ -21,7 +22,9 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
       pending_(/*max_pending=*/0, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它字段);
-      // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
+      // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。trace_sink
+      // 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的 close_drop 批量
+      // 归因均经它可选上报。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events,
@@ -154,7 +157,10 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    return;  // 坏 sample / codec 错误:丢弃(kBadFrame 已由 P5-3 覆盖,本票不重复)。
+    // 坏 sample / codec 错误:丢弃。归因 kBadFrame(P5-3)。
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordDrop(DropReason::kBadFrame, bad_frame_count_, config_.trace_sink);
+    return;
   }
   // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
   RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
@@ -178,7 +184,8 @@ void DdsNode::Dispatch(Message msg) {
       // RouteUnmatched 内联锁死:无匹配在途 Request(迟到 / 无匹配 correlation_id)→
       // 归因丢弃,不误配。
       std::lock_guard<std::mutex> lock(mutex_);
-      ++unmatched_reply_count_;
+      RecordDrop(DropReason::kUnmatchedOrLateResponse, unmatched_reply_count_,
+                config_.trace_sink);
     }
     return;
   }
@@ -190,7 +197,8 @@ void DdsNode::Dispatch(Message msg) {
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  ++dropped_no_handler_count_;
+  RecordDrop(DropReason::kNoHandlerConfigured, dropped_no_handler_count_,
+            config_.trace_sink);
 }
 
 std::size_t DdsNode::UnmatchedReplyCount() const {
@@ -214,6 +222,11 @@ std::size_t DdsNode::HandlerExceptionCount() const {
 std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
 
 std::size_t DdsNode::CloseDropCount() const { return runtime_.CloseDropCount(); }
+
+std::size_t DdsNode::BadFrameCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return bad_frame_count_;
+}
 
 DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
   return pending_.LastRequestLatency();
