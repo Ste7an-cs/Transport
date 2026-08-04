@@ -22,6 +22,7 @@ class FakeCoroTransport final : public transport::ITransport {
   using Datagram = transport::Datagram;
   using LifecycleState = transport::LifecycleState;
   using OperationOptions = transport::OperationOptions;
+  using Clock = OperationOptions::Clock;
   template <typename T>
   using Result = transport::Result<T>;
   using SendUnit = transport::SendUnit;
@@ -44,6 +45,11 @@ class FakeCoroTransport final : public transport::ITransport {
     std::size_t send_waiters{0};
     std::vector<SendUnit> sent;
     transport::SharedCompletion<void> closed;
+    // I/O 事实(ADR-0003 D13 / ITransport 契约):Write 成功记 last_send;Read 成功
+    // 记 last_recv;Write/Read 失败记 last_error(与生产传输的记账口径对齐)。
+    std::optional<Clock::time_point> last_send;
+    std::optional<Clock::time_point> last_recv;
+    std::error_code last_error;
   };
 
  public:
@@ -91,6 +97,7 @@ class FakeCoroTransport final : public transport::ITransport {
     if (queued) {
       auto result = std::move(*queued);
       FinishRead(state, nullptr);
+      RecordReadOutcome(state, result);
       return result;
     }
 
@@ -120,18 +127,17 @@ class FakeCoroTransport final : public transport::ITransport {
     registration.Reset();
     FinishRead(state, waiter);
 
-    if (notification) {
-      return notification;
+    Result<Datagram> outcome = std::move(notification);
+    if (!outcome) {
+      if (outcome.error() == std::make_error_code(std::errc::timed_out)) {
+        outcome = transport::make_error_code(TransportErrc::kTimeout);
+      } else if (outcome.error().category() !=
+                 transport::transport_error_category()) {
+        outcome = transport::make_error_code(TransportErrc::kInternal);
+      }
     }
-    if (notification.error() ==
-        std::make_error_code(std::errc::timed_out)) {
-      return transport::make_error_code(TransportErrc::kTimeout);
-    }
-    if (notification.error().category() ==
-        transport::transport_error_category()) {
-      return notification.error();
-    }
-    return transport::make_error_code(TransportErrc::kInternal);
+    RecordReadOutcome(state, outcome);
+    return outcome;
   }
 
   Status Write(SendUnit unit) override {
@@ -161,11 +167,13 @@ class FakeCoroTransport final : public transport::ITransport {
       if (!acquired) {
         // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数,不释放写槽。
         LeaveWriteQueue(state);
-        return acquired.error().category() ==
-                       transport::transport_error_category()
-                   ? Status{acquired.error()}
-                   : Status{transport::make_error_code(
-                         TransportErrc::kClosed)};
+        Status failure = acquired.error().category() ==
+                                 transport::transport_error_category()
+                             ? Status{acquired.error()}
+                             : Status{transport::make_error_code(
+                                   TransportErrc::kClosed)};
+        RecordWriteOutcome(state, failure);
+        return failure;
       }
     }
 
@@ -187,6 +195,7 @@ class FakeCoroTransport final : public transport::ITransport {
                           : Status{transport::make_error_code(
                                 TransportErrc::kInternal)};
         ExitWrite(state);
+        RecordWriteOutcome(state, status);
         return status;
       }
     }
@@ -217,6 +226,7 @@ class FakeCoroTransport final : public transport::ITransport {
           transport::make_error_code(TransportErrc::kClosed));
     }
     ExitWrite(state);
+    RecordWriteOutcome(state, result);
     return result;
   }
 
@@ -309,6 +319,27 @@ class FakeCoroTransport final : public transport::ITransport {
     return state->send_waiters;
   }
 
+  /// @brief 最近一次 Write 成功完成的时刻(尚无则空)。
+  std::optional<Clock::time_point> LastSendTime() const override {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->last_send;
+  }
+
+  /// @brief 最近一次 Read 成功返回数据的时刻(尚无则空)。
+  std::optional<Clock::time_point> LastReceiveTime() const override {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->last_recv;
+  }
+
+  /// @brief 最近一次 Write/Read 操作错误(无则默认构造的 error_code)。
+  std::error_code LastError() const override {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->last_error;
+  }
+
  private:
   static void FinishRead(
       const std::shared_ptr<State>& state,
@@ -376,6 +407,29 @@ class FakeCoroTransport final : public transport::ITransport {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->send_waiters > 0) {
       state->send_waiters -= 1;
+    }
+  }
+
+  // I/O 事实记账(与生产传输口径对齐):Write 成功记 last_send,失败记
+  // last_error。
+  static void RecordWriteOutcome(const std::shared_ptr<State>& state,
+                                 const Status& outcome) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (outcome) {
+      state->last_send = Clock::now();
+    } else {
+      state->last_error = outcome.error();
+    }
+  }
+
+  // I/O 事实记账:Read 成功记 last_recv,失败记 last_error。
+  static void RecordReadOutcome(const std::shared_ptr<State>& state,
+                                const Result<Datagram>& outcome) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (outcome) {
+      state->last_recv = Clock::now();
+    } else {
+      state->last_error = outcome.error();
     }
   }
 

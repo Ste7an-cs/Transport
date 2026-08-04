@@ -6,11 +6,14 @@
 //   * 发侧:Write → provider.Publish 到 destination.topic;非 topic → kInvalidArgument。
 //   * Unsubscribe/Close 后迟到样本丢弃、不碰已销毁对象。
 //   * ★ 跨线程确证:listener(std::thread)Push、fiber Pop,压测无崩溃/无丢唤醒/无死锁。
+//   * I/O 观测面(ADR-0003 D13/RT_NODE_006):Publish 成功记 LastSendTime;出队样本记
+//     LastReceiveTime;Publish/Read 操作失败记 LastError。
 #include "transport/io/dds/DdsTransport.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -22,6 +25,7 @@
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/io/dds/FakeDdsProvider.hpp"
+#include "transport/io/dds/IDdsProvider.hpp"
 
 using namespace std::chrono_literals;
 using transport::Datagram;
@@ -67,6 +71,24 @@ OperationOptions Deadline(std::chrono::milliseconds d) {
   o.deadline = OperationOptions::Clock::now() + d;
   return o;
 }
+
+// 最小 IDdsProvider 替身,专供 LastError 测试:Init/Subscribe/Unsubscribe/Shutdown
+// 恒成功(不驱动任何真实收发),Publish 恒失败(模拟 provider 侧发布故障)。
+using transport::IDdsProvider;
+class FailingPublishProvider : public IDdsProvider {
+ public:
+  Status Init(const DdsConfig&) override { return Status{}; }
+  void Shutdown() override {}
+  Status Publish(const std::string&, const std::vector<uint8_t>&) override {
+    return make_error_code(TransportErrc::kIo);
+  }
+  Status Subscribe(const std::string&,
+                   std::function<void(const std::vector<uint8_t>&)>) override {
+    return Status{};
+  }
+  Status Unsubscribe(const std::string&) override { return Status{}; }
+  std::string Name() const override { return "failing-publish"; }
+};
 
 }  // namespace
 
@@ -255,4 +277,73 @@ TEST(DdsTransport, CrossThreadCloseRacesWithListenerPush) {
   // 关闭后 Read 返 kClosed(不挂起)。
   auto after = rx->Read(Deadline(2000ms));
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+}
+
+// —— I/O 观测面(ADR-0003 D13/RT_NODE_006「所有介质如实报」)——
+
+TEST(DdsTransport, PublishSuccessUpdatesLastSendTime) {
+  Fixture f;
+  auto rx = f.MakeRx({"t"});
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+  EXPECT_FALSE(rx->LastSendTime().has_value());  // 未发送前为空。
+
+  const auto before = OperationOptions::Clock::now();
+  SendUnit unit;
+  unit.bytes = {1, 2, 3};
+  unit.destination = Endpoint::Topic("out");
+  ASSERT_TRUE(static_cast<bool>(rx->Write(std::move(unit))));
+  const auto after = OperationOptions::Clock::now();
+
+  ASSERT_TRUE(rx->LastSendTime().has_value());
+  EXPECT_GE(*rx->LastSendTime(), before);
+  EXPECT_LE(*rx->LastSendTime(), after);
+}
+
+TEST(DdsTransport, HandoffSampleUpdatesLastReceiveTime) {
+  Fixture f;
+  auto rx = f.MakeRx({"t"});
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+  EXPECT_FALSE(rx->LastReceiveTime().has_value());  // 未收到前为空。
+
+  const auto before = OperationOptions::Clock::now();
+  ASSERT_TRUE(static_cast<bool>(f.tx.Publish("t", {1, 2, 3})));
+  auto dg = rx->Read(Deadline(2000ms));
+  const auto after = OperationOptions::Clock::now();
+  ASSERT_TRUE(static_cast<bool>(dg));
+
+  ASSERT_TRUE(rx->LastReceiveTime().has_value());
+  EXPECT_GE(*rx->LastReceiveTime(), before);
+  EXPECT_LE(*rx->LastReceiveTime(), after);
+}
+
+TEST(DdsTransport, PublishFailureUpdatesLastErrorWithoutTouchingLastSendTime) {
+  auto rx = std::make_unique<DdsTransport>(
+      std::make_unique<FailingPublishProvider>(), Cfg(),
+      std::vector<std::string>{});
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+  EXPECT_FALSE(rx->LastError());  // 初始无错误。
+
+  SendUnit unit;
+  unit.bytes = {9};
+  unit.destination = Endpoint::Topic("t");
+  auto written = rx->Write(std::move(unit));
+
+  ASSERT_FALSE(static_cast<bool>(written));
+  EXPECT_EQ(written.error(), make_error_code(TransportErrc::kIo));
+  EXPECT_EQ(rx->LastError(), make_error_code(TransportErrc::kIo));
+  EXPECT_FALSE(rx->LastSendTime().has_value());  // 失败不应记为一次成功发送。
+}
+
+TEST(DdsTransport, ReadTimeoutDoesNotUpdateLastError) {
+  Fixture f;
+  auto rx = f.MakeRx({"t"});
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+
+  // 空队列、短 deadline:handoff.Pop 必然超时。kTimeout 是正常操作结果(无数据
+  // 到达),不是故障事实——同 TCP/UDP/Serial 惯例,不计入 LastError,保持它作为
+  // "真故障"信号不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
+  auto dg = rx->Read(Deadline(20ms));
+  ASSERT_FALSE(static_cast<bool>(dg));
+  EXPECT_EQ(dg.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_FALSE(rx->LastError());
 }

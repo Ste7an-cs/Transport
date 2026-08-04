@@ -114,11 +114,13 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
   /// @brief 当前处于 Write 中的 fiber 数(委托内层)。
   [[nodiscard]] std::size_t SendWaiterDepth() const;
   /// @brief 最近一次发送完成时刻(委托内层)。
-  [[nodiscard]] std::optional<Clock::time_point> LastSendTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastSendTime()
+      const override;
   /// @brief 最近一次收到字节时刻(委托内层)。
-  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime()
+      const override;
   /// @brief 最近一次内层 I/O 错误(委托内层)。
-  [[nodiscard]] std::error_code LastError() const;
+  [[nodiscard]] std::error_code LastError() const override;
 
   struct Impl;  // 不透明:定义在 .cpp,connect-loop fiber 与本类共享。
 

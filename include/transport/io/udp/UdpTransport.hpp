@@ -68,11 +68,13 @@ class UdpTransport final : public ITransport {
   /// @brief 本地实际绑定端口(config 端口为 0 时由 OS 分配;未 Start 前为 0)。
   [[nodiscard]] std::uint16_t LocalPort() const;
   /// @brief 最近一次发送完成的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastSendTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastSendTime()
+      const override;
   /// @brief 最近一次收到报文的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime()
+      const override;
   /// @brief 最近一次操作错误(无则默认构造的 error_code)。
-  [[nodiscard]] std::error_code LastError() const;
+  [[nodiscard]] std::error_code LastError() const override;
 
   struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
 

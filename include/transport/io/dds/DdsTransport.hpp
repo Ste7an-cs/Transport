@@ -7,7 +7,9 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "transport/io/ITransport.hpp"
@@ -48,6 +50,8 @@ struct Sample {
  */
 class DdsTransport final : public ITransport {
  public:
+  using Clock = OperationOptions::Clock;
+
   /// @brief 交接边界默认样本数上限(ADR-0002 D4,与 BoundedQueue 默认一致)。
   static constexpr std::size_t kDefaultMaxSamples = 1024;
   /// @brief 交接边界默认字节上限:16 MiB(ADR-0002 D4)。
@@ -94,6 +98,17 @@ class DdsTransport final : public ITransport {
 
   /// @brief 交接边界累计 tail-drop 丢弃样本数(命名归因 `dds_handoff_overflow`,RT_NODE_007)。
   [[nodiscard]] std::size_t DdsHandoffOverflowCount() const;
+
+  // I/O 事实(ADR-0003 D13,RT_NODE_006「所有介质如实报」)——非"连接健康"裁决。
+
+  /// @brief 最近一次 `provider.Publish` 成功完成的时刻(尚无则空)。
+  [[nodiscard]] std::optional<Clock::time_point> LastSendTime()
+      const override;
+  /// @brief 最近一次从交接边界出队到样本的时刻(尚无则空)。
+  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime()
+      const override;
+  /// @brief 最近一次 Publish/Read 操作错误(无则默认构造的 error_code)。
+  [[nodiscard]] std::error_code LastError() const override;
 
   struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
 
