@@ -3,6 +3,9 @@
 #include <string>
 #include <utility>
 
+#include "transport/core/DropReason.hpp"
+#include "transport/core/Observability.hpp"
+
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
 // 终结判别、topic 寻址、reply_to=inbox。协议无关机制(生命周期三方汇合、handler 消费者、
 // 业务队列、读循环骨架)组合并驱动 NodeRuntime;关联复用 PendingTable<std::string,Message>。
@@ -18,11 +21,13 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
       pending_(),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它字段);
-      // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
+      // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。trace_sink
+      // 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的 close_drop 批量
+      // 归因均经它可选上报。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events,
-               config_.business_queue_max_bytes) {}
+               config_.business_queue_max_bytes, config_.trace_sink) {}
 
 DdsNode::~DdsNode() { Close(); }
 
@@ -144,7 +149,10 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    return;  // 坏 sample / codec 错误:丢弃。
+    // 坏 sample / codec 错误:丢弃。归因 kBadFrame(P5-3)。
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordDrop(DropReason::kBadFrame, bad_frame_count_, config_.trace_sink);
+    return;
   }
   for (auto& msg : decoded.value()) {
     // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
@@ -162,7 +170,8 @@ void DdsNode::Dispatch(Message msg) {
       // RouteUnmatched 内联锁死:无匹配在途 Request(迟到 / 无匹配 correlation_id)→
       // 归因丢弃,不误配。
       std::lock_guard<std::mutex> lock(mutex_);
-      ++unmatched_reply_count_;
+      RecordDrop(DropReason::kUnmatchedOrLateResponse, unmatched_reply_count_,
+                config_.trace_sink);
     }
     return;
   }
@@ -174,7 +183,8 @@ void DdsNode::Dispatch(Message msg) {
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  ++dropped_no_handler_count_;
+  RecordDrop(DropReason::kNoHandlerConfigured, dropped_no_handler_count_,
+            config_.trace_sink);
 }
 
 std::size_t DdsNode::UnmatchedReplyCount() const {
@@ -198,6 +208,11 @@ std::size_t DdsNode::HandlerExceptionCount() const {
 std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
 
 std::size_t DdsNode::CloseDropCount() const { return runtime_.CloseDropCount(); }
+
+std::size_t DdsNode::BadFrameCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return bad_frame_count_;
+}
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————
 

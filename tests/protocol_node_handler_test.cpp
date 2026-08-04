@@ -25,6 +25,8 @@
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
 #include "transport/node/ProtocolNode.hpp"
+#include "transport/core/DropReason.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemCodec.hpp"
 #include "coro_test_util.hpp"
@@ -33,7 +35,10 @@
 using namespace std::chrono_literals;
 using testutil::FakeCoroTransport;
 using testutil::pumpFiberUntil;
+using transport::CapturingTraceSink;
 using transport::Datagram;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::FrameType;
 using transport::HandlerContext;
 using transport::Message;
@@ -261,6 +266,54 @@ TEST(ProtocolNodeHandler, QueueOverflowTailDropsWhileResponsesStillMatch) {
   }
   node.Close();
   EXPECT_TRUE(request.get());
+}
+
+// P5-3(issue #88):kBusinessQueueOverflow 定义点在 BoundedQueue::Push 内(经
+// NodeRuntime 构造业务队列时透传 config.trace_sink)——配置 trace_sink 时,队列满
+// tail-drop 应同步产生可辨识的 TraceEvent,且 BusinessQueueOverflowCount()(代理
+// BoundedQueue::DroppedCount())不变。沿用上一用例(GateBank 卡住消费者)确定化溢出的
+// 拓扑,只是额外挂了 sink 断言。
+TEST(ProtocolNodeHandler, QueueOverflowWithSinkEmitsDropTraceForEachDrop) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  GateBank bank;
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.business_queue_max_events = 2;  // 小容量,便于溢出。
+  config.trace_sink = &sink;
+  config.handler = [&bank](const Message&, HandlerContext&) -> Status {
+    auto gate = bank.Enter();
+    Coro::await(gate);
+    bank.Leave();
+    return Status{};
+  };
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  // 第 1 条被消费者取走并卡在 handler(队列空);随后灌满 + 溢出 2 条。
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0011));
+  ASSERT_TRUE(pumpFiberUntil([&] { return bank.Entered() == 1; }));
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 2, 0x0012));  // 入队(size 1)
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 3, 0x0013));  // 入队(size 2 满)
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 4, 0x0014));  // 满 → tail-drop
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 5, 0x0015));  // 满 → tail-drop
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.BusinessQueueOverflowCount() == 2u; }));
+  EXPECT_EQ(node.BusinessQueueOverflowCount(), 2u);
+
+  const auto records = sink.Records();
+  // 每次 tail-drop 恰好一条 Trace(RecordDrop 与 DroppedCount 同一临界区同步 +1)。
+  ASSERT_EQ(records.size(), 2u);
+  for (const auto& rec : records) {
+    EXPECT_EQ(rec.category, "drop");
+    EXPECT_EQ(rec.message, DropReasonName(DropReason::kBusinessQueueOverflow));
+  }
+
+  while (bank.Release()) {
+    pumpFiberUntil([&] { return false; }, 5);
+  }
+  node.Close();
 }
 
 // 未设 handler → 业务帧仍归因 dropped_no_handler(P1 行为不变),不入队。

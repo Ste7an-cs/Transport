@@ -23,6 +23,8 @@
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
 #include "transport/node/ProtocolNode.hpp"
+#include "transport/core/DropReason.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/codec/SystemCodec.hpp"
 #include "coro_test_util.hpp"
@@ -31,7 +33,10 @@
 using namespace std::chrono_literals;
 using testutil::FakeCoroTransport;
 using testutil::pumpFiberUntil;
+using transport::CapturingTraceSink;
 using transport::Datagram;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::FrameType;
 using transport::HandlerContext;
 using transport::Message;
@@ -255,4 +260,40 @@ TEST(ProtocolNodeLifecycle, UnstartedQueuedBusinessCountedAsCloseDrop) {
   EXPECT_TRUE(node.WaitClosed());
   EXPECT_EQ(node.CloseDropCount(), 2u);  // 未启动的两帧归因 close_drop,不处理。
   EXPECT_EQ(entered.load(), 1);          // 仅首条曾启动。
+}
+
+// P5-3(issue #88):同一场景配置 trace_sink → close_drop 逐条 RecordDrop,DroppedCount
+// 与 sink 收到的 TraceEvent 条数一致同步(2 帧未启动 → 2 条 category="drop"/kCloseDrop)。
+TEST(ProtocolNodeLifecycle, UnstartedQueuedBusinessCloseDropWithSinkEmitsTraceEvents) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  std::atomic_int entered{0};
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.trace_sink = &sink;
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+    entered.fetch_add(1);
+    ctx.cancellation().Wait();  // 卡住首条,让后续帧只入队不启动。
+    return Status{};
+  };
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));  // 被消费、卡住。
+  ASSERT_TRUE(pumpFiberUntil([&] { return entered.load() == 1; }));
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 2, 0x0002));  // 入队,未启动。
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 3, 0x0003));  // 入队,未启动。
+  pumpFiberUntil([&] { return false; }, 40);
+
+  ASSERT_TRUE(node.Close());
+  EXPECT_TRUE(node.WaitClosed());
+  EXPECT_EQ(node.CloseDropCount(), 2u);
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 2u);  // 逐条归因:2 帧 close_drop → 2 条 TraceEvent。
+  for (const auto& rec : records) {
+    EXPECT_EQ(rec.category, "drop");
+    EXPECT_EQ(rec.message, DropReasonName(DropReason::kCloseDrop));
+  }
 }

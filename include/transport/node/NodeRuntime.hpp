@@ -41,8 +41,11 @@
 
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/Cancellation.hpp"
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
+#include "transport/core/Observability.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/SharedCompletion.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -68,12 +71,18 @@ class NodeRuntime {
    * @param byte_size_of  业务队列的字节计量回调(node 传 payload.size());runtime 不读字段。
    * @param max_events    业务队列事件数上界(越界由 BoundedQueue 钳制)。
    * @param max_bytes     业务队列字节数上界(越界由 BoundedQueue 钳制)。
+   * @param trace_sink    可选 Trace 出口(P5-3,ADR-0003 D13);非拥有,可为 nullptr。传给
+   *                      业务队列(归因 kBusinessQueueOverflow)与 Close 时的 close_drop 批量
+   *                      归因。RT_TRACE_002:为空时不改变任何控制流/计数。
    */
   NodeRuntime(ITransport* transport,
               typename BoundedQueue<Event>::ByteSizeOf byte_size_of,
-              std::size_t max_events, std::size_t max_bytes)
+              std::size_t max_events, std::size_t max_bytes,
+              ITraceSink* trace_sink = nullptr)
       : transport_(transport),
-        business_queue_(std::move(byte_size_of), max_events, max_bytes) {}
+        business_queue_(std::move(byte_size_of), max_events, max_bytes,
+                        DropReason::kBusinessQueueOverflow, trace_sink),
+        trace_sink_(trace_sink) {}
 
   NodeRuntime(const NodeRuntime&) = delete;
   NodeRuntime& operator=(const NodeRuntime&) = delete;
@@ -224,8 +233,12 @@ class NodeRuntime {
           }
           {
             std::lock_guard<std::mutex> lock(mutex_);
-            // 未启动的排队业务归因 close_drop(不排空处理)。
-            close_drop_count_ += business_queue_.Drain().size();
+            // 未启动的排队业务归因 close_drop(不排空处理):逐条 RecordDrop(与原地
+            // += size() 同一临界区宽度,只是把裸算术换成归因原语;取舍见 PR 说明)。
+            auto drained = business_queue_.Drain();
+            for (std::size_t i = 0; i < drained.size(); ++i) {
+              RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
+            }
             lifecycle_ = LifecycleState::kClosed;
           }
           closed_.Complete(Status{});
@@ -234,7 +247,10 @@ class NodeRuntime {
         // 从未 spawn 读循环:直接收敛。残留业务(理论上无)一并 close_drop 归因。
         {
           std::lock_guard<std::mutex> lock(mutex_);
-          close_drop_count_ += business_queue_.Drain().size();
+          auto drained = business_queue_.Drain();
+          for (std::size_t i = 0; i < drained.size(); ++i) {
+            RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
+          }
           lifecycle_ = LifecycleState::kClosed;
         }
         closed_.Complete(Status{});
@@ -380,6 +396,7 @@ class NodeRuntime {
 
   ITransport* transport_;             ///< 非拥有字节管道(读循环 Read + 收敛 RequestClose)。
   BoundedQueue<Event> business_queue_;  ///< 入站业务事件队列(协议无关):读循环 Push、消费者 Pop。
+  ITraceSink* trace_sink_;  ///< 可选 Trace 出口(非拥有,P5-3):Close 时 close_drop 归因用。
   CancellationSource handler_cancellation_;  ///< handler 协作取消源:Close 时 Cancel。
 
   SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享)。

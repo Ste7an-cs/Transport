@@ -34,6 +34,7 @@
 #include "transport/core/Endpoint.hpp"
 #include "transport/codec/ICodec.hpp"
 #include "transport/io/ITransport.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
@@ -106,6 +107,9 @@ struct DdsNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
+  /// 可选 Trace 出口(P5-3,ADR-0003 D13);非拥有,可为 nullptr(RT_TRACE_002:未配置
+  /// 不改变任何控制流/字节流/错误结果/计数)。传给 NodeRuntime 业务队列与本类各丢弃归因点。
+  ITraceSink* trace_sink = nullptr;
 };
 
 /**
@@ -193,6 +197,10 @@ class DdsNode {
   /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
   [[nodiscard]] std::size_t CloseDropCount() const;
 
+  /// @brief 观测:读循环 `codec_->Decode` 失败(坏 sample / codec 语义错误)而丢弃的累计
+  ///        次数(P5-3,ADR-0003 D13;命名归因 kBadFrame)。
+  [[nodiscard]] std::size_t BadFrameCount() const;
+
  private:
   friend class DdsHandlerContext;
 
@@ -225,6 +233,7 @@ class DdsNode {
   std::uint64_t correlation_counter_{0};  ///< 确定性 correlation_id 单调序号。
   std::size_t unmatched_reply_count_{0};
   std::size_t dropped_no_handler_count_{0};
+  std::size_t bad_frame_count_{0};
 };
 
 }  // namespace transport

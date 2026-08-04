@@ -17,7 +17,10 @@
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
 #include "transport/node/ProtocolNode.hpp"
+#include "transport/core/DropReason.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/TransportTypes.hpp"
+#include "transport/codec/ICodec.hpp"
 #include "transport/codec/SystemCodec.hpp"
 #include "coro_test_util.hpp"
 #include "fake_coro_transport.hpp"
@@ -25,10 +28,14 @@
 using namespace std::chrono_literals;
 using testutil::FakeCoroTransport;
 using testutil::pumpFiberUntil;
+using transport::CapturingTraceSink;
 using transport::CorrelationKeyStrategy;
 using transport::Datagram;
 using transport::DefaultProtocolKeyStrategy;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::FrameType;
+using transport::ICodec;
 using transport::Message;
 using transport::OperationOptions;
 using transport::ProtocolKey;
@@ -79,6 +86,22 @@ Message MakeRequest(std::uint16_t message_id, std::vector<std::uint8_t> payload)
   req.payload = std::move(payload);
   return req;
 }
+
+// codec 双:Encode 委托真实 SystemCodec(Request 仍可正常编码上线),Decode 恒返回
+// kCodec——供确定性触发 DecodeAndDispatch 的坏帧分支(P5-3 kBadFrame),不依赖
+// SystemCodec 内部 resync 细节(其 Decode 遇坏 CRC 会前移重扫、不对外报错)。
+class AlwaysFailDecodeCodec : public ICodec {
+ public:
+  Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
+    return real_.Encode(msg);
+  }
+  Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
+    return make_error_code(TransportErrc::kCodec);
+  }
+
+ private:
+  SystemCodec real_;
+};
 
 }  // namespace
 
@@ -244,4 +267,108 @@ TEST(ProtocolNode, RequestTimesOutAndReleasesCorrelation) {
 
   node.Close();
   EXPECT_TRUE(request.get());
+}
+
+// -----------------------------------------------------------------------------
+// P5-3:全线接入丢弃归因(issue #88)——配 CapturingTraceSink 时,各丢弃点计数与
+// 可辨识的 TraceEvent(category="drop", message=DropReasonName)同步产生。
+// -----------------------------------------------------------------------------
+
+// kUnmatchedOrLateResponse:迟到响应归因丢弃时,配置 trace_sink → 收到对应事件。
+TEST(ProtocolNode, UnmatchedResponseWithSinkEmitsDropTrace) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.trace_sink = &sink;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  // 无在途请求:注入一条响应帧 → 无匹配、归因丢弃。
+  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
+  EXPECT_EQ(node.UnmatchedResponseCount(), 1u);
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1u);
+  EXPECT_EQ(records.front().category, "drop");
+  EXPECT_EQ(records.front().message,
+           DropReasonName(DropReason::kUnmatchedOrLateResponse));
+
+  node.Close();
+}
+
+// kNoHandlerConfigured:未设 handler 的业务帧归因丢弃时,配置 trace_sink → 收到对应事件。
+TEST(ProtocolNode, DroppedNoHandlerWithSinkEmitsDropTrace) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.trace_sink = &sink;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.DroppedNoHandlerCount() == 1u; }));
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1u);
+  EXPECT_EQ(records.front().category, "drop");
+  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kNoHandlerConfigured));
+
+  node.Close();
+}
+
+// kBadFrame:codec.Decode 失败(坏帧/codec 语义错误)时,新增 BadFrameCount() 归因 +1,
+// 配置 trace_sink → 收到对应事件。
+TEST(ProtocolNode, BadFrameDecodeFailureCountedAndTraced) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.trace_sink = &sink;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<AlwaysFailDecodeCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  EXPECT_EQ(node.BadFrameCount(), 0u);
+  Datagram garbage;
+  garbage.bytes = {0xDE, 0xAD, 0xBE, 0xEF};
+  fake->Inject(std::move(garbage));
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 1u; }));
+  EXPECT_EQ(node.BadFrameCount(), 1u);
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 1u);
+  EXPECT_EQ(records.front().category, "drop");
+  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kBadFrame));
+
+  // 再来一帧:计数与 Trace 同步递增。
+  Datagram garbage2;
+  garbage2.bytes = {0x01};
+  fake->Inject(std::move(garbage2));
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 2u; }));
+  EXPECT_EQ(sink.Records().size(), 2u);
+
+  node.Close();
+}
+
+// RT_TRACE_002:未配置 trace_sink(默认 nullptr)时,坏帧 / 迟到响应的计数行为与配置了
+// sink 时完全一致——sink 只是可选旁路,不影响控制流/计数。
+TEST(ProtocolNode, NoSinkConfiguredCountsUnaffected) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNode node(std::move(fake_owner), std::make_unique<AlwaysFailDecodeCodec>());
+  ASSERT_TRUE(node.Start());  // config.trace_sink 缺省 nullptr。
+
+  Datagram garbage;
+  garbage.bytes = {0xFF};
+  fake->Inject(std::move(garbage));
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 1u; }));
+  EXPECT_EQ(node.BadFrameCount(), 1u);
+
+  node.Close();
 }

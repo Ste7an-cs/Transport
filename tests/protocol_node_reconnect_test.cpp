@@ -32,8 +32,10 @@
 #include "coro_test_util.hpp"
 #include "fake_coro_transport.hpp"
 #include "task/fibertask.h"
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
 #include "transport/io/tcp/TcpClientTransport.hpp"
@@ -44,7 +46,10 @@
 using namespace std::chrono_literals;
 using testutil::FakeCoroTransport;
 using testutil::pumpFiberUntil;
+using transport::CapturingTraceSink;
 using transport::Datagram;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::Endpoint;
 using transport::FrameType;
 using transport::HandlerContext;
@@ -316,6 +321,66 @@ TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDroppedRunningHandlerComp
   gate->close();
   ASSERT_TRUE(pumpFiberUntil([&] { return completed == 1; }, 3000));
   EXPECT_EQ(completed, 1);
+
+  ASSERT_TRUE(node->Close());
+  EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
+  server_txp1->RequestClose();
+}
+
+// P5-3(issue #88):同一断连拓扑,配置 trace_sink → 代际隔离批量 Drain 逐条 RecordDrop,
+// GenerationIsolationDropCount() 与 sink 收到的 TraceEvent 条数一致同步(取舍见 PR 说明:
+// 批量 Drain 逐条归因,而非以 size=N 单次记,以保持与既有精确计数断言一致)。
+TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDropWithSinkEmitsTraceEvents) {
+  QTcpServer server;
+  ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
+  const quint16 port = server.serverPort();
+
+  auto gate = std::make_shared<Coro::Awaitable<void>>();
+  int started = 0;
+  CapturingTraceSink sink;
+  ProtocolNodeConfig cfg;
+  cfg.trace_sink = &sink;
+  cfg.handler = [&started, gate](const Message&, HandlerContext&) -> Status {
+    ++started;
+    Coro::await(gate);  // 阻塞到测试释放:一帧"正在运行"的 handler。
+    return Status{};
+  };
+
+  auto node = MakeClientNode(port, std::move(cfg));
+  ASSERT_TRUE(node->Start());
+
+  QTcpSocket* accepted1 = AcceptNext(server, 4000);
+  ASSERT_NE(accepted1, nullptr);
+  auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
+  ASSERT_TRUE(server_txp1->Start());
+
+  constexpr int kBusinessFrames = 4;
+  for (int i = 0; i < kBusinessFrames; ++i) {
+    Message biz;
+    biz.frm_type = FrameType::kState;
+    biz.message_id = static_cast<std::uint16_t>(0x0040 + i);
+    biz.payload = {static_cast<std::uint8_t>(i)};
+    ServerSend(*server_txp1, biz);
+  }
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return started == 1; }, 3000));
+  pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队。
+
+  accepted1->abort();
+  ASSERT_TRUE(pumpFiberUntil(
+      [&] { return node->GenerationIsolationDropCount() >= 1; }, 4000));
+  EXPECT_EQ(node->GenerationIsolationDropCount(),
+           static_cast<std::size_t>(kBusinessFrames - 1));
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), static_cast<std::size_t>(kBusinessFrames - 1));
+  for (const auto& rec : records) {
+    EXPECT_EQ(rec.category, "drop");
+    EXPECT_EQ(rec.message, DropReasonName(DropReason::kGenerationIsolationDrop));
+  }
+
+  gate->resolve();
+  gate->close();
 
   ASSERT_TRUE(node->Close());
   EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));

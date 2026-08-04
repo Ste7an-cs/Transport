@@ -22,15 +22,20 @@
 #include <gtest/gtest.h>
 
 #include "coro_test_util.hpp"
+#include "transport/core/DropReason.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/io/dds/FakeDdsProvider.hpp"
 #include "transport/io/dds/IDdsProvider.hpp"
 
 using namespace std::chrono_literals;
+using transport::CapturingTraceSink;
 using transport::Datagram;
 using transport::DdsConfig;
 using transport::DdsTransport;
+using transport::DropReason;
+using transport::DropReasonName;
 using transport::Endpoint;
 using transport::FakeDdsProvider;
 using transport::OperationOptions;
@@ -58,10 +63,11 @@ struct Fixture {
 
   std::unique_ptr<DdsTransport> MakeRx(std::vector<std::string> topics,
                                        std::size_t max_samples = DdsTransport::kDefaultMaxSamples,
-                                       std::size_t max_bytes = DdsTransport::kDefaultMaxBytes) {
+                                       std::size_t max_bytes = DdsTransport::kDefaultMaxBytes,
+                                       transport::ITraceSink* trace_sink = nullptr) {
     return std::make_unique<DdsTransport>(std::make_unique<FakeDdsProvider>(bus),
                                           Cfg(), std::move(topics), max_samples,
-                                          max_bytes);
+                                          max_bytes, trace_sink);
   }
   Fixture() { (void)tx.Init(Cfg()); }
 };
@@ -148,6 +154,43 @@ TEST(DdsTransport, HandoffFullTailDropsAndCountsWithoutBlockingListener) {
     ASSERT_TRUE(static_cast<bool>(dg));
     EXPECT_EQ(Dec(dg.value().bytes), i);
   }
+}
+
+// P5-3(issue #88):kDdsHandoffOverflow 定义点在 BoundedQueue::Push 内(交接边界经
+// DdsTransport 构造函数透传可选 trace_sink)——配置 trace_sink 时,交接满 tail-drop
+// 应逐条产生可辨识的 TraceEvent,且 DdsHandoffOverflowCount()(代理
+// BoundedQueue::DroppedCount())不变。
+TEST(DdsTransport, HandoffOverflowWithSinkEmitsDropTraceForEachDrop) {
+  Fixture f;
+  CapturingTraceSink sink;
+  auto rx = f.MakeRx({"t"}, /*max_samples=*/3,
+                     /*max_bytes=*/DdsTransport::kDefaultMaxBytes, &sink);
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", Enc(i))));
+  }
+  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 7u);
+
+  const auto records = sink.Records();
+  ASSERT_EQ(records.size(), 7u);  // 逐条归因:7 次 tail-drop → 7 条 TraceEvent。
+  for (const auto& rec : records) {
+    EXPECT_EQ(rec.category, "drop");
+    EXPECT_EQ(rec.message, DropReasonName(DropReason::kDdsHandoffOverflow));
+  }
+}
+
+// RT_TRACE_002:未配置 trace_sink(默认 nullptr)时,交接满 tail-drop 计数不受影响
+// (行为与既有 HandoffFullTailDropsAndCountsWithoutBlockingListener 一致,不重复断言细节)。
+TEST(DdsTransport, HandoffOverflowNoSinkConfiguredCountUnaffected) {
+  Fixture f;
+  auto rx = f.MakeRx({"t"}, /*max_samples=*/3);  // trace_sink 缺省 nullptr。
+  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", Enc(i))));
+  }
+  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 2u);
 }
 
 TEST(DdsTransport, WritePublishesToDestinationTopic) {

@@ -33,6 +33,7 @@
 #include "transport/io/IConnectionObservable.hpp"
 #include "transport/codec/ICodec.hpp"
 #include "transport/io/ITransport.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
@@ -123,6 +124,9 @@ struct ProtocolNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
+  /// 可选 Trace 出口(P5-3,ADR-0003 D13);非拥有,可为 nullptr(RT_TRACE_002:未配置
+  /// 不改变任何控制流/字节流/错误结果/计数)。传给 NodeRuntime 业务队列与本类各丢弃归因点。
+  ITraceSink* trace_sink = nullptr;
 };
 
 /**
@@ -223,6 +227,11 @@ class ProtocolNode {
   ///        reactor 时非零)。区别于 Close 的 close_drop(终态)。
   [[nodiscard]] std::size_t GenerationIsolationDropCount() const;
 
+  /// @brief 观测:读循环单次 `codec_->Decode` 调用返回错误(坏帧 / codec 语义错误,该次
+  ///        收到的整段字节判为不可解析而整体丢弃)的累计次数(P5-3,ADR-0003 D13;命名
+  ///        归因 kBadFrame)。
+  [[nodiscard]] std::size_t BadFrameCount() const;
+
  private:
   friend class HandlerContext;
 
@@ -272,6 +281,7 @@ class ProtocolNode {
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
   std::size_t generation_isolation_drop_count_{0};
+  std::size_t bad_frame_count_{0};
 };
 
 }  // namespace transport
