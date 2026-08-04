@@ -142,16 +142,20 @@ Result<Datagram> DdsTransport::Read(OperationOptions options) {
   }
 
   // 出队交接边界:空则 fiber 协作 await,被 listener 线程 Push 或 Close 唤醒。错误类别
-  // (kClosed/kTimeout/kCancelled)由 BoundedQueue 直接透传;DDS 没有 TCP 那样的
-  // socket 级错误分层,故 Pop 失败(含 kTimeout/kClosed/kCancelled)一律计入
-  // LastError——这是本介质唯一的操作失败事实来源(ADR-0003 D13)。
+  // (kClosed/kTimeout/kCancelled)由 BoundedQueue 直接透传。kTimeout(无数据到达)/
+  // kClosed(我方主动关闭)/kCancelled(调用方取消)是正常操作结果,不是故障事实,
+  // 不计入 LastError——同 TCP/UDP/Serial 惯例,保持 LastError 作为"真故障"信号,
+  // 不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
   Result<Sample> sample = state->handoff.Pop(std::move(options));
   if (!sample) {
-    {
+    const auto error = sample.error();
+    if (error != make_error_code(TransportErrc::kTimeout) &&
+        error != make_error_code(TransportErrc::kClosed) &&
+        error != make_error_code(TransportErrc::kCancelled)) {
       std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_error = sample.error();
+      state->last_error = error;
     }
-    return sample.error();
+    return error;
   }
   Datagram datagram;
   datagram.bytes = std::move(sample.value().bytes);

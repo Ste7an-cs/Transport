@@ -334,15 +334,16 @@ TEST(DdsTransport, PublishFailureUpdatesLastErrorWithoutTouchingLastSendTime) {
   EXPECT_FALSE(rx->LastSendTime().has_value());  // 失败不应记为一次成功发送。
 }
 
-TEST(DdsTransport, ReadTimeoutUpdatesLastError) {
+TEST(DdsTransport, ReadTimeoutDoesNotUpdateLastError) {
   Fixture f;
   auto rx = f.MakeRx({"t"});
   ASSERT_TRUE(static_cast<bool>(rx->Start()));
 
-  // 空队列、短 deadline:handoff.Pop 必然超时——DDS 没有 TCP 那样的 socket 错误
-  // 分层,Pop 失败即记 LastError(与 Publish 失败对称,ADR-0003 D13)。
+  // 空队列、短 deadline:handoff.Pop 必然超时。kTimeout 是正常操作结果(无数据
+  // 到达),不是故障事实——同 TCP/UDP/Serial 惯例,不计入 LastError,保持它作为
+  // "真故障"信号不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
   auto dg = rx->Read(Deadline(20ms));
   ASSERT_FALSE(static_cast<bool>(dg));
   EXPECT_EQ(dg.error(), make_error_code(TransportErrc::kTimeout));
-  EXPECT_EQ(rx->LastError(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_FALSE(rx->LastError());
 }
