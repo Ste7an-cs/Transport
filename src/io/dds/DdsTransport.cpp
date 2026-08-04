@@ -32,6 +32,12 @@ struct DdsTransport::State {
   BoundedQueue<Sample> handoff;
   LifecycleState lifecycle{LifecycleState::kCreated};
   SharedCompletion<void> closed;
+
+  // I/O 事实(ADR-0003 D13):Publish 成功记 last_send;出队样本记 last_recv;
+  // Publish/Pop 操作失败记 last_error(RT_NODE_006「所有介质如实报」)。
+  std::optional<Clock::time_point> last_send;
+  std::optional<Clock::time_point> last_recv;
+  std::error_code last_error;
 };
 
 namespace {
@@ -136,14 +142,24 @@ Result<Datagram> DdsTransport::Read(OperationOptions options) {
   }
 
   // 出队交接边界:空则 fiber 协作 await,被 listener 线程 Push 或 Close 唤醒。错误类别
-  // (kClosed/kTimeout/kCancelled)由 BoundedQueue 直接透传。
+  // (kClosed/kTimeout/kCancelled)由 BoundedQueue 直接透传;DDS 没有 TCP 那样的
+  // socket 级错误分层,故 Pop 失败(含 kTimeout/kClosed/kCancelled)一律计入
+  // LastError——这是本介质唯一的操作失败事实来源(ADR-0003 D13)。
   Result<Sample> sample = state->handoff.Pop(std::move(options));
   if (!sample) {
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->last_error = sample.error();
+    }
     return sample.error();
   }
   Datagram datagram;
   datagram.bytes = std::move(sample.value().bytes);
   datagram.source = Endpoint::Topic(std::move(sample.value().topic));
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->last_recv = Clock::now();
+  }
   return Result<Datagram>{std::move(datagram)};
 }
 
@@ -161,14 +177,24 @@ Status DdsTransport::Write(SendUnit unit) {
     provider = state->provider.get();
   }
   // 统一寻址:DDS 每条消息经 destination.topic 发往不同 topic;非 topic 目的地
-  // (kDefault/kNet)对 DDS 无意义 → kInvalidArgument。
+  // (kDefault/kNet)对 DDS 无意义 → kInvalidArgument(调用契约错误,不算一次
+  // Publish 尝试,不计入 LastError,同 UdpTransport 对早期寻址校验的处理)。
   if (unit.destination.kind != Endpoint::Kind::kTopic) {
     return make_error_code(TransportErrc::kInvalidArgument);
   }
   if (!provider) {
     return make_error_code(TransportErrc::kInvalidState);
   }
-  return provider->Publish(unit.destination.topic, unit.bytes);
+  Status result = provider->Publish(unit.destination.topic, unit.bytes);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (result) {
+      state->last_send = Clock::now();
+    } else {
+      state->last_error = result.error();
+    }
+  }
+  return result;
 }
 
 Status DdsTransport::RequestClose() {
@@ -188,6 +214,23 @@ Status DdsTransport::WaitClosed(OperationOptions options) {
 
 std::size_t DdsTransport::DdsHandoffOverflowCount() const {
   return state_->handoff.DroppedCount();
+}
+
+std::optional<DdsTransport::Clock::time_point> DdsTransport::LastSendTime()
+    const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->last_send;
+}
+
+std::optional<DdsTransport::Clock::time_point>
+DdsTransport::LastReceiveTime() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->last_recv;
+}
+
+std::error_code DdsTransport::LastError() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->last_error;
 }
 
 }  // namespace transport

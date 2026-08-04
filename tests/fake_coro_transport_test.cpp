@@ -446,6 +446,55 @@ TEST(CoroFakeTransport, RequestCloseAndWaitClosedAreIdempotent) {
   EXPECT_TRUE(fake.RequestClose());
 }
 
+TEST(CoroFakeTransport, WriteSuccessUpdatesLastSendTimeAndReadSuccessUpdatesLastReceiveTime) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  EXPECT_FALSE(fake.LastSendTime().has_value());
+  EXPECT_FALSE(fake.LastReceiveTime().has_value());
+  EXPECT_FALSE(fake.LastError());
+
+  const auto before_write = OperationOptions::Clock::now();
+  ASSERT_TRUE(fake.Write(SendUnit{{1, 2}, Endpoint::Default()}));
+  const auto after_write = OperationOptions::Clock::now();
+  ASSERT_TRUE(fake.LastSendTime().has_value());
+  EXPECT_GE(*fake.LastSendTime(), before_write);
+  EXPECT_LE(*fake.LastSendTime(), after_write);
+  EXPECT_FALSE(fake.LastReceiveTime().has_value());  // 未收前仍空。
+
+  const auto before_read = OperationOptions::Clock::now();
+  fake.Inject(Datagram{{3, 4}, Endpoint::Default()});
+  const auto received = fake.Read();
+  const auto after_read = OperationOptions::Clock::now();
+  ASSERT_TRUE(received);
+  ASSERT_TRUE(fake.LastReceiveTime().has_value());
+  EXPECT_GE(*fake.LastReceiveTime(), before_read);
+  EXPECT_LE(*fake.LastReceiveTime(), after_read);
+}
+
+TEST(CoroFakeTransport, WriteFailureUpdatesLastErrorWithoutTouchingLastSendTime) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  fake.FailNextWrite(make_error_code(TransportErrc::kIo), false);
+
+  const auto failed = fake.Write(SendUnit{{1}, Endpoint::Default()});
+  ASSERT_FALSE(failed);
+  EXPECT_EQ(fake.LastError(), make_error_code(TransportErrc::kIo));
+  EXPECT_FALSE(fake.LastSendTime().has_value());
+}
+
+TEST(CoroFakeTransport, InjectedReadErrorUpdatesLastError) {
+  FakeCoroTransport fake;
+  ASSERT_TRUE(fake.Start());
+  fake.InjectError(make_error_code(TransportErrc::kConnection));
+
+  OperationOptions no_block;
+  no_block.deadline = OperationOptions::Clock::now() - 1ms;
+  const auto result = fake.Read(no_block);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(fake.LastError(), make_error_code(TransportErrc::kConnection));
+  EXPECT_FALSE(fake.LastReceiveTime().has_value());
+}
+
 TEST(CoroFakeTransport, DestructionWakesAnActiveReadWithoutUsingObjectStorage) {
   auto fake = std::make_unique<FakeCoroTransport>();
   ASSERT_TRUE(fake->Start());

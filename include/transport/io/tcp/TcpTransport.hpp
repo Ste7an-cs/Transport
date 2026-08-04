@@ -74,11 +74,13 @@ class TcpTransport final : public ITransport {
   /// @brief 当前处于 Write 中的 fiber 数(排队 + 在写);并发时可 >1,反映背压积压。
   [[nodiscard]] std::size_t SendWaiterDepth() const;
   /// @brief 最近一次发送完成的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastSendTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastSendTime()
+      const override;
   /// @brief 最近一次收到字节的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime() const;
+  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime()
+      const override;
   /// @brief 最近一次操作错误(无则默认构造的 error_code)。
-  [[nodiscard]] std::error_code LastError() const;
+  [[nodiscard]] std::error_code LastError() const override;
 
   struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
 
