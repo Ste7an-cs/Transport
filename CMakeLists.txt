@@ -105,6 +105,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/shared_completion_test.cpp
     tests/pending_table_test.cpp
     tests/bounded_queue_test.cpp
+    tests/observability_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_handler_test.cpp
     tests/protocol_node_lifecycle_test.cpp
@@ -138,6 +139,9 @@ if(TRANSPORT_BUILD_TESTS)
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  # 供 observability_test.cpp 的协议无关自审读取 core/ 头文件源码文本核验(而非硬编码 grep)。
+  target_compile_definitions(transport_tests PRIVATE
+    TRANSPORT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(transport_tests PRIVATE transport asynctask GTest::gtest Qt5::Core Qt5::Network util)
   add_test(NAME transport_tests COMMAND transport_tests)
 endif()
