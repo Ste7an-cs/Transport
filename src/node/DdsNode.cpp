@@ -19,7 +19,8 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       config_(std::move(config)),
       // 关联表:correlation_id 无天然容量语义(≠ session_id 的 uint8 硬顶)→ 纯计数无限
       // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
-      pending_(),
+      // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      pending_(/*max_pending=*/0, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它字段);
       // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。trace_sink
       // 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的 close_drop 批量
@@ -104,7 +105,14 @@ Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
   SendUnit unit;
   unit.bytes = std::move(encoded).value();
   unit.destination = std::move(dest);
-  return transport_->Write(std::move(unit));
+  const std::size_t sent_bytes = unit.bytes.size();
+  auto written = transport_->Write(std::move(unit));
+  if (written) {
+    // Write 完成边界(P5-4):Request/Publish/Reply 共用本收口,不逐字节。
+    RecordEvent("send", config_.trace_sink, {}, {}, {}, {},
+                static_cast<long>(sent_bytes));
+  }
+  return written;
 }
 
 Result<Message> DdsNode::Request(Message req, Endpoint target,
@@ -154,10 +162,16 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
     RecordDrop(DropReason::kBadFrame, bad_frame_count_, config_.trace_sink);
     return;
   }
+  // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
+  RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
+              static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
     msg.source = datagram.source.topic;
     msg.topic = datagram.source.topic;
+    // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
+    RecordEvent("recv", config_.trace_sink, {}, {}, msg.source, {},
+                static_cast<long>(msg.payload.size()));
     Dispatch(std::move(msg));
   }
 }
@@ -212,6 +226,18 @@ std::size_t DdsNode::CloseDropCount() const { return runtime_.CloseDropCount(); 
 std::size_t DdsNode::BadFrameCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return bad_frame_count_;
+}
+
+DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
+  return pending_.LastRequestLatency();
+}
+
+DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
+  return runtime_.LastHandlerDuration();
+}
+
+DdsNode::Clock::duration DdsNode::LastCloseLatency() const {
+  return runtime_.LastCloseLatency();
 }
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————

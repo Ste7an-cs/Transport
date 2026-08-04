@@ -60,6 +60,20 @@ using transport::make_error_code;
 
 namespace {
 
+// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
+// decode/handler/close 等事件(共用同一 trace_sink),按 category 过滤才是"这次丢弃
+// 恰好一条 Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
+std::vector<CapturingTraceSink::Record> DropRecords(
+    const std::vector<CapturingTraceSink::Record>& records) {
+  std::vector<CapturingTraceSink::Record> out;
+  for (const auto& rec : records) {
+    if (rec.category == "drop") {
+      out.push_back(rec);
+    }
+  }
+  return out;
+}
+
 DdsConfig Cfg() {
   DdsConfig c;
   c.domain_id = 0;
@@ -366,7 +380,7 @@ TEST(DdsNode, UnmatchedReplyWithSinkEmitsDropTrace) {
   c.InjectRaw("cli_inbox", MessageKind::kReply, "cli:999", "", {0xEE});
   ASSERT_TRUE(pumpFiberUntil([&] { return client->UnmatchedReplyCount() == 1u; }));
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message,
@@ -390,7 +404,7 @@ TEST(DdsNode, DroppedNoHandlerWithSinkEmitsDropTrace) {
   c.InjectRaw("news", MessageKind::kNotify, "", "", {0xAB});
   ASSERT_TRUE(pumpFiberUntil([&] { return subscriber->DroppedNoHandlerCount() == 1u; }));
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message, DropReasonName(DropReason::kNoHandlerConfigured));
@@ -417,7 +431,7 @@ TEST(DdsNode, BadFrameDecodeFailureCountedAndTraced) {
   ASSERT_TRUE(pumpFiberUntil([&] { return node->BadFrameCount() == 1u; }));
   EXPECT_EQ(node->BadFrameCount(), 1u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message, DropReasonName(DropReason::kBadFrame));
@@ -455,7 +469,7 @@ TEST(DdsNode, BusinessQueueOverflowWithSinkEmitsDropTrace) {
       pumpFiberUntil([&] { return subscriber->BusinessQueueOverflowCount() == 2u; }));
   EXPECT_EQ(subscriber->BusinessQueueOverflowCount(), 2u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 2u);
   for (const auto& rec : records) {
     EXPECT_EQ(rec.category, "drop");
@@ -496,7 +510,7 @@ TEST(DdsNode, CloseDropWithSinkEmitsTraceEvents) {
   EXPECT_TRUE(static_cast<bool>(subscriber->WaitClosed()));
   EXPECT_EQ(subscriber->CloseDropCount(), 2u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 2u);
   for (const auto& rec : records) {
     EXPECT_EQ(rec.category, "drop");

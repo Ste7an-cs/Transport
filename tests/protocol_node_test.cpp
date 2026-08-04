@@ -48,6 +48,20 @@ using transport::make_error_code;
 
 namespace {
 
+// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
+// decode/close 等事件(共用同一 trace_sink),按 category 过滤才是"这次丢弃恰好一条
+// Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
+std::vector<CapturingTraceSink::Record> DropRecords(
+    const std::vector<CapturingTraceSink::Record>& records) {
+  std::vector<CapturingTraceSink::Record> out;
+  for (const auto& rec : records) {
+    if (rec.category == "drop") {
+      out.push_back(rec);
+    }
+  }
+  return out;
+}
+
 // 构造一个响应帧 Datagram:用独立 SystemCodec 把响应 Message 编成字节。
 Datagram MakeResponseDatagram(std::uint8_t session_id, std::uint16_t message_id,
                               std::vector<std::uint8_t> payload,
@@ -290,7 +304,7 @@ TEST(ProtocolNode, UnmatchedResponseWithSinkEmitsDropTrace) {
   ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
   EXPECT_EQ(node.UnmatchedResponseCount(), 1u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message,
@@ -313,7 +327,7 @@ TEST(ProtocolNode, DroppedNoHandlerWithSinkEmitsDropTrace) {
   fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
   ASSERT_TRUE(pumpFiberUntil([&] { return node.DroppedNoHandlerCount() == 1u; }));
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message, DropReasonName(DropReason::kNoHandlerConfigured));
@@ -341,7 +355,7 @@ TEST(ProtocolNode, BadFrameDecodeFailureCountedAndTraced) {
   ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 1u; }));
   EXPECT_EQ(node.BadFrameCount(), 1u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), 1u);
   EXPECT_EQ(records.front().category, "drop");
   EXPECT_EQ(records.front().message, DropReasonName(DropReason::kBadFrame));
@@ -351,7 +365,7 @@ TEST(ProtocolNode, BadFrameDecodeFailureCountedAndTraced) {
   garbage2.bytes = {0x01};
   fake->Inject(std::move(garbage2));
   ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 2u; }));
-  EXPECT_EQ(sink.Records().size(), 2u);
+  EXPECT_EQ(DropRecords(sink.Records()).size(), 2u);
 
   node.Close();
 }

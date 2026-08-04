@@ -53,6 +53,20 @@ using transport::make_error_code;
 
 namespace {
 
+// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
+// decode/handler/close 等事件(共用同一 trace_sink),按 category 过滤才是"这次丢弃
+// 恰好一条 Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
+std::vector<CapturingTraceSink::Record> DropRecords(
+    const std::vector<CapturingTraceSink::Record>& records) {
+  std::vector<CapturingTraceSink::Record> out;
+  for (const auto& rec : records) {
+    if (rec.category == "drop") {
+      out.push_back(rec);
+    }
+  }
+  return out;
+}
+
 // 构造一个业务帧 Datagram(非 kResponse/kResult):经 SystemCodec 编成字节喂读循环。
 Datagram MakeBusinessDatagram(FrameType frm_type, std::uint8_t session_id,
                               std::uint16_t message_id,
@@ -302,7 +316,7 @@ TEST(ProtocolNodeHandler, QueueOverflowWithSinkEmitsDropTraceForEachDrop) {
   ASSERT_TRUE(pumpFiberUntil([&] { return node.BusinessQueueOverflowCount() == 2u; }));
   EXPECT_EQ(node.BusinessQueueOverflowCount(), 2u);
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   // 每次 tail-drop 恰好一条 Trace(RecordDrop 与 DroppedCount 同一临界区同步 +1)。
   ASSERT_EQ(records.size(), 2u);
   for (const auto& rec : records) {

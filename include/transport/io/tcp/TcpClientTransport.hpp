@@ -109,6 +109,10 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
   [[nodiscard]] std::optional<Clock::time_point> NextAttemptTime()
       const override;
 
+  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
+  ///        关闭完成时为 0。
+  [[nodiscard]] Clock::duration LastCloseLatency() const;
+
   // -- I/O 事实 getter(委托当前代际内层;无内层则空)--
 
   /// @brief 当前处于 Write 中的 fiber 数(委托内层)。

@@ -14,15 +14,19 @@
  * await 只出现在 Handle::Wait 的挂起点。
  */
 
+#include <chrono>
 #include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
 
 #include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
+#include "transport/core/Observability.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/SharedCompletion.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -39,17 +43,24 @@ namespace transport {
  */
 template <typename Key, typename T>
 class PendingTable {
+ public:
+  using Clock = OperationOptions::Clock;
+
  private:
-  /// 单个在途 entry:仅含其值信箱。以 shared_ptr 存,身份用于摘除时的精确匹配。
+  /// 单个在途 entry:值信箱 + 登记时刻(供终结时计请求时延,P5-4)。
   struct Entry {
     SharedCompletion<T> completion;
+    Clock::time_point registered_at{};
   };
 
-  /// 表的共享状态:map + closed latch,由一把 mutex 守。Handle 与表共享它。
+  /// 表的共享状态:map + closed latch + 可选 Trace 出口 + 最近请求时延,由一把 mutex 守。
+  /// Handle 与表共享它。
   struct Shared {
     std::mutex mutex;
     std::map<Key, std::shared_ptr<Entry>> entries;
     bool closed{false};
+    ITraceSink* sink{nullptr};             ///< 可选 Trace 出口(P5-4);为空则 RT_TRACE_002。
+    Clock::duration last_request_latency{};  ///< 最近一次终结请求的时延(简单存最近值)。
   };
 
  public:
@@ -110,6 +121,32 @@ class PendingTable {
           outcome = entry_->completion.Wait();
         }
       }
+      // 终结点(P5-4,RT_DATA_BUFFER 请求时延):记 Register→本次终结耗时(简单存最近值,
+      // 分布分析留 P6)+ 按结果分类 Trace——match(成功)/timeout/cancel 三类
+      // (RT_REQUEST_003 四类终结之二 + 成功一类);第四类 FailAll(kConnection/kClosed)
+      // 不在本三类之列,不发 Trace,但仍计入时延。
+      const Clock::duration latency = Clock::now() - entry_->registered_at;
+      ITraceSink* sink = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(shared_->mutex);
+        shared_->last_request_latency = latency;
+        sink = shared_->sink;
+      }
+      std::string_view category;
+      if (outcome) {
+        category = "match";
+      } else if (outcome.error() == make_error_code(TransportErrc::kTimeout)) {
+        category = "timeout";
+      } else if (outcome.error() == make_error_code(TransportErrc::kCancelled)) {
+        category = "cancel";
+      }
+      if (!category.empty()) {
+        RecordEvent(category, sink, /*message=*/{}, /*key=*/{}, /*endpoint=*/{},
+                    /*error=*/{},
+                    static_cast<long>(std::chrono::duration_cast<
+                                       std::chrono::microseconds>(latency)
+                                           .count()));
+      }
       Evict();
       finalized_ = true;
       return outcome;
@@ -152,9 +189,13 @@ class PendingTable {
    *                    >0 时 Register 在 Size() 已达上限时返 kResourceExhausted。此上限只
    *                    数 entry、不碰键语义,协议特有的容量语义(如 session_id 空间)由
    *                    调用方 node 另行内联(ADR-0003 D10)。
+   * @param sink        可选 Trace 出口(P5-4);为空则 `Handle::Wait` 终结点的
+   *                    `RecordEvent` 仅一次判空(RT_TRACE_002)。
    */
-  explicit PendingTable(std::size_t max_pending = 0)
-      : shared_(std::make_shared<Shared>()), max_pending_(max_pending) {}
+  explicit PendingTable(std::size_t max_pending = 0, ITraceSink* sink = nullptr)
+      : shared_(std::make_shared<Shared>()), max_pending_(max_pending) {
+    shared_->sink = sink;
+  }
 
   /**
    * @brief 唯一登记一个在途请求。
@@ -176,6 +217,7 @@ class PendingTable {
       return make_error_code(TransportErrc::kInvalidState);
     }
     auto entry = std::make_shared<Entry>();
+    entry->registered_at = Clock::now();
     shared_->entries.emplace(key, entry);
     return Handle(shared_, key, std::move(entry));
   }
@@ -247,6 +289,13 @@ class PendingTable {
   [[nodiscard]] std::size_t Size() const {
     std::lock_guard<std::mutex> lock(shared_->mutex);
     return shared_->entries.size();
+  }
+
+  /// @brief 观测:最近一次终结请求的时延(Register→终结,P5-4,RT_DATA_BUFFER)。尚无
+  ///        已终结请求时为 0。简单存最近值(非直方图,分布分析留 P6)。
+  [[nodiscard]] Clock::duration LastRequestLatency() const {
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return shared_->last_request_latency;
   }
 
  private:

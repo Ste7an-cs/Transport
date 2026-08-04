@@ -70,6 +70,20 @@ using Clock = OperationOptions::Clock;
 
 namespace {
 
+// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
+// decode/handler/close/reconnect 等事件(共用同一 trace_sink),按 category 过滤才是
+// "这次丢弃恰好一条 Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
+std::vector<CapturingTraceSink::Record> DropRecords(
+    const std::vector<CapturingTraceSink::Record>& records) {
+  std::vector<CapturingTraceSink::Record> out;
+  for (const auto& rec : records) {
+    if (rec.category == "drop") {
+      out.push_back(rec);
+    }
+  }
+  return out;
+}
+
 // 小值确定化配置:短连接超时、小退避、关抖动 → 断连后毫秒级自动重连。
 TcpClientConfig FastClientConfig(quint16 port) {
   TcpClientConfig cfg;
@@ -372,7 +386,7 @@ TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDropWithSinkEmitsTraceEve
   EXPECT_EQ(node->GenerationIsolationDropCount(),
            static_cast<std::size_t>(kBusinessFrames - 1));
 
-  const auto records = sink.Records();
+  const auto records = DropRecords(sink.Records());
   ASSERT_EQ(records.size(), static_cast<std::size_t>(kBusinessFrames - 1));
   for (const auto& rec : records) {
     EXPECT_EQ(rec.category, "drop");

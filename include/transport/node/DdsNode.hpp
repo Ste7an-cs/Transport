@@ -33,6 +33,7 @@
 #include "transport/core/Cancellation.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/codec/ICodec.hpp"
+#include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
@@ -107,8 +108,11 @@ struct DdsNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
-  /// 可选 Trace 出口(P5-3,ADR-0003 D13);非拥有,可为 nullptr(RT_TRACE_002:未配置
-  /// 不改变任何控制流/字节流/错误结果/计数)。传给 NodeRuntime 业务队列与本类各丢弃归因点。
+  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeRuntime
+  /// 业务队列与本类各丢弃归因点(kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured),
+  /// 并在 send/recv/decode/match/timeout/cancel/handler/close 等边界点上报事件。
+  /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,`RecordEvent`/`RecordDrop`
+  /// 仅一次判空。
   ITraceSink* trace_sink = nullptr;
 };
 
@@ -121,6 +125,8 @@ struct DdsNodeConfig {
  */
 class DdsNode {
  public:
+  using Clock = OperationOptions::Clock;
+
   DdsNode(std::unique_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
           DdsNodeConfig config);
   ~DdsNode();
@@ -200,6 +206,18 @@ class DdsNode {
   /// @brief 观测:读循环 `codec_->Decode` 失败(坏 sample / codec 语义错误)而丢弃的累计
   ///        次数(P5-3,ADR-0003 D13;命名归因 kBadFrame)。
   [[nodiscard]] std::size_t BadFrameCount() const;
+
+  /// @brief 观测:最近一次 Request 从 Register 到终结的时延(P5-4,RT_DATA_BUFFER)。尚无
+  ///        已终结请求时为 0。
+  [[nodiscard]] Clock::duration LastRequestLatency() const;
+
+  /// @brief 观测:最近一次 handler 单次调用的处理时长(P5-4,RT_DATA_BUFFER)。尚无已
+  ///        完成调用时为 0。
+  [[nodiscard]] Clock::duration LastHandlerDuration() const;
+
+  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
+  ///        关闭完成时为 0。
+  [[nodiscard]] Clock::duration LastCloseLatency() const;
 
  private:
   friend class DdsHandlerContext;
