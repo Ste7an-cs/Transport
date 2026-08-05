@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### 清理:P6 前置清理 —— 请求-响应链路评审整改(#98)
+> 来源:ProtocolNode 请求-响应实现评审(2026-08-04)。全部为内部工程质量整改,公开 API 不变;唯一线缆可见变化是 Trace 生命周期类别改名与 noresponse `Send` 盖章取值。
+- **变更** Trace 类别常量集中收口 `include/transport/core/TraceCategories.hpp`(单一权威,发射点不再散落字符串字面量);生命周期类别 **`"close"` 改名 `"lifecycle"`**("running" 挂在 "close" 下是命名误导;消费方按类别过滤需同步)。同步 SDD §6 / ADR-0003 D13 九类清单。
+- **变更** `ProtocolNode::Send`(noresponse)session_id 改为**只读空闲集尾部盖帧**(不出队):不再搅动 Request 的 FIFO 退休窗口(RT_REQUEST_005 迟到误配防护不被高频 Send 削弱);256 全在途仍拒绝(既定边界策略不变)。新增回归测试 `NoresponseSendDoesNotDisturbSessionFifoOrBudget`。
+- **变更** `ITraceSink` 契约硬化:`OnTrace` 可能在库内锁临界区内被调——写明必须快速返回、不得阻塞、**不得回调本库任何 API**(否则同锁重入死锁)。
+- **修复** `NodeRuntime` `has_handler_` 读写挪进锁内(消除对 bring-up 无挂起点时序的隐式依赖);`ProtocolNode::Request` 的 session 归还改 RAII `SessionLease`(任一提前返回不再依赖手工 `ReleaseSession` 纪律)。
+- **清理** `NodeRuntime::Close` 两分支重复收敛段提取 `ConvergeToClosed()`;删 `PendingTable::Handle::finalized_` 死成员;去重头文件 include;`max_pending=256` 双重限流补"仅防自定义键策略绕过 session 预算"注释。
+
 ## [0.4.5] - 2026-08-04
 
 > **P5 观测 + 完整性归因里程碑**——可插拔结构化 Trace(push)+ 命名计数(pull)双面观测,7 类 `DropReason` 经唯一 `RecordDrop` 归因点使"无静默丢失"成为结构性可断言(`Σ命名=总丢弃`),I/O 事实统一为 base `ITransport` 强制接口。全量测试 220→270 全绿;详见 SDD §4 P5 / §7 追溯矩阵、#86–#90。（本版一并含 #81 的 UDP 无缝切换验证与 Default 寻址修复。）

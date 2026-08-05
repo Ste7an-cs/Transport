@@ -29,6 +29,7 @@ using transport::FrameType;
 using transport::Message;
 using transport::ProtocolNode;
 using transport::Result;
+using transport::Status;
 using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -215,6 +216,54 @@ TEST(ProtocolNodeCapacity, SessionIdReuseIsFifoForMaxRetirementWindow) {
     EXPECT_EQ(sent.session_id, expected) << "第 " << int(expected) << " 轮 session_id";
     fake->Inject(MakeMatchingResponse(sent));
     ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
+    EXPECT_TRUE(req.get());
+  }
+
+  node.Close();
+}
+
+// #98:noresponse Send 只读空闲集尾部(最新释放者)盖帧、不出队——不扰动 Request 的
+// FIFO 退休窗口(RT_REQUEST_005),也不占 256 在途预算。每轮 Request 前穿插一条 Send:
+// Request 的 session 序仍为 0,1,2(若 Send 仍借道 pop/push,序会被搅乱);Send 盖的
+// id 依次为 255(初始尾部)、0、1(上一轮 Request 释放的最新者)。
+TEST(ProtocolNodeCapacity, NoresponseSendDoesNotDisturbSessionFifoOrBudget) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
+  ASSERT_TRUE(node.Start());
+
+  const std::uint8_t expect_send_id[] = {255, 0, 1};  // 各轮空闲集尾部。
+  std::size_t frames = 0;  // fake->sent() 游标(Send 帧与 Request 帧交错)。
+  for (std::uint8_t expected = 0; expected < 3; ++expected) {
+    // 穿插 noresponse Send:盖空闲集尾部 id,不出队。
+    Status send_result = make_error_code(TransportErrc::kInternal);
+    bool sent_done = false;
+    auto sender = Coro::makeTask([&] {
+      send_result = node.Send(MakeRequest(0x0033));
+      sent_done = true;
+    });
+    ASSERT_TRUE(pumpFiberUntil([&] { return sent_done; }));
+    ASSERT_TRUE(send_result);
+    ASSERT_TRUE(pumpFiberUntil([&] { return fake->sent().size() == frames + 1; }));
+    Message oneway = DecodeSent(fake->sent().at(frames).bytes);
+    EXPECT_EQ(oneway.session_id, expect_send_id[expected])
+        << "第 " << int(expected) << " 轮 Send 应盖空闲集尾部";
+    ++frames;
+    EXPECT_TRUE(sender.get());
+
+    // Request:FIFO 序不被穿插的 Send 扰动,仍依次取 0/1/2。
+    bool done = false;
+    auto req = Coro::makeTask([&] {
+      (void)node.Request(MakeRequest(0x0002));
+      done = true;
+    });
+    ASSERT_TRUE(pumpFiberUntil([&] { return fake->sent().size() == frames + 1; }));
+    Message sent = DecodeSent(fake->sent().at(frames).bytes);
+    EXPECT_EQ(sent.session_id, expected)
+        << "Send 穿插后第 " << int(expected) << " 轮 Request session_id";
+    fake->Inject(MakeMatchingResponse(sent));
+    ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
+    ++frames;
     EXPECT_TRUE(req.get());
   }
 

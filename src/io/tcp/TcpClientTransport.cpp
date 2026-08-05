@@ -25,6 +25,7 @@
 #include "transport/core/Error.hpp"
 #include "transport/core/Observability.hpp"
 #include "transport/core/SharedCompletion.hpp"
+#include "transport/core/TraceCategories.hpp"
 #include "transport/io/tcp/TcpTransport.hpp"
 
 namespace transport {
@@ -126,7 +127,7 @@ void NotifyWaiters(const StatePtr& s) {
 
 // 记录状态并广播跃迁;同态则无副作用(避免把 loop 中重复的 Connecting 报为跃迁)。
 // "connect" 类别 Trace(P5-4):Connecting/Connected/Reconnecting 三态跃迁边界点上报;
-// 终态 Disconnected 归"close"类别(生命周期终态,非连接管理态),此处不重复。
+// 终态 Disconnected 归 "lifecycle" 类别(生命周期终态,非连接管理态),此处不重复。
 void SetConnectionState(const StatePtr& s, ConnectionState next) {
   ITraceSink* sink = nullptr;
   {
@@ -138,7 +139,7 @@ void SetConnectionState(const StatePtr& s, ConnectionState next) {
     sink = s->config.trace_sink;
   }
   if (next != ConnectionState::kDisconnected) {
-    RecordEvent("connect", sink, ConnectionStateName(next));
+    RecordEvent(kTraceCategoryConnect, sink, ConnectionStateName(next));
   }
   NotifyWaiters(s);
 }
@@ -289,7 +290,7 @@ void RunConnectLoop(StatePtr s) {
         s->last_failure = ClassifyConnectFailure(r.error());
       }
       // "reconnect" 类别 Trace(P5-4):本次 connect 尝试失败(每次尝试成功/失败均上报)。
-      RecordEvent("reconnect", sink, "attempt-failed", {}, endpoint,
+      RecordEvent(kTraceCategoryReconnect, sink, "attempt-failed", {}, endpoint,
                   r.error().message(), kNoNum, static_cast<int>(attempt_no));
       // 端点热更新(掐断本次 Connecting)→ 立即以新端点重试,不先等退避。
       if (ConsumeEndpointReconfig(s)) {
@@ -317,7 +318,7 @@ void RunConnectLoop(StatePtr s) {
         s->last_failure = make_error_code(TransportErrc::kInternal);
       }
       // "reconnect" 类别 Trace(P5-4):物理连接成功但内层启动失败,仍归本次尝试失败。
-      RecordEvent("reconnect", sink, "start-failed", {}, endpoint,
+      RecordEvent(kTraceCategoryReconnect, sink, "start-failed", {}, endpoint,
                   started.error().message(), kNoNum, static_cast<int>(attempt_no));
       if (!BackoffWait(s)) {
         break;
@@ -332,10 +333,11 @@ void RunConnectLoop(StatePtr s) {
       new_generation = s->generation;
     }
     // "generation" 类别 Trace(P5-4):新代际建立,与 connect 成功同点;size 载新代际号。
-    RecordEvent("generation", sink, {}, {}, endpoint, {},
+    RecordEvent(kTraceCategoryGeneration, sink, {}, {}, endpoint, {},
                 static_cast<long>(new_generation));
     // "reconnect" 类别 Trace(P5-4):本次 connect 尝试成功。
-    RecordEvent("reconnect", sink, "attempt-succeeded", {}, endpoint, {}, kNoNum,
+    RecordEvent(kTraceCategoryReconnect, sink, "attempt-succeeded", {}, endpoint,
+                {}, kNoNum,
                 static_cast<int>(attempt_no));
     const auto connected_at = Clock::now();
     SetConnectionState(s, ConnectionState::kConnected);
@@ -381,8 +383,8 @@ void RunConnectLoop(StatePtr s) {
     }
     closing_sink = s->config.trace_sink;
   }
-  // "close" 类别 Trace(P5-4):生命周期终态 Closed;size 载关闭时延(微秒)。
-  RecordEvent("close", closing_sink, "closed", {}, {}, {},
+  // "lifecycle" 类别 Trace(P5-4,#98 改名):生命周期终态 Closed;size 载关闭时延(微秒)。
+  RecordEvent(kTraceCategoryLifecycle, closing_sink, "closed", {}, {}, {},
               static_cast<long>(
                   std::chrono::duration_cast<std::chrono::microseconds>(
                       close_latency)
@@ -456,8 +458,8 @@ Status TcpClientTransport::Start() {
     state_->conn = ConnectionState::kConnecting;  // 立即进 Connecting(不等首次连上)。
     sink = state_->config.trace_sink;
   }
-  // "close" 类别 Trace(P5-4):生命周期跃迁 Created→Running。
-  RecordEvent("close", sink, "running");
+  // "lifecycle" 类别 Trace(P5-4,#98 改名):生命周期跃迁 Created→Running。
+  RecordEvent(kTraceCategoryLifecycle, sink, "running");
   auto s = state_;
   state_->loop_task = std::make_shared<Coro::FiberTask<void>>(
       Coro::makeTask([s] { RunConnectLoop(s); }));
@@ -572,8 +574,9 @@ Status TcpClientTransport::RequestClose() {
     backoff_gate = state_->backoff_gate;
     inner = state_->inner;
   }
-  // "close" 类别 Trace(P5-4):生命周期跃迁 Running→Closing(从未 Start 则直落 Closed)。
-  RecordEvent("close", sink, never_started ? "closed" : "closing");
+  // "lifecycle" 类别 Trace(P5-4,#98 改名):生命周期跃迁 Running→Closing(从未 Start
+  // 则直落 Closed)。
+  RecordEvent(kTraceCategoryLifecycle, sink, never_started ? "closed" : "closing");
   // 掐断当前尝试的各相位:abort 连接中 socket、唤醒退避等待、关闭当前内层。
   if (connecting) {
     connecting->abort();

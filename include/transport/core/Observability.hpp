@@ -18,6 +18,7 @@
 
 #include "transport/core/DropReason.hpp"
 #include "transport/core/ITraceSink.hpp"
+#include "transport/core/TraceCategories.hpp"
 
 namespace transport {
 
@@ -28,6 +29,8 @@ namespace transport {
 /// 若 `sink` 非空,额外发送一条 `category = "drop"`、`message = DropReasonName(reason)`
 /// 的 `TraceEvent`。RT_TRACE_002:`sink == nullptr` 时只有一次判空,不构造
 /// `TraceEvent`、不做任何 Trace 相关工作。
+/// 重入警示(#98):调用点常与 `counter` 的保护锁同临界区 → `sink->OnTrace` 可能在库内
+/// 锁内被调——sink 实现须遵 `ITraceSink` 重入契约(快速返回、不回调本库 API)。
 /// @param reason 丢弃归因(见 `DropReason`)。
 /// @param counter 调用方持有的具名计数成员,调用后恰好 +1。
 /// @param sink 可选 Trace 出口,可为 `nullptr`。
@@ -41,7 +44,7 @@ inline void RecordDrop(DropReason reason, std::size_t& counter, ITraceSink* sink
   if (sink == nullptr) return;
   TraceEvent ev{};
   ev.level = level;
-  ev.category = "drop";
+  ev.category = kTraceCategoryDrop;
   ev.message = DropReasonName(reason);
   ev.key = key;
   ev.endpoint = endpoint;

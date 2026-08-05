@@ -29,6 +29,7 @@
 #include "transport/core/Observability.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/SharedCompletion.hpp"
+#include "transport/core/TraceCategories.hpp"
 #include "transport/core/TransportTypes.hpp"
 
 namespace transport {
@@ -78,8 +79,7 @@ class PendingTable {
     Handle(Handle&& other) noexcept
         : shared_(std::move(other.shared_)),
           key_(std::move(other.key_)),
-          entry_(std::move(other.entry_)),
-          finalized_(other.finalized_) {
+          entry_(std::move(other.entry_)) {
       other.entry_.reset();
     }
 
@@ -89,7 +89,6 @@ class PendingTable {
         shared_ = std::move(other.shared_);
         key_ = std::move(other.key_);
         entry_ = std::move(other.entry_);
-        finalized_ = other.finalized_;
         other.entry_.reset();
       }
       return *this;
@@ -134,11 +133,11 @@ class PendingTable {
       }
       std::string_view category;
       if (outcome) {
-        category = "match";
+        category = kTraceCategoryMatch;
       } else if (outcome.error() == make_error_code(TransportErrc::kTimeout)) {
-        category = "timeout";
+        category = kTraceCategoryTimeout;
       } else if (outcome.error() == make_error_code(TransportErrc::kCancelled)) {
-        category = "cancel";
+        category = kTraceCategoryCancel;
       }
       if (!category.empty()) {
         RecordEvent(category, sink, /*message=*/{}, /*key=*/{}, /*endpoint=*/{},
@@ -148,7 +147,6 @@ class PendingTable {
                                            .count()));
       }
       Evict();
-      finalized_ = true;
       return outcome;
     }
 
@@ -179,7 +177,6 @@ class PendingTable {
     std::shared_ptr<Shared> shared_;
     Key key_{};
     std::shared_ptr<Entry> entry_;
-    bool finalized_{false};
   };
 
   /**

@@ -46,6 +46,7 @@
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Observability.hpp"
+#include "transport/core/TraceCategories.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/SharedCompletion.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -154,7 +155,8 @@ class NodeRuntime {
       lifecycle_ = LifecycleState::kRunning;
       starting_ = false;
     }
-    RecordEvent("close", trace_sink_, "running");  // 生命周期跃迁(P5-4:Created→Running)。
+    // 生命周期跃迁 Trace(P5-4:Created→Running;类别原名 "close",#98 改 lifecycle)。
+    RecordEvent(kTraceCategoryLifecycle, trace_sink_, "running");
   }
 
   /**
@@ -187,9 +189,10 @@ class NodeRuntime {
     bool first_closer = false;
     bool spawn_finalizer = false;
     bool in_handler_fiber = false;
-    const bool has_handler = has_handler_;
+    bool has_handler = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      has_handler = has_handler_;  // 与写方(SpawnHandlerLoop)同锁,不依赖 bring-up 时序(#98)。
       in_handler_fiber = InHandlerFiberLocked();
       if (lifecycle_ == LifecycleState::kClosed) {
         return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
@@ -203,7 +206,8 @@ class NodeRuntime {
     }
 
     if (first_closer) {
-      RecordEvent("close", trace_sink_, "closing");  // 生命周期跃迁(Running→Closing)。
+      // 生命周期跃迁 Trace(Running→Closing)。
+      RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closing");
       // 三方汇合信号(锁外):runtime 侧唤醒读循环 + 消费者 + 触发 handler 取消。
       transport_->RequestClose();
       business_queue_.Close();
@@ -239,43 +243,11 @@ class NodeRuntime {
               handler_done_.Wait();  // 仍等 handler 实际退出(RT_LIFECYCLE_006)。
             }
           }
-          Clock::duration latency{};
-          {
-            std::lock_guard<std::mutex> lock(mutex_);
-            // 未启动的排队业务归因 close_drop(不排空处理):逐条 RecordDrop(与原地
-            // += size() 同一临界区宽度,只是把裸算术换成归因原语;取舍见 PR 说明)。
-            auto drained = business_queue_.Drain();
-            for (std::size_t i = 0; i < drained.size(); ++i) {
-              RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
-            }
-            lifecycle_ = LifecycleState::kClosed;
-            latency = Clock::now() - close_requested_at_;
-            last_close_latency_ = latency;  // P5-4:关闭时延终点。
-          }
-          RecordEvent("close", trace_sink_, "closed", {}, {}, {},
-                      static_cast<long>(std::chrono::duration_cast<
-                                         std::chrono::microseconds>(latency)
-                                             .count()));
-          closed_.Complete(Status{});
+          ConvergeToClosed();
         });
       } else {
         // 从未 spawn 读循环:直接收敛。残留业务(理论上无)一并 close_drop 归因。
-        Clock::duration latency{};
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          auto drained = business_queue_.Drain();
-          for (std::size_t i = 0; i < drained.size(); ++i) {
-            RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
-          }
-          lifecycle_ = LifecycleState::kClosed;
-          latency = Clock::now() - close_requested_at_;
-          last_close_latency_ = latency;  // P5-4:关闭时延终点。
-        }
-        RecordEvent("close", trace_sink_, "closed", {}, {}, {},
-                    static_cast<long>(std::chrono::duration_cast<
-                                       std::chrono::microseconds>(latency)
-                                           .count()));
-        closed_.Complete(Status{});
+        ConvergeToClosed();
       }
     }
 
@@ -343,7 +315,11 @@ class NodeRuntime {
    * kClosed)→ 消费者退出、Complete handler_done_。记录本 fiber id 供重入自锁检测。
    */
   void SpawnHandlerLoop(std::function<void(Event&&)> consume) {
-    has_handler_ = true;
+    {
+      // 与 Close 的读方同锁(#98):不依赖"bring-up 无挂起点"的隐式时序防跨线程竞态。
+      std::lock_guard<std::mutex> lock(mutex_);
+      has_handler_ = true;
+    }
     Coro::makeTask([this, consume = std::move(consume)]() mutable {
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -356,7 +332,7 @@ class NodeRuntime {
           break;  // kClosed / kCancelled:队列收敛 → 消费者退出。
         }
         Event event = std::move(item).value();
-        RecordEvent("handler", trace_sink_, "start");  // P5-4:调用起点。
+        RecordEvent(kTraceCategoryHandler, trace_sink_, "start");  // P5-4:调用起点。
         const Clock::time_point started_at = Clock::now();
         bool threw = false;
         try {
@@ -371,7 +347,8 @@ class NodeRuntime {
           std::lock_guard<std::mutex> lock(mutex_);
           last_handler_duration_ = duration;  // P5-4:处理器时长(简单存最近值)。
         }
-        RecordEvent("handler", trace_sink_, threw ? "exception" : "end", {}, {}, {},
+        RecordEvent(kTraceCategoryHandler, trace_sink_, threw ? "exception" : "end",
+                    {}, {}, {},
                     static_cast<long>(std::chrono::duration_cast<
                                        std::chrono::microseconds>(duration)
                                            .count()));  // P5-4:调用止点。
@@ -441,6 +418,28 @@ class NodeRuntime {
   [[nodiscard]] bool InHandlerFiberLocked() const {
     return handler_fiber_id_set_ &&
            boost::this_fiber::get_id() == handler_fiber_id_;
+  }
+
+  /// @brief 收敛到 Closed 的共用尾段(#98 收口,finalizer 分支与"从未 spawn 读循环"
+  ///        直接收敛分支共用):Drain 未启动的排队业务逐条归因 close_drop(不排空处理)
+  ///        → 置 Closed + 记关闭时延(P5-4)→ lifecycle Trace → closed_.Complete。
+  void ConvergeToClosed() {
+    Clock::duration latency{};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto drained = business_queue_.Drain();
+      for (std::size_t i = 0; i < drained.size(); ++i) {
+        RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
+      }
+      lifecycle_ = LifecycleState::kClosed;
+      latency = Clock::now() - close_requested_at_;
+      last_close_latency_ = latency;
+    }
+    RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closed", {}, {}, {},
+                static_cast<long>(std::chrono::duration_cast<
+                                   std::chrono::microseconds>(latency)
+                                       .count()));
+    closed_.Complete(Status{});
   }
 
   ITransport* transport_;             ///< 非拥有字节管道(读循环 Read + 收敛 RequestClose)。
