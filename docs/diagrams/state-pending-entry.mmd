@@ -1,24 +1,29 @@
 stateDiagram-v2
     direction LR
-    [*] --> Registered: Register(key)<br/>唯一登记 + 记 registered_at
+    [*] --> Registered: Register(key)<br/>唯一登记 + 建裸 Awaitable 信箱 + 记 registered_at
 
-    state 四方仲裁（原子首胜 Complete） {
-        Registered --> Resolved: Dispatch → Resolve(key,value)
-        Registered --> TimedOut: deadline 到 → kTimeout
-        Registered --> Cancelled: 取消令牌 → kCancelled
-        Registered --> Failed: FailAll(error)<br/>Close=kClosed / 断连=kConnection
+    state 抢占仲裁（表锁 find+erase，谁先摘除谁胜） {
+        Registered --> Resolved: Resolve(key,value)<br/>抢到 → 信箱 push 值 + close
+        Registered --> TimedOut: await_for 超时 → 抢占<br/>抢到即 kTimeout
+        Registered --> Cancelled: 取消令牌 → 抢占 → close(kCancelled)
+        Registered --> Failed: FailAll(error) 摘除全部<br/>→ close(kConnection/kClosed)
     }
 
-    Resolved --> Finalized
-    TimedOut --> Finalized: Wait 先 Complete(error) 置终结<br/>(抢输则采用真正终结结果)
-    Cancelled --> Finalized
-    Failed --> Finalized
-
-    Finalized --> Evicted: 从表摘除 entry<br/>(按身份匹配，不误删同键新登记)
+    Resolved --> Evicted: 已在抢占时摘除
+    TimedOut --> Evicted: 已在抢占时摘除
+    Cancelled --> Evicted: 已在抢占时摘除
+    Failed --> Evicted: 已在抢占时摘除
     Evicted --> [*]
 
     note right of Registered
-        每个在途 entry 复用一个
-        SharedCompletion 作值信箱；
-        四方抢同一 Complete → 恰好一次终结
+        entry 只有一个等待者：信箱退化为一条
+        裸 Coro::Awaitable&lt;T&gt;（一次性 channel），
+        只承载唤醒+带值/带错，不自持仲裁锁。
+        唯一仲裁点 = 表锁内 find+erase 抢占终结权。
+    end note
+
+    note right of TimedOut
+        本地超时抢输时（Resolve/cancel/FailAll 已在途）：
+        在信箱上 await 一次 drain 出对方结果
+        （Awaitable“关闭后先取尽值再报错”语义裁决竞态）
     end note
