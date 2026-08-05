@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-08-04
+
+> **P5 观测 + 完整性归因里程碑**——可插拔结构化 Trace(push)+ 命名计数(pull)双面观测,7 类 `DropReason` 经唯一 `RecordDrop` 归因点使"无静默丢失"成为结构性可断言(`Σ命名=总丢弃`),I/O 事实统一为 base `ITransport` 强制接口。全量测试 220→270 全绿;详见 SDD §4 P5 / §7 追溯矩阵、#86–#90。（本版一并含 #81 的 UDP 无缝切换验证与 Default 寻址修复。）
+
+### 里程碑:P5 观测 + 完整性归因 —— 结构化 Trace + 丢弃归因 + loss=0(协程原生)— 2026-08(路线图 P5)
+> 按 SDD §4 P5,把各期就地埋的散落计数器收口成"完整性可断言"的观测面。遵 ADR-0003 **D13**:双面观测、结构性丢弃归因纪律、I/O 观测面统一。
+- **新增** `DropReason` 七项枚举(业务队列溢出/DDS交接溢出/**坏帧**新增/迟到·重复·无匹配响应合并/关闭丢弃/连接代际隔离丢弃/**无处理器**新增)+ 协议无关观测原语 `RecordDrop`(计数 pull + 可选 Trace push 一次调用)/ `RecordEvent`(`include/transport/core/{DropReason,Observability}.hpp`,#86)。
+- **变更** I/O 事实观测面统一(遗留项 B):`LastSendTime`/`LastReceiveTime`/`LastError` 提升为 base `ITransport` **强制虚方法**(RT_NODE_006 所有介质如实报;`SendWaiterDepth` 非普适仍留各类);补 `DdsTransport` 缺口 + `FakeCoroTransport` 测试替身(#87)。合并前审查发现并修正 DDS `LastError` 误把 `kTimeout`/`kClosed`/`kCancelled` 正常结果当故障的语义偏差。
+- **新增** 7 类丢弃全线接入 `RecordDrop` 归因(每 reason 一个归属组件+定义时刻),含此前零覆盖的 `kBadFrame`(坏帧)埋点 + `BadFrameCount()`;既有具名 getter API 稳定不变(#88)。
+- **新增** 9 类 Trace category(connect/generation/send/recv/decode/match/timeout·cancel/handler/reconnect/close)+ 补齐 4 项零覆盖指标:请求时延/处理器时长/重连次数/关闭时延(#89)。
+- **验证** `tests/loss_accounting_test.cpp` loss=0 harness(非新运行时组件):干净跑全部 `DropReason` 计数器保持 0 + 混合故障 7 类各用最小介质触发、`Σ命名=总丢弃`(`drop_records.size()==Σ` 证无多记漏记)+ push/pull 一致 + 未配 sink 零影响(RT_TRACE_002,#90)。全量 **220→270 全绿**。
+- **文档** ADR-0003 增 **D13**(P5 观测+完整性归因);SDD §4 P5 标记交付、§6 回填 P5 签名、§7 追溯 RT_TRACE_001/002·RT_DATA_BUFFER·RT_DESIGN_006 升 ✅;README 更新至 P0–P5。
+
 ### 验证 + 修复:ProtocolNode 无缝跑在 UdpTransport 上(#81)
 - **验证** `ITransport` 缝可无缝切换:同一 `ProtocolNode` 只换注入的 transport/codec(`TcpTransport`+`SystemCodec` → `UdpTransport`+`SystemDatagramCodec`),Request/读-分发循环/关联匹配零改动,真实 UDP 回环跑通请求-响应 + 乱序/迟到丢弃观测(断言与 TCP 回环用例一致);新增 `tests/protocol_node_udp_test.cpp`。
 - **修复** `UdpTransport::Write` 寻址:原将 `Endpoint::Default()` 当非法,与 `Endpoint::kDefault`(用 config 默认目的地)+ `UdpConfig.remote_addr` 设计本意冲突,导致恒发 Default 的传输无关调用方在 UDP 上 `kInvalidArgument`;修成 **Default → 解析为 config 默认目的地**(未配 remote 仍 `kInvalidArgument`,向后兼容)。SDD §7 追溯 RT_IF_UDP/RT_IN_INTERFACE_001/RT_DESIGN_006 补 node 端到端。
