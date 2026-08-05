@@ -1,0 +1,41 @@
+flowchart TB
+    APP([宿主应用])
+    MEDIA([通信介质对端])
+
+    P1["P1 出站<br/>盖章 + Encode + Write"]
+    P2["P2 入站读循环<br/>Read + Decode + Dispatch 分类"]
+    P3["P3 请求关联<br/>Register / Resolve / 终结仲裁"]
+    P4["P4 业务处理<br/>入队 + 单消费者 handler"]
+    P5["P5 生命周期/连接<br/>三方汇合 + reactor 代际隔离"]
+
+    D1[("D1 在途请求表<br/>PendingTable")]
+    D2[("D2 业务队列<br/>BoundedQueue")]
+    D3[("D3 交互状态<br/>session 空闲集 / 连接代际")]
+
+    APP -->|Request/Send/Publish| P1
+    P1 -->|Register key| D1
+    P1 -->|分配 session_id| D3
+    P1 -->|SendUnit 字节| MEDIA
+
+    MEDIA -->|到达字节/样本| P2
+    P2 -->|响应帧 → Resolve key| D1
+    P2 -->|业务帧 → Push| D2
+    D1 -.->|唤醒 Handle.Wait| P1
+    P1 -->|Result 响应/错误| APP
+
+    D2 -->|Pop| P4
+    P4 -->|handler 处理结果 记录| APP
+    P4 -.->|ctx.Send / Reply| P1
+
+    APP -->|Start/Close| P5
+    P5 -->|RequestClose + FailAll| D1
+    P5 -->|Close/Drain| D2
+    P5 -->|代际隔离 FailAll不latch| D1
+    MEDIA -->|断连/连接跃迁| P5
+
+    classDef ext fill:#eef2f7,stroke:#93a4b5,color:#233;
+    classDef proc fill:#eef5fb,stroke:#3d6a8c,color:#233;
+    classDef store fill:#eaf3ea,stroke:#4a8c5a,color:#233;
+    class APP,MEDIA ext;
+    class P1,P2,P3,P4,P5 proc;
+    class D1,D2,D3 store;

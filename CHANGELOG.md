@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+### 文档:SRS/SDD 对齐 AsyncTask 范本(GJB 438C ID 体系 + 双向追溯 + 动因型需求)
+> 参考 `third_party/AsyncTask/doc/{需求规格说明,软件设计说明}.md` 的成熟 GJB 438C 惯例,优化 transport 的需求规格说明与设计说明。仅文档,不涉代码。
+- **SDD**(`docs/软件设计说明-GJB438C.md` v2.0)重写为完整 ID 体系:DD-n 设计决策(各映射 RT_*);§4.1 CSC 部件(CSC_CORE/IO/CODEC/NODE)+ 部件依赖图 + 部件类图;§4.2 执行方案 MS_* 图(**新增** DFD 上下文图 + 顶层数据流图 + 数据存储表 D1/D2/D3,复用时序/状态/数据流图并赋 MS_* ID);§4.3 JK 接口(五要素:优先级/接口类型/数据元素/通信方式/协议特征);§5 CSU 详细设计(逐单元);§6 **双向追溯**(§6.1 设计单元→需求 + §6.2 需求→设计单元)。
+- **SRS**(`docs/需求规格说明书-协程原生.md`):§3.2.1 接口 ASCII 图改 Mermaid→SVG;§4.5 **新增「需求标识说明」**(RT_* 前缀体系);为 6 个核心能力(RT_CORO_RUNTIME/RT_TRANSPORT/RT_REQUEST/RT_HANDLER/RT_LIFECYCLE/RT_NODE)补 **动因型需求 RT_*_MOT_n**(固化设计取舍理由,供 DD-n 对应)。
+- **图**:新增 6 张 Mermaid→SVG(dfd-context、dfd-toplevel、sdd-csc-layers、sdd-csc-node、sdd-csc-io、srs-interface);state-pending-entry 已随上条同步。
+
 ### 简化:PendingTable entry 改用裸 Coro::Awaitable(去掉 SharedCompletion 层)
 > 拉取 AsyncTask 最新《使用说明》后重评:PendingTable 每个在途 entry 只有一个等待者(当前键空间不需同 key 并发多待,ADR-0001),此前背的 `SharedCompletion<T>`(多等待者 waiter-map + 第二把 mutex + 广播)是死重。公开 API 与可观察行为不变。
 - **简化** `Entry` 信箱 `SharedCompletion<T>` → 裸 `std::shared_ptr<Coro::Awaitable<T>>`;**唯一仲裁点改为表锁内 `find+erase` 抢占终结权**(四方 Resolve/超时/取消/FailAll 谁先摘除谁胜),胜方在锁外对信箱 `push`+`close`;`Handle::Wait` 用 `await`/`await_for` + 抢输时一次 drain(靠 `Awaitable`"关闭后先取尽值再报错"语义裁决竞态)。对齐 AsyncTask《使用说明》§6.3 一次性等待范式。

@@ -1,0 +1,33 @@
+flowchart TB
+    subgraph HOST[" "]
+      APP([宿主应用])
+    end
+    NODE["CSC_NODE（交互层）<br/>ProtocolNode · DdsNode · NodeRuntime<br/>PendingTable · BoundedQueue · HandlerContext"]
+    CODEC["CSC_CODEC（编解码层）<br/>ICodec · SystemCodec · DatagramCodec · DdsCodec"]
+    IO["CSC_IO（传输层）<br/>ITransport · IConnectionObservable<br/>Tcp/Udp/Serial/Dds Transport · TcpServer"]
+    CORE["CSC_CORE（核心原语）<br/>Result/Status · Message · Endpoint · Cancellation<br/>SharedCompletion · Observability · ITraceSink"]
+    RT([AsyncTask 运行时 · boost.fiber])
+    QT([Qt Core/Network/SerialPort]):::opt
+
+    APP --> NODE
+    NODE -->|组合| CODEC
+    NODE -->|组合| IO
+    NODE --> CORE
+    CODEC --> CORE
+    IO --> CORE
+    IO -.Qt socket/串口.-> QT
+    NODE --> RT
+    IO --> RT
+    CORE --> RT
+
+    classDef host fill:#eef2f7,stroke:#93a4b5,color:#233;
+    classDef node fill:#eef5fb,stroke:#3d6a8c,color:#233;
+    classDef codec fill:#fbf6ef,stroke:#b8860b,color:#233;
+    classDef io fill:#f2f7fb,stroke:#3d6a8c,color:#233;
+    classDef core fill:#f6f6f8,stroke:#8a8aa0,color:#233;
+    classDef opt fill:#f0f0f0,stroke:#aaa,color:#555,stroke-dasharray:4 3;
+    class APP host;
+    class NODE node;
+    class CODEC codec;
+    class IO io;
+    class CORE core;

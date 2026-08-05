@@ -1,0 +1,42 @@
+classDiagram
+    direction TB
+    class ProtocolNode {
+        +Request(Message, options) Result~Message~
+        +Send(Message) Status
+        -DecodeAndDispatch() / Dispatch()
+        -AllocateSession() / SessionLease
+        -RunReactorLoop()
+    }
+    class DdsNode {
+        +Request(Message, target, options)
+        +Publish(Message, topic)
+        -Dispatch(kReply) / NextCorrelationId()
+    }
+    class NodeRuntime~Event~ {
+        +Start / Close / WaitClosed
+        +SpawnReadLoop / SpawnHandlerLoop
+        +Enqueue / DrainBusinessQueue
+        -ConvergeToClosed() / finalizer
+    }
+    class PendingTable~K_T~ {
+        +Register(key) Result~Handle~
+        +Resolve(key, value) bool
+        +FailAll(error, latch)
+        +Handle::Wait(options)
+    }
+    class BoundedQueue~T~ {
+        +Push / Pop / Close / Drain
+        +双上界 tail-drop
+    }
+    class HandlerContext {
+        +Send / RequestClose / cancellation
+    }
+
+    ProtocolNode *-- NodeRuntime : 组合
+    ProtocolNode *-- PendingTable : 组合
+    DdsNode *-- NodeRuntime : 组合
+    DdsNode *-- PendingTable : 组合
+    NodeRuntime *-- BoundedQueue : 拥有
+    ProtocolNode ..> HandlerContext : 构造传入
+    DdsNode ..> HandlerContext : 构造传入
+    note for PendingTable "entry = 裸 Coro::Awaitable~T~ 信箱\n表锁 find+erase 作唯一仲裁点"

@@ -1,0 +1,24 @@
+flowchart TB
+    APP([宿主应用])
+    NODE["交互节点（ProtocolNode / DdsNode / TcpServer）"]
+    CODEC["Codec 公共扩展点"]
+    TCP([TCP 对端])
+    UDP([UDP 对端])
+    SER([串口设备])
+    DDS([DDS Domain / Topic])
+
+    APP -->|RT_IF_API：节点/配置/handler/请求/可观测| NODE
+    NODE -->|RT_IF_SYSFRAME / DDS 消息格式| CODEC
+    NODE -->|RT_IF_TCP| TCP
+    NODE -->|RT_IF_UDP| UDP
+    NODE -->|RT_IF_SERIAL| SER
+    NODE -->|RT_IF_DDS| DDS
+
+    classDef app fill:#eef2f7,stroke:#93a4b5,color:#233;
+    classDef node fill:#eef5fb,stroke:#3d6a8c,color:#233;
+    classDef codec fill:#fbf6ef,stroke:#b8860b,color:#233;
+    classDef ext fill:#f2f7fb,stroke:#7d8b99,color:#233;
+    class APP app;
+    class NODE node;
+    class CODEC codec;
+    class TCP,UDP,SER,DDS ext;
