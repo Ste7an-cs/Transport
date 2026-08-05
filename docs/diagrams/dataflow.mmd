@@ -1,0 +1,38 @@
+flowchart TB
+    subgraph OUT["出站（调用方 fiber）"]
+        direction LR
+        RQ["Request / Send<br/>分配 session_id + 盖章"]
+        REG["PendingTable.Register(key)<br/>（Send 不登记）"]
+        ENC["ICodec.Encode<br/>Message → 线缆字节"]
+        WR["ITransport.Write<br/>帧进内核才成功 · 背压"]
+        WT["Handle.Wait<br/>挂起等唯一响应"]
+        RQ --> REG --> ENC --> WR --> WT
+    end
+
+    WR -. 线缆 → 对端 → 回送响应 .-> RD
+
+    subgraph IN["入站（读循环 fiber）"]
+        direction LR
+        RD["ITransport.Read<br/>一次一片 Datagram"]
+        SK["NodeRuntime 读循环骨架<br/>错误分类 kClosed/kConnection→退出"]
+        DEC["ICodec.Decode<br/>字节 → 0..N Message"]
+        DSP{"Dispatch（内联）<br/>终结判别 + 键派生"}
+        RD --> SK --> DEC --> DSP
+    end
+
+    DSP -->|响应帧| RES["PendingTable.Resolve(key)<br/>未命中 → kUnmatchedOrLateResponse"]
+    DSP -->|业务帧·有 handler| BQ["BoundedQueue.Push<br/>满 tail-drop → business_queue_overflow"]
+    DSP -->|无 handler| NH["kNoHandlerConfigured 丢弃"]
+    BQ --> HD["handler 消费者 fiber<br/>Pop → 串行处理 · 异常隔离"]
+    RES -. 唤醒 .-> WT
+
+    DEC -.->|坏帧| BF["kBadFrame 丢弃"]
+
+    classDef greenC fill:#e8f3ea,stroke:#4a8c5a,color:#234;
+    classDef goldC fill:#fbf6ef,stroke:#b8860b,color:#234;
+    classDef blueC fill:#eef5fb,stroke:#3d6a8c,color:#234;
+    classDef dropC fill:#faf0ea,stroke:#b5651d,color:#7a3b12;
+    class REG,WT,RES,BQ greenC;
+    class ENC,DEC goldC;
+    class RQ,WR,RD,SK,DSP,HD blueC;
+    class NH,BF dropC;

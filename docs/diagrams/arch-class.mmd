@@ -1,0 +1,104 @@
+classDiagram
+    direction TB
+
+    class ITransport {
+        <<interface>>
+        +Start() Status
+        +Read(options) Result~Datagram~
+        +Write(SendUnit) Status
+        +RequestClose() Status
+        +WaitClosed(options) Status
+        +LastSendTime() time_point
+        +LastReceiveTime() time_point
+        +LastError() error_code
+    }
+    class IConnectionObservable {
+        <<interface>>
+        +State() ConnectionState
+        +WaitStateChange(options) Result~ConnectionState~
+        +Generation() uint64
+        +AttemptCount() size_t
+    }
+    class ICodec {
+        <<interface>>
+        +Encode(Message) bytes
+        +Decode(bytes) Message[]
+    }
+
+    class ProtocolNode {
+        +Start() / Close() / WaitClosed()
+        +Request(Message, options) Result~Message~
+        +Send(Message) Status
+        -DecodeAndDispatch() / Dispatch()
+        -AllocateSession() / SessionLease
+    }
+    class DdsNode {
+        +Request(Message, target, options)
+        +Publish(Message, topic)
+        -Dispatch(kReply) / NextCorrelationId()
+    }
+    class NodeRuntime~Event~ {
+        <<协议无关机制>>
+        +Start() / Close() / WaitClosed()
+        +SpawnReadLoop(fn) / SpawnHandlerLoop(fn)
+        +Enqueue() / DrainBusinessQueue()
+        -ConvergeToClosed() / finalizer fiber
+    }
+    class PendingTable~K,T~ {
+        <<协议无关机制>>
+        +Register(key) Result~Handle~
+        +Resolve(key, value) bool
+        +FailAll(error, latch)
+        +Handle::Wait(options) Result~T~
+    }
+    class BoundedQueue~T~ {
+        <<协议无关机制>>
+        +Push() / Pop() / Close() / Drain()
+        +双上界 tail-drop
+    }
+    class HandlerContext {
+        +Send() / RequestClose()
+        +cancellation()
+    }
+    class SharedCompletion~T~ {
+        +Complete(result) bool
+        +Wait(options) Result~T~
+    }
+    class ITraceSink {
+        <<interface>>
+        +OnTrace(TraceEvent)
+    }
+
+    class TcpTransport
+    class TcpClientTransport
+    class UdpTransport
+    class SerialTransport
+    class DdsTransport
+    class TcpServer
+    class SystemCodec
+    class DatagramCodec
+    class DdsCodec
+
+    ITransport <|.. TcpTransport
+    ITransport <|.. TcpClientTransport
+    ITransport <|.. UdpTransport
+    ITransport <|.. SerialTransport
+    ITransport <|.. DdsTransport
+    IConnectionObservable <|.. TcpClientTransport
+    ICodec <|.. SystemCodec
+    ICodec <|.. DatagramCodec
+    ICodec <|.. DdsCodec
+
+    ProtocolNode *-- ITransport : 组合
+    ProtocolNode *-- ICodec : 组合
+    ProtocolNode *-- PendingTable : 组合
+    ProtocolNode *-- NodeRuntime : 组合
+    DdsNode *-- ITransport : 组合
+    DdsNode *-- ICodec : 组合
+    DdsNode *-- PendingTable : 组合
+    DdsNode *-- NodeRuntime : 组合
+    NodeRuntime *-- BoundedQueue : 拥有
+    PendingTable ..> SharedCompletion : 复用
+    ProtocolNode ..> HandlerContext : 构造传入
+    TcpServer ..> ProtocolNode : 每连接派生
+    NodeRuntime ..> ITraceSink : 可选出口

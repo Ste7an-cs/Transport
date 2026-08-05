@@ -1,0 +1,29 @@
+sequenceDiagram
+    autonumber
+    actor C as 调用方 fiber
+    participant N as ProtocolNode
+    participant P as PendingTable
+    participant K as ICodec
+    participant T as ITransport
+    participant R as 读循环 fiber
+
+    C->>N: Request(req, options)
+    N->>N: AllocateSession() → session_id<br/>（SessionLease 接管，析构自动归还）
+    N->>N: 盖章 frm_type/protocol_id/session_id
+    N->>P: Register(request_key) → Handle
+    N->>K: Encode(req) → bytes
+    N->>T: Write(SendUnit) 帧进内核才成功
+    Note over C,N: 背压经 await 传导；Write 成功后
+    N->>P: Handle.Wait(options) 挂起
+    Note over C: 调用方 fiber 在此挂起等待
+
+    T-->>R: 对端回送响应字节到达
+    R->>T: Read() → Datagram
+    R->>K: Decode(bytes) → Message[]
+    R->>N: DecodeAndDispatch → Dispatch(msg)
+    N->>N: IsTerminal? kResponse/kResult → response_key
+    N->>P: Resolve(key, msg)
+    Note over P: Resolve / 超时 / 取消 / FailAll<br/>四方抢同一原子首胜 Complete
+    P-->>C: 唤醒 Handle.Wait → Result~Message~
+    N->>N: SessionLease 析构 → ReleaseSession
+    N-->>C: return Result~Message~
