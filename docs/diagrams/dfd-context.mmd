@@ -1,0 +1,24 @@
+flowchart LR
+    APP([宿主应用])
+    MEDIA([通信介质对端<br/>TCP/UDP/串口/DDS])
+    RT([AsyncTask 运行时<br/>boost.fiber])
+    DDS([DDS Provider<br/>可选：Fast DDS])
+
+    TRANSPORT["transport<br/>（通信中间件 CSCI）"]
+
+    APP -->|装配 codec / 注册 handler<br/>Request / Send / Publish / 配置| TRANSPORT
+    TRANSPORT -->|Result / Message / 连接状态 / 观测计数 / Trace| APP
+
+    TRANSPORT -->|字节/样本收发 · connect/close| MEDIA
+    MEDIA -->|到达字节/样本 · 断连/错误事件| TRANSPORT
+
+    TRANSPORT -->|makeTask / await / 让出| RT
+    RT -->|协程创建/恢复/超时/跨线程唤醒| TRANSPORT
+
+    TRANSPORT -->|Subscribe/Publish topic| DDS
+    DDS -->|listener 回调样本| TRANSPORT
+
+    classDef ext fill:#eef2f7,stroke:#93a4b5,color:#233;
+    classDef core fill:#eaf3ea,stroke:#4a8c5a,color:#233;
+    class APP,MEDIA,RT,DDS ext;
+    class TRANSPORT core;

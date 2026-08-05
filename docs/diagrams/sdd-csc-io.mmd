@@ -1,0 +1,34 @@
+classDiagram
+    direction TB
+    class ITransport {
+        <<interface>>
+        +Start() / Read(options) / Write(SendUnit)
+        +RequestClose() / WaitClosed(options)
+        +LastSendTime / LastReceiveTime / LastError
+    }
+    class IConnectionObservable {
+        <<interface>>
+        +State() / WaitStateChange(options)
+        +Generation() / AttemptCount() / LastFailure()
+    }
+    class TcpTransport { +已连接字节管道 }
+    class TcpClientTransport { +连接状态机+自动重连+ApplyConfig }
+    class UdpTransport { +报文+地址 }
+    class SerialTransport { +串口字节流 }
+    class DdsTransport { +provider 跨线程有界交接 }
+    class TcpServer { +accept 每连接一 node }
+    class IDdsProvider {
+        <<interface>>
+        +Init/Shutdown/Subscribe/Publish
+    }
+
+    ITransport <|.. TcpTransport
+    ITransport <|.. TcpClientTransport
+    ITransport <|.. UdpTransport
+    ITransport <|.. SerialTransport
+    ITransport <|.. DdsTransport
+    IConnectionObservable <|.. TcpClientTransport
+    TcpClientTransport *-- TcpTransport : 一代际一内层
+    DdsTransport *-- IDdsProvider : 组合
+    TcpServer ..> TcpTransport : 每连接接管
+    note for DdsTransport "listener 线程非阻塞 Push → BoundedQueue~Sample~\nRead 侧 fiber 出队（跨线程唤醒）"
