@@ -6,6 +6,7 @@
 #include "task/fibertask.h"  // Coro::makeTask —— reactor fiber(其余 fiber 由 NodeRuntime 起)
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
+#include "transport/core/TraceCategories.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址、reactor 连接观察。协议无关机制
@@ -38,6 +39,9 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
       codec_(std::move(codec)),
       config_(std::move(config)),
       // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      // max_pending=256 与 session 空闲集是同一上限的双重执法(#98 注):默认键策略下
+      // AllocateSession 先行拒绝,此纯计数上限不可达——保留仅为防**自定义键策略**绕过
+      // session 预算造出超额在途(RT_DESIGN_008 自定义键开放后的兜底)。
       pending_(kSessionIdSpace, config_.trace_sink),
       // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
       // 其它字段);transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
@@ -139,41 +143,39 @@ Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
   if (!session) {
     return make_error_code(TransportErrc::kResourceExhausted);
   }
+  // RAII 租约(#98):此后任一返回路径(登记冲突 / 编码失败 / 写失败 / 正常终结)均经
+  // lease 析构自动归还 session_id——不再靠手工 ReleaseSession 纪律。lease 先于 handle
+  // 构造 → 后于 handle 析构:归还必发生在 entry 摘除之后。
+  SessionLease lease(this, *session);
   // node 盖章:命令帧、默认协议 id、分配到的 session_id。
   req.frm_type = FrameType::kCommand;
   req.protocol_id = config_.protocol_id;
-  req.session_id = *session;
+  req.session_id = lease.id();
   const ProtocolKey key = config_.key_strategy.request_key(req);
 
-  // 任一提前返回都须归还 session_id(否则在途预算泄漏,终致假 kResourceExhausted)。
   auto registration = pending_.Register(key);
   if (!registration) {
-    ReleaseSession(*session);
     return registration.error();  // 重复键 kInvalidState / closed kClosed 透传。
   }
   auto handle = std::move(registration).value();
 
   auto encoded = codec_->Encode(req);
   if (!encoded) {
-    ReleaseSession(*session);  // handle 析构兜底摘除未终结 entry(取消纪律)。
-    return encoded.error();
+    return encoded.error();  // handle 析构兜底摘除未终结 entry(取消纪律)。
   }
   SendUnit unit;
   unit.bytes = std::move(encoded).value();
   unit.destination = Endpoint::Default();
   const std::size_t sent_bytes = unit.bytes.size();
   if (auto written = transport_->Write(std::move(unit)); !written) {
-    ReleaseSession(*session);
     return written.error();
   }
   // Write 完成边界(P5-4):不逐字节,一次性记本帧大小。
-  RecordEvent("send", config_.trace_sink, "request", {}, {}, {},
+  RecordEvent(kTraceCategorySend, config_.trace_sink, "request", {}, {}, {},
               static_cast<long>(sent_bytes));
 
-  // 等唯一响应;请求终结(值/超时/取消/FailAll)后释放 session_id 回空闲集。
-  auto outcome = handle.Wait(std::move(options));
-  ReleaseSession(*session);
-  return outcome;
+  // 等唯一响应;请求终结(值/超时/取消/FailAll)后 lease 析构释放 session_id 回空闲集。
+  return handle.Wait(std::move(options));
 }
 
 std::optional<std::uint8_t> ProtocolNode::AllocateSession() {
@@ -191,6 +193,14 @@ void ProtocolNode::ReleaseSession(std::uint8_t session_id) {
   free_sessions_.push_back(session_id);
 }
 
+std::optional<std::uint8_t> ProtocolNode::PeekIdleSession() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (free_sessions_.empty()) {
+    return std::nullopt;  // 256 全在途。
+  }
+  return free_sessions_.back();  // 只读尾部(最新释放者),不出队(#98)。
+}
+
 void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
@@ -201,11 +211,11 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
     return;
   }
   // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
-  RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
+  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
               static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
-    RecordEvent("recv", config_.trace_sink, {}, {}, {}, {},
+    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, {}, {},
                 static_cast<long>(msg.payload.size()));
     Dispatch(std::move(msg));
   }
@@ -278,19 +288,20 @@ Status ProtocolNode::Send(Message msg) {
   if (!runtime_.IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
-  // 分配 session_id 盖帧后立即释放:不登记 PendingTable、不占 256 在途预算。全在途无空闲
-  // → kResourceExhausted(边界策略:与 Request 一致地拒绝,不与在途请求争 session_id)。
-  auto session = AllocateSession();
+  // 盖帧只需一个"当前不在途"的 session_id,不需要独占预算:只读空闲集尾部(最新释放者,
+  // #98)盖帧——不出队,不与 Request 争 LRU 头部,不扰动 FIFO 退休窗口(RT_REQUEST_005
+  // 的迟到误配防护不被高频 Send 削弱)。空闲集空(256 全在途)仍拒绝:与 Request 一致的
+  // 既定边界策略(P2-3),且此时任何可盖的 id 都正被某在途请求占用,盖上即有误配面。
+  auto session = PeekIdleSession();
   if (!session) {
     return make_error_code(TransportErrc::kResourceExhausted);
   }
-  // 盖章:调用方给的业务类型优先,否则默认命令帧;默认协议 id;分配到的 session_id。
+  // 盖章:调用方给的业务类型优先,否则默认命令帧;默认协议 id;尾部空闲 session_id。
   if (msg.frm_type == FrameType::kUnknown) {
     msg.frm_type = FrameType::kCommand;
   }
   msg.protocol_id = config_.protocol_id;
   msg.session_id = *session;
-  ReleaseSession(*session);  // 盖帧完毕立即归还(fire-and-forget,不占预算)。
 
   auto encoded = codec_->Encode(msg);
   if (!encoded) {
@@ -303,8 +314,8 @@ Status ProtocolNode::Send(Message msg) {
   auto written = transport_->Write(std::move(unit));  // 遵 RT_TRANSPORT_008 背压。
   if (written) {
     // Write 完成边界(P5-4):不逐字节,一次性记本帧大小。
-    RecordEvent("send", config_.trace_sink, "fire-and-forget", {}, {}, {},
-                static_cast<long>(sent_bytes));
+    RecordEvent(kTraceCategorySend, config_.trace_sink, "fire-and-forget", {}, {},
+                {}, static_cast<long>(sent_bytes));
   }
   return written;
 }

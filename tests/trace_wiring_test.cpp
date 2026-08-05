@@ -3,15 +3,16 @@
 //
 // 承接 ADR-0003 D13 Q5、RT_TRACE_001/002、RT_DATA_BUFFER。验证:
 //   · 9 类 Trace(connect/generation/send/recv/decode/match/timeout/cancel/handler/
-//     reconnect/close)各至少产生一条可采集事件(CapturingTraceSink)。
+//     reconnect/lifecycle,#98:生命周期类别原名 close)各至少产生一条可采集事件
+//     (CapturingTraceSink)。
 //   · 4 项新增指标 getter 数值合理:LastRequestLatency/LastHandlerDuration/
 //     LastCloseLatency(TcpClientTransport 已有 AttemptCount,本票只补 Trace)。
 //   · 未配 sink(RT_TRACE_002):控制流/结果与配 sink 时一致,指标 getter 仍正常记录
 //     (latency 追踪与 Trace 上报解耦,互不依赖)。
 //
-// 拓扑:TCP 类别(connect/generation/reconnect/close)用真实 TcpClientTransport +
+// 拓扑:TCP 类别(connect/generation/reconnect/lifecycle)用真实 TcpClientTransport +
 // QTcpServer 回环(同 tcp_client_transport_test 范式);send/recv/decode/match/
-// timeout/cancel/handler/close 用 ProtocolNode + FakeCoroTransport(同
+// timeout/cancel/handler/lifecycle 用 ProtocolNode + FakeCoroTransport(同
 // protocol_node_handler_test 范式)。DdsNode 复用 dds_node_test 的 FakeDdsProvider
 // 共享 Bus 拓扑,验证 trace_sink 装配对 DDS 侧同样生效(send/recv/decode/match)。
 // -----------------------------------------------------------------------------
@@ -160,7 +161,7 @@ TEST(TraceWiring, TcpClientCapturesConnectGenerationReconnectAndClose) {
   EXPECT_TRUE(HasCategory(records, "connect"));
   EXPECT_TRUE(HasCategory(records, "generation"));
   EXPECT_TRUE(HasCategory(records, "reconnect"));
-  EXPECT_TRUE(HasCategory(records, "close"));
+  EXPECT_TRUE(HasCategory(records, "lifecycle"));
   EXPECT_GT(client.LastCloseLatency().count(), 0);
 }
 
@@ -208,7 +209,7 @@ TEST(TraceWiring, ProtocolNodeCapturesSendRecvDecodeMatchHandlerAndClose) {
   EXPECT_TRUE(HasCategory(records, "decode"));
   EXPECT_TRUE(HasCategory(records, "match"));
   EXPECT_TRUE(HasCategory(records, "handler"));
-  EXPECT_TRUE(HasCategory(records, "close"));
+  EXPECT_TRUE(HasCategory(records, "lifecycle"));
 }
 
 // —— PendingTable::Handle::Wait 的另两类终结:timeout / cancel(+ LastRequestLatency)。——

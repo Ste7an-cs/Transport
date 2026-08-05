@@ -5,6 +5,7 @@
 
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
+#include "transport/core/TraceCategories.hpp"
 
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
 // 终结判别、topic 寻址、reply_to=inbox。协议无关机制(生命周期三方汇合、handler 消费者、
@@ -109,7 +110,7 @@ Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
   auto written = transport_->Write(std::move(unit));
   if (written) {
     // Write 完成边界(P5-4):Request/Publish/Reply 共用本收口,不逐字节。
-    RecordEvent("send", config_.trace_sink, {}, {}, {}, {},
+    RecordEvent(kTraceCategorySend, config_.trace_sink, {}, {}, {}, {},
                 static_cast<long>(sent_bytes));
   }
   return written;
@@ -163,14 +164,14 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
     return;
   }
   // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
-  RecordEvent("decode", config_.trace_sink, {}, {}, {}, {},
+  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
               static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
     msg.source = datagram.source.topic;
     msg.topic = datagram.source.topic;
     // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
-    RecordEvent("recv", config_.trace_sink, {}, {}, msg.source, {},
+    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, msg.source, {},
                 static_cast<long>(msg.payload.size()));
     Dispatch(std::move(msg));
   }

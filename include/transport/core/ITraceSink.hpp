@@ -32,6 +32,11 @@ struct TraceEvent {
 };
 
 // 可能被 io / worker / 调用方线程并发调用 → 实现必须线程安全。
+//
+// 重入契约(P6 前置清理 #98):OnTrace 可能在本库内部锁的临界区内被调用(如丢弃归因
+// 与其计数器同临界区)。实现必须快速返回、不得阻塞,且**不得回调本库任何 API**(含各
+// node/transport 的观测 getter)——否则同一把锁重入即死锁。需据事件联动查询的消费方,
+// 应在 OnTrace 内只做记录,查询挪到自己的线程/fiber 异步进行。
 class ITraceSink {
  public:
   virtual ~ITraceSink() = default;

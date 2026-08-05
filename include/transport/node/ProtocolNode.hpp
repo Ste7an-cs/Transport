@@ -34,7 +34,6 @@
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
@@ -195,11 +194,13 @@ class ProtocolNode {
   /**
    * @brief noresponse fire-and-forget 出站:盖章 + 编码 + 写出,不期待应答。
    *
-   * node 盖 frm_type(调用方给的业务类型优先,否则默认 kCommand)、默认 protocol_id、从
-   * 空闲集分配一个 session_id 盖帧后**立即释放**(不登记 PendingTable、不占 256 在途预算)。
-   * 编码后经 transport.Write 上线,遵 RT_TRANSPORT_008 背压。关闭后返 kClosed;256 个
-   * session_id 全在途(无空闲)时返 kResourceExhausted(边界策略:与 Request 一致地拒绝,
-   * 不与在途请求争用 session_id 空间)。
+   * node 盖 frm_type(调用方给的业务类型优先,否则默认 kCommand)、默认 protocol_id、
+   * session_id 取**空闲集尾部(最新释放者)只读盖帧**(#98:不出队、不登记 PendingTable、
+   * 不占 256 在途预算,也不扰动 Request 的 FIFO 退休窗口——RT_REQUEST_005 的迟到误配
+   * 防护不被高频 Send 削弱)。编码后经 transport.Write 上线,遵 RT_TRANSPORT_008 背压。
+   * 关闭后返 kClosed;256 个 session_id 全在途(空闲集空)时返 kResourceExhausted
+   * (边界策略:与 Request 一致地拒绝——此时任何可盖的 id 都正被某在途请求占用,盖上
+   * 即有误配面)。
    *
    * @param msg 出站 Message(payload + 可选 message_id / frm_type 由调用方填)。
    * @return 写出结果或机器可判别错误(kClosed / kResourceExhausted / 编码 / 传输错误)。
@@ -271,8 +272,8 @@ class ProtocolNode {
   /**
    * @brief 从空闲集分配一个 session_id(最久释放者优先 = FIFO / 最大退休窗口)。
    *
-   * 协议特有语义(uint8=256 空间),内联本类(D10)。可复用:P2-3 noresponse Send 亦
-   * 盖 session_id(盖帧后立即释放、不占在途预算)。自持锁。
+   * 协议特有语义(uint8=256 空间),内联本类(D10)。仅 Request 独占分配;noresponse
+   * Send 改走 PeekIdleSession 只读盖帧(#98,不出队)。自持锁。
    *
    * @return 一个空闲 session_id;256 个全在途时返 std::nullopt(调用方据此拒绝发送)。
    */
@@ -280,6 +281,31 @@ class ProtocolNode {
 
   /// @brief 归还一个 session_id 回空闲集尾(push_back → 最大化其复用前的退休窗口)。自持锁。
   void ReleaseSession(std::uint8_t session_id);
+
+  /// @brief 只读取空闲集尾部(最新释放者)供 Send 盖帧(#98):不出队、不占在途预算、
+  ///        不扰动 FIFO 序;取尾不取头——头部即将被下一个 Request 独占,尾部距离被复用
+  ///        最远,误配面最小。空闲集空返 std::nullopt。自持锁。
+  [[nodiscard]] std::optional<std::uint8_t> PeekIdleSession() const;
+
+  /**
+   * @brief RAII session 租约(#98):构造接管一个已分配的 session_id,析构自动归还空闲集。
+   *
+   * Request 全部返回路径(登记冲突 / 编码失败 / 写失败 / 正常终结)统一经析构归还,
+   * 消除手工 ReleaseSession 纪律——漏一处即慢性泄漏,终致假 kResourceExhausted。
+   */
+  class SessionLease {
+   public:
+    SessionLease(ProtocolNode* node, std::uint8_t id) : node_(node), id_(id) {}
+    ~SessionLease() { node_->ReleaseSession(id_); }
+    SessionLease(const SessionLease&) = delete;
+    SessionLease& operator=(const SessionLease&) = delete;
+
+    [[nodiscard]] std::uint8_t id() const { return id_; }
+
+   private:
+    ProtocolNode* node_;
+    std::uint8_t id_;
+  };
 
   std::unique_ptr<ITransport> transport_;
   std::unique_ptr<ICodec> codec_;

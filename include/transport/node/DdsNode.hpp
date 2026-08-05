@@ -35,7 +35,6 @@
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
