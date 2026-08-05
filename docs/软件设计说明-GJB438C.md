@@ -180,12 +180,13 @@ CSCI 分为四个软件包（对应 `include/transport/` 与 `src/` 的子目录
 
 - **文件：** `node/PendingTable.hpp`（RT_IN_INTERFACE_004 / ADR-0001 D2）
 - **职责：** 四件事——唯一登记（`Register`）、恰好一次完成（`Resolve`）、全部收敛（`FailAll`）、取消纪律（`Handle` 析构兜底）。不 decode、不算 key、不判终结、不跑读循环。
-- **数据结构：** `std::map<Key, shared_ptr<Entry>>`，`Entry{SharedCompletion<T> completion; time_point registered_at}`；共享状态含 `closed` latch、可选 `sink`、`last_request_latency`，一把 `std::mutex` 守。
-- **在途 entry 状态机：** 见图 5-1。四方（Resolve/超时/取消/FailAll）抢同一 `Complete`，原子首胜 → 恰好一次终结。`Handle::Wait` 的二段仲裁：本地超时/取消后先尝试 `Complete(error)` 置终结，抢输则采用真正终结结果（堵"超时返回但 entry 未终结、随后 Resolve 假成功"竞态缝）。
+- **数据结构：** `std::map<Key, shared_ptr<Entry>>`，`Entry{shared_ptr<Coro::Awaitable<T>> mailbox; time_point registered_at}`——entry 只有一个等待者（当前键空间不需同 key 并发多待，ADR-0001），信箱是一条**裸 `Coro::Awaitable<T>`**（底层一条 FiberChannel 的一次性 channel），只承载"唤醒 + 带值/带错"。共享状态含 `closed` latch、可选 `sink`、`last_request_latency`，一把 `std::mutex` 守。要求 `T` 可默认构造且可拷贝（信箱语义）。
+- **在途 entry 状态机与仲裁：** 见图 5-1。**唯一仲裁点 = 表锁内 `find+erase` 抢占终结权**——四方（Resolve/超时/取消/FailAll）谁先把该 entry 从 map 摘除谁胜（恰好一次，RT_REQUEST_003）；胜方在锁外对信箱 `push` 值 + `close`（Resolve）或 `close(error)`（超时/取消/FailAll）。`Handle::Wait` 在信箱上 `await`/`await_for`：收到值 → Resolve 抢先；本地超时抢到 → `kTimeout`，抢输（他方已在途）→ 在信箱 `await` 一次 drain 出对方结果（`Awaitable`"关闭后先取尽已入队值再报 close_error"语义天然裁决"值抢在 close 前落地"的竞态）。
+- **简化沿革：** 此前每个 entry 背一个 `SharedCompletion<T>`（自带第二把 mutex + 多等待者 waiter-map + 广播）；单等待者场景用不到多等待者机制，改用裸 `Awaitable<T>` + 表锁唯一仲裁点后去掉该层（`SharedCompletion` 仍供 §5.2 的多等待者 void 事件用），对齐 AsyncTask《使用说明》§6.3"一次性等待 = push + closeStop，消费方 await 一次即得"范式。对外 `Register/Resolve/FailAll/Handle::Wait` 签名与语义不变。
 
-**图 5-1 PendingTable 在途 entry 四方仲裁状态图**
+**图 5-1 PendingTable 在途 entry 抢占仲裁状态图**
 
-![PendingTable 在途 entry 四方仲裁状态图](diagrams/state-pending-entry.svg)
+![PendingTable 在途 entry 抢占仲裁状态图](diagrams/state-pending-entry.svg)
 
 - **`FailAll(error, latch_closed)`：** `latch_closed=true`（Close 语义）之后 `Register` 返 `kClosed`，表永久收敛；`false`（断连语义）只清空当前在途、不 latch，表继续可用。绝不 un-latch。
 - **容量：** 可选 `max_pending` 纯计数上限（协议无关）；ProtocolNode 传 256 作双重执法，仅防自定义键策略绕过 session 预算。
@@ -196,7 +197,7 @@ CSCI 分为四个软件包（对应 `include/transport/` 与 `src/` 的子目录
 - **文件：** `core/SharedCompletion.hpp`
 - **职责：** 一次性完成原语，支持多等待者、原子首胜 `Complete`、`Wait` 支持 deadline/取消。要求 `T` 为 void 或可拷贝（每个等待者持独立 `Result<T>`）。
 - **实现：** 共享 `State{mutex; StoredResult completion; map<id, weak_ptr<Waiter>>}`；`Complete` 锁内置结果并摘取全部 waiter，锁外 `resolve+close`；`Wait` 已完成即返，否则登记 waiter 并 `await`/`await_for`，本地超时置 `kTimeout`、取消置 `kCancelled`。
-- **用途：** PendingTable entry 值信箱；NodeRuntime 的 `start_done_`/`loop_done_`/`handler_done_`/`closed_`；reactor 的 `reactor_done_`。
+- **用途：** 仅用于**多等待者 void 事件**——NodeRuntime 的 `start_done_`/`loop_done_`/`handler_done_`/`closed_`、reactor 的 `reactor_done_`、各传输/`TcpServer` 的 `closed`/`accept_done` 等（多个 `WaitClosed` 共享）。PendingTable 已不再用它（§5.1 简化沿革：单等待者改用裸 `Awaitable<T>`）。
 
 ### 5.3 BoundedQueue\<T\>（协议无关有界队列）
 

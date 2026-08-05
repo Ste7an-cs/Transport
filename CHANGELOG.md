@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+### 简化:PendingTable entry 改用裸 Coro::Awaitable(去掉 SharedCompletion 层)
+> 拉取 AsyncTask 最新《使用说明》后重评:PendingTable 每个在途 entry 只有一个等待者(当前键空间不需同 key 并发多待,ADR-0001),此前背的 `SharedCompletion<T>`(多等待者 waiter-map + 第二把 mutex + 广播)是死重。公开 API 与可观察行为不变。
+- **简化** `Entry` 信箱 `SharedCompletion<T>` → 裸 `std::shared_ptr<Coro::Awaitable<T>>`;**唯一仲裁点改为表锁内 `find+erase` 抢占终结权**(四方 Resolve/超时/取消/FailAll 谁先摘除谁胜),胜方在锁外对信箱 `push`+`close`;`Handle::Wait` 用 `await`/`await_for` + 抢输时一次 drain(靠 `Awaitable`"关闭后先取尽值再报错"语义裁决竞态)。对齐 AsyncTask《使用说明》§6.3 一次性等待范式。
+- **保留** `SharedCompletion` 仅供多等待者 void 事件(NodeRuntime 生命周期/reactor、各传输 `closed`、TcpServer accept)。`Register/Resolve/FailAll/Handle::Wait` 签名与语义不变,`ProtocolNode`/`DdsNode`/测试零改动。
+- **验证** 全量 270 tests 全绿(除已知 CGNAT flake);关联/容量(256 在途+乱序+迟到不误配+FIFO)/取消/重连/生命周期 20 遍重复压测无竞态。文档:GJB438C §5.1/§5.2 + 状态图重渲染 + 路线图 SDD §6 更新。
+
 ### 清理:P6 前置清理 —— 请求-响应链路评审整改(#98)
 > 来源:ProtocolNode 请求-响应实现评审(2026-08-04)。全部为内部工程质量整改,公开 API 不变;唯一线缆可见变化是 Trace 生命周期类别改名与 noresponse `Send` 盖章取值。
 - **变更** Trace 类别常量集中收口 `include/transport/core/TraceCategories.hpp`(单一权威,发射点不再散落字符串字面量);生命周期类别 **`"close"` 改名 `"lifecycle"`**("running" 挂在 "close" 下是命名误导;消费方按类别过滤需同步)。同步 SDD §6 / ADR-0003 D13 九类清单。
