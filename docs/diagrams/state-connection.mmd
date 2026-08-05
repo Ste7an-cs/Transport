@@ -1,0 +1,24 @@
+stateDiagram-v2
+    direction LR
+    [*] --> Disconnected
+
+    Disconnected --> Connecting: Start()<br/>(spawn connect-loop fiber)
+    Connecting --> Connected: 物理连接成功<br/>(Generation +1，切内层 TcpTransport)
+    Connecting --> Reconnecting: 连接超时/失败<br/>(abort + deleteLater)
+    Connecting --> Connecting: 端点热更新<br/>(掐断当前尝试，立即以新端点重试)
+
+    Connected --> Reconnecting: 对端断连<br/>(waitForDisconnected 唤醒)
+    Reconnecting --> Connecting: 退避到期<br/>(1s×2 上限 30s ±20% jitter)
+    Reconnecting --> Reconnecting: 端点热更新<br/>(重置退避级别)
+
+    Connected --> Disconnected: RequestClose / Close
+    Connecting --> Disconnected: RequestClose / Close
+    Reconnecting --> Disconnected: RequestClose / Close
+    Disconnected --> [*]
+
+    note right of Connected
+        稳定 ≥ stable_reset_after 后
+        下次断开重置退避级别；
+        node 侧 reactor 观察本状态机
+        的下降沿做代际隔离
+    end note

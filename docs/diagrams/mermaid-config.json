@@ -1,0 +1,9 @@
+{
+  "theme": "neutral",
+  "themeVariables": {
+    "fontfamily": "Segoe UI, Helvetica, Arial, sans-serif",
+    "fontSize": "14px"
+  },
+  "flowchart": { "curve": "basis", "htmlLabels": true },
+  "sequence": { "showSequenceNumbers": true, "wrap": true }
+}
