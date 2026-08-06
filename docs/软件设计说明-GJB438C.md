@@ -40,8 +40,8 @@
 - **DD-5 结果承载错误、不抛异常（满足 RT_ERROR_001/002/003、RT_DESIGN_005）：** 预期失败用 `Result<T>`/`Status`（`[[nodiscard]]`）+ 机器可判别 `TransportErrc` 类别，不靠解析字符串前缀。唯一授权的 `catch` 在 handler 消费者边界（隔离第三方逃逸异常）。
 - **DD-6 发送排序（满足 RT_TRANSPORT_007/004；ADR-0004 D5）：** 同 fiber 程序序、跨 fiber 串行为一致全序，单帧字节不与另一帧交错。**发送完成语义与协程背压已撤销**（原"帧进内核才报成功"，ADR-0002 D2 → 被 ADR-0004 D5 撤销）：发送成功此后仅表示该帧已交付下层发送通路。并发写串行化**保留**——它是 RT_TRANSPORT_004 的实现手段，与完成语义是两件事。**代价**：发送侧不再有框架级内存上界（见 §7.2 已知缺口）。
 - **DD-7 两个独立生命周期轴 + 链路可用性上移（满足 RT_LIFECYCLE_001/002、RT_TRANSPORT_009；ADR-0004 D2）：** 节点生命周期 `Created→Running→Closing→Closed`（全介质通用）与 TCP 物理连接状态（仅 TCP 客户端，Running 内子状态）正交。**连接管理**（状态机/退避/重连策略/代际推进）不下沉纯字节管道；但**当前链路可用性**作为与 `LastSendTime`/`LastError` 同类的 I/O 事实**上移至 `ITransport` 基类**，所有介质同形作答——交互层因此不再按介质探测可选能力接口（`IConnectionObservable` 取消）。此为 ADR-0002 D3′ 的边界重划。
-- **DD-11 读取终止语义二义化（满足 RT_TRANSPORT_008；ADR-0004 D1）：** `Read` 失败收敛为两义——`kConnection` = 链路断开（可重连传输将自行重连，继续读即可在新链路取数）；`kClosed` = 传输终结（我方关闭，或不可重连传输的底层致命错误）。不可重连介质（UDP/串口/已接受的 TCP 连接）致命错误统一返 `kClosed`。**交互层因此对三介质使用同一段读循环**。
-- **DD-12 撤销连接代际隔离（满足 RT_TCP_RECONNECT_002 改写；ADR-0004 D3/D4）：** 断链时交互层不再批量终结在途请求、不再清空旧链路排队业务，"代际"概念自交互层消失。在途请求由各自总超时（**缺省值为强制项**）、取消或关闭终结。RT_REQUEST_004"旧代际响应不得完成新请求"由物理事实保证（旧 socket 已关，字节不跨链路投递；在途关联标识未释放，新请求取不到同键）。配套 `ICodec` 增加**重置**：断链重连时清残留，避免半帧残尾与新链路首字节拼成错帧。
+- **DD-11 读取终止语义单一化 + 重连完全透明（满足 RT_TRANSPORT_008；ADR-0004 D1）：** `Read` 失败中仅 `kClosed` = 传输终结（我方关闭，或不可重连传输的底层致命错误），其余为可继续的瞬时错误。不可重连介质（UDP/串口/已接受的 TCP 连接）致命错误统一返 `kClosed`；**可重连传输在内部透明处理链路中断**，不向交互层暴露断链事件。`kConnection` 此后仅存于写路径（RT_TCP_RECONNECT_003）。**交互层因此对三介质使用同一段读循环，且无链路中断分支**。
+- **DD-12 撤销连接代际隔离（满足 RT_TCP_RECONNECT_002 改写；ADR-0004 D3/D4）：** 断链时交互层不再批量终结在途请求、不再清空旧链路排队业务，"代际"概念自交互层消失。在途请求由各自总超时（**缺省值 30 秒，强制项**）、取消或关闭终结。RT_REQUEST_004"旧代际响应不得完成新请求"由物理事实保证（旧 socket 已关，字节不跨链路投递；在途关联标识未释放，新请求取不到同键）。**不引入编解码器重置**（ADR-0004 D4 撤销）：断链残尾与新链路首字节可能拼成错帧，由编解码器既有校验与重同步处置（报坏帧后恢复）。
 - **DD-8 恰好一次终结的挂起-应答仲裁（满足 RT_REQUEST_001..005）：** 请求↔响应关联复用 `PendingTable`，每个在途 entry 一个等待者、以裸 `Coro::Awaitable<T>` 为信箱，**表锁 `find+erase` 作唯一仲裁点**（Resolve/超时/取消/FailAll 谁先摘除谁胜）。原则：恰好一次不靠状态枚举而靠单点抢占，竞态面小。
 - **DD-9 底层回调不碰节点状态（满足 RT_HANDLER_002、RT_NODE_004、RT_IN_INTERFACE_003）：** Qt I/O 回调在 socket QThread、DDS 样本在 provider listener 线程，均须安全转交节点执行域；DDS 经跨线程有界交接边界（`BoundedQueue<Sample>`）转交，跨线程唤醒靠 boost.fiber channel 跨线程安全。
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**六项** `DropReason` 之一（原七项，`kGenerationIsolationDrop` 随 ADR-0004 D3 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
@@ -166,9 +166,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![断连代际隔离时序图](diagrams/seq-generation-isolation.svg)
 
-**图例说明（ADR-0004 D1/D3/D4 后的新流程；下图 SVG 仍为旧代际隔离流程，待重渲染）**：链路断开时 `TcpClientTransport` 清空对外通道残留字节，令 `Read` 返回**一次** `kConnection`；node 读循环收到后**只做一件事——重置编解码器**（清半帧残尾），随即继续 `Read`，该次 `Read` 阻塞至新链路就绪。node 保持 Running。
+**图例说明（ADR-0004 D1/D3/D4 后的新流程；下图 SVG 仍为旧代际隔离流程，待重渲染）**：链路断开对交互层**完全透明**——`TcpClientTransport` 的 connect-loop 转入重连，`Read` 因对外通道无数据而自然挂起，重连成功后新链路数据到达即被唤醒。node 读循环**无任何断链分支**，node 保持 Running。
 
-**不再发生的动作**（原代际隔离）：不批量终结在途请求、不清空旧链路排队业务、无 reactor 协程、无状态下降沿甄别。在途请求由各自总超时/取消/关闭终结（ADR-0004 D3）。
+**不再发生的动作**（原代际隔离）：不批量终结在途请求、不清空旧链路排队业务、无 reactor 协程、无状态下降沿甄别、**不向交互层发任何断链信号**。在途请求由各自总超时（缺省 30 秒）/取消/关闭终结（ADR-0004 D3）。
 
 #### 4.2.7 节点生命周期状态（MS_NODE_LIFECYCLE）
 
@@ -247,7 +247,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - 数据元素：`SendUnit{bytes,destination}`、`Datagram{bytes,source}`、`OperationOptions`。
 - 通信方式：协程 await 式拉模型；`Read` 一次一片；`Write` 成功表示帧已交付下层发送通路（**非**"已进内核"、**非**"对端已收"，ADR-0004 D5）。
 - 协议特征：`Start/Read(options)/Write(SendUnit)/RequestClose/WaitClosed` + 强制 I/O 观测面 `LastSendTime/LastReceiveTime/LastError/LinkState`；同实例同一时刻至多一个有效读。
-- **读取终止二义语义（DD-11）**：`Read` 失败仅两种终止含义——`kConnection`=链路断开（可重连传输将自行重连，继续读即可）、`kClosed`=传输终结（应停止读）；其余失败为可继续的瞬时错误。**所有介质同形**，交互层无需知道哪种介质会重连。
+- **读取终止语义（DD-11）**：`Read` 失败中仅 `kClosed`=传输终结（应停止读），其余为可继续的瞬时错误；可重连传输透明跨越链路中断，不暴露断链事件。**所有介质同形**，交互层无需知道哪种介质会重连。
 - **链路可用性（DD-7）**：`LinkState()` 为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。`IConnectionObservable` 已取消。
 
 #### 4.3.6 DDS provider 抽象（JK_PROVIDER）
@@ -325,7 +325,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **键派生**：`CorrelationKeyStrategy`（可注入）；默认请求键 `(session_id<<16)|message_id`，响应键清 `0x1000` 标记位归一化。
 - **session_id**：空闲集 `deque<uint8>`（0..255），Request `pop_front` 取最久释放者（FIFO 退休窗口 RT_REQUEST_005），`SessionLease` RAII 归还；256 全在途 `kResourceExhausted`。Send 只读空闲集尾部盖帧、不出队（不扰 FIFO、不占预算）。
 - **Dispatch**：`kResponse`/`kResult`=响应帧→`Resolve`（未命中归因 kUnmatchedOrLateResponse）；否则业务帧入队/丢弃（无 handler 归因 kNoHandlerConfigured）。
-- **链路断开处置（DD-11/DD-12，取代原 reactor）**：读循环收到 `kConnection` → **仅重置编解码器**（清半帧残尾）后继续 `Read`。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环。
+- **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
 
 **软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。
 
@@ -335,13 +335,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **单元设计决策**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7）；连接管理（TCP 客户端）与纯管道分离并**维持两层**（ADR-0004 D8：合并只会复制收发语义）；TCP 客户端内部改为**连接泵 + 对外通道**（ADR-0004 D6）；DDS 跨线程有界交接闭合 ADR-0001 未决项。
 
-**设计约束**：并发写串行化保留（RT_TRANSPORT_004）、**发送完成语义与背压已撤销**（DD-6）；UDP/DDS 单次一报文/样本，过大发送前失败；**读取终止二义**（DD-11）：不可重连介质致命错误返 `kClosed`，可重连介质链路断开返 `kConnection` 且每次断链**恰好一次**（其后 `Read` 阻塞至新链路就绪，不得反复返回致读循环空转）；socket/串口在节点执行域 fiber 内创建（亲和纪律）。
+**设计约束**：并发写串行化保留（RT_TRANSPORT_004）、**发送完成语义与背压已撤销**（DD-6）；UDP/DDS 单次一报文/样本，过大发送前失败；**读取终止语义**（DD-11）：不可重连介质致命错误返 `kClosed`，可重连介质链路中断**对调用方透明**（`Read` 挂起至新链路就绪，不返回任何断链错误）；socket/串口在节点执行域 fiber 内创建（亲和纪律）。
 
 **软件逻辑**：见 `src/io/*`。
 | 单元 | 关键逻辑 |
 |---|---|
 | TcpTransport | 接管已连接 socket；复用 corosocket `readAll` 流；写路径**并发写按到达序串行化**（不再等字节进内核）；对端断开 → `Read` 返 `kClosed`（不可重连，DD-11） |
-| TcpClientTransport | connect-loop fiber 持 socket 跑状态机 `Connecting/Connected/Reconnecting`，建连后以流式读取器持续取数投入**对外通道**；`Read` 从该通道取；断链时清空通道残留并令 `Read` 返回**一次** `kConnection`，随后继续重连。`Write` **直操当前 socket**（重连期立即返 `kConnection`，不缓存——RT_TCP_RECONNECT_003），不经通道。`abort()+deleteLater()` 管超时；退避 1s×2 上限 30s ±20%；`ApplyConfig`/`Generation()`/`AttemptCount()` 等降级为**具体方法**（ADR-0004 D7）。**已知缺口**：对外通道无界（见 §7.2） |
+| TcpClientTransport | connect-loop fiber 持 socket 跑状态机 `Connecting/Connected/Reconnecting`，建连后以流式读取器持续取数投入**对外通道**；`Read` 从该通道取；断链**不发信号**，connect-loop 转入重连、`Read` 自然挂起至新链路数据到达（完全透明，DD-11）。`Write` **直操当前 socket**（重连期立即返 `kConnection`，不缓存——RT_TCP_RECONNECT_003），不经通道。`abort()+deleteLater()` 管超时；退避 1s×2 上限 30s ±20%；`ApplyConfig`/`Generation()`/`AttemptCount()` 等降级为**具体方法**（ADR-0004 D7）。**已知缺口**：对外通道无界（见 §7.2） |
 | UdpTransport | coroudpsocket 报文收发；`Write` 寻址 kDefault→config 默认 / kNet→ip:port；`writeDatagram` 同步原子发送；底层致命 → `Read` 返 `kClosed` |
 | SerialTransport | coroiodevice 字节流；设备断开/致命 → `Read` 返 `kClosed`（不重连，TBD-005） |
 | DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
@@ -353,9 +353,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **单元设计决策**：`ICodec` 可有状态（`SystemCodec` 单线程喂滚动缓冲）或无状态并发（`DdsCodec` 多 listener 线程并发喂）；坏帧诊断 + 重同步。
 
-**设计约束**：`Encode` 一对一；`Decode` 半包返回空、粘包返回多条；分帧错误 `kFrame`、语义错误 `kCodec`；**`Reset` 丢弃未成帧残留**（RT_CODEC_007 / DD-12），由节点在链路断开后调用。
+**设计约束**：`Encode` 一对一；`Decode` 半包返回空、粘包返回多条；分帧错误 `kFrame`、语义错误 `kCodec`。**不设重置操作**（ADR-0004 D4 撤销）——透明重连后残尾与新链路首字节拼成的错帧，由既有校验与重同步处置（报坏帧、计入坏帧计数后恢复）。
 
-**软件逻辑**：`SystemCodec`（外部协议流式，占位帧常量 TBD-003，跨切片拼帧 + 重同步；`Reset` 清滚动缓冲）；`DatagramCodec`（报文式保边界；`Reset` 空操作）；`DdsCodec`（kind/correlation_id/reply_to 元数据，无状态；`Reset` 空操作）；`LengthFieldCodec`（长度字段分帧基元；`Reset` 清缓冲）。
+**软件逻辑**：`SystemCodec`（外部协议流式，占位帧常量 TBD-003，跨切片拼帧 + 重同步）；`DatagramCodec`（报文式保边界）；`DdsCodec`（kind/correlation_id/reply_to 元数据，无状态）；`LengthFieldCodec`（长度字段分帧基元）。
 
 **执行时序/数据流**：见 §4.2.3（Decode 在读循环、Encode 在出站）。
 
@@ -375,7 +375,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | MS_DFD_CONTEXT / MS_DFD_TOPLEVEL | 执行方案 | RT_IN_INTERFACE_001、RT_TRANSPORT、RT_REQUEST | §4.2.1、§4.2.2 |
 | MS_NODE_DATAFLOW / MS_REQ_RESP | 执行方案 | RT_REQUEST、RT_NODE_003 | §4.2.3、§4.2.4 |
 | MS_CLOSE / MS_NODE_LIFECYCLE | 执行方案 | RT_LIFECYCLE_001/003–007 | §4.2.5、§4.2.7 |
-| MS_LINK_DOWN / MS_CONNECTION | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008、RT_CODEC_007、RT_LIFECYCLE_002 | §4.2.6、§4.2.8 |
+| MS_LINK_DOWN / MS_CONNECTION | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008、RT_LIFECYCLE_002 | §4.2.6、§4.2.8 |
 | MS_PENDING | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.10 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
@@ -398,7 +398,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 |---|---|
 | RT_CORO_RUNTIME_001..005 | DD-2 / CSC_CORE、CSC_NODE / CSU_NODERUNTIME / MS_DYNAMIC_LIFECYCLE |
 | RT_TRANSPORT_001..009 | DD-6、DD-11 / CSC_IO / CSU_IO / JK_TRANSPORT / MS_DFD_TOPLEVEL |
-| RT_CODEC_001..007 | DD-12 / CSC_CODEC / CSU_CODEC / JK_CODEC |
+| RT_CODEC_001..006 | CSC_CODEC / CSU_CODEC / JK_CODEC |
 | RT_REQUEST_001..006 | DD-8 / CSC_NODE / CSU_PENDINGTABLE、CSU_PROTOCOLNODE / MS_REQ_RESP、MS_PENDING |
 | RT_HANDLER_001..006 | CSC_NODE / CSU_NODERUNTIME、CSU_BOUNDEDQUEUE / MS_NODE_DATAFLOW |
 | RT_LIFECYCLE_001..007 | DD-7 / CSU_NODERUNTIME / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、MS_CONNECTION |
