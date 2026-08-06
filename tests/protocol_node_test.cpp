@@ -284,6 +284,109 @@ TEST(ProtocolNode, RequestTimesOutAndReleasesCorrelation) {
 }
 
 // -----------------------------------------------------------------------------
+// 总超时缺省值(SRS §3.1.4.4 / ADR-0004 D3,issue #108)——调用方不给 deadline 时节点
+// 套用 config.default_request_timeout;节点不接受"永不超时"的请求。测试把默认值配小
+// (50ms / 20ms,而非缺省 30s)以落在单测时间尺度内。
+// -----------------------------------------------------------------------------
+
+// ①不给 deadline:无响应时于配置的默认超时后返 kTimeout,且关联被清理(与显式 deadline
+// 走同一条终结路径)。若无此缺省,断链后该请求将无任何终结源(交互层已不再终结在途请求)。
+TEST(ProtocolNode, RequestWithoutDeadlineTimesOutAtConfiguredDefault) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNodeConfig config;
+  config.default_request_timeout = 50ms;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  bool done = false;
+  OperationOptions::Clock::duration elapsed{};
+  auto request = Coro::makeTask([&] {
+    const auto started = OperationOptions::Clock::now();
+    outcome = node.Request(MakeRequest(0x0002, {}));  // 不给 options → 走默认超时。
+    elapsed = OperationOptions::Clock::now() - started;
+    done = true;
+  });
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_GE(elapsed, 50ms);  // 不早于默认超时终结(缺省值确实被套用而非即时失败)。
+
+  // 关联已清理:迟到响应无匹配丢弃 +1(证明超时时已 Evict entry、session_id 已归还)。
+  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
+
+  node.Close();
+  EXPECT_TRUE(request.get());
+}
+
+// ②-a 显式 deadline 比默认值短:以调用方的为准(默认值不得把它拉长)。默认配 2s,显式
+// 给 20ms —— 若默认值覆盖了显式值,请求将在 pump 预算内一直挂着而非 kTimeout。
+TEST(ProtocolNode, ExplicitShortDeadlineNotOverriddenByDefault) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  ProtocolNodeConfig config;
+  config.default_request_timeout = 2s;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  bool done = false;
+  OperationOptions::Clock::duration elapsed{};
+  auto request = Coro::makeTask([&] {
+    OperationOptions options;
+    options.deadline = OperationOptions::Clock::now() + 20ms;
+    const auto started = OperationOptions::Clock::now();
+    outcome = node.Request(MakeRequest(0x0002, {}), options);
+    elapsed = OperationOptions::Clock::now() - started;
+    done = true;
+  });
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 1000));
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_LT(elapsed, 1s);  // 按 20ms 终结,而非等到 2s 的默认值。
+
+  node.Close();
+  EXPECT_TRUE(request.get());
+}
+
+// ②-b 显式 deadline 比默认值长:同样以调用方的为准(默认值不得把它截短)。默认配 20ms,
+// 显式给 3s —— 越过默认值良久后请求仍在途,随后注入的匹配响应正常完成它。
+TEST(ProtocolNode, ExplicitLongDeadlineNotShortenedByDefault) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNodeConfig config;
+  config.default_request_timeout = 20ms;
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  bool done = false;
+  auto request = Coro::makeTask([&] {
+    OperationOptions options;
+    options.deadline = OperationOptions::Clock::now() + 3s;
+    outcome = node.Request(MakeRequest(0x0002, {}), options);
+    done = true;
+  });
+
+  // 默认超时(20ms)早已越过,请求仍未终结。
+  EXPECT_FALSE(pumpFiberUntil([&] { return done; }, 200));
+
+  fake->Inject(MakeResponseDatagram(0, 0x1002, {0x5A}));
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
+  ASSERT_TRUE(outcome);
+  EXPECT_EQ(outcome.value().payload, std::vector<std::uint8_t>{0x5A});
+
+  node.Close();
+  EXPECT_TRUE(request.get());
+}
+
+// -----------------------------------------------------------------------------
 // P5-3:全线接入丢弃归因(issue #88)——配 CapturingTraceSink 时,各丢弃点计数与
 // 可辨识的 TraceEvent(category="drop", message=DropReasonName)同步产生。
 // -----------------------------------------------------------------------------

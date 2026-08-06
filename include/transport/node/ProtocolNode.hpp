@@ -20,6 +20,7 @@
  * fiber 调度器、无 affinity(D8/Q9)。
  */
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -114,10 +115,23 @@ struct CorrelationKeyStrategy {
 CorrelationKeyStrategy DefaultProtocolKeyStrategy(
     std::uint16_t response_marker = kResponseMarker);
 
-/// ProtocolNode 配置:关联键策略 + 默认外部协议 id + 可选入站业务处理器 + 业务队列上界。
+/// ProtocolNode 配置:关联键策略 + 默认外部协议 id + 默认请求超时 + 可选入站业务处理器
+/// + 业务队列上界。
 struct ProtocolNodeConfig {
   CorrelationKeyStrategy key_strategy = DefaultProtocolKeyStrategy();
   std::uint8_t protocol_id = 0;
+  /**
+   * 默认请求总超时(SRS §3.1.4.4 总超时缺省值,ADR-0004 D3):调用方 `Request` 未显式给出
+   * `options.deadline` 时,节点以 `now + default_request_timeout` 补齐——**节点不得接受
+   * "永不超时"的请求**。
+   *
+   * 存在理由:链路断开**不再终结在途请求**(RT_TCP_RECONNECT_002 改写——代际隔离已撤销,
+   * 重连对交互层完全透明),故断链后一个无 deadline 的请求将失去全部终结源、一直挂到节点
+   * 关闭,与 RT_REQUEST_003"每个请求恰好终结一次"冲突。总超时缺省值即该场景下的兜底终结源。
+   *
+   * 须为正值,否则 `Start` 返 kConfiguration 并停在 Created(RT_LIFECYCLE_007)。
+   */
+  OperationOptions::Clock::duration default_request_timeout = std::chrono::seconds(30);
   /// 入站业务处理器(RT_HANDLER_001);为空 = P1 行为(业务帧归因 dropped_no_handler)。
   InboundHandler handler;
   /// 业务队列事件数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
@@ -152,7 +166,8 @@ class ProtocolNode {
   /**
    * @brief 并发安全幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
    *
-   * 首个 Start 先校验 config(队列上界落 [1,65536] / [64KiB,256MiB]、key_strategy 非空)
+   * 首个 Start 先校验 config(队列上界落 [1,65536] / [64KiB,256MiB]、key_strategy 非空、
+   * default_request_timeout 为正)
    * → 失败返 kConfiguration、停在 Created、允许改配重试;通过则置 starting、做实事(transport
    * Start + spawn 读循环/handler fiber)、Complete start_done_。初始化期间并发进来的 Start
    * await 同一 start_done_ 结果、不重复 spawn。已 Running 再启 → 成功;Closing/Closed →
@@ -182,10 +197,13 @@ class ProtocolNode {
    * LRU 分配 session_id;request_key → PendingTable.Register(重复键 kInvalidState 透传)→
    * Encode → transport.Write → Handle::Wait 等唯一响应,终结后释放 session_id 回空闲集。
    * 256 个 session_id 全在途时发送前返 kResourceExhausted(不登记、不发送)。总超时经
-   * options.deadline(调用方从接受请求起算)。关闭后返 kClosed。
+   * options.deadline(从节点接受请求起算);**调用方未给 deadline 时,节点在接受请求处补
+   * `now + config.default_request_timeout`**(SRS §3.1.4.4 总超时缺省值)——链路断开不再终结
+   * 在途请求(ADR-0004 D3),无此缺省则该请求会一直挂到节点关闭。调用方**显式给出的
+   * deadline 一律照用,不被缺省覆盖**。关闭后返 kClosed。
    *
    * @param req     请求 Message(payload + message_id 由调用方填)。
-   * @param options 截止时间与取消令牌。
+   * @param options 截止时间(缺省时套用节点默认请求超时)与取消令牌。
    * @return 匹配响应 Message,或机器可判别错误(kClosed / kResourceExhausted /
    *         kInvalidState / kTimeout / …)。
    */

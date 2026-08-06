@@ -154,6 +154,27 @@ TEST(ProtocolNodeLifecycle, NullKeyStrategyRejectedAsConfiguration) {
   EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
 }
 
+// RT_LIFECYCLE_007 + SRS §3.1.4.4(issue #108):默认请求超时非正(0 = "永不超时"、负值
+// = 已过期)→ Start 返 kConfiguration、停 Created、可改配重试。节点不得接受"永不超时"的
+// 请求:断链已不再终结在途请求(ADR-0004 D3),缺省超时是其唯一兜底终结源。
+TEST(ProtocolNodeLifecycle, NonPositiveDefaultRequestTimeoutRejectedAsConfiguration) {
+  for (auto bad : {OperationOptions::Clock::duration::zero(),
+                   OperationOptions::Clock::duration(-1)}) {
+    auto fake_owner = std::make_unique<FakeCoroTransport>();
+    FakeCoroTransport* fake = fake_owner.get();
+    ProtocolNodeConfig config;
+    config.default_request_timeout = bad;
+    ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                      std::move(config));
+
+    auto started = node.Start();
+    ASSERT_FALSE(started);
+    EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
+    // 停在 Created:传输从未启动,节点未进 Running。
+    EXPECT_EQ(fake->state(), transport::LifecycleState::kCreated);
+  }
+}
+
 // RT_LIFECYCLE_007:修正配置后重试成功——先以非法配置构造(Start 失败停 Created),再以
 // 合法配置构造同型节点验证 Start 成功(node 无 pre-start reconfig API,以状态语义体现)。
 TEST(ProtocolNodeLifecycle, ValidConfigStartsAfterInvalidRejected) {
