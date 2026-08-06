@@ -76,6 +76,12 @@ Status ProtocolNode::ValidateConfig() const {
   if (!config_.key_strategy.request_key || !config_.key_strategy.response_key) {
     return make_error_code(TransportErrc::kConfiguration);
   }
+  // 默认请求超时须为正(SRS §3.1.4.4):零或负值等价于"永不超时"或立即超时,前者会让
+  // 断链后的无 deadline 请求失去全部终结源(ADR-0004 D3 撤销代际隔离后交互层不再终结在途
+  // 请求),破坏 RT_REQUEST_003;故在 Start 前拒绝,停 Created 允许改配重试。
+  if (config_.default_request_timeout <= Clock::duration::zero()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
   return Status{};
 }
 
@@ -135,6 +141,14 @@ Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
   if (!runtime_.IsRunning()) {
     // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
     return make_error_code(TransportErrc::kClosed);
+  }
+
+  // 总超时缺省值(SRS §3.1.4.4):调用方没给 deadline 就补上默认请求超时,且**在此处**
+  // 补——总超时"从节点接受请求时开始",含分配 session、登记、编码、写出与等响应的全部
+  // 时间。节点不接受"永不超时"的请求:断链已不再终结在途请求(ADR-0004 D3),无 deadline
+  // 者将挂到节点关闭为止。显式给出的 deadline 是调用方意图,一律不覆盖。
+  if (!options.deadline) {
+    options.deadline = Clock::now() + config_.default_request_timeout;
   }
 
   // 从空闲集 LRU 分配 session_id;256 个全在途 → 发送前返 kResourceExhausted(不登记、
