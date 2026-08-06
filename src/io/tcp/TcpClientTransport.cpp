@@ -821,4 +821,24 @@ std::error_code TcpClientTransport::LastError() const {
   return inner ? inner->LastError() : std::error_code{};
 }
 
+// 链路可用性直接映射连接状态机(不委托内层):内层只在 Connected 期存在,而
+// Connecting/Reconnecting 期须如实报 kEstablishing。生命周期先决——Closing/Closed
+// 期连接状态机可能尚未收敛到 Disconnected,但链路对调用方已不可用。
+LinkState TcpClientTransport::CurrentLinkState() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->lifecycle != LifecycleState::kRunning) {
+    return LinkState::kDown;
+  }
+  switch (state_->conn) {
+    case ConnectionState::kConnected:
+      return LinkState::kUp;
+    case ConnectionState::kConnecting:
+    case ConnectionState::kReconnecting:
+      return LinkState::kEstablishing;
+    case ConnectionState::kDisconnected:
+      break;
+  }
+  return LinkState::kDown;
+}
+
 }  // namespace transport

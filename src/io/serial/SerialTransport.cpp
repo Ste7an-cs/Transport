@@ -475,4 +475,15 @@ std::error_code SerialTransport::LastError() const {
   return state_->last_error;
 }
 
+// 串口的"链路可用"即设备已打开:Start 只在 open + 参数应用成功后落 Running;设备
+// 致命断开(拔线)经 OnDeviceError→BeginClose 关设备并离开 Running。isOpen() 一并
+// 核对设备句柄本身,避免 lifecycle 与设备实态脱节时误报可用。
+LinkState SerialTransport::CurrentLinkState() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return (state_->lifecycle == LifecycleState::kRunning && state_->port &&
+          state_->port->isOpen())
+             ? LinkState::kUp
+             : LinkState::kDown;
+}
+
 }  // namespace transport

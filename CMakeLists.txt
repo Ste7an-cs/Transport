@@ -114,6 +114,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/protocol_node_tcp_smoke_test.cpp
     tests/protocol_node_reconnect_test.cpp
     tests/transport_contract_test.cpp
+    tests/link_state_test.cpp
     tests/coro_harness_test.cpp
     tests/fake_coro_transport_test.cpp
     tests/send_semantics_fake_test.cpp

@@ -394,4 +394,17 @@ std::error_code TcpTransport::LastError() const {
   return state_->last_error;
 }
 
+// 链路可用性以 socket 的当前连接态为准而非以生命周期推断:对端断开时本类不改
+// lifecycle(读侧只以 kConnection 收敛,不重连),故 Running 期仍须问 socket 才能
+// 如实报告"连接已不存续"。
+LinkState TcpTransport::CurrentLinkState() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->lifecycle != LifecycleState::kRunning || !state_->socket) {
+    return LinkState::kDown;
+  }
+  return state_->socket->state() == QAbstractSocket::ConnectedState
+             ? LinkState::kUp
+             : LinkState::kDown;
+}
+
 }  // namespace transport
