@@ -52,8 +52,10 @@ class TcpTransport final : public ITransport {
 
   /// @brief 读一片已到达字节(拉模型,单一顺序读者;流式,一次一任意切片)。
   /// @param options 取消信号与截止时间。
-  /// @return 一片 Datagram;超时 Timeout、取消 Cancelled、断连 Io/Connection、
-  ///         关闭 Closed。
+  /// @return 一片 Datagram;超时 Timeout、取消 Cancelled(均为可继续的瞬时错误);
+  ///         **传输终结** Closed——本类不重连,故对端断开/底层致命错误与我方关闭
+  ///         同以 Closed 收敛,调用方应停止读取(RT_TRANSPORT_008 / ADR-0004 D1);
+  ///         底层成因经 LastError() 诊断。
   Result<Datagram> Read(OperationOptions options = {}) override;
 
   /// @brief 发送一帧;仅在帧字节全部离开框架用户态缓冲、进入操作系统发送缓冲后

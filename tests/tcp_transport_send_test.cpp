@@ -237,8 +237,9 @@ TEST(CoroTcpTransport, PeerResetDuringFlushFailsWriteAndClosesConnection) {
   accepted->deleteLater();
 }
 
-// 读侧:对端正常关闭时在途 Read 以 Connection 收敛(readAll 流对端关闭 ≠ 我方关闭)。
-TEST(CoroTcpTransport, PeerCloseWakesPendingReadWithConnection) {
+// 读侧:对端正常关闭时在途 Read 以 Closed 收敛——本类不重连,连接终结即传输终结
+// (RT_TRANSPORT_008 / ADR-0004 D1)。
+TEST(CoroTcpTransport, PeerCloseWakesPendingReadWithClosed) {
   QTcpServer server;
   QTcpSocket* client = nullptr;
   QTcpSocket* accepted = nullptr;
@@ -265,7 +266,7 @@ TEST(CoroTcpTransport, PeerCloseWakesPendingReadWithConnection) {
 
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
   client->deleteLater();
 }
 

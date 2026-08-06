@@ -23,7 +23,8 @@ namespace transport {
  * (from 可变);`Write(SendUnit)` 按 `destination`(须为 `kNet`)发往不同地址,
  * 一次一报文。UDP 无连接:不构造伪连接状态,只暴露 I/O 事实(最近收发时间戳、
  * 单操作错误,RT_NODE_006/ADR-0002 D3);底层致命 I/O 使生命周期 `Closing→Closed`
- * 而非重连(ADR-0002 D3′)。socket 在调用 `Start()` 的 fiber(节点执行域)内创建
+ * 而非重连(ADR-0002 D3′),读取以 `Closed` 收敛(ADR-0004 D1)。socket 在调用
+ * `Start()` 的 fiber(节点执行域)内创建
  * 并绑定,守亲和纪律。
  */
 // 与 TCP 的差异:UDP `writeDatagram` 是同步非阻塞的单报文原子发送——要么整报文
@@ -47,7 +48,10 @@ class UdpTransport final : public ITransport {
 
   /// @brief 收一条完整报文(拉模型,单一顺序读者);source 填发送方地址(from 可变)。
   /// @param options 截止时间(取消见 TCP 读侧同理:持久单流不逐读取消)。
-  /// @return 一条 Datagram;超时 Timeout、底层致命 Io/Connection、关闭 Closed。
+  /// @return 一条 Datagram;超时 Timeout(可继续的瞬时错误);**传输终结** Closed
+  ///         ——UDP 不重连,故 socket 级致命 I/O 与我方关闭同以 Closed 收敛,调用方
+  ///         应停止读取(RT_TRANSPORT_008 / ADR-0004 D1);底层成因经 LastError()
+  ///         诊断。单次发送的可恢复失败不经本路径(见 Write)。
   Result<Datagram> Read(OperationOptions options = {}) override;
 
   /// @brief 发一条报文;一次一完整报文。寻址:`kDefault` → 解析为 UdpConfig 默认目的地

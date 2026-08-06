@@ -21,6 +21,8 @@ namespace {
 
 // 把 Qt socket 错误映射到传输错误类别:对端主动关闭 / 网络层断裂归 Connection,
 // 其余读写故障归 Io(RT_TRANSPORT_004.4 允许 Io 或 Connection)。
+// 用途:**写路径**的失败原因(ADR-0004 D1:kConnection 此后仅存于写路径)与
+// LastError() 诊断;读路径的终止一律以 kClosed 呈现,不用本映射作返回值。
 std::error_code MapSocketError(std::error_code error) {
   if (error.category() == Coro::detail::socket_error_category()) {
     switch (static_cast<QAbstractSocket::SocketError>(error.value())) {
@@ -242,22 +244,19 @@ Result<Datagram> TcpTransport::Read(OperationOptions options) {
   } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
     result = make_error_code(TransportErrc::kTimeout);
   } else if (chunk.error().category() == Coro::detail::socket_error_category()) {
+    // 已连接 socket 上的底层致命错误(对端 reset、网络断裂):本类不重连,连接终结
+    // 即传输终结 → 读取以 kClosed 收敛(RT_TRANSPORT_008 / ADR-0004 D1),底层成因
+    // 降为诊断事实留在 LastError()。
     std::error_code mapped = MapSocketError(chunk.error());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
     }
-    result = mapped;
+    result = make_error_code(TransportErrc::kClosed);
   } else {
-    // channel 无错误关闭(对端正常关闭)或我方关闭:关闭中 → Closed,否则对端断
-    // 开 → Connection。
-    bool closing;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      closing = state->lifecycle != LifecycleState::kRunning;
-    }
-    result = make_error_code(closing ? TransportErrc::kClosed
-                                     : TransportErrc::kConnection);
+    // channel 无错误关闭:对端正常关闭,或我方关闭。本类不重连,二者对调用方同一
+    // 含义——传输终结、停止读取 → kClosed(ADR-0004 D1 终止语义单一化)。
+    result = make_error_code(TransportErrc::kClosed);
   }
   FinishRead(state);
   return result;
@@ -395,7 +394,7 @@ std::error_code TcpTransport::LastError() const {
 }
 
 // 链路可用性以 socket 的当前连接态为准而非以生命周期推断:对端断开时本类不改
-// lifecycle(读侧只以 kConnection 收敛,不重连),故 Running 期仍须问 socket 才能
+// lifecycle(读侧只以 kClosed 收敛,不重连),故 Running 期仍须问 socket 才能
 // 如实报告"连接已不存续"。
 LinkState TcpTransport::CurrentLinkState() const {
   std::lock_guard<std::mutex> lock(state_->mutex);

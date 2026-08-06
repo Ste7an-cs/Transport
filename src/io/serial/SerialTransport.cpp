@@ -71,8 +71,9 @@ struct SerialTransport::State {
   std::deque<std::shared_ptr<Coro::Awaitable<void>>> write_queue;
   // 在途写的刷空等待者:设备致命错误时由 BeginClose 唤醒,避免写 fiber 永挂。
   std::shared_ptr<Coro::Awaitable<void>> active_flush;
-  // 设备致命断开错误(非我方 RequestClose):非空时在途 Read 以其收敛(Connection),
-  // 区别于我方关闭的 Closed。
+  // 设备致命断开错误(非我方 RequestClose):作为**写路径**的失败原因(链路已断,
+  // ADR-0004 D1 保留 kConnection 于写路径)与诊断事实;读路径不再区分成因,一律以
+  // kClosed 收敛。
   std::error_code disconnect_error;
   std::optional<Clock::time_point> last_send;
   std::optional<Clock::time_point> last_recv;
@@ -135,8 +136,9 @@ void OnDeviceError(const std::shared_ptr<SerialTransport::State>& state,
     if (state->lifecycle != LifecycleState::kRunning || state->disconnect_error) {
       return;  // 已在关闭或已记录首个断开。
     }
-    // 任一设备致命错误 = 链路断裂(等同 TCP 对端断开),统一归 Connection;
-    // 在途 Read 据此以 Connection 收敛,并触发 Closing→Closed(不重连,D3′)。
+    // 任一设备致命错误 = 链路断裂(等同 TCP 对端断开),成因统一归 Connection
+    // (写路径失败原因 + LastError 诊断);并触发 Closing→Closed(不重连,D3′),
+    // 在途 Read 随流关闭以 kClosed 收敛(ADR-0004 D1)。
     const std::error_code mapped = make_error_code(TransportErrc::kConnection);
     state->disconnect_error = mapped;
     state->last_error = mapped;
@@ -314,21 +316,10 @@ Result<Datagram> SerialTransport::Read(OperationOptions options) {
   } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
     result = make_error_code(TransportErrc::kTimeout);  // 超时不停流,可再读。
   } else {
-    // 流关闭:设备致命断开 → 记录的 disconnect_error(Connection);否则我方关闭
-    // 中 → Closed。
-    std::error_code disconnect;
-    bool closing = false;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      disconnect = state->disconnect_error;
-      closing = state->lifecycle != LifecycleState::kRunning;
-    }
-    if (disconnect) {
-      result = disconnect;
-    } else {
-      result = make_error_code(closing ? TransportErrc::kClosed
-                                       : TransportErrc::kConnection);
-    }
+    // 流关闭:设备致命断开(disconnect_error 已记)或我方关闭。串口不重连,二者对
+    // 调用方同一含义——传输终结、停止读取 → kClosed(RT_TRANSPORT_008 / ADR-0004
+    // D1)。底层成因降为诊断事实,留在 LastError()(见 OnDeviceError)。
+    result = make_error_code(TransportErrc::kClosed);
   }
   FinishRead(state);
   return result;

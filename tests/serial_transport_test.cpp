@@ -208,8 +208,9 @@ TEST(CoroSerialTransport, OpenFailureYieldsConnection) {
   EXPECT_EQ(s.error(), make_error_code(TransportErrc::kConnection));
 }
 
-// 断开致命:对端(master)关闭 → 在途 Read 以 Connection 收敛,传输 Closing→Closed
-// (不自动重连);WaitClosed 完成。
+// 断开致命(RT_TRANSPORT_008 / ADR-0004 D1):设备致命错误(对端 master 关闭)→ 在途
+// Read 以 Closed 收敛(串口不重连,链路终结即传输终结),传输 Closing→Closed;
+// WaitClosed 完成。底层成因(Connection)降为诊断事实,留在 LastError()。
 TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
   PtyPair pty = MakePty();
   ASSERT_TRUE(pty.ok);
@@ -235,7 +236,7 @@ TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
 
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(t.LastError(), make_error_code(TransportErrc::kConnection));
 
   // 致命 → 已 Closing→Closed:WaitClosed 立即完成,后续 Read 返回 Closed(不重连)。
@@ -247,7 +248,8 @@ TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
 }
 
-// 我方 RequestClose → 在途 Read 以 Closed 收敛(区别于设备断开的 Connection)。
+// 我方 RequestClose → 在途 Read 以 Closed 收敛(与设备致命断开同一终止语义:调用方
+// 无须区分"谁终结了传输",只须停止读取)。
 TEST(CoroSerialTransport, RequestCloseWakesPendingReadWithClosed) {
   PtyPair pty = MakePty();
   ASSERT_TRUE(pty.ok);
@@ -313,7 +315,8 @@ TEST(CoroSerialTransport, ConcurrentSecondReadIsInvalidState) {
   ::close(pty.master);
 }
 
-// 带 deadline 的 Read 超时 → Timeout,且不停流:后续数据到达后再次 Read 仍拿到。
+// 边界守卫:可继续的瞬时读错误**不是**致命——带 deadline 的 Read 超时 → Timeout
+// (非 kClosed),且不停流:后续数据到达后再次 Read 仍拿到(SRS §3.1.2.4)。
 TEST(CoroSerialTransport, DeadlineTimeoutDoesNotStopStream) {
   PtyPair pty = MakePty();
   ASSERT_TRUE(pty.ok);
