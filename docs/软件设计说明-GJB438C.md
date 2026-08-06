@@ -246,9 +246,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - 接口类型：C++ 抽象类 `ITransport`（`io/ITransport.hpp`）。
 - 数据元素：`SendUnit{bytes,destination}`、`Datagram{bytes,source}`、`OperationOptions`。
 - 通信方式：协程 await 式拉模型；`Read` 一次一片；`Write` 成功表示帧已交付下层发送通路（**非**"已进内核"、**非**"对端已收"，ADR-0004 D5）。
-- 协议特征：`Start/Read(options)/Write(SendUnit)/RequestClose/WaitClosed` + 强制 I/O 观测面 `LastSendTime/LastReceiveTime/LastError/CurrentLinkState`；同实例同一时刻至多一个有效读。
+- 协议特征：`Start/Read(options)/Write(SendUnit)/RequestClose/WaitClosed` + 强制 I/O 观测面 `LastSendTime/LastReceiveTime/LastError/LinkState`；同实例同一时刻至多一个有效读。
 - **读取终止语义（DD-11）**：`Read` 失败中仅 `kClosed`=传输终结（应停止读），其余为可继续的瞬时错误；可重连传输透明跨越链路中断，不暴露断链事件。**所有介质同形**，交互层无需知道哪种介质会重连。
-- **链路可用性（DD-7）**：`CurrentLinkState()`（返回 `enum class LinkState{kDown,kEstablishing,kUp}`）为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。方法名与类型名不同名——同名会在类内隐藏类型名 `LinkState`。`IConnectionObservable` 已取消。
+- **链路可用性（DD-7）**：`LinkState()` 为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。`IConnectionObservable` 已取消。
 
 #### 4.3.6 DDS provider 抽象（JK_PROVIDER）
 - 优先级：中。
