@@ -82,6 +82,10 @@ class TcpTransport final : public ITransport {
   /// @brief 最近一次操作错误(无则默认构造的 error_code)。
   [[nodiscard]] std::error_code LastError() const override;
 
+  /// @brief 当前链路可用性(RT_TRANSPORT_009):已接管连接存续 → `kUp`;未 Start、
+  ///        对端断开或已关闭 → `kDown`。本类不管理连接,故永不出现 `kEstablishing`。
+  [[nodiscard]] LinkState CurrentLinkState() const override;
+
   struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
 
  private:

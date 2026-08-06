@@ -240,4 +240,14 @@ std::error_code DdsTransport::LastError() const {
   return state_->last_error;
 }
 
+// DDS 的"链路可用"即 provider 已初始化且订阅全部完成:Start 只在 Init 与逐 topic
+// Subscribe 全部成功后才落 Running(任一失败中途返回、不进 Running),故 Running +
+// provider 存活是充要判据。
+LinkState DdsTransport::CurrentLinkState() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return (state_->lifecycle == LifecycleState::kRunning && state_->provider)
+             ? LinkState::kUp
+             : LinkState::kDown;
+}
+
 }  // namespace transport

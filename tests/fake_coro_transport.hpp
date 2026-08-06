@@ -21,6 +21,7 @@ class FakeCoroTransport final : public transport::ITransport {
  private:
   using Datagram = transport::Datagram;
   using LifecycleState = transport::LifecycleState;
+  using LinkState = transport::LinkState;
   using OperationOptions = transport::OperationOptions;
   using Clock = OperationOptions::Clock;
   template <typename T>
@@ -50,6 +51,9 @@ class FakeCoroTransport final : public transport::ITransport {
     std::optional<Clock::time_point> last_send;
     std::optional<Clock::time_point> last_recv;
     std::error_code last_error;
+    // 链路可用性(RT_TRANSPORT_009):缺省由生命周期推导(Running → kUp,其余
+    // kDown),SetLinkState 可注入任意取值以模拟"进程活着但链路不可用/建立中"。
+    std::optional<LinkState> link_state_override;
   };
 
  public:
@@ -338,6 +342,32 @@ class FakeCoroTransport final : public transport::ITransport {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     return state->last_error;
+  }
+
+  /// @brief 当前链路可用性:默认与生命周期同调(Running → kUp,其余 kDown);
+  ///        经 SetLinkState 注入后以注入值为准。
+  LinkState CurrentLinkState() const override {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->link_state_override) {
+      return *state->link_state_override;
+    }
+    return state->lifecycle == LifecycleState::kRunning ? LinkState::kUp
+                                                       : LinkState::kDown;
+  }
+
+  /// @brief 注入链路可用性(测试钩子):此后 CurrentLinkState 恒返注入值。
+  void SetLinkState(LinkState link_state) {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->link_state_override = link_state;
+  }
+
+  /// @brief 撤销注入,恢复"与生命周期同调"的缺省口径(测试钩子)。
+  void ClearLinkState() {
+    const auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->link_state_override.reset();
   }
 
  private:

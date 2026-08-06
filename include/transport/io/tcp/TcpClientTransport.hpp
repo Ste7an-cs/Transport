@@ -126,6 +126,12 @@ class TcpClientTransport final : public ITransport, public IConnectionObservable
   /// @brief 最近一次内层 I/O 错误(委托内层)。
   [[nodiscard]] std::error_code LastError() const override;
 
+  /// @brief 当前链路可用性(RT_TRANSPORT_009):映射内部连接状态机——`Connected` →
+  ///        `kUp`,`Connecting`/`Reconnecting` → `kEstablishing`,`Disconnected`
+  ///        与未 Start / 关闭中 / 已关闭 → `kDown`。**只报事实,不报策略**:退避参数、
+  ///        重连决策仍是本类内部事(诊断面见 `NextAttemptTime`/`AttemptCount`)。
+  [[nodiscard]] LinkState CurrentLinkState() const override;
+
   struct Impl;  // 不透明:定义在 .cpp,connect-loop fiber 与本类共享。
 
  private:

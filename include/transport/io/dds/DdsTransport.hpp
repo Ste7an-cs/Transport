@@ -115,6 +115,11 @@ class DdsTransport final : public ITransport {
   /// @brief 最近一次 Publish/Read 操作错误(无则默认构造的 error_code)。
   [[nodiscard]] std::error_code LastError() const override;
 
+  /// @brief 当前链路可用性(RT_TRANSPORT_009):provider 已 `Init` 且订阅全部完成 →
+  ///        `kUp`;未 Start、Init/Subscribe 失败或已关闭 → `kDown`。DDS 无连接建立
+  ///        相位,故永不出现 `kEstablishing`。
+  [[nodiscard]] LinkState CurrentLinkState() const override;
+
   struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
 
  private:

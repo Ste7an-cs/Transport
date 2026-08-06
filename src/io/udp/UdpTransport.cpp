@@ -350,4 +350,13 @@ std::error_code UdpTransport::LastError() const {
   return state_->last_error;
 }
 
+// UDP 的"链路可用"即 socket 已绑定:Start 只在 bind 成功后落 Running 并置 socket,
+// 故 Running + socket 非空是充要判据(bind 失败不进 Running)。
+LinkState UdpTransport::CurrentLinkState() const {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return (state_->lifecycle == LifecycleState::kRunning && state_->socket)
+             ? LinkState::kUp
+             : LinkState::kDown;
+}
+
 }  // namespace transport
