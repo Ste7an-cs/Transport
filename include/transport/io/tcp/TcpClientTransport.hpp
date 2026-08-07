@@ -11,19 +11,30 @@
 #include <optional>
 #include <system_error>
 
-// ConnectionState 定义处(接口本身不再被本类实现;头文件删除留待 T7/#111)。
-#include "transport/io/IConnectionObservable.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/io/tcp/TcpClientConfig.hpp"
 
 namespace transport {
 
 /**
+ * @brief 连接管理状态机可观察态(RT_LIFECYCLE_002,TCP 客户端 Running 内子状态)。
+ *
+ * 与 base 生命周期 `LifecycleState` 正交:连接代际 churn 在 Running 内进行,`Close`
+ * 走 `Closing→Closed` 终态,不在此枚举内。
+ */
+enum class ConnectionState {
+  kDisconnected,  ///< 未连接(初始 / 关闭后)。
+  kConnecting,    ///< 正在发起一次连接尝试。
+  kConnected,     ///< 已建立物理连接,内层传输就绪。
+  kReconnecting,  ///< 断连后等待下一次尝试。
+};
+
+/**
  * @brief 外层 TCP 客户端连接管理传输(ADR-0003 D11 分层;内部结构见 ADR-0004 D6)。
  *
  * owns `QTcpSocket`,组合 P1 内层 `TcpTransport`(一代际一实例)。**只实现 `ITransport`**
- * ——连接观察面(`IConnectionObservable`)已随 ADR-0004 D2/D7 取消,其诊断项降级为本类的
- * 具体方法,不进基类、不构成多态缝(交互层不再按介质探测能力)。
+ * ——独立的连接观察面接口已随 ADR-0004 D2/D7 取消(链路可用性并入 `ITransport`),其诊断项
+ * 降级为本类的具体方法,不进基类、不构成多态缝(交互层不再按介质探测能力)。
  *
  * **内部结构:连接泵 + 对外通道(ADR-0004 D6)**
  *

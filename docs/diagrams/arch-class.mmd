@@ -11,13 +11,7 @@ classDiagram
         +LastSendTime() time_point
         +LastReceiveTime() time_point
         +LastError() error_code
-    }
-    class IConnectionObservable {
-        <<interface>>
-        +State() ConnectionState
-        +WaitStateChange(options) Result~ConnectionState~
-        +Generation() uint64
-        +AttemptCount() size_t
+        +CurrentLinkState() LinkState
     }
     class ICodec {
         <<interface>>
@@ -70,7 +64,13 @@ classDiagram
     }
 
     class TcpTransport
-    class TcpClientTransport
+    class TcpClientTransport {
+        <<具体诊断，非多态缝>>
+        +State() ConnectionState
+        +WaitForState(target, options) Status
+        +Generation() / AttemptCount() / LastFailure()
+        +ApplyConfig(TcpClientConfig, version)
+    }
     class UdpTransport
     class SerialTransport
     class DdsTransport
@@ -84,7 +84,6 @@ classDiagram
     ITransport <|.. UdpTransport
     ITransport <|.. SerialTransport
     ITransport <|.. DdsTransport
-    IConnectionObservable <|.. TcpClientTransport
     ICodec <|.. SystemCodec
     ICodec <|.. DatagramCodec
     ICodec <|.. DdsCodec

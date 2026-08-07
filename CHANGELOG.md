@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### 破坏性变更:删除 `IConnectionObservable` 接口(ADR-0004 D2/D7 收尾,#111)
+> ADR-0004 **D2**(链路可用性并入 `ITransport`)与 **D7**(连接诊断项降级为具体方法)落地后,该可选观察面接口已无实现者、无调用方,予以删除。交互层不再按介质探测能力接口。
+- **移除**(**破坏性**)公开头文件 `include/transport/io/IConnectionObservable.hpp` 及接口 `transport::IConnectionObservable`。下游若直接包含该头文件,改为包含 `transport/io/tcp/TcpClientTransport.hpp`。
+- **变更** `ConnectionState` 枚举的定义位置随之迁至 `include/transport/io/tcp/TcpClientTransport.hpp`(其唯一使用者)。**命名空间与枚举项不变**(仍为 `transport::ConnectionState::{kDisconnected,kConnecting,kConnected,kReconnecting}`),`TcpClientTransport::State/WaitForState/WaitStateChange` 签名不变;库内所有使用者已包含该头文件,零改动。
+- **替代能力**:所有介质同形的链路可用性经 `ITransport::CurrentLinkState()` 获取;连接代际/尝试次数/最近失败/下次尝试时刻等诊断为 `TcpClientTransport` 的具体方法,不构成多态缝。
+- **文档** 同步更新 SDD(GJB438C §4.3.5)、设计说明书 §3 目录分组与 §6 P3 回填记录、README P3 条目;类图 `arch-class`/`sdd-csc-io`/`sdd-csc-layers` 去掉该接口并补 `CurrentLinkState`,图 4-9(`seq-generation-isolation`)改绘为 ADR-0004 D1/D3 后的"断链对交互层完全透明"流程(SVG 一并重渲染)。
+
 ### ⚠ 破坏性变更:丢弃归因七项减为六项 —— 删 `DropReason::kGenerationIsolationDrop`(#112)
 > 依据 ADR-0004 **D3(撤销连接代际隔离)**:断链时交互层不再批量终结在途请求、不再清空旧链路排队业务,该归因项的**产生机制已不存在**(其 `ProtocolNode` 侧计数器与访问器已随 #110 删除,计数恒为 0)。本次删除归因项本身并改写 loss=0 harness。
 - **破坏性** 公开枚举 `transport::DropReason` 移除枚举项 `kGenerationIsolationDrop`;`DropReasonName` 不再产生稳定短名 `"generation-isolation-drop"`。下游若对该枚举做穷尽 `switch` 或依赖该短名字符串,需同步调整。**六项**为:业务队列溢出 / DDS 交接溢出 / 坏帧 / 迟到·重复·无匹配响应 / 关闭丢弃 / 无处理器丢弃。
