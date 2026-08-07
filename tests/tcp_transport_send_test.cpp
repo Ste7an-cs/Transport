@@ -63,10 +63,14 @@ SendUnit Frame(std::vector<std::uint8_t> bytes) {
 }
 
 // 收紧内核收发缓冲,让慢读取端能确定性地把内核发送缓冲填满(制造背压)。
+// 只收紧内核缓冲不够:QAbstractSocket::readBufferSize() 默认 0 = 用户态读缓冲无上限,
+// 事件循环一转就把内核接收缓冲抽干、灌进无界的用户态缓冲,"慢读取端"前提失效、背压
+// 提前释放。故同时给用户态读缓冲设上限(夹具前提,非产品行为)。
 void Throttle(QTcpSocket* client, QTcpSocket* accepted, int bytes = 16384) {
   client->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, bytes);
   accepted->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption,
                             bytes);
+  accepted->setReadBufferSize(bytes);
 }
 
 // 串行排队下并发写不再被拒:直接发,断言成功(后到者内部排队等待写槽)。
@@ -125,9 +129,10 @@ TEST(CoroTcpTransport, SlowReaderAppliesBackpressureAndBoundsInFlightFrames) {
   ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
   Throttle(client, accepted);
   TcpTransport sender(client);
-  TcpTransport receiver(accepted);
+  // 读取端**暂不接**:TcpTransport::Start() 会建立 readAll 流,该流在每次 readyRead
+  // 上把 socket 抽干 → 就不再是"慢读取端"。慢读取端的构造 = 背压窗口内无人读
+  //(内核接收缓冲 + 上了限的 Qt 用户态读缓冲一起被填满),排空阶段再接上读取端。
   ASSERT_TRUE(sender.Start());
-  ASSERT_TRUE(receiver.Start());
 
   const std::vector<std::uint8_t> big(256u * 1024u, 0x33);  // 256 KiB,远超收紧后的缓冲。
   Status write_status{make_error_code(TransportErrc::kInternal)};
@@ -148,7 +153,10 @@ TEST(CoroTcpTransport, SlowReaderAppliesBackpressureAndBoundsInFlightFrames) {
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 2; }));
 
-  // 排空接收端 → 背压释放,两帧依序完成、串行上线(先 big,后 0x99)。
+  // 接上读取端并排空 → 背压释放,两帧依序完成、串行上线(先 big,后 0x99)。
+  // readAll 建流时会先 drain 已到达的字节,故背压窗口内被缓冲的字节不会丢。
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(receiver.Start());
   const auto received = ReadExact(receiver, big.size() + 1, 8000);
   EXPECT_TRUE(writer.get());
   EXPECT_TRUE(writer_b.get());
@@ -281,9 +289,9 @@ TEST(CoroTcpTransport, TimeoutAfterWriteStartedDoesNotTruncateHealthyFrame) {
   ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
   Throttle(client, accepted);
   TcpTransport sender(client);
-  TcpTransport receiver(accepted);
+  // 读取端暂不接:本用例要求在写帧在超时窗口内仍未刷完(背压持续),故超时窗口内
+  // 不能有人抽干 socket——Start() 建立的 readAll 流会在每次 readyRead 上抽干。
   ASSERT_TRUE(sender.Start());
-  ASSERT_TRUE(receiver.Start());
 
   const std::vector<std::uint8_t> big(256u * 1024u, 0x77);
   Status write_status{make_error_code(TransportErrc::kInternal)};
@@ -301,7 +309,9 @@ TEST(CoroTcpTransport, TimeoutAfterWriteStartedDoesNotTruncateHealthyFrame) {
   EXPECT_EQ(waited.error(), std::make_error_code(std::errc::timed_out));
   EXPECT_EQ(sender.SendWaiterDepth(), 1U);  // 底层仍在尽力刷完。
 
-  // 排空接收端:帧未被截断,对端完整收到,且底层刷完最终成功。
+  // 接上读取端并排空:帧未被截断,对端完整收到,且底层刷完最终成功。
+  TcpTransport receiver(accepted);
+  ASSERT_TRUE(receiver.Start());
   const auto received = ReadExact(receiver, big.size(), 8000);
   EXPECT_TRUE(writer.get());
   EXPECT_TRUE(write_status);

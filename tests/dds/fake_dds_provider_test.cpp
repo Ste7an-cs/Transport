@@ -40,6 +40,14 @@ TEST(FakeDdsProvider, UnsubscribeStopsDelivery) {
 TEST(FakeDdsProvider, StaticBusIsolatesByDomain) {
   // 默认构造(无注入 Bus)→ Init 接入按 domain 的静态总线。
   FakeDdsProvider tx, rx_same, rx_other;
+  // 静态 domain 总线是进程级共享状态,且 provider 析构不自动退订:不复位则上一轮
+  // 的订阅会残留到下一轮(--gtest_repeat 下确定性失败)。用 RAII 保证即便断言中途
+  // 失败也退订复位。
+  struct ShutdownAll {
+    FakeDdsProvider* ps[3];
+    ~ShutdownAll() { for (auto* p : ps) p->Shutdown(); }
+  } cleanup{{&tx, &rx_same, &rx_other}};
+
   (void)tx.Init(Cfg(7)); (void)rx_same.Init(Cfg(7)); (void)rx_other.Init(Cfg(8));
   int same = 0, other = 0;
   (void)rx_same.Subscribe("t", [&](const std::vector<uint8_t>&) { ++same; });
