@@ -17,10 +17,10 @@ stateDiagram-v2
     Closed --> [*]
 
     note right of Closing
-        重入自锁防护：若当前即 handler
-        消费者 fiber，只发起拆卸、跳过
-        对 closed_ 的自等待（避自锁），
-        节点由读循环收敛（ADR-0005 D1）
+        重入守卫（ADR-0005 D6）：两条内部工作
+        单元（读-分发循环 / handler 消费者）调
+        Close/WaitClosed 一律返 kInvalidState，
+        且不做任何拆卸 —— 关闭只能外部发起
     end note
 
     note right of Running

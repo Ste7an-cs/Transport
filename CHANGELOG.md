@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 💥 重入守卫:关闭仅外部发起,落地 RT_LIFECYCLE_005(ADR-0005 D6,#121)
+
+> 依 ADR-0005 **D6** / RT_LIFECYCLE_005。**ADR-0005 至此全部实施完毕**(D1 #118 / D2·D8 #119 / D5 #120 / D6 #121)。
+
+- **💥 破坏性** 移除处理器能力面上的"请求关闭"入口:`HandlerContext::RequestClose()` 与 `DdsHandlerContext::RequestClose()`。入站业务处理器自此**不含关闭本节点的能力**;handler 识别出的协议级终止条件只能经处理结果与可观测状态上报,由宿主裁决是否关闭。(SRS §3.2.2 接口变更登记早已预告。)
+- **变更** 内部工作单元调 `Close()` / `WaitClosed()` 一律返 `kInvalidState` 且**不做任何拆卸**(节点保持原状态、仍可正常交互),取代原先"只发起拆卸、不自等待"的**半执行**分支。守卫置于一切逻辑之前——连"已 Closed 直接成功"这条捷径也不给,因为契约是"内部工作单元无权关闭节点",与节点当前处于哪个状态无关。
+- **变更** 守卫覆盖面由**一条**扩到**两条**内部工作单元:除既有的 handler 消费者 fiber,新增**读-分发循环 fiber**。后者不是理论风险——`decode_and_dispatch`(及其调到的 key_strategy / codec / trace_sink 等用户代码)就跑在读循环 fiber 上,而 D1 之后读循环兼任收敛者,它调 `Close` 即"收敛者等自己退出"的自锁。
+- **实现细节** 两条 fiber 均在各自 fiber 体首部登记 id、末尾(收敛完成之后)注销。注销是必要的:fiber 退出后其 id 可被新 fiber 复用,陈旧登记会把**外部**调用者误判为内部来源;fiber 存活期间 id 不会被复用,故登记窗口内无误判。
+- **不受影响** 收敛路径不经公开 API(`ConvergeAfterReadLoop` 只调私有的 `SignalCloseIfFirstCloser` / `ConvergeToClosed`);`TcpServer` 的 supervisor 与 `Close` 跑在子节点之外的独立 fiber;析构调 `Close` 由宿主发起。
+- **新增/改写测试** handler 内硬调 `Close`/`WaitClosed` 均返 `kInvalidState` 且节点仍 `Running` 仍可 `Send`,随后外部 `Close` 正常收敛;**从读循环 fiber 内**硬调同样如此(守卫若失效该用例必然挂死,故它同时是行为证据)。原 `HandlerRequestCloseDoesNotSelfDeadlock` / `HandlerNodeCloseDoesNotSelfDeadlock` 语义已变,合并改写。
+- **验证** 全量 293 tests `--gtest_repeat=3` 三轮一致(292 通过 / 1 既有失败 #123),**无挂起**;生命周期与重连五套件 52 tests `--gtest_repeat=20` 全绿无挂起。
+
 ### 功能:致命错误自终,落地 RT_LIFECYCLE_008(ADR-0005 D5,#120)
 
 > 依 ADR-0005 **D5** / RT_LIFECYCLE_008。此前节点因底层致命错误而收发终止后会停留在 `Running`,读-分发循环退出后常驻在收敛入口等待外部关闭,`WaitClosed` 的等待者永不被唤醒(僵尸节点)。本次消除该状态。

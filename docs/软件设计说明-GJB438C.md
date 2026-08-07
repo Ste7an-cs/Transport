@@ -177,7 +177,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![节点生命周期状态图](diagrams/state-node-lifecycle.svg)
 
-**图例说明**：`Created→Running→Closing→Closed`。并发幂等 Start 共享 `start_done_` 不重复 spawn；多等待者共享 `closed_`；重入自锁防护比对 handler fiber id。
+**图例说明**：`Created→Running→Closing→Closed`。并发幂等 Start 共享 `start_done_` 不重复 spawn；多等待者共享 `closed_`；**重入守卫**（ADR-0005 D6）比对两条内部工作单元（读-分发循环 / handler 消费者）的 fiber id，命中即返 `kInvalidState` 且不做任何拆卸。
 
 #### 4.2.8 TCP 连接状态机（MS_CONNECTION）
 
@@ -304,9 +304,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ### 5.4 节点运行时详细设计（CSU_NODERUNTIME）
 
-**单元设计决策（DD-3）**：把多节点共享的协议无关机制收成可组合薄件——①生命周期状态机 + 并发幂等 Start + 收敛（并入读循环，ADR-0005 D1）+ 重入自锁防护；②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离 + close_drop 归因；③读-分发循环骨架 `SpawnReadLoop(fn)`。对 Event 不透明。
+**单元设计决策（DD-3）**：把多节点共享的协议无关机制收成可组合薄件——①生命周期状态机 + 并发幂等 Start + 收敛（并入读循环，ADR-0005 D1）+ 致命错误自终（D5）+ 重入守卫（D6）；②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离 + close_drop 归因；③读-分发循环骨架 `SpawnReadLoop(fn)`。对 Event 不透明。
 
-**设计约束**：同步纪律（D8）——生命周期状态/计数/handler 任务句柄均入锁，唤醒/回调锁外；重入自锁防护比对 `boost::this_fiber::get_id()`；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
+**设计约束**：同步纪律（D8）——生命周期状态/计数/handler 任务句柄均入锁，唤醒/回调锁外；重入守卫比对 `boost::this_fiber::get_id()`——两条内部工作单元各自在 fiber 体首部登记 id、收敛完成后于末尾注销（fiber 退出后 id 可被复用，陈旧登记会误判外部调用者）；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
 
 **软件逻辑**：见 `node/NodeRuntime.hpp`。
 - **Start(validate, bring_up)**：首个 Start 校验 config → 置 starting → 调 node `bring_up`（transport.Start + MarkRunning + SpawnReadLoop/HandlerLoop）；并发 Start await 同一 `start_done_`。
