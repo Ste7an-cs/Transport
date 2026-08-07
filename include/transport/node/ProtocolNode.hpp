@@ -242,10 +242,6 @@ class ProtocolNode {
   /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
   [[nodiscard]] std::size_t CloseDropCount() const;
 
-  /// @brief 观测:Close 时 handler 协作取消超 ~500ms 观测阈值(TBD-007)记 kInternal 的累计
-  ///        次数;超时不强杀 fiber、仍等其实际退出(RT_LIFECYCLE_006)。
-  [[nodiscard]] std::size_t HandlerCancelOverrunCount() const;
-
   /// @brief 观测:读循环单次 `codec_->Decode` 调用返回错误(坏帧 / codec 语义错误,该次
   ///        收到的整段字节判为不可解析而整体丢弃)的累计次数(P5-3,ADR-0003 D13;命名
   ///        归因 kBadFrame)。

@@ -414,7 +414,7 @@ TEST(ProtocolNodeHandler, NoresponseSendDoesNotRegisterPending) {
   EXPECT_TRUE(sender.get());
 }
 
-// Close → 消费者 handler fiber 干净退出、WaitClosed 完成(三方汇合含 handler_done)。
+// Close → 消费者 handler fiber 干净退出、WaitClosed 完成(收敛者 join handler 任务)。
 TEST(ProtocolNodeHandler, CloseConvergesConsumerFiber) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   ProtocolNodeConfig config;

@@ -315,10 +315,6 @@ std::size_t ProtocolNode::CloseDropCount() const {
   return runtime_.CloseDropCount();
 }
 
-std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
-  return runtime_.HandlerCancelOverrunCount();
-}
-
 std::size_t ProtocolNode::BadFrameCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return bad_frame_count_;
