@@ -159,9 +159,7 @@ TEST(LinkState, TcpClientEstablishingThenUpThenDownOnClose) {
   cfg.host = kLoopback;
   cfg.port = server.serverPort();
   cfg.connect_timeout = 400ms;
-  cfg.initial_backoff = 30ms;
-  cfg.max_backoff = 120ms;
-  cfg.jitter_enabled = false;
+  cfg.reconnect_interval = 30ms;
 
   TcpClientTransport client(cfg);
   EXPECT_EQ(client.CurrentLinkState(), LinkState::kDown);  // 未 Start。
@@ -190,9 +188,7 @@ TEST(LinkState, TcpClientStaysEstablishingWhileReconnecting) {
   cfg.host = kLoopback;
   cfg.port = dead_port;
   cfg.connect_timeout = 200ms;
-  cfg.initial_backoff = 20ms;
-  cfg.max_backoff = 40ms;
-  cfg.jitter_enabled = false;
+  cfg.reconnect_interval = 20ms;
 
   TcpClientTransport client(cfg);
   ASSERT_TRUE(client.Start());

@@ -1,32 +1,30 @@
 // -----------------------------------------------------------------------------
-// tcp_client_e2e_test.cpp — P3-4 真实 TCP 断连-重连回环 + 代际隔离端到端(P3 收官)
+// tcp_client_e2e_test.cpp — 真实 TCP 断连-重连回环端到端(ProtocolNode + 连接泵)
 //
-// 承接 ADR-0003 D11、SDD §4 P3 验收、RT_TCP_RECONNECT 全 / RT_TCP_RECONFIG 全 /
-// RT_LIFECYCLE_002 / RT_DATA_STATE(seed #20)。在 fiber 调度器(coro_test_main)内用
-// 本机真实 TCP 回环把 `ProtocolNode` + `TcpClientTransport` 的完整链路端到端跑通:
+// 承接 ADR-0004 D1/D3/D6、ADR-0005 D4、RT_TCP_RECONNECT 全 / RT_TCP_RECONFIG 全 /
+// RT_LIFECYCLE_002 / RT_DATA_STATE。在 fiber 调度器(coro_test_main)内用本机真实 TCP
+// 回环把 `ProtocolNode` + `TcpClientTransport` 的完整链路端到端跑通:
 //
 //   请求方 = 真 ProtocolNode(真 TcpClientTransport(client) + SystemCodec)。
 //   对端    = 可控 echo server:裸 QTcpServer + 真 TcpTransport(accepted) + SystemCodec,
 //             收 kCommand → 回 kResponse(session_id 原样、message_id|0x1000、payload echo);
 //             测试可令其静默(不回帧)、abort(模拟物理断连)、下线/上线(拒绝/接受连接)。
 //
-// 覆盖五条 SDD §4 P3 验收:
-//   ① 真实断连-重连回环:Request 恰好一次完成(echo)→ server 断开 → 在途恰好一次
-//      kConnection → 自动重连(退避,Generation 递增)→ 新代际 Request 成功;node 全程
-//      Running、读循环透明续命未退出。
-//   ② 代际隔离:新 socket 物理隔离 + FailAll 清在途;旧代际迟到响应归因丢弃不误配;断连
-//      时未启动排队业务 → GenerationIsolationDropCount 计数。
-//   ③ 重连退避:断开后按退避序列重试(小参数 + 关 jitter,断言时序上升到 cap);稳定阈值
-//      缩短验证重置语义。
-//   ④ 重配置端点切换:ApplyConfig 改 host/port → 旧在途 kConnection + 新代际立即尝试
-//      (不等退避)→ 连上第二个 server、新 Request 成功;Generation 与 ConfigVersion 各自递增。
-//   ⑤ Close 端到端收敛:Connected / 退避中 Close → node Closing→Closed,WaitClosed 完成,
-//      连接撕掉。
+// 覆盖:
+//   ① 真实断连-重连回环:Request 恰好一次完成(echo)→ server 断开 → **在途请求不被
+//      框架终结**(ADR-0004 D3),由其总超时收敛 → 自动重连(Generation 递增)→ 新代际
+//      Request 成功;node 全程 Running、读循环透明续命未退出(ADR-0004 D1)。
+//   ② 代际隔离已撤销:断连**不丢弃**未开始处理的业务事件、**不终结**在途请求;隔离丢弃
+//      计数恒为 0;释放 handler 后滞留业务照常处理完。
+//   ③ 重连节奏:断开后按**固定间隔**重试(ADR-0005 D4:无指数增长)。
+//   ④ 重配置端点切换:ApplyConfig 改 host/port → 立即切新代际连第二个 server(不等剩余
+//      间隔)→ 新 Request 成功;旧在途请求由总超时收敛;Generation 与 ConfigVersion 各自递增。
+//   ⑤ Close 端到端收敛:Connected / 重连等待中 Close → node Closing→Closed,WaitClosed
+//      完成,连接撕掉。
 //
-// 确定化 / 防 flake 手段:所有连接超时/退避/稳定阈值用毫秒级小值注入;jitter 关闭以断言
-// 确定退避序列;沉默对端 + 无 deadline 在途请求靠断连收敛(而非计时);端口用 FreePort
-// (listen 后即关)确定"被拒绝";退避时序断言采用"相邻间隔递增/上界"的宽松容差(容调度
-// 抖动)。所有 spawn 的 fiber 均在用例末 join,避免跨用例泄漏。
+// 确定化 / 防 flake 手段:所有连接超时/重连间隔用毫秒级小值注入;在途请求一律给显式短
+// deadline(总超时是断链后唯一的收敛手段);端口用 FreePort(listen 后即关)确定"被拒绝";
+// 时序断言采用宽松容差(容调度抖动)。所有 spawn 的 fiber 均在用例末 join,避免跨用例泄漏。
 // -----------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
@@ -76,17 +74,13 @@ using Clock = OperationOptions::Clock;
 
 namespace {
 
-// 小值确定化配置:短连接超时、小退避、关抖动 → 断连后毫秒级自动重连。
+// 小值确定化配置:短连接超时、小固定重连间隔 → 断连后毫秒级自动重连。
 TcpClientConfig FastClientConfig(quint16 port) {
   TcpClientConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = port;
   cfg.connect_timeout = 400ms;
-  cfg.initial_backoff = 20ms;
-  cfg.max_backoff = 80ms;
-  cfg.backoff_multiplier = 2.0;
-  cfg.jitter_enabled = false;
-  cfg.stable_reset_after = 10s;
+  cfg.reconnect_interval = 20ms;
   return cfg;
 }
 
@@ -141,7 +135,7 @@ std::vector<Message> EchoResponder(const Message& command) {
 }
 
 // 裸 echo harness fiber:真 TcpTransport + SystemCodec,收 kCommand → responder → 回帧。
-// 传输终结(对端撕连接 kConnection / 我方 kClosed)→ 退出并置 ended=true。
+// 传输终结(对端撕连接 / 我方关闭,均为 kClosed)→ 退出并置 ended=true。
 template <typename Responder>
 auto SpawnEcho(TcpTransport& transport, Responder responder, bool& ended) {
   return Coro::makeTask([&transport, responder, &ended] {
@@ -178,7 +172,7 @@ auto SpawnEcho(TcpTransport& transport, Responder responder, bool& ended) {
   });
 }
 
-// 服务端主动发一帧(不经 echo responder):供注入旧代际迟到响应。
+// 服务端主动发一帧(不经 echo responder)。
 void ServerSend(TcpTransport& transport, const Message& msg) {
   SystemCodec codec;
   auto encoded = codec.Encode(msg);
@@ -205,10 +199,10 @@ NodeWithClient MakeNodeWithClient(const TcpClientConfig& cfg,
 
 }  // namespace
 
-// —— ① 真实断连-重连回环(SDD §4 P3 验收 1)——
-// 连上 → Request 恰好一次完成(echo)→ server 断开 → 在途 Request 恰好一次 kConnection →
-// 自动重连(Generation 递增)→ server 恢复 → 新代际 Request 成功;node 全程 Running、读循环
-// 透明续命未退出(响应经同一未退出读循环路由)。覆盖 RT_TCP_RECONNECT_002/003/004。
+// —— ① 真实断连-重连回环 ——
+// 连上 → Request 恰好一次完成(echo)→ server 断开 → **在途 Request 不被框架终结**
+// (ADR-0004 D3),按其总超时收敛 → 自动重连(Generation 递增)→ server 恢复 → 新代际
+// Request 成功;node 全程 Running、读循环透明续命未退出。覆盖 RT_TCP_RECONNECT_002/003/004。
 TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
@@ -244,22 +238,27 @@ TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
   const std::uint64_t gen1 = nc.client->Generation();
   EXPECT_EQ(gen1, 1u);
 
-  // 令对端静默 → 起一个在途 Request(无 deadline,靠断连收敛)。
+  // 令对端静默 → 起一个在途 Request(总超时 900ms:断链后唯一的收敛手段)。
   *silent = true;
   Result<Message> b{make_error_code(TransportErrc::kInternal)};
   bool b_done = false;
   auto req_b = Coro::makeTask([&] {
-    b = node.Request(MakeRequest(0x0002, {0x22}));
+    b = node.Request(MakeRequest(0x0002, {0x22}), Deadline(900ms));
     b_done = true;
   });
   ASSERT_TRUE(pumpFiberUntil([&] { return node.PendingCount() == 1u; }, 3000));
   EXPECT_FALSE(b_done);
 
-  // server 断开(abort accepted socket):在途 Request 恰好一次 kConnection,在途清空。
+  // server 断开(abort accepted socket):在途 Request **不被** 断链终结(D3 撤销代际隔离)。
   accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil([&] { return b_done; }, 4000));
+  pumpFiberUntil([] { return false; }, 250);  // 让断链充分传播。
+  EXPECT_FALSE(b_done) << "断链不得终结在途请求(ADR-0004 D3)";
+  EXPECT_EQ(node.PendingCount(), 1u);
+
+  // 它由自己的总超时收敛(RT_TCP_RECONNECT_002 改写后的唯一路径)。
+  ASSERT_TRUE(pumpFiberUntil([&] { return b_done; }, 3000));
   ASSERT_FALSE(b);
-  EXPECT_EQ(b.error(), make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(b.error(), make_error_code(TransportErrc::kTimeout));
   EXPECT_EQ(node.PendingCount(), 0u);
 
   // node 全程 Running(读循环透明续命未退出):WaitClosed 短 deadline → kTimeout。
@@ -303,11 +302,10 @@ TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
   EXPECT_TRUE(req_c.get());
 }
 
-// —— ② 代际隔离(SDD §4 P3 验收 2)——
-// 断连时未启动排队业务 → GenerationIsolationDropCount 计数;新 socket 物理隔离 + FailAll 清
-// 在途;重连后旧代际迟到响应(旧 session 键)无匹配在途 → 归因丢弃(UnmatchedResponseCount)
-// 不误配。覆盖 RT_TCP_RECONNECT_004、3.1.7.4。
-TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
+// —— ② 代际隔离已撤销(ADR-0004 D3)——
+// 断连时:未开始处理的业务事件**不丢弃**(隔离丢弃计数恒 0)、在途请求**不终结**;释放
+// handler 后滞留业务照常全部处理完。重连后旧代际迟到响应无匹配在途 → 归因丢弃不误配。
+TEST(TcpClientE2E, DisconnectKeepsQueuedBusinessAndInFlightRequests) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
@@ -320,7 +318,9 @@ TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
   cfg.handler = [&started, &completed, gate](const Message&,
                                              HandlerContext&) -> Status {
     ++started;
-    Coro::await(gate);
+    if (started == 1) {
+      Coro::await(gate);  // 仅首帧挂住,后续帧释放后依次跑完。
+    }
     ++completed;
     return Status{};
   };
@@ -334,14 +334,14 @@ TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
   auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
   ASSERT_TRUE(server_txp1->Start());
 
-  // 在途 Request(session 0):sink 对端(不回),使 FailAll 清在途可观测。
+  // 在途 Request(session 0):sink 对端(不回),总超时 1200ms。
   bool echo1_ended = false;
   auto sink = [](const Message&) { return std::vector<Message>{}; };
   auto echo1 = SpawnEcho(*server_txp1, sink, echo1_ended);
   Result<Message> req{make_error_code(TransportErrc::kInternal)};
   bool req_done = false;
   auto request = Coro::makeTask([&] {
-    req = node.Request(MakeRequest(0x0007, {0x01}));
+    req = node.Request(MakeRequest(0x0007, {0x01}), Deadline(1200ms));
     req_done = true;
   });
   ASSERT_TRUE(pumpFiberUntil([&] { return node.PendingCount() == 1u; }, 3000));
@@ -358,22 +358,30 @@ TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
   ASSERT_TRUE(pumpFiberUntil([&] { return started == 1; }, 3000));
   pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队(确定化)。
 
-  // 物理断连:在途 Request 恰好一次 kConnection;未启动 3 帧 → 代际隔离丢弃。
+  // 物理断连:在途 Request 不被终结、未启动的 3 帧不被丢弃(代际隔离已撤销)。
   accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil([&] { return req_done; }, 4000));
-  EXPECT_EQ(req.error(), make_error_code(TransportErrc::kConnection));
-  EXPECT_EQ(node.PendingCount(), 0u);
-  ASSERT_TRUE(pumpFiberUntil(
-      [&] { return node.GenerationIsolationDropCount() >= 1; }, 4000));
-  EXPECT_EQ(node.GenerationIsolationDropCount(),
-            static_cast<std::size_t>(kBusinessFrames - 1));
-  // 隔离丢弃不误记为 close_drop / overflow / dropped_no_handler。
+  pumpFiberUntil([] { return false; }, 250);
+  EXPECT_FALSE(req_done) << "断链不得终结在途请求(ADR-0004 D3)";
+  EXPECT_EQ(node.PendingCount(), 1u);
+  EXPECT_EQ(node.GenerationIsolationDropCount(), 0u)
+      << "代际隔离丢弃已撤销,不得再产生";
   EXPECT_EQ(node.CloseDropCount(), 0u);
   EXPECT_EQ(node.BusinessQueueOverflowCount(), 0u);
   EXPECT_EQ(node.DroppedNoHandlerCount(), 0u);
 
+  // 释放 gate:滞留的业务帧照常全部处理完(断链未清空业务队列)。
+  gate->resolve();
+  gate->close();
+  ASSERT_TRUE(pumpFiberUntil([&] { return completed == kBusinessFrames; }, 4000));
+  EXPECT_EQ(started, kBusinessFrames);
+
+  // 在途请求最终由自己的总超时收敛。
+  ASSERT_TRUE(pumpFiberUntil([&] { return req_done; }, 3000));
+  EXPECT_EQ(req.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(node.PendingCount(), 0u);
+
   // 代际2:重连;对端在新连接(新 socket 物理隔离)上补发旧代际迟到响应(session 0,
-  // message_id 0x1007)。无匹配在途(已 FailAll 清空)→ 归因丢弃、不误配。
+  // message_id 0x1007)。无匹配在途(已超时收敛)→ 归因丢弃、不误配。
   QTcpSocket* accepted2 = AcceptNext(server, 5000);
   ASSERT_NE(accepted2, nullptr);
   auto server_txp2 = std::make_shared<TcpTransport>(accepted2);
@@ -386,15 +394,7 @@ TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
   ServerSend(*server_txp2, stale);
   ASSERT_TRUE(
       pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }, 4000));
-  EXPECT_EQ(node.UnmatchedResponseCount(), 1u);
   EXPECT_EQ(node.PendingCount(), 0u);
-
-  // 运行中 handler 未被强杀:释放 gate → 首帧跑完。
-  EXPECT_EQ(started, 1);
-  EXPECT_EQ(completed, 0);
-  gate->resolve();
-  gate->close();
-  ASSERT_TRUE(pumpFiberUntil([&] { return completed == 1; }, 3000));
 
   ASSERT_TRUE(node.Close());
   EXPECT_TRUE(node.WaitClosed(Deadline(2000ms)));
@@ -405,19 +405,16 @@ TEST(TcpClientE2E, GenerationIsolationDropsQueuedAndAttributesStaleResponse) {
   EXPECT_TRUE(request.get());
 }
 
-// —— ③a 重连退避:断开后按退避序列重试,间隔递增到 cap(SDD §4 P3 验收 3)——
-// 确定化:jitter 关闭 + 小 initial/cap;连上 echo 后 server 下线,相邻尝试间隔 1×→2×→cap
-// 递增(容调度抖动的宽松容差)。node 全程 Running(读循环透明续命)。
-TEST(TcpClientE2E, ReconnectBackoffSequenceRisesToCap) {
+// —— ③ 重连节奏:固定间隔(ADR-0005 D4)——
+// 确定化:小固定间隔;连上 echo 后 server 下线,相邻尝试间隔稳定在配置值附近、**不随
+// 失败次数增长**(旧指数退避会 1×→2×→4× 上升)。node 全程 Running(读循环透明续命)。
+TEST(TcpClientE2E, ReconnectUsesFixedIntervalWithoutGrowth) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
 
   TcpClientConfig cfg = FastClientConfig(port);
-  cfg.initial_backoff = 60ms;
-  cfg.max_backoff = 240ms;
-  cfg.backoff_multiplier = 2.0;
-  cfg.jitter_enabled = false;
+  cfg.reconnect_interval = 120ms;
   auto nc = MakeNodeWithClient(cfg);
   ProtocolNode& node = *nc.node;
   ASSERT_TRUE(node.Start());
@@ -427,13 +424,11 @@ TEST(TcpClientE2E, ReconnectBackoffSequenceRisesToCap) {
   ASSERT_TRUE(pumpFiberUntil([&] { return nc.client->Generation() == 1u; }, 4000));
   const std::size_t attempts_connected = nc.client->AttemptCount();
 
-  // server 下线 + 断连:客户端进入退避重试(端口被拒绝,近乎瞬时失败,间隔≈退避)。
+  // server 下线 + 断连:客户端进入固定间隔重试(端口被拒绝,近乎瞬时失败)。
   server.close();
   accepted1->abort();
   accepted1->deleteLater();
 
-  // 采集断连后前若干次尝试时刻(端口被拒绝近乎瞬时失败,相邻间隔≈退避时长)。多采几个
-  // 样本以覆盖"从低于 cap 上升到 cap"整段(采样起点落在升级中途亦稳健)。
   std::vector<Clock::time_point> attempt_times;
   std::size_t last = attempts_connected;
   const auto budget_end = Clock::now() + 6s;
@@ -450,16 +445,14 @@ TEST(TcpClientE2E, ReconnectBackoffSequenceRisesToCap) {
   for (std::size_t i = 1; i < attempt_times.size(); ++i) {
     intervals.push_back(attempt_times[i] - attempt_times[i - 1]);
   }
-  const auto first_interval = intervals.front();
-  const auto last_interval = intervals.back();
-  // 退避序列从低于 cap(240ms)上升并触顶 cap:首个间隔明显低于 cap,末间隔逼近 cap,
-  // 且整体清晰上升(容调度抖动的宽松容差)。
-  EXPECT_LT(first_interval, 180ms) << "起始退避应低于 cap(初值 60ms / 一次升级 120ms)";
-  EXPECT_GT(last_interval, 180ms) << "退避应上升触顶 cap(240ms)";
-  EXPECT_GT(last_interval, first_interval + 40ms) << "退避序列应清晰上升到 cap";
-  EXPECT_LT(last_interval, 240ms + 160ms);  // 未超过 cap 太多。
+  for (const auto& d : intervals) {
+    EXPECT_GT(d, 50ms) << "间隔不得塌陷(零间隔会退化为紧循环)";
+    EXPECT_LT(d, 400ms) << "间隔应稳定在配置的 120ms 附近(容调度抖动)";
+  }
+  EXPECT_LT(intervals.back(), intervals.front() + 100ms)
+      << "固定间隔重连不得随失败次数增长";
 
-  // node 未 Closed(读循环透明续命跨退避):WaitClosed 短 deadline → kTimeout。
+  // node 未 Closed(读循环透明续命跨重连):WaitClosed 短 deadline → kTimeout。
   auto wc = node.WaitClosed(Deadline(30ms));
   ASSERT_FALSE(wc);
   EXPECT_EQ(wc.error(), make_error_code(TransportErrc::kTimeout));
@@ -468,77 +461,19 @@ TEST(TcpClientE2E, ReconnectBackoffSequenceRisesToCap) {
   EXPECT_TRUE(node.WaitClosed(Deadline(2000ms)));
 }
 
-// —— ③b 稳定阈值重置:稳定连接 ≥ stable_reset_after 后断开,退避从 initial 重置(SDD §4
-// P3 验收 3)——
-// 确定化:先 server 下线令退避升到 cap,再上线连上并稳定 > 阈值 → 下次断开首个退避 = initial
-// (远小于 cap)。以"断连到重连的时延"区分重置(<150ms,initial 60ms)vs 未重置(cap 240ms)。
-TEST(TcpClientE2E, StableConnectionResetsBackoffLevel) {
-  const quint16 port = FreePort();  // 先无 server → 连接被拒绝。
-
-  TcpClientConfig cfg = FastClientConfig(port);
-  cfg.initial_backoff = 60ms;
-  cfg.max_backoff = 240ms;
-  cfg.backoff_multiplier = 2.0;
-  cfg.jitter_enabled = false;
-  cfg.stable_reset_after = 250ms;
-  auto nc = MakeNodeWithClient(cfg);
-  ProtocolNode& node = *nc.node;
-  ASSERT_TRUE(node.Start());
-
-  // 退避升级:多次失败后退避级别攀到 cap。
-  ASSERT_TRUE(pumpFiberUntil([&] { return nc.client->AttemptCount() >= 4; }, 5000));
-
-  // server 上线 → 连上;稳定 > stable_reset_after(250ms)→ 下次断开重置退避级别。
-  QTcpServer server;
-  ASSERT_TRUE(server.listen(QHostAddress::LocalHost, port));
-  ASSERT_TRUE(pumpFiberUntil([&] { return nc.client->Generation() == 1u; }, 5000));
-  QTcpSocket* accepted1 = AcceptNext(server);
-  ASSERT_NE(accepted1, nullptr);
-  auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
-  ASSERT_TRUE(server_txp1->Start());
-  bool echo1_ended = false;
-  auto echo1 = SpawnEcho(*server_txp1, EchoResponder, echo1_ended);
-  boost::this_fiber::sleep_for(350ms);  // 稳定连接 > 阈值。
-
-  // 断开:退避级别应已重置为 initial(60ms)→ 下次尝试快速重连(server 仍在)。
-  const auto t0 = Clock::now();
-  accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil([&] { return nc.client->Generation() >= 2u; }, 4000));
-  const auto reconnect_latency = Clock::now() - t0;
-  EXPECT_LT(reconnect_latency, 150ms)
-      << "稳定 ≥ 阈值后重置为 initial(60ms);未重置则应停在 cap(240ms)";
-
-  // 收尾:接受重连出的新连接以清理(重置后已重连,server 有 pending 连接)。
-  QTcpSocket* accepted2 = AcceptNext(server, 3000);
-  ASSERT_NE(accepted2, nullptr);
-  auto server_txp2 = std::make_shared<TcpTransport>(accepted2);
-  ASSERT_TRUE(server_txp2->Start());
-  bool echo2_ended = false;
-  auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
-
-  ASSERT_TRUE(node.Close());
-  EXPECT_TRUE(node.WaitClosed(Deadline(2000ms)));
-  server_txp1->RequestClose();
-  server_txp2->RequestClose();
-  EXPECT_TRUE(pumpFiberUntil([&] { return echo1_ended && echo2_ended; }));
-  EXPECT_TRUE(echo1.get());
-  EXPECT_TRUE(echo2.get());
-}
-
-// —— ④ 重配置端点切换(SDD §4 P3 验收 4)——
-// ApplyConfig 改 host/port(指向第二个 server)→ 旧在途 kConnection + 新代际立即尝试(不等
-// 退避)→ 连上新 server、新 Request 成功;Generation 与 ConfigVersion 各自递增。覆盖
-// RT_TCP_RECONFIG_005、RT_DATA_STATE。
-TEST(TcpClientE2E, ReconfigEndpointSwitchFailsInFlightAndConnectsNewServer) {
+// —— ④ 重配置端点切换 ——
+// ApplyConfig 改 host/port(指向第二个 server)→ 立即切新代际(不等剩余间隔)→ 连上
+// server_b、新 Request 成功;旧在途请求由总超时收敛;Generation 与 ConfigVersion 各自
+// 递增。覆盖 RT_TCP_RECONFIG_005、RT_DATA_STATE。
+TEST(TcpClientE2E, ReconfigEndpointSwitchConnectsNewServer) {
   QTcpServer server_a;
   ASSERT_TRUE(server_a.listen(QHostAddress::LocalHost, 0));
   QTcpServer server_b;
   ASSERT_TRUE(server_b.listen(QHostAddress::LocalHost, 0));
 
-  // 大退避确保"切端点立即尝试(不等退避)"可判别:仅端点变化应立即以新端点重试。
+  // 大重连间隔确保"切端点立即尝试(不等剩余间隔)"可判别。
   TcpClientConfig cfg = FastClientConfig(server_a.serverPort());
-  cfg.initial_backoff = 1500ms;
-  cfg.max_backoff = 1500ms;
+  cfg.reconnect_interval = 1500ms;
   auto nc = MakeNodeWithClient(cfg);
   ProtocolNode& node = *nc.node;
   ASSERT_TRUE(node.Start());
@@ -557,34 +492,33 @@ TEST(TcpClientE2E, ReconfigEndpointSwitchFailsInFlightAndConnectsNewServer) {
   Result<Message> a{make_error_code(TransportErrc::kInternal)};
   bool a_done = false;
   auto req_a = Coro::makeTask([&] {
-    a = node.Request(MakeRequest(0x0005, {0x55}));  // 无 deadline,靠切端点断连收敛。
+    a = node.Request(MakeRequest(0x0005, {0x55}), Deadline(900ms));
     a_done = true;
   });
   ASSERT_TRUE(pumpFiberUntil([&] { return node.PendingCount() == 1u; }, 3000));
 
   // ApplyConfig 切端点到 server_b(新版本 2)。
   TcpClientConfig to_b = FastClientConfig(server_b.serverPort());
-  to_b.initial_backoff = 1500ms;
-  to_b.max_backoff = 1500ms;
+  to_b.reconnect_interval = 1500ms;
   const auto t0 = Clock::now();
   ASSERT_TRUE(nc.client->ApplyConfig(to_b, 2));
   EXPECT_EQ(nc.client->ConfigVersion(), 2u);
   EXPECT_EQ(nc.client->ConfigChangeCount(), 1u);
 
-  // 旧在途以 kConnection 终结(端点变化掐断当前连接)。
-  ASSERT_TRUE(pumpFiberUntil([&] { return a_done; }, 4000));
-  ASSERT_FALSE(a);
-  EXPECT_EQ(a.error(), make_error_code(TransportErrc::kConnection));
-  EXPECT_EQ(node.PendingCount(), 0u);
-
-  // 新代际立即尝试新端点(不等 1500ms 退避)→ 迅速连上 server_b。
+  // 新代际立即尝试新端点(不等 1500ms 间隔)→ 迅速连上 server_b。
   QTcpSocket* accepted_b = AcceptNext(server_b, 3000);
   ASSERT_NE(accepted_b, nullptr);
-  EXPECT_LT(Clock::now() - t0, 1000ms) << "端点变化应立即重试,不等剩余退避";
+  EXPECT_LT(Clock::now() - t0, 1000ms) << "端点变化应立即重试,不等剩余重连间隔";
   auto server_txp_b = std::make_shared<TcpTransport>(accepted_b);
   ASSERT_TRUE(server_txp_b->Start());
   bool echo_b_ended = false;
   auto echo_b = SpawnEcho(*server_txp_b, EchoResponder, echo_b_ended);
+
+  // 旧在途请求由其总超时收敛(切端点不再主动终结,ADR-0004 D3)。
+  ASSERT_TRUE(pumpFiberUntil([&] { return a_done; }, 4000));
+  ASSERT_FALSE(a);
+  EXPECT_EQ(a.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(node.PendingCount(), 0u);
 
   // Generation 与 ConfigVersion 各自递增(两轴独立)。
   EXPECT_GE(nc.client->Generation(), 2u);
@@ -613,9 +547,9 @@ TEST(TcpClientE2E, ReconfigEndpointSwitchFailsInFlightAndConnectsNewServer) {
   EXPECT_TRUE(req_b.get());
 }
 
-// —— ⑤a Close 端到端收敛(Connected)——(SDD §4 P3 验收 5)
+// —— ⑤a Close 端到端收敛(Connected)——
 // 连上后 Close → node Closing→Closed、WaitClosed 完成;物理连接撕掉(对端 echo 读观测
-// kConnection 退出)。覆盖 RT_LIFECYCLE。
+// 传输终结退出)。覆盖 RT_LIFECYCLE。
 TEST(TcpClientE2E, CloseWhileConnectedConvergesAndTearsConnection) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
@@ -633,29 +567,32 @@ TEST(TcpClientE2E, CloseWhileConnectedConvergesAndTearsConnection) {
 
   ASSERT_TRUE(node.Close());
   EXPECT_TRUE(node.WaitClosed(Deadline(2000ms)));
-  // 物理连接撕掉 → 对端 echo 读观测 kConnection 退出。
+  // 物理连接撕掉 → 对端 echo 读观测传输终结退出。
   EXPECT_TRUE(pumpFiberUntil([&] { return echo_ended; }, 3000));
   EXPECT_TRUE(echo.get());
   server_txp->RequestClose();
 }
 
-// —— ⑤b Close 端到端收敛(退避中)——(SDD §4 P3 验收 5)
-// 退避重连中 Close → 掐断当前尝试/重连,node 迅速收敛到 Closed,连接状态归 Disconnected。
-TEST(TcpClientE2E, CloseDuringBackoffCutsReconnectAndConverges) {
+// —— ⑤b Close 端到端收敛(重连等待中)——
+// 重连等待中 Close → 掐断当前尝试/重连,node 迅速收敛到 Closed,连接状态归 Disconnected。
+TEST(TcpClientE2E, CloseDuringReconnectWaitCutsReconnectAndConverges) {
   TcpClientConfig cfg = FastClientConfig(FreePort());
-  cfg.initial_backoff = 300ms;
-  cfg.max_backoff = 300ms;
+  cfg.reconnect_interval = 800ms;
   auto nc = MakeNodeWithClient(cfg);
   ProtocolNode& node = *nc.node;
   ASSERT_TRUE(node.Start());
 
-  // 进入退避(第一次失败后)。
+  // 进入重连等待(第一次失败后)。
   ASSERT_TRUE(pumpFiberUntil(
       [&] { return nc.client->State() == ConnectionState::kReconnecting; }, 3000));
 
   const auto t0 = Clock::now();
   ASSERT_TRUE(node.Close());
   EXPECT_TRUE(node.WaitClosed(Deadline(1500ms)));
-  EXPECT_LT(Clock::now() - t0, 300ms) << "应掐断退避等待、迅速收敛";
-  EXPECT_EQ(nc.client->State(), ConnectionState::kDisconnected);
+  EXPECT_LT(Clock::now() - t0, 500ms) << "应掐断间隔等待、迅速收敛";
+  // 链路对调用方立即不可用;传输自身的 connect-loop 随后收敛到 Disconnected(node 的
+  // 收敛不再等待传输连接状态机——读循环由对外通道关闭直接唤醒,ADR-0004 D6)。
+  EXPECT_EQ(nc.client->CurrentLinkState(), transport::LinkState::kDown);
+  EXPECT_TRUE(pumpFiberUntil(
+      [&] { return nc.client->State() == ConnectionState::kDisconnected; }, 2000));
 }

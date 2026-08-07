@@ -1,8 +1,8 @@
-// 协程原生 TcpClientTransport 运行时重配置(ApplyConfig)集成测试(ADR-0003 D11 Q5,
-// RT_TCP_RECONFIG)。在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证:单调版本、
-// 先校验后原子应用、端点变化(切新代际 + 立即尝试新端点)vs 仅策略变化(不打断当前尝试
-// /退避、下次用新参数)、配置版本与连接代际两轴独立递增。退避/超时/稳定阈值用小值注入
-// 以确定化单条时长。
+// 协程原生 TcpClientTransport 运行时重配置(ApplyConfig)集成测试(RT_TCP_RECONFIG)。
+// 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证:单调版本、先校验后原子应用、
+// 端点变化(切新代际 + 立即尝试新端点)vs 仅策略变化(不打断当前尝试/间隔等待、下次用
+// 新参数)、配置版本与连接代际两轴独立递增。热更新范围为端点/连接超时/**重连间隔**
+// (RT_TCP_RECONFIG_002,ADR-0005 D4 撤销退避参数)。所有时长用小值注入以确定化。
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -31,17 +31,13 @@ using Clock = OperationOptions::Clock;
 
 namespace {
 
-// 小值确定化配置:短连接超时、小退避、关抖动。
+// 小值确定化配置:短连接超时、小重连间隔(固定,无退避)。
 TcpClientConfig FastConfig(quint16 port) {
   TcpClientConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = port;
   cfg.connect_timeout = 400ms;
-  cfg.initial_backoff = 30ms;
-  cfg.max_backoff = 120ms;
-  cfg.backoff_multiplier = 2.0;
-  cfg.jitter_enabled = false;
-  cfg.stable_reset_after = 10s;
+  cfg.reconnect_interval = 30ms;
   return cfg;
 }
 
@@ -130,6 +126,13 @@ TEST(CoroTcpClientReconfig, InvalidFieldsRejectedAndDistinct) {
   ASSERT_FALSE(r4);
   EXPECT_EQ(r4.error(), make_error_code(TransportErrc::kConfiguration));
 
+  // 重连间隔非正(零间隔会退化为紧循环,ADR-0005 D4 要求保留非零间隔)。
+  TcpClientConfig zero_interval = FastConfig(FreePort());
+  zero_interval.reconnect_interval = 0ms;
+  auto r5 = client.ApplyConfig(zero_interval, 5);
+  ASSERT_FALSE(r5);
+  EXPECT_EQ(r5.error(), make_error_code(TransportErrc::kConfiguration));
+
   // 全部失败:配置版本不变(旧配置不变)。
   EXPECT_EQ(client.ConfigVersion(), 1u);
   EXPECT_EQ(client.ConfigChangeCount(), 0u);
@@ -203,12 +206,11 @@ TEST(CoroTcpClientReconfig, EndpointChangeSwitchesGenerationAndConnectsNewServer
   accepted_b->deleteLater();
 }
 
-// 端点变化在退避期发生 → 立即以新端点重试,不等剩余退避;连到新 server。
-TEST(CoroTcpClientReconfig, EndpointChangeDuringBackoffRetriesImmediately) {
-  // 起始端点为被拒绝端口(进入退避),大退避确保停在退避里。
+// 端点变化在重连等待期发生 → 立即以新端点重试,不等剩余间隔;连到新 server。
+TEST(CoroTcpClientReconfig, EndpointChangeDuringReconnectWaitRetriesImmediately) {
+  // 起始端点为被拒绝端口(进入重连等待),大间隔确保停在等待里。
   TcpClientConfig cfg = FastConfig(FreePort());
-  cfg.initial_backoff = 1500ms;
-  cfg.max_backoff = 1500ms;
+  cfg.reconnect_interval = 1500ms;
   TcpClientTransport client(cfg);
   ASSERT_TRUE(client.Start());
   ASSERT_TRUE(testutil::pumpFiberUntil(
@@ -217,44 +219,41 @@ TEST(CoroTcpClientReconfig, EndpointChangeDuringBackoffRetriesImmediately) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   TcpClientConfig to_server = FastConfig(server.serverPort());
-  to_server.initial_backoff = 1500ms;
-  to_server.max_backoff = 1500ms;
+  to_server.reconnect_interval = 1500ms;
 
   auto t0 = Clock::now();
   ASSERT_TRUE(client.ApplyConfig(to_server, 2));
-  // 立即尝试新端点(不等 1500ms 退避)→ 迅速连上。
+  // 立即尝试新端点(不等 1500ms 剩余间隔)→ 迅速连上。
   ASSERT_TRUE(client.WaitForState(ConnectionState::kConnected, Deadline(1000ms)));
-  EXPECT_LT(Clock::now() - t0, 1000ms) << "端点变化应立即重试,不等剩余退避";
+  EXPECT_LT(Clock::now() - t0, 1000ms) << "端点变化应立即重试,不等剩余重连间隔";
 
   client.RequestClose();
   EXPECT_TRUE(client.WaitClosed(Deadline(2000ms)));
 }
 
-// 仅退避/超时变化(端点不变)→ 不打断当前退避;下次连接动作用新退避参数(可从退避序列
-// 变化观察)。同时 ConfigVersion 递增而 Generation 不变(两轴独立)。
+// 仅重连间隔/超时变化(端点不变)→ 不打断当前间隔等待;下次连接动作用新间隔(可从尝试
+// 时序变化观察)。同时 ConfigVersion 递增而 Generation 不变(两轴独立)。
 TEST(CoroTcpClientReconfig, PolicyOnlyChangeAppliesToNextActionWithoutInterrupt) {
-  // 起始:小退避(30ms)且端点被拒绝,持续退避重试。
+  // 起始:小间隔(40ms)且端点被拒绝,持续按固定间隔重试。
   TcpClientConfig cfg = FastConfig(FreePort());
-  cfg.initial_backoff = 40ms;
-  cfg.max_backoff = 40ms;
+  cfg.reconnect_interval = 40ms;
   TcpClientTransport client(cfg);
   ASSERT_TRUE(client.Start());
   ASSERT_TRUE(testutil::pumpFiberUntil(
       [&] { return client.AttemptCount() >= 2; }, 3000));
   const auto gen_before = client.Generation();
 
-  // 仅策略变化:同端点(host/port 不变),放大退避到 300ms;新版本 2。
+  // 仅策略变化:同端点(host/port 不变),放大重连间隔到 300ms;新版本 2。
   TcpClientConfig slower = cfg;
-  slower.initial_backoff = 300ms;
-  slower.max_backoff = 300ms;
+  slower.reconnect_interval = 300ms;
   ASSERT_TRUE(client.ApplyConfig(slower, 2));
   EXPECT_EQ(client.ConfigVersion(), 2u);
   EXPECT_EQ(client.ConfigChangeCount(), 1u);
   // 仅策略变化不切代际:Generation 不因 ApplyConfig 改变。
   EXPECT_EQ(client.Generation(), gen_before);
 
-  // 应用后连续采样若干相邻尝试间隔:退避账本保留(不打断),但新的 max_backoff(300ms)
-  // 令后续退避可攀升越过旧上限(40ms)——旧参数下任何间隔都不可能 > 100ms。
+  // 应用后连续采样若干相邻尝试间隔:当前那次等待用旧快照(不打断),但下一次连接动作起
+  // 用新间隔(300ms)——旧参数(40ms)下任何间隔都不可能 > 100ms。
   std::size_t last = client.AttemptCount();
   Clock::time_point prev = Clock::now();
   Clock::duration max_interval{};
@@ -272,7 +271,7 @@ TEST(CoroTcpClientReconfig, PolicyOnlyChangeAppliesToNextActionWithoutInterrupt)
     boost::this_fiber::sleep_for(5ms);
   }
   EXPECT_GT(max_interval, 100ms)
-      << "下次连接动作应使用新的(更大)退避参数,间隔应越过旧上限 40ms";
+      << "下次连接动作应使用新的(更大)重连间隔,间隔应越过旧值 40ms";
 
   client.RequestClose();
   EXPECT_TRUE(client.WaitClosed(Deadline(2000ms)));
