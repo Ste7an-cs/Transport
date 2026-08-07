@@ -262,10 +262,4 @@ Status DdsHandlerContext::Publish(Message msg, Endpoint topic) {
   return node_->Publish(std::move(msg), std::move(topic));
 }
 
-Status DdsHandlerContext::RequestClose() {
-  // 发起完整关闭拆卸;因当前即 handler 消费者 fiber,runtime.Close 内重入自锁防护只发起、
-  // 不自等,立即返回(RT_LIFECYCLE_005)。节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
-  return node_->Close();
-}
-
 }  // namespace transport

@@ -13,7 +13,8 @@
  *      退出 → Drain 归因 → 置 Closed;Close 只发汇合信号并等结果)+ **致命错误自终**
  *      (ADR-0005 D5 / RT_LIFECYCLE_008:读循环退出时若节点仍 Running 即非我方 Close 所致,
  *      由读循环自行置 Closing 并发同一组汇合信号,再走同一段收敛)+ 多等待者 WaitClosed +
- *      重入自锁防护(比对 handler fiber id)。
+ *      **重入守卫**(ADR-0005 D6 / RT_LIFECYCLE_005:比对两条内部工作单元的 fiber id,
+ *      内部来源调 `Close`/`WaitClosed` 一律返 kInvalidState,不做任何拆卸)。
  *   2. handler 消费者 fiber + `BoundedQueue<Event>` 集成:入队(Enqueue)/串行消费/异常
  *      隔离(consume 逃逸异常兜住 → 记 handler_exception,不自关)/ close_drop 归因
  *      (Close 时 Drain 未启动业务计数)。
@@ -191,14 +192,20 @@ class NodeRuntime {
    * closed_.Complete(见 ConvergeAfterReadLoop)。
    * 从未 spawn 读循环(Created/starting)时无收敛者,由本函数就地收敛。
    * 后续关闭者共享 closed_(多等待者);已 Closed 再关直接成功。**读循环因致命错误自终**
-   * (D5)时本函数即"后续关闭者",一样等 closed_。当前若就是 handler 消费者 fiber(重入)
-   * → 只发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。
+   * (D5)时本函数即"后续关闭者",一样等 closed_。
+   *
+   * **重入守卫(ADR-0005 D6 / RT_LIFECYCLE_005)**:调用者若是节点自身的内部工作单元
+   * (读-分发循环 / handler 消费者)→ 立即返 kInvalidState,**不发任何汇合信号、不做任何
+   * 拆卸**(见 InInternalWorkUnitLocked)。关闭只能由节点外部发起。
    */
   Status Close() {
-    bool in_handler_fiber = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      in_handler_fiber = InHandlerFiberLocked();
+      // 守卫先于一切:内部来源一律拒绝,连"已 Closed 直接成功"这条捷径也不给——契约是
+      // "内部工作单元无权关闭节点",与节点当前处于哪个状态无关。
+      if (InInternalWorkUnitLocked()) {
+        return make_error_code(TransportErrc::kInvalidState);
+      }
       if (lifecycle_ == LifecycleState::kClosed) {
         return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
       }
@@ -209,21 +216,16 @@ class NodeRuntime {
       // 从未 spawn 读循环:无收敛者,就地收敛。残留业务(理论上无)一并 close_drop 归因。
       ConvergeToClosed();
     }
-
-    // 重入自锁防护:当前若就是 handler 消费者 fiber,等 closed_ = 等自己退出 = 自锁。
-    // 只发起(上文已做)不自等,立即返回;节点由读循环收敛(RT_LIFECYCLE_005)。
-    if (in_handler_fiber) {
-      return Status{};
-    }
     return closed_.Wait();  // 后续关闭者与外部调用者共享同一收敛结果(多等待者)。
   }
 
-  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline/取消)。handler 消费者 fiber 内且
-  ///        未 Closed 时返 kInvalidState(等自己 = 自锁,RT_LIFECYCLE_005)。
+  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline/取消)。
+  ///        内部工作单元(读-分发循环 / handler 消费者)内调用 → 返 kInvalidState
+  ///        (等收敛 = 等自己退出 = 自锁,ADR-0005 D6 / RT_LIFECYCLE_005)。
   [[nodiscard]] Status WaitClosed(OperationOptions options = {}) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (InHandlerFiberLocked() && lifecycle_ != LifecycleState::kClosed) {
+      if (InInternalWorkUnitLocked()) {
         return make_error_code(TransportErrc::kInvalidState);
       }
     }
@@ -257,9 +259,20 @@ class NodeRuntime {
    * **退出后本 fiber 兼任收敛者**(ADR-0005 D1,见 ConvergeAfterReadLoop):两条内部工作
    * 单元中读循环恒是第一个退出的,故它天然是收敛的正确位置——无需独立 finalizer fiber,
    * 也无人再等"读循环已退出"这一事件。
+   *
+   * **重入守卫登记(ADR-0005 D6)**:进循环前先登记本 fiber id、跑完收敛后注销,使
+   * `Close`/`WaitClosed` 能识别"调用者就是读循环自己"——`fn`(node 的 decode+dispatch,
+   * 及其调到的 key_strategy / codec / trace_sink 等用户代码)正跑在本 fiber 上,它调
+   * `Close` 即"收敛者等自己退出"的自锁。注销放在收敛之后、fiber 体末尾:fiber 尚存活
+   * 期间其 id 不会被复用,故不存在"id 张冠李戴"的误判窗口。
    */
   void SpawnReadLoop(std::function<void(Datagram)> decode_and_dispatch) {
     Coro::makeTask([this, fn = std::move(decode_and_dispatch)]() mutable {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        read_loop_fiber_id_ = boost::this_fiber::get_id();
+        read_loop_fiber_id_set_ = true;
+      }
       while (true) {
         auto datagram = transport_->Read();  // 裸读,无 deadline。
         if (!datagram) {
@@ -271,6 +284,12 @@ class NodeRuntime {
         fn(std::move(datagram).value());  // node 内联 decode + 分发(协议特有)。
       }
       ConvergeAfterReadLoop();  // 读循环兼任收敛者(D1);不得调公开的 Close(会自等)。
+      {
+        // 本内部工作单元就此终止 → 注销重入守卫登记(D6):此后本 fiber id 可被新 fiber
+        // 复用,留着它会把无辜的外部调用者误判为内部来源。
+        std::lock_guard<std::mutex> lock(mutex_);
+        read_loop_fiber_id_set_ = false;
+      }
     });
   }
 
@@ -322,6 +341,12 @@ class NodeRuntime {
                     static_cast<long>(std::chrono::duration_cast<
                                        std::chrono::microseconds>(duration)
                                            .count()));  // P5-4:调用止点。
+      }
+      {
+        // 本内部工作单元就此终止 → 注销重入守卫登记(D6),同读循环:fiber 退出后其 id
+        // 可被复用,留着会误判外部调用者。
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler_fiber_id_set_ = false;
       }
     };
     // 句柄登记先于 fiber 首次得以运行:makeTask 的 fiber 与本调用同线程亲和
@@ -376,10 +401,21 @@ class NodeRuntime {
   }
 
  private:
-  /// @brief 是否当前 fiber 即 handler 消费者 fiber(重入自锁检测)。自持锁调用。
-  [[nodiscard]] bool InHandlerFiberLocked() const {
-    return handler_fiber_id_set_ &&
-           boost::this_fiber::get_id() == handler_fiber_id_;
+  /**
+   * @brief 当前 fiber 是否为节点自身的内部工作单元(重入守卫判据,ADR-0005 D6 /
+   *        RT_LIFECYCLE_005)。自持锁调用。
+   *
+   * 内部工作单元恰两条:**读-分发循环**(D1 之后它兼任收敛者,调 `Close` 即等自己退出)与
+   * **handler 消费者**(收敛要等它退出,调 `Close` 即等自己退出)。二者的 fiber id 在各自
+   * fiber 体的首尾登记/注销,故"已登记"⇔"该工作单元正在运行"。
+   *
+   * 注意判别的是**从内部工作单元调公开 API**;收敛自身走的是私有的
+   * `SignalCloseIfFirstCloser`/`ConvergeToClosed`,不经本守卫。
+   */
+  [[nodiscard]] bool InInternalWorkUnitLocked() const {
+    const auto self = boost::this_fiber::get_id();
+    return (handler_fiber_id_set_ && self == handler_fiber_id_) ||
+           (read_loop_fiber_id_set_ && self == read_loop_fiber_id_);
   }
 
   /**
@@ -452,6 +488,9 @@ class NodeRuntime {
    * 彼时 lifecycle 已非 Running——无需按介质分支,判据只是"读循环退出时是否仍 Running"。
    * **与 RT_LIFECYCLE_005 的边界**:自终的收敛驱动者是读循环,而 D1 之后**无人等待读循环
    * 退出**(`loop_done_` 已删),故它不是"被收敛所等待的内部工作单元",不构成自等待。
+   * 本函数全程只走**私有**的 `SignalCloseIfFirstCloser`/`ConvergeToClosed`,不经公开
+   * `Close`/`WaitClosed`,故 D6 的重入守卫拦不到收敛路径——守卫拦的是"内部工作单元调
+   * 公开 API",而非收敛本身。
    */
   void ConvergeAfterReadLoop() {
     (void)SignalCloseIfFirstCloser(nullptr);  // 仍 Running ⇒ 致命错误自终(D5)。
@@ -513,8 +552,12 @@ class NodeRuntime {
   mutable std::mutex mutex_;  ///< 守生命周期状态(D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
   bool starting_{false};  ///< 首个 Start 正在初始化(并发 Start 据此 await start_done_)。
-  boost::fibers::fiber::id handler_fiber_id_;  ///< handler 消费者 fiber id(重入自锁检测)。
+  /// 两条内部工作单元的 fiber id(重入守卫判据,D6):各自 fiber 体首登记、末注销,
+  /// "已登记"⇔"该工作单元正在运行"。
+  boost::fibers::fiber::id handler_fiber_id_;  ///< handler 消费者 fiber id。
   bool handler_fiber_id_set_{false};
+  boost::fibers::fiber::id read_loop_fiber_id_;  ///< 读-分发循环 fiber id。
+  bool read_loop_fiber_id_set_{false};
   /// handler 消费者 fiber 的结构化并发句柄(ADR-0005 D2);为空即未 spawn handler。
   /// 收敛者以 `get()` 让出式 join 之(ConvergeAfterReadLoop)。
   std::shared_ptr<Coro::FiberTask<void>> handler_task_;

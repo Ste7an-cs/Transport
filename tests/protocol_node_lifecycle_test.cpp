@@ -8,8 +8,9 @@
 //     (可重试,不被污染)(RT_LIFECYCLE_007)。
 //   · Close 协作取消收敛正在运行的 handler(观察 token 返回)、三方汇合后 Closed、多个
 //     WaitClosed 全唤醒(RT_LIFECYCLE_004/006)。
-//   · handler 内经 ctx.RequestClose() / 捕获 node& 调 node.Close() 发起关闭 → 不自锁、
-//     正常收敛(RT_LIFECYCLE_005)。
+//   · **重入守卫**(RT_LIFECYCLE_005 / ADR-0005 D6):两条内部工作单元(handler 消费者、
+//     读-分发循环)内调 Close()/WaitClosed() → kInvalidState 且不做任何拆卸(节点仍
+//     Running、仍可交互),其后外部 Close 正常收敛。
 //   · Close 时未启动的排队业务 → CloseDropCount() 归因(不排空处理,ADR-0001 D5)。
 //   · **致命错误自终**(RT_LIFECYCLE_008 / ADR-0005 D5):不可重连介质底层致命错误
 //     (Read 返 kClosed)而节点仍 Running → 节点自行 Closing→Closed,在途 WaitClosed
@@ -236,33 +237,32 @@ TEST(ProtocolNodeLifecycle, CloseCooperativelyCancelsHandlerAndWakesAllWaiters) 
   EXPECT_TRUE(w3.get());
 }
 
-// RT_LIFECYCLE_005:handler 内经 ctx.RequestClose() 发起关闭 → 不自锁,节点正常收敛到
-// Closed(外部 WaitClosed 完成即证无自等待死锁)。
-TEST(ProtocolNodeLifecycle, HandlerRequestCloseDoesNotSelfDeadlock) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNodeConfig config;
-  config.handler = [](const Message&, HandlerContext& ctx) -> Status {
-    return ctx.RequestClose();  // 消费者 fiber 内发起关闭。
-  };
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
-
-  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  // 节点应自行收敛到 Closed;外部 WaitClosed 完成(不挂起)证实不自锁。
-  EXPECT_TRUE(node.WaitClosed());
-}
-
-// RT_LIFECYCLE_005:handler 捕获 node& 直接调 node.Close() → 重入自锁防护只发起、不自等,
-// 节点正常收敛。
-TEST(ProtocolNodeLifecycle, HandlerNodeCloseDoesNotSelfDeadlock) {
+// RT_LIFECYCLE_005 / ADR-0005 D6(重入守卫,#121):handler 消费者是节点的**内部工作单元**
+// ——收敛要等它退出,故它调 Close 即"等自己退出"。捕获 node& 硬调 Close()/WaitClosed()
+// 一律返 kInvalidState,且**不做任何拆卸**:节点仍 Running(后续帧照常消费、ctx.Send 照常
+// 成功),随后**外部** Close 能正常收敛。
+// (旧用例 HandlerRequestCloseDoesNotSelfDeadlock / HandlerNodeCloseDoesNotSelfDeadlock
+//  的"只发起不自等"半执行语义已随 D6 删除,`HandlerContext::RequestClose` 亦已移除。)
+TEST(ProtocolNodeLifecycle, HandlerCloseAndWaitClosedRejectedWithoutTeardown) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();
   ProtocolNode* node_ptr = nullptr;
+  std::atomic_int handled{0};
+  Status close_result;
+  Status wait_result;
+  Status send_result;
   ProtocolNodeConfig config;
-  config.handler = [&node_ptr](const Message&, HandlerContext&) -> Status {
-    return node_ptr->Close();  // 消费者 fiber 内直接 Close(重入)。
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+    if (handled.load() == 0) {
+      close_result = node_ptr->Close();       // 内部工作单元发起关闭 → 守卫拒绝。
+      wait_result = node_ptr->WaitClosed();   // 等自己退出 → 守卫拒绝。
+    } else {
+      Message ping;
+      ping.message_id = 0x0003;
+      send_result = ctx.Send(std::move(ping));  // 非 Running 会返 kClosed。
+    }
+    handled.fetch_add(1);
+    return Status{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -270,7 +270,65 @@ TEST(ProtocolNodeLifecycle, HandlerNodeCloseDoesNotSelfDeadlock) {
   ASSERT_TRUE(node.Start());
 
   fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  EXPECT_TRUE(node.WaitClosed());  // 收敛不挂起 = 不自锁。
+  ASSERT_TRUE(pumpFiberUntil([&] { return handled.load() == 1; }));
+  ASSERT_FALSE(close_result);
+  EXPECT_EQ(close_result.error(), make_error_code(TransportErrc::kInvalidState));
+  ASSERT_FALSE(wait_result);
+  EXPECT_EQ(wait_result.error(), make_error_code(TransportErrc::kInvalidState));
+
+  // 未做任何拆卸:第二帧照常被消费,且此时 ctx.Send 成功 = 节点仍 Running。
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 2, 0x0002));
+  ASSERT_TRUE(pumpFiberUntil([&] { return handled.load() == 2; }));
+  EXPECT_TRUE(send_result);
+
+  // 外部发起的关闭仍正常收敛(守卫没有留下任何半执行残迹)。
+  ASSERT_TRUE(node.Close());
+  EXPECT_TRUE(node.WaitClosed());
+}
+
+// RT_LIFECYCLE_005 / ADR-0005 D6(重入守卫,#121):**读-分发循环**同样是内部工作单元,且
+// D1 之后它兼任收敛者——它调 Close 即"收敛者等自己退出"。本用例从 decode_and_dispatch 内
+// (key_strategy.response_key 由 ProtocolNode::Dispatch 在读循环 fiber 上调用)硬调
+// Close()/WaitClosed():须返 kInvalidState 且不破坏后续收敛。守卫若失效,本用例会挂死。
+TEST(ProtocolNodeLifecycle, ReadLoopCloseAndWaitClosedRejectedWithoutTeardown) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNode* node_ptr = nullptr;
+  std::atomic_int dispatched{0};
+  Status close_result;
+  Status wait_result;
+  ProtocolNodeConfig config;
+  auto default_keys = transport::DefaultProtocolKeyStrategy();
+  config.key_strategy.request_key = default_keys.request_key;
+  config.key_strategy.response_key =
+      [&, inner = default_keys.response_key](const Message& msg) {
+        if (dispatched.load() == 0) {
+          close_result = node_ptr->Close();      // 读循环 fiber 内发起关闭 → 守卫拒绝。
+          wait_result = node_ptr->WaitClosed();  // 等自己退出 → 守卫拒绝。
+        }
+        dispatched.fetch_add(1);
+        return inner(msg);
+      };
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  node_ptr = &node;
+  ASSERT_TRUE(node.Start());
+
+  // 响应帧 → Dispatch 走 IsTerminal 分支 → 在读循环 fiber 上调 response_key。
+  fake->Inject(MakeBusinessDatagram(FrameType::kResponse, 1, 0x1001));
+  ASSERT_TRUE(pumpFiberUntil([&] { return dispatched.load() == 1; }));
+  ASSERT_FALSE(close_result);
+  EXPECT_EQ(close_result.error(), make_error_code(TransportErrc::kInvalidState));
+  ASSERT_FALSE(wait_result);
+  EXPECT_EQ(wait_result.error(), make_error_code(TransportErrc::kInvalidState));
+
+  // 未做任何拆卸:读循环仍在跑,第二帧照常分发。
+  fake->Inject(MakeBusinessDatagram(FrameType::kResponse, 2, 0x1002));
+  ASSERT_TRUE(pumpFiberUntil([&] { return dispatched.load() == 2; }));
+
+  // 外部发起的关闭仍正常收敛(读循环仍是那个能收敛的收敛者)。
+  ASSERT_TRUE(node.Close());
+  EXPECT_TRUE(node.WaitClosed());
 }
 
 // RT_LIFECYCLE / ADR-0001 D5:Close 时未启动的排队业务 → CloseDropCount() 归因,不排空处理。

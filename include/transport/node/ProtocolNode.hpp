@@ -46,25 +46,19 @@ class ProtocolNode;
 
 /**
  * @brief 入站业务处理器的能力面(RT_HANDLER_001):handler 经它与节点交互,而非裸捕获
- *        node&。只露三项能力,协议内部状态不外泄。
+ *        node&。只露两项能力,协议内部状态不外泄。
  *
  * 由 ProtocolNode 在消费者 fiber 内构造并按引用传入 handler;handler 不得持有其地址越出
  * 单次调用(生命周期系于该次分发)。
+ *
+ * **不含"关闭本节点"**(RT_LIFECYCLE_005 / ADR-0005 D6):关闭只能由节点外部发起——
+ * handler 消费者是节点的内部工作单元,收敛要等它退出,它发起关闭即等自己退出。handler
+ * 识别出的协议级终止条件只能经处理结果与可观测状态上报,由宿主裁决是否关闭。
  */
 class HandlerContext {
  public:
   /// @brief 从本节点 fire-and-forget 发一帧(noresponse);委托到 ProtocolNode::Send。
   [[nodiscard]] Status Send(Message msg);
-
-  /**
-   * @brief 请求关闭本节点(非阻塞):发起完整收敛拆卸但不自等待(RT_LIFECYCLE_005)。
-   *
-   * 委托 ProtocolNode::Close;因当前即 handler 消费者 fiber,Close 内的重入自锁防护会
-   * 只发起拆卸(置 Closing + RequestClose 传输 + Close 业务队列 + 触发 handler 取消 +
-   * FailAll),跳过对 closed_ 的自等待(等自己 = 自锁),立即返回。节点由**读循环**在其
-   * 自身退出且 handler 也退出后收敛到 Closed(ADR-0005 D1)。
-   */
-  Status RequestClose();
 
   /// @brief 节点所属执行域的协作取消令牌(Close 时被触发);handler 可据它提前收手。
   [[nodiscard]] const CancellationToken& cancellation() const {
@@ -180,9 +174,11 @@ class ProtocolNode {
    * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),随后**等收敛结果**。
    * 收敛由读循环兼任(ADR-0005 D1):读循环退出 →(设 handler 时)等消费者 fiber 退出 → Drain
    * 未启动业务归因 close_drop → 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享
-   * closed_(多等待者);已 Closed 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只
-   * 发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。关闭后 Request/Send 一律
-   * kClosed。
+   * closed_(多等待者);已 Closed 再关直接成功。关闭后 Request/Send 一律 kClosed。
+   *
+   * **重入守卫(ADR-0005 D6 / RT_LIFECYCLE_005)**:关闭只能由节点**外部**发起。调用者若是
+   * 节点自身的内部工作单元(读-分发循环 / handler 消费者)→ 返 kInvalidState,**不做任何
+   * 拆卸**(不置 Closing、不发汇合信号),节点原样继续运行。
    *
    * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:不具重连能力的传输(UDP / 串口 /
    * TCP 服务端已接受连接)发生底层致命错误时,读循环退出而节点仍 Running,此时由读循环
@@ -192,6 +188,8 @@ class ProtocolNode {
   Status Close();
 
   /// @brief 等待节点收敛到 Closed(复用 SharedCompletion<void>,支持 deadline/取消)。
+  ///        内部工作单元(读-分发循环 / handler 消费者)内调用 → kInvalidState
+  ///        (等收敛 = 等自己退出,ADR-0005 D6 / RT_LIFECYCLE_005)。
   [[nodiscard]] Status WaitClosed(OperationOptions options = {});
 
   /**
