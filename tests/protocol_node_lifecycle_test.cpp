@@ -11,6 +11,11 @@
 //   · handler 内经 ctx.RequestClose() / 捕获 node& 调 node.Close() 发起关闭 → 不自锁、
 //     正常收敛(RT_LIFECYCLE_005)。
 //   · Close 时未启动的排队业务 → CloseDropCount() 归因(不排空处理,ADR-0001 D5)。
+//   · **致命错误自终**(RT_LIFECYCLE_008 / ADR-0005 D5):不可重连介质底层致命错误
+//     (Read 返 kClosed)而节点仍 Running → 节点自行 Closing→Closed,在途 WaitClosed
+//     等待者被唤醒、在途请求恰好一次 kClosed、未启动业务归因 close_drop、其后 Request/
+//     Send 返 kClosed(可观察结果与外部发起关闭一致,SRS §3.1.6.3 第 7 条)。
+//     反向用例(TCP 客户端断链**不**自终)在 protocol_node_reconnect_test.cpp。
 // -----------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -331,4 +336,95 @@ TEST(ProtocolNodeLifecycle, UnstartedQueuedBusinessCloseDropWithSinkEmitsTraceEv
     EXPECT_EQ(rec.category, "drop");
     EXPECT_EQ(rec.message, DropReasonName(DropReason::kCloseDrop));
   }
+}
+
+// RT_LIFECYCLE_008 / ADR-0005 D5:不可重连介质发生底层致命错误(Read 返 kClosed,ADR-0004
+// D1 唯一终止语义)而节点仍 Running → 节点**自行**收敛:读循环置 Closing、发与 Close 完全
+// 相同的一组汇合信号(含 handler 协作取消)、走同一段收敛尾段。断言其可观察结果与外部发起
+// 关闭一致(SRS §3.1.6.3 第 7 条):在途 WaitClosed 等待者被唤醒(不再是僵尸节点)、未启动
+// 的排队业务归因 close_drop、其后 Request/Send 一律 kClosed、再 Close 幂等成功。
+TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminatesAndWakesWaiters) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  std::atomic_int entered{0};
+  CapturingTraceSink sink;
+  ProtocolNodeConfig config;
+  config.trace_sink = &sink;
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+    entered.fetch_add(1);
+    // 卡住首条:自终若不触发 handler 协作取消,收敛将卡在 join handler 上(必挂)。
+    ctx.cancellation().Wait();
+    return Status{};
+  };
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));  // 被消费、卡住。
+  ASSERT_TRUE(pumpFiberUntil([&] { return entered.load() == 1; }));
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 2, 0x0002));  // 入队,未启动。
+  pumpFiberUntil([&] { return false; }, 40);  // 让读循环把该帧解码入队(确定化)。
+
+  // 在途关闭等待者:自终前登记,收敛后须全部被唤醒(僵尸节点的正是这些等待者永不返回)。
+  std::atomic_int woken{0};
+  auto w1 = Coro::makeTask([&] { (void)node.WaitClosed(); woken.fetch_add(1); });
+  auto w2 = Coro::makeTask([&] { (void)node.WaitClosed(); woken.fetch_add(1); });
+
+  // 底层致命错误:此刻节点仍 Running,无人调用 Close。
+  fake->InjectError(make_error_code(TransportErrc::kClosed));
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return woken.load() == 2; }));
+  EXPECT_EQ(woken.load(), 2);
+  EXPECT_TRUE(w1.get());
+  EXPECT_TRUE(w2.get());
+  EXPECT_EQ(entered.load(), 1);          // 仅首条曾启动(取消后返回)。
+  EXPECT_EQ(node.CloseDropCount(), 1u);  // 未启动的一帧归因 close_drop,不处理。
+  const auto records = DropRecords(sink.Records());
+  ASSERT_EQ(records.size(), 1u);
+  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kCloseDrop));
+
+  // 其后新交互一律 kClosed;再 Close / WaitClosed 幂等成功(不挂起)。
+  Message req;
+  req.message_id = 0x0007;
+  auto after = node.Request(std::move(req));
+  ASSERT_FALSE(after);
+  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+  Message evt;
+  evt.message_id = 0x0008;
+  auto sent = node.Send(std::move(evt));
+  ASSERT_FALSE(sent);
+  EXPECT_EQ(sent.error(), make_error_code(TransportErrc::kClosed));
+  EXPECT_TRUE(node.Close());
+  EXPECT_TRUE(node.WaitClosed());
+}
+
+// RT_LIFECYCLE_008 + SRS §3.1.6.3 第 3 条:自终路径必须发出**与 Close 相同**的 node 侧收敛
+// 信号(PendingTable.FailAll)——在途请求恰好一次以 kClosed 终结,而不是苦等各自的总超时。
+// (该回调此前只作为 Close 的入参传入,自终取不到;故改由 runtime 于 node 构造期持有。)
+TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminationFailsInFlightRequest) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
+  ASSERT_TRUE(node.Start());
+
+  // 在途请求:对端(fake)不回响应 → 只能由收敛或总超时(默认 30s)终结。
+  transport::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  std::atomic_bool done{false};
+  auto request = Coro::makeTask([&] {
+    Message req;
+    req.message_id = 0x0011;
+    outcome = node.Request(std::move(req));
+    done.store(true);
+  });
+  ASSERT_TRUE(pumpFiberUntil([&] { return node.PendingCount() == 1u; }));
+  EXPECT_FALSE(done.load());
+
+  fake->InjectError(make_error_code(TransportErrc::kClosed));  // 底层致命错误。
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return done.load(); }));
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.PendingCount(), 0u);
+  EXPECT_TRUE(request.get());
+  EXPECT_TRUE(node.WaitClosed());  // 已自行收敛:不挂起。
 }

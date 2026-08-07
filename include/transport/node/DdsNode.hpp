@@ -152,6 +152,10 @@ class DdsNode {
    * (设 handler 时)等消费者 fiber 退出 → 置 Closed。后续关闭者共享 closed_(多等待者);
    * 已 Closed 再关直接成功。当前若即 handler
    * 消费者 fiber(重入)→ 只发起拆卸、跳过自等待。关闭后 Request/Publish 一律 kClosed。
+   *
+   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:DDS 非重连(断开即致命,Read 返
+   * kClosed),此时读循环退出而节点仍 Running → 由读循环**自行**走上述同一条关闭路径,
+   * 宿主无需干预;可观察结果与外部发起关闭一致。
    */
   Status Close();
 

@@ -10,7 +10,9 @@
  *
  *   1. 生命周期状态机(Created→Running→Closing→Closed)+ 并发幂等 Start(共享一次结果、
  *      不重复 spawn)+ **收敛并入读循环**(ADR-0005 D1:读循环退出后兼任收敛者,等 handler
- *      退出 → Drain 归因 → 置 Closed;Close 只发汇合信号并等结果)+ 多等待者 WaitClosed +
+ *      退出 → Drain 归因 → 置 Closed;Close 只发汇合信号并等结果)+ **致命错误自终**
+ *      (ADR-0005 D5 / RT_LIFECYCLE_008:读循环退出时若节点仍 Running 即非我方 Close 所致,
+ *      由读循环自行置 Closing 并发同一组汇合信号,再走同一段收敛)+ 多等待者 WaitClosed +
  *      重入自锁防护(比对 handler fiber id)。
  *   2. handler 消费者 fiber + `BoundedQueue<Event>` 集成:入队(Enqueue)/串行消费/异常
  *      隔离(consume 逃逸异常兜住 → 记 handler_exception,不自关)/ close_drop 归因
@@ -163,24 +165,36 @@ class NodeRuntime {
   }
 
   /**
+   * @brief 登记 node 侧协议特有收敛信号(典型为 `PendingTable.FailAll(kClosed)`)。
+   *
+   * 由 node 在**构造期**登记一次:关闭汇合有两个发起点——外部 `Close` 与读循环的致命错误
+   * 自终(ADR-0005 D5),二者须发出**完全相同**的一组汇合信号,故该回调不能再作为 `Close`
+   * 的入参(自终路径无从取得),改由 runtime 持有。
+   *
+   * 同步纪律:与 `trace_sink_` 同——写一次(node 构造期,节点尚未发布给任何 fiber)、
+   * 此后只读不再变,故读取不需持锁。
+   *
+   * @param signal 协议特有收敛信号(锁外调用,可为空)。
+   */
+  void SetNodeConvergenceSignal(std::function<void()> signal) {
+    node_convergence_signal_ = std::move(signal);
+  }
+
+  /**
    * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
    *
    * **Close 只发汇合信号 + 等收敛结果**(ADR-0005 D1),不亲自收敛。首个关闭者:
-   * Running→Closing(立即拒新交互)→ 汇合信号:runtime 侧(transport.RequestClose +
-   * 业务队列 Close + handler 协作取消)+ node 侧 @p signal_node_convergence(协议特有:
-   * PendingTable.FailAll 等)→ Complete close_signalled_(读循环据此收敛)。收敛由**读循环
-   * 兼任**:读循环 Read 返 kClosed 退出后等 handler 退出 → Drain 未启动业务归因 close_drop
-   * → 置 Closed → closed_.Complete(见 ConvergeAfterReadLoop)。
+   * Running→Closing(立即拒新交互)→ 汇合信号(见 SignalCloseIfFirstCloser:runtime 侧
+   * transport.RequestClose + 业务队列 Close + handler 协作取消,node 侧已登记的收敛信号)
+   * → Complete close_signalled_(读循环据此收敛)。收敛由**读循环兼任**:读循环 Read 返
+   * kClosed 退出后等 handler 退出 → Drain 未启动业务归因 close_drop → 置 Closed →
+   * closed_.Complete(见 ConvergeAfterReadLoop)。
    * 从未 spawn 读循环(Created/starting)时无收敛者,由本函数就地收敛。
-   * 后续关闭者共享 closed_(多等待者);已 Closed 再关直接成功。当前若就是 handler 消费者
-   * fiber(重入)→ 只发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。
-   *
-   * @param signal_node_convergence node 侧协议特有收敛信号(锁外调用,可为空)。
-   *        典型为 PendingTable.FailAll(kClosed)。
+   * 后续关闭者共享 closed_(多等待者);已 Closed 再关直接成功。**读循环因致命错误自终**
+   * (D5)时本函数即"后续关闭者",一样等 closed_。当前若就是 handler 消费者 fiber(重入)
+   * → 只发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。
    */
-  Status Close(const std::function<void()>& signal_node_convergence) {
-    bool first_closer = false;
-    bool read_loop_converges = false;
+  Status Close() {
     bool in_handler_fiber = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -188,32 +202,12 @@ class NodeRuntime {
       if (lifecycle_ == LifecycleState::kClosed) {
         return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
       }
-      if (lifecycle_ != LifecycleState::kClosing) {
-        first_closer = true;
-        // Running ⇒ bring_up 已 spawn 读循环 ⇒ 收敛者就位;否则(Created/starting)无人收敛。
-        read_loop_converges = (lifecycle_ == LifecycleState::kRunning);
-        lifecycle_ = LifecycleState::kClosing;
-        close_requested_at_ = Clock::now();  // P5-4:关闭时延起点。
-      }
     }
 
-    if (first_closer) {
-      // 生命周期跃迁 Trace(Running→Closing)。
-      RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closing");
-      // 汇合信号(锁外):runtime 侧唤醒读循环 + 消费者 + 触发 handler 取消。
-      transport_->RequestClose();
-      business_queue_.Close();
-      handler_cancellation_.Cancel();
-      if (signal_node_convergence) {
-        signal_node_convergence();  // node 侧:PendingTable.FailAll 等。
-      }
-      if (read_loop_converges) {
-        // 最后一步:此时上述信号均已发出,读循环一旦被放行即可无条件走完收敛。
-        close_signalled_.Complete(Status{});
-      } else {
-        // 从未 spawn 读循环:无收敛者,就地收敛。残留业务(理论上无)一并 close_drop 归因。
-        ConvergeToClosed();
-      }
+    bool read_loop_converges = false;
+    if (SignalCloseIfFirstCloser(&read_loop_converges) && !read_loop_converges) {
+      // 从未 spawn 读循环:无收敛者,就地收敛。残留业务(理论上无)一并 close_drop 归因。
+      ConvergeToClosed();
     }
 
     // 重入自锁防护:当前若就是 handler 消费者 fiber,等 closed_ = 等自己退出 = 自锁。
@@ -389,20 +383,79 @@ class NodeRuntime {
   }
 
   /**
+   * @brief 置 Closing 并发出**全部**关闭汇合信号——`Close` 与致命错误自终共用的同一段发起
+   *        代码(ADR-0005 D5:正常关闭与自终合并为一条路径,区别仅在"谁先置的 Closing")。
+   *
+   * 首个关闭者(lifecycle 尚非 Closing/Closed)独占地:置 Closing(立即拒新交互)→ 记关闭
+   * 时延起点 → 锁外发汇合信号(transport.RequestClose + 业务队列 Close + handler 协作取消
+   * + node 侧已登记的收敛信号)→ 最后 Complete close_signalled_ 放行收敛者。并发的 `Close`
+   * 与自终以 lifecycle_ 为唯一仲裁点,故**恒只有一个发起者**,close_signalled_ 也只被
+   * Complete 一次。
+   *
+   * @param[out] read_loop_converges 非空时写出"收敛者是否已就位":自 Running 进入 Closing
+   *             ⇒ bring_up 已 spawn 读循环 ⇒ 由它收敛;否则(Created/starting)无人收敛,
+   *             调用者须就地 ConvergeToClosed。非首个关闭者时写 false(其无收敛职责)。
+   * @return 本调用是否为首个关闭者。
+   */
+  bool SignalCloseIfFirstCloser(bool* read_loop_converges) {
+    bool first_closer = false;
+    bool converger_ready = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (lifecycle_ != LifecycleState::kClosing &&
+          lifecycle_ != LifecycleState::kClosed) {
+        first_closer = true;
+        // Running ⇒ bring_up 已 spawn 读循环 ⇒ 收敛者就位;否则(Created/starting)无人收敛。
+        converger_ready = (lifecycle_ == LifecycleState::kRunning);
+        lifecycle_ = LifecycleState::kClosing;
+        close_requested_at_ = Clock::now();  // P5-4:关闭时延起点。
+      }
+    }
+    if (read_loop_converges) {
+      *read_loop_converges = converger_ready;
+    }
+    if (!first_closer) {
+      return false;
+    }
+    // 生命周期跃迁 Trace(Running→Closing)。
+    RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closing");
+    // 汇合信号(锁外):runtime 侧唤醒读循环 + 消费者 + 触发 handler 取消。
+    transport_->RequestClose();
+    business_queue_.Close();
+    handler_cancellation_.Cancel();
+    if (node_convergence_signal_) {
+      node_convergence_signal_();  // node 侧:PendingTable.FailAll 等。
+    }
+    // 最后一步:此时上述信号均已发出,读循环一旦被放行即可无条件走完收敛。**无条件**
+    // Complete(即便此刻无收敛者):它是"首个关闭者已发完全部汇合信号"这一事实本身,
+    // 无人等待时 Complete 亦无副作用;而漏发一次即等于读循环永久挂在 Wait 上。
+    close_signalled_.Complete(Status{});
+    return true;
+  }
+
+  /**
    * @brief 读循环退出后的收敛尾段(ADR-0005 D1):读循环兼任收敛者,在其自身 fiber 内跑完
    *        整个收敛,故**不得调公开的 `Close()`**(那会等 closed_ = 等自己退出 = 自锁)。
    *
-   * 依次:等关闭汇合信号 →(设 handler 时)等 handler 退出 → ConvergeToClosed。
+   * 依次:自终判定 → 等关闭汇合信号 →(设 handler 时)等 handler 退出 → ConvergeToClosed。
    *
-   * 首步等 close_signalled_ 的理由:读循环退出有两种成因——我方 `Close`(信号已在退出前
-   * 发出,`Wait` 立即返回、不挂起),或不具重连能力的传输发生底层致命错误而节点仍 `Running`
-   * (ADR-0004 D1 后二者同为 kClosed、读循环无从区分)。后者若径直收敛,即等于"致命错误
-   * 自终"——那是 RT_LIFECYCLE_008 / ADR-0005 D5 的范围,**本票不做**;且此时业务队列未
-   * Close、handler 未取消,径直收敛会卡死在等 handler 退出上。故一律等到 `Close` 发出汇合
-   * 信号后再收敛。
+   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:读循环退出有两种成因——我方
+   * `Close`(信号已在退出前发出),或不具重连能力的传输发生底层致命错误而节点仍 `Running`
+   * (ADR-0004 D1 后二者同为 kClosed、读循环无从区分)。后者由本 fiber **自行**置 Closing
+   * 并发出与 `Close` 完全相同的一组汇合信号(SignalCloseIfFirstCloser),再走下面同一段
+   * 收敛代码;不这样做则业务队列未 Close、handler 未取消,节点将停在 `Running` 而收发已
+   * 终止,`WaitClosed` 的等待者永不被唤醒(僵尸节点)。
+   * 我方 `Close` 所致时 lifecycle 已是 Closing/Closed,自终判定原样退让,`Wait` 至多挂起到
+   * `Close` 把余下的汇合信号发完(读循环可能在 transport.RequestClose 后、其余信号发出前
+   * 就已退出);自终时则是本 fiber 自己刚刚 Complete 的,`Wait` 立即返回。
+   * **TCP 客户端天然落不到自终分支**:它无限重连,`Read` 只在我方 `Close` 后返 kClosed,
+   * 彼时 lifecycle 已非 Running——无需按介质分支,判据只是"读循环退出时是否仍 Running"。
+   * **与 RT_LIFECYCLE_005 的边界**:自终的收敛驱动者是读循环,而 D1 之后**无人等待读循环
+   * 退出**(`loop_done_` 已删),故它不是"被收敛所等待的内部工作单元",不构成自等待。
    */
   void ConvergeAfterReadLoop() {
-    close_signalled_.Wait();  // 我方 Close 时已 Complete,立即返回、不挂起。
+    (void)SignalCloseIfFirstCloser(nullptr);  // 仍 Running ⇒ 致命错误自终(D5)。
+    close_signalled_.Wait();  // 信号已 Complete(我方 Close 或上一行自终),立即返回。
     std::shared_ptr<Coro::FiberTask<void>> handler;
     {
       // 与写方(SpawnHandlerLoop)同锁,不依赖 bring-up 时序(#98)。
@@ -446,10 +499,14 @@ class NodeRuntime {
   /// 可选 Trace 出口(非拥有,P5-3/P5-4):业务队列 kBusinessQueueOverflow 归因、Close 时
   /// close_drop 归因,以及生命周期/handler 的 RecordEvent。写一次(构造)不再变,读不需持锁。
   ITraceSink* trace_sink_{nullptr};
+  /// node 侧协议特有收敛信号(PendingTable.FailAll 等):`Close` 与致命错误自终(D5)共用。
+  /// 与 trace_sink_ 同纪律:node 构造期写一次(节点尚未发布)、此后只读,读不需持锁。
+  std::function<void()> node_convergence_signal_;
   CancellationSource handler_cancellation_;  ///< handler 协作取消源:Close 时 Cancel。
 
   SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享)。
-  /// 首个 Close 已发出全部汇合信号(读循环退出后据此放行收敛;D1)。
+  /// 首个关闭者(外部 `Close` 或致命错误自终的读循环自身,D5)已发出全部汇合信号
+  /// (读循环退出后据此放行收敛;D1)。
   SharedCompletion<void> close_signalled_;
   SharedCompletion<void> closed_;  ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
 
