@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 功能:致命错误自终,落地 RT_LIFECYCLE_008(ADR-0005 D5,#120)
+
+> 依 ADR-0005 **D5** / RT_LIFECYCLE_008。此前节点因底层致命错误而收发终止后会停留在 `Running`,读-分发循环退出后常驻在收敛入口等待外部关闭,`WaitClosed` 的等待者永不被唤醒(僵尸节点)。本次消除该状态。
+
+- **变更** 读-分发循环退出时若节点仍 `Running`(即非我方 `Close` 所致),由其**自行**置 `Closing` 并发出与 `Close` **完全相同**的一组汇合信号(`transport.RequestClose` + 业务队列 `Close` + handler 协作取消 + node 侧收敛信号),再走**同一段**收敛代码。正常关闭与自终由此合并为一条路径,区别仅在"谁先置的 `Closing`"。
+- **变更** 发起段抽为共用的内部 `SignalCloseIfFirstCloser()`;仲裁点仍是 `lifecycle_` 单点,故并发的 `Close` 与自终之间**恒只有一个发起者**,`close_signalled_` 亦只被 Complete 一次。
+- **变更** node 侧协议特有收敛信号(`PendingTable.FailAll` 等)由 `NodeRuntime::Close` 的入参改为**构造期登记**(`SetNodeConvergenceSignal`)——自终路径无从取得入参,却必须发出完全相同的一组信号。`NodeRuntime::Close` 签名相应变为无参(内部接缝,不属公开 API)。
+- **不按介质分支**:判据只是"读循环退出时是否仍 `Running`"。TCP 客户端无限重连、`Read` 只在我方 `Close` 后返 `kClosed`,彼时 lifecycle 已非 `Running`,**天然不自终**;TCP 服务端已接受连接仍由 `TcpServer` supervisor 驱动收敛。
+- **新增测试** 自终唤醒 `WaitClosed` 等待者、自终终结在途请求、TCP 客户端断连不自终。
+- **验证** 全量 293 tests `--gtest_repeat=3` 三轮一致(292 通过 / 1 既有失败 #123),**无挂起**;生命周期与重连五套件 52 tests `--gtest_repeat=20` 全绿无挂起。
+
 ### 重构:handler 汇合改用结构化并发 join,移除处理器取消超时观测(ADR-0005 D2/D8,#119)
 
 > 依 ADR-0005 **D2**(handler 汇合改 `FiberTask::get()`)与 **D8**(删除 500 ms 处理器取消观测)。**关闭路径的行为保证不变**:仍触发 handler 协作取消、仍等待处理器实际退出、仍不强制销毁 fiber;变的是汇合机制与诊断埋点。

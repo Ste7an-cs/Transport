@@ -159,7 +159,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![关闭收敛时序图](diagrams/seq-close.svg)
 
-**图例说明（ADR-0005 D1）**：`Close` **只发汇合信号 + 等收敛结果**（transport.RequestClose + 业务队列 Close + handler 取消 + PendingTable.FailAll），收敛由**读-分发循环兼任**——两条内部工作单元中读循环恒是第一个退出的，故它退出后依次等 handler 退出、Drain 归因 close_drop、置 `Closed`、唤醒全部关闭等待者。收敛者不在调用者 fiber 内，天然规避 handler 内 `RequestClose` 的自等待自锁。
+**图例说明（ADR-0005 D1/D5）**：`Close` **只发汇合信号 + 等收敛结果**（transport.RequestClose + 业务队列 Close + handler 取消 + PendingTable.FailAll），收敛由**读-分发循环兼任**——两条内部工作单元中读循环恒是第一个退出的，故它退出后依次等 handler 退出、Drain 归因 close_drop、置 `Closed`、唤醒全部关闭等待者。收敛者不在调用者 fiber 内，天然规避 handler 内 `RequestClose` 的自等待自锁。
 
 #### 4.2.6 链路断开处置时序（MS_LINK_DOWN，原 MS_GEN_ISOLATION）
 
@@ -310,8 +310,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **软件逻辑**：见 `node/NodeRuntime.hpp`。
 - **Start(validate, bring_up)**：首个 Start 校验 config → 置 starting → 调 node `bring_up`（transport.Start + MarkRunning + SpawnReadLoop/HandlerLoop）；并发 Start await 同一 `start_done_`。
-- **Close(signal_node_convergence)**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。首个关闭者 Running→Closing → 汇合信号（transport.RequestClose + 业务队列 Close + handler 取消 + node 侧收敛回调）→ `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。重入（当前即 handler fiber）只发起不自等。
-- **SpawnReadLoop(fn)**：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：等 `close_signalled_` → 以 `FiberTask::get()` 让出式 join handler 任务（仍等其实际退出、不强杀 fiber）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
+- **Close()**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。发起段抽为共用的 `SignalCloseIfFirstCloser()`——首个关闭者 Running→Closing → 汇合信号（transport.RequestClose + 业务队列 Close + handler 取消 + **构造期登记的** node 侧收敛回调）→ `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。node 侧收敛回调由 `SetNodeConvergenceSignal()` 在 node 构造期登记而非作为 `Close` 入参，因致命错误自终路径（D5）无从取得入参却须发出**完全相同**的一组信号。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。重入（当前即 handler fiber）只发起不自等。
+- **SpawnReadLoop(fn)**：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：先做**致命错误自终判定**（D5，见下）→ 等 `close_signalled_` → 以 `FiberTask::get()` 让出式 join handler 任务（仍等其实际退出、不强杀 fiber）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
+- **致命错误自终（ADR-0005 **D5** / RT_LIFECYCLE_008）**：读循环退出有两种成因，ADR-0004 D1 之后同为 `kClosed`、读循环无从区分——我方 `Close`，或不具重连能力的传输发生底层致命错误而节点仍 `Running`。后者由读循环**自行**调 `SignalCloseIfFirstCloser()` 置 `Closing` 并发出与 `Close` 完全相同的一组汇合信号，再走**同一段**收敛代码；正常关闭与自终由此合并为一条路径，区别仅在"谁先置的 `Closing`"。判据只是"读循环退出时是否仍 `Running`"，**无需按介质分支**：TCP 客户端无限重连、`Read` 只在我方 `Close` 后返 `kClosed`，彼时 lifecycle 已非 `Running`，天然落不到自终分支。仲裁点仍是 `lifecycle_` 单点，故并发的 `Close` 与自终之间恒只有一个发起者。
 - **SpawnHandlerLoop(consume)**：`Pop → consume 到完成（含 await）→ 下一条`（严格串行）；逃逸异常记 handler_exception。**保留 `FiberTask<void>` 句柄**供收敛者结构化 join（ADR-0005 D2）。
 
 **执行时序/状态**：见 §4.2.5（关闭收敛）、§4.2.7（生命周期状态）。

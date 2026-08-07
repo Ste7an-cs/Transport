@@ -8,6 +8,7 @@ stateDiagram-v2
 
     Running --> Running: 再次 Start（幂等成功）
     Running --> Closing: 首个 Close<br/>(汇合信号 + FailAll<br/>+ 放行读循环收敛)
+    Running --> Closing: 致命错误自终<br/>(读循环退出时仍 Running →<br/>自发同一组汇合信号，ADR-0005 D5)
 
     Closing --> Closing: 后续 Close<br/>(共享 closed_，多等待者)
     Closing --> Closed: 读循环收敛完成<br/>(读循环退出→等 handler 退出<br/>→close_drop→Closed)
