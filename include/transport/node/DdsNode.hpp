@@ -15,9 +15,9 @@
  * `NodeRuntime` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply` 终结判别、topic
  * 寻址、reply_to=inbox——**全部内联本类**;基座保持协议无关(RT_DESIGN_008 红线)。
  *
- * **无连接**(D3′):无连接状态机 / reactor / 重连;底层 provider 致命 → 传输 Read 返
- * kClosed/kConnection → 读循环退出 → Closing→Closed。判活(Liveliness/Deadline QoS 或心跳
- * 超时,RT_NODE_006)归协议层,P4 不强做、留占位。
+ * **无连接**(D3′):无连接状态机 / 重连;底层 provider 致命 → 传输 Read 返 kClosed
+ * (ADR-0004 D1 单一终止语义)→ 读循环退出 → Closing→Closed。判活(Liveliness/
+ * Deadline QoS 或心跳超时,RT_NODE_006)归协议层,P4 不强做、留占位。
  *
  * 交互状态(correlation_id 计数器、生命周期、观测计数器)由一把 std::mutex 守(D8);单
  * fiber 调度器、无 affinity(D8/Q9)。

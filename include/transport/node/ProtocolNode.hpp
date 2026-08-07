@@ -31,7 +31,6 @@
 
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/Cancellation.hpp"
-#include "transport/io/IConnectionObservable.hpp"
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
@@ -39,7 +38,6 @@
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
 #include "transport/core/Result.hpp"
-#include "transport/core/SharedCompletion.hpp"
 #include "transport/core/TransportTypes.hpp"
 
 namespace transport {
@@ -139,8 +137,8 @@ struct ProtocolNodeConfig {
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
   /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeRuntime
-  /// 业务队列与本类各丢弃归因点(kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured/
-  /// kGenerationIsolationDrop),并在 send/recv/decode/match/timeout/cancel/handler/close
+  /// 业务队列与本类各丢弃归因点(kBadFrame / kUnmatchedOrLateResponse /
+  /// kNoHandlerConfigured),并在 send/recv/decode/match/timeout/cancel/handler/close
   /// 等边界点上报事件。RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,
   /// `RecordEvent`/`RecordDrop` 仅一次判空。
   ITraceSink* trace_sink = nullptr;
@@ -247,11 +245,6 @@ class ProtocolNode {
   ///        次数;超时不强杀 fiber、仍等其实际退出(RT_LIFECYCLE_006)。
   [[nodiscard]] std::size_t HandlerCancelOverrunCount() const;
 
-  /// @brief 观测:连接断连时,旧连接代际里尚未启动处理的排队业务事件被 Drain 丢弃、归因
-  ///        `连接代际隔离丢弃` 的累计数(RT_TCP_RECONNECT 3.1.7.4;仅自动重连传输上有
-  ///        reactor 时非零)。区别于 Close 的 close_drop(终态)。
-  [[nodiscard]] std::size_t GenerationIsolationDropCount() const;
-
   /// @brief 观测:读循环单次 `codec_->Decode` 调用返回错误(坏帧 / codec 语义错误,该次
   ///        收到的整段字节判为不可解析而整体丢弃)的累计次数(P5-3,ADR-0003 D13;命名
   ///        归因 kBadFrame)。
@@ -280,12 +273,6 @@ class ProtocolNode {
   void DecodeAndDispatch(Datagram datagram);
   /// 单条 Message 的分发(协议特有分类):响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
   void Dispatch(Message msg);
-  /// @brief reactor fiber 体(仅传输为 IConnectionObservable 时 spawn,ADR-0003 D11 Q1③/Q3④):
-  ///        WaitStateChange 循环订阅连接状态跃迁;每次代际结束(离开 kConnected)执行代际隔离——
-  ///        FailAll(kConnection, 不 latch) 令在途请求恰好一次收敛 + Drain 未启动旧代际业务归因
-  ///        `连接代际隔离丢弃`;正在运行的 handler 让其跑完(不强杀);node 保持 Running。Close 时
-  ///        经 reactor_cancellation_ 取消,WaitStateChange 返 kCancelled → 干净退出、纳入关闭汇合。
-  void RunReactorLoop(IConnectionObservable* observable);
 
   /**
    * @brief 从空闲集分配一个 session_id(最久释放者优先 = FIFO / 最大退休窗口)。
@@ -332,17 +319,12 @@ class ProtocolNode {
   /// 协议无关运行时机制(组合并驱动,ADR-0003 D10/D12):生命周期状态机 + 三方汇合 +
   /// handler 消费者 fiber + 业务队列 + 读循环骨架。node 内联协议特有语义驱动它。
   NodeRuntime<Message> runtime_;
-  /// reactor fiber 协作取消源:Close 时 Cancel,令 WaitStateChange 返 kCancelled 退出(D11)。
-  CancellationSource reactor_cancellation_;
-  /// reactor fiber 退出通知(finalizer 追加汇合点;仅传输为 IConnectionObservable 时用)。
-  SharedCompletion<void> reactor_done_;
 
   mutable std::mutex mutex_;  ///< 守协议特有交互状态(session 空闲集、协议计数,D8)。
   /// session_id 空闲集(构造时填 0..255);pop_front 分配、push_back 释放 = FIFO 复用。
   std::deque<std::uint8_t> free_sessions_;
   std::size_t unmatched_response_count_{0};
   std::size_t dropped_no_handler_count_{0};
-  std::size_t generation_isolation_drop_count_{0};
   std::size_t bad_frame_count_{0};
 };
 

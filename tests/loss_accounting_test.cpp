@@ -198,7 +198,7 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
     EXPECT_EQ(node.DroppedNoHandlerCount(), 0u);
     EXPECT_EQ(node.BusinessQueueOverflowCount(), 0u);
     EXPECT_EQ(node.CloseDropCount(), 0u);
-    EXPECT_EQ(node.GenerationIsolationDropCount(), 0u);
+    // kGenerationIsolationDrop 的 node 访问器随 #110(T6)删除(归因项本身待 #112 删)。
     EXPECT_EQ(node.BadFrameCount(), 0u);
   };
   AssertAllZero();
@@ -656,9 +656,12 @@ std::size_t RunGenerationIsolationScenario(ITraceSink* sink) {
   pumpFiberUntil([&] { return started == 1; }, 3000);
   pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队(确定化)。
 
-  accepted1->abort();  // 物理断连:reactor 遇代际结束 → Drain 未启动的 3 帧。
-  pumpFiberUntil([&] { return node->GenerationIsolationDropCount() >= 1; }, 4000);
-  const std::size_t generation_isolation = node->GenerationIsolationDropCount();
+  accepted1->abort();  // 物理断连(旧语义下 reactor 会 Drain 未启动的 3 帧)。
+  // 代际隔离已由 ADR-0004 D3 撤销,其 node 访问器随 #110(T6)删除 → 此处恒为 0。本
+  // harness 连同 kGenerationIsolationDrop 归因项的删除属 #112(T9),届时整体改写;在此
+  // 之前调用方的三个用例均 GTEST_SKIP,本函数不会被执行。
+  pumpFiberUntil([] { return false; }, 250);
+  const std::size_t generation_isolation = 0;
 
   // 运行中 handler 未被强杀:先放行、等其真正跑完,再 Close(避免"未完成先关"死锁)。
   gate->resolve();

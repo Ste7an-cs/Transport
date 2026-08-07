@@ -363,8 +363,8 @@ TEST(TcpClientE2E, DisconnectKeepsQueuedBusinessAndInFlightRequests) {
   pumpFiberUntil([] { return false; }, 250);
   EXPECT_FALSE(req_done) << "断链不得终结在途请求(ADR-0004 D3)";
   EXPECT_EQ(node.PendingCount(), 1u);
-  EXPECT_EQ(node.GenerationIsolationDropCount(), 0u)
-      << "代际隔离丢弃已撤销,不得再产生";
+  // 代际隔离丢弃已撤销(ADR-0004 D3),其访问器随 #110 一并删除:改由"业务事件一条不少地
+  // 被处理完 + 其余丢弃计数恒 0"反证断链未丢弃任何业务。
   EXPECT_EQ(node.CloseDropCount(), 0u);
   EXPECT_EQ(node.BusinessQueueOverflowCount(), 0u);
   EXPECT_EQ(node.DroppedNoHandlerCount(), 0u);

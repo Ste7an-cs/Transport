@@ -1,19 +1,21 @@
 // -----------------------------------------------------------------------------
-// protocol_node_reconnect_test.cpp — P3-2 节点集成断连:reactor fiber + Read 透明跨重连
+// protocol_node_reconnect_test.cpp — 节点集成断连:重连对交互层完全透明
 //
-// 承接 ADR-0003 D11 Q1/Q3、RT_TCP_RECONNECT_002/004、RT_DESIGN_008。验证 ProtocolNode 在
-// 自动重连传输(TcpClientTransport,实现 IConnectionObservable)上"观察连接状态但不管理
-// churn":
-//   ① Read 透明跨重连 → node 读循环永不因 TCP 客户端断连而退出(只 Close 退出)。
-//   ② reactor fiber 遇代际结束 → PendingTable.FailAll(kConnection) 令在途请求恰好一次收敛
-//      + Drain 未启动旧代际业务归因 连接代际隔离丢弃 + 运行中 handler 跑完 + node 保持 Running。
-//   ③ 旧代际迟到响应到达新代际 → 归因丢弃(UnmatchedResponseCount),在途已 FailAll 清空不误配。
-//   ④ 非 IConnectionObservable 传输(Fake)→ node 无 reactor,行为同 P2(回归)。
+// 承接 **ADR-0004 D1/D2/D3**、RT_TCP_RECONNECT_002/004、RT_TRANSPORT_008、RT_DESIGN_008。
+// 交互层不再感知连接管理:无能力探测、无 reactor 协程、无连接代际概念,读循环仅区分
+// `kClosed`(终结)与其余(瞬时错误,继续)。本文件验证由此得到的对外可观察语义:
+//   ① 断链**不终结**在途请求:请求继续在途,直至自己的总超时;读循环透明续命,node 保持
+//      Running;重连后新请求正常收发(RT_TCP_RECONNECT_002 改写)。
+//   ② 断链**不清空**排队业务:未启动的旧链路业务事件保留,释放运行中 handler 后照常全部
+//      处理完;运行中 handler 不被强杀(D3 撤销代际隔离丢弃)。
+//   ③ 断链全程**不产生任何丢弃归因 Trace**(D3:不再有"旧代际业务被丢弃"这一事件)。
+//   ④ 在途请求在终结前不释放其关联标识 → 重连后的新请求取不到同一关联键、不被旧链路迟到
+//      响应误配;在途请求终结后,迟到响应无匹配 → 归因丢弃(RT_TCP_RECONNECT_004)。
 //
 // 拓扑沿用 tcp_client_transport_test / protocol_node_tcp_loopback_test 的真实可控 server 范式:
 // 请求方 = 真 ProtocolNode(真 TcpClientTransport(client) + SystemCodec);对端 = 裸 QTcpServer
 // + 真 TcpTransport(accepted) + SystemCodec,测试 abort accepted socket 模拟物理断连,再 accept
-// 新连接模拟自动重连。所有退避/超时用小值注入以确定化单条时长。
+// 新连接模拟自动重连。所有重连间隔/超时用小值注入以确定化单条时长。
 // -----------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
@@ -30,9 +32,7 @@
 #include "await/awaitable.hpp"
 #include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
-#include "fake_coro_transport.hpp"
 #include "task/fibertask.h"
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/core/ITraceSink.hpp"
@@ -44,12 +44,8 @@
 #include "transport/codec/SystemCodec.hpp"
 
 using namespace std::chrono_literals;
-using testutil::FakeCoroTransport;
 using testutil::pumpFiberUntil;
 using transport::CapturingTraceSink;
-using transport::Datagram;
-using transport::DropReason;
-using transport::DropReasonName;
 using transport::Endpoint;
 using transport::FrameType;
 using transport::HandlerContext;
@@ -191,16 +187,10 @@ std::unique_ptr<ProtocolNode> MakeClientNode(quint16 port,
 
 }  // namespace
 
-// —— ① + node 保持 Running 跨断连-重连:在途请求断连恰好一次 kConnection,读循环透明续命,
-// 重连后新代际 Request 正常完成,仅 Close 使 node 收敛。 ——
-// 覆盖 RT_TCP_RECONNECT_002/004、验收 1/3/6。
-TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
-  // 本用例的断言建立在"交互层观察连接状态并做代际隔离"之上:reactor fiber 经
-  // `dynamic_cast<IConnectionObservable*>` 探测传输后启动,断链时批量终结在途请求、
-  // 清空未启动业务。ADR-0004 D2/D3 撤销了该机制(T5/#109 起 TcpClientTransport 不再
-  // 实现 IConnectionObservable),故旧语义断言已不成立;按新语义重写属 T6(#110)
-  // 的连带修改范围,本处先跳过以免整套用例挂死。
-  GTEST_SKIP() << "代际隔离已由 ADR-0004 D3 撤销,本用例待 #110(T6)按新语义重写";
+// —— ① 断链不终结在途请求;读循环透明续命,node 保持 Running;重连后新请求正常收发;
+// 旧请求最终由**自己的总超时**终结(唯一剩下的终结源)。 ——
+// 覆盖 ADR-0004 D1/D3、RT_TCP_RECONNECT_002(改写)、RT_TRANSPORT_008。
+TEST(ProtocolNodeReconnect, InFlightRequestSurvivesDisconnectThenReconnectResumes) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
@@ -208,7 +198,7 @@ TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
   auto node = MakeClientNode(port);
   ASSERT_TRUE(node->Start());
 
-  // 代际1:接受连接 + 沉默对端(收命令不回响应)→ 在途 Request 挂起。
+  // 链路1:接受连接 + 沉默对端(收命令不回响应)→ 在途 Request 挂起。
   QTcpSocket* accepted1 = AcceptNext(server, 4000);
   ASSERT_NE(accepted1, nullptr);
   auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
@@ -217,32 +207,30 @@ TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
   auto silent = [](const Message&) { return std::vector<Message>{}; };
   auto echo1 = SpawnEcho(*server_txp1, silent, echo1_ended);
 
+  // 显式总超时:断链已不再终结在途请求,总超时是它唯一的终结源(ADR-0004 D3)。
   Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
-    outcome = node->Request(MakeRequest(0x0002, {0x01}));  // 无 deadline,靠断连收敛。
+    outcome = node->Request(MakeRequest(0x0002, {0x01}), Deadline(2500ms));
     done = true;
   });
-  boost::this_fiber::sleep_for(60ms);
-  EXPECT_FALSE(done);                     // 在途挂起。
-  EXPECT_EQ(node->PendingCount(), 1u);    // 恰一在途。
+  ASSERT_TRUE(pumpFiberUntil([&] { return node->PendingCount() == 1u; }, 3000));
+  EXPECT_FALSE(done);  // 在途挂起。
 
-  // 物理断连:abort 服务端 socket → 客户端 TcpClientTransport 检测断连 → reactor 触发。
+  // 物理断连:abort 服务端 socket。交互层收不到任何链路中断信号(D1 完全透明)。
   accepted1->abort();
+  pumpFiberUntil([] { return false; }, 300);  // 让断链充分传导(确定化)。
 
-  // 在途请求恰好一次以 kConnection 收敛(不跨代际重放,RT_TCP_RECONNECT_002)。
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 4000));
-  ASSERT_FALSE(outcome);
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kConnection));
-  // 在途已 FailAll 清空(session_id 亦释放)。
-  EXPECT_EQ(node->PendingCount(), 0u);
+  // 断链**不终结**在途请求:仍在途,未收敛。
+  EXPECT_FALSE(done) << "断链不得终结在途请求(ADR-0004 D3)";
+  EXPECT_EQ(node->PendingCount(), 1u);
 
-  // node 未 Closed(读循环透明续命未退出):WaitClosed 短 deadline → kTimeout。
+  // node 未 Closed(读循环仅 kClosed 退出,断链不是终结):WaitClosed 短 deadline → kTimeout。
   auto wc = node->WaitClosed(Deadline(50ms));
   ASSERT_FALSE(wc);
   EXPECT_EQ(wc.error(), make_error_code(TransportErrc::kTimeout));
 
-  // 代际2:客户端自动重连 → 服务端接受新连接,这次挂 echo 响应对端。
+  // 链路2:客户端自动重连 → 服务端接受新连接,这次挂 echo 响应对端。
   QTcpSocket* accepted2 = AcceptNext(server, 5000);
   ASSERT_NE(accepted2, nullptr);
   auto server_txp2 = std::make_shared<TcpTransport>(accepted2);
@@ -250,7 +238,7 @@ TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
   bool echo2_ended = false;
   auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
 
-  // 新代际请求正常完成 → 证读循环跨重连续命(响应经同一未退出的读循环路由)。
+  // 重连后新请求正常完成 → 证读循环跨重连续命(响应经同一未退出的读循环路由)。
   Result<Message> outcome2{make_error_code(TransportErrc::kInternal)};
   bool done2 = false;
   auto request2 = Coro::makeTask([&] {
@@ -261,12 +249,21 @@ TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
   ASSERT_TRUE(outcome2) << outcome2.error().message();
   EXPECT_EQ(outcome2.value().message_id, 0x1004);
   EXPECT_EQ(outcome2.value().payload, (std::vector<std::uint8_t>{0xAB}));
+  // 旧请求此刻仍在途(其响应永远不会到:发在已死的链路1上)。
+  EXPECT_FALSE(done);
+  EXPECT_EQ(node->PendingCount(), 1u);
+
+  // 旧请求最终由自己的总超时恰好一次终结(RT_REQUEST_003)。
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 4000));
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(node->PendingCount(), 0u);  // 终结后 session_id 亦释放。
 
   // 仅 Close 使 node Closing→Closed。
   ASSERT_TRUE(node->Close());
   EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
 
-  // 收敛所有 spawn 的 fiber(server 端两代际 echo + 两个请求 fiber),避免跨用例泄漏。
+  // 收敛所有 spawn 的 fiber(server 端两条链路的 echo + 两个请求 fiber),避免跨用例泄漏。
   server_txp1->RequestClose();
   server_txp2->RequestClose();
   EXPECT_TRUE(pumpFiberUntil([&] { return echo1_ended && echo2_ended; }));
@@ -276,20 +273,15 @@ TEST(ProtocolNodeReconnect, InFlightRequestFailsOnceThenReconnectResumes) {
   EXPECT_TRUE(request2.get());
 }
 
-// —— ② 断连时未启动排队业务 → 连接代际隔离丢弃 计数;正在运行 handler 跑完(不强杀)。 ——
-// 覆盖 RT_TCP_RECONNECT 3.1.7.4、验收 2。
-TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDroppedRunningHandlerCompletes) {
-  // 本用例的断言建立在"交互层观察连接状态并做代际隔离"之上:reactor fiber 经
-  // `dynamic_cast<IConnectionObservable*>` 探测传输后启动,断链时批量终结在途请求、
-  // 清空未启动业务。ADR-0004 D2/D3 撤销了该机制(T5/#109 起 TcpClientTransport 不再
-  // 实现 IConnectionObservable),故旧语义断言已不成立;按新语义重写属 T6(#110)
-  // 的连带修改范围,本处先跳过以免整套用例挂死。
-  GTEST_SKIP() << "代际隔离已由 ADR-0004 D3 撤销,本用例待 #110(T6)按新语义重写";
+// —— ② 断链**不清空**排队业务:未启动的业务事件不被丢弃,释放运行中 handler 后照常全部
+// 处理完;运行中 handler 不被强杀。 ——
+// 覆盖 ADR-0004 D3(撤销代际隔离丢弃)。
+TEST(ProtocolNodeReconnect, QueuedBusinessSurvivesDisconnectRunningHandlerCompletes) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
 
-  // handler:首帧进入即 ++started 并阻塞在 gate(模拟"运行中"),释放后 ++completed。
+  // handler:首帧进入即阻塞在 gate(模拟"正在运行"),其余帧释放后依次跑完。
   auto gate = std::make_shared<Coro::Awaitable<void>>();
   int started = 0;
   int completed = 0;
@@ -297,7 +289,9 @@ TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDroppedRunningHandlerComp
   cfg.handler = [&started, &completed, gate](const Message&,
                                              HandlerContext&) -> Status {
     ++started;
-    Coro::await(gate);  // 阻塞到测试释放:一帧"正在运行"的 handler。
+    if (started == 1) {
+      Coro::await(gate);  // 仅首帧挂住:一帧"正在运行"的 handler。
+    }
     ++completed;
     return Status{};
   };
@@ -325,52 +319,56 @@ TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDroppedRunningHandlerComp
   ASSERT_TRUE(pumpFiberUntil([&] { return started == 1; }, 3000));
   pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队(确定化)。
 
-  // 物理断连:reactor 遇代际结束 → Drain 未启动的 3 帧 → 连接代际隔离丢弃。
+  // 物理断连:交互层无任何动作——不清队列、不终结请求、不改生命周期。
   accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil(
-      [&] { return node->GenerationIsolationDropCount() >= 1; }, 4000));
-  EXPECT_EQ(node->GenerationIsolationDropCount(),
-            static_cast<std::size_t>(kBusinessFrames - 1));
-  // 隔离丢弃不误记为 close_drop / overflow / dropped_no_handler。
+  pumpFiberUntil([] { return false; }, 300);  // 让断链充分传导(确定化)。
+
+  // 运行中 handler 未被强杀,滞留帧也未被丢弃(无任何丢弃归因)。
+  EXPECT_EQ(started, 1);
+  EXPECT_EQ(completed, 0);
   EXPECT_EQ(node->CloseDropCount(), 0u);
   EXPECT_EQ(node->BusinessQueueOverflowCount(), 0u);
   EXPECT_EQ(node->DroppedNoHandlerCount(), 0u);
+  EXPECT_EQ(node->UnmatchedResponseCount(), 0u);
 
-  // 运行中 handler 未被强杀:释放 gate → 首帧跑完清理。
-  EXPECT_EQ(started, 1);
-  EXPECT_EQ(completed, 0);
+  // node 保持 Running(读循环未因断链退出)。
+  auto wc = node->WaitClosed(Deadline(50ms));
+  ASSERT_FALSE(wc);
+  EXPECT_EQ(wc.error(), make_error_code(TransportErrc::kTimeout));
+
+  // 释放 gate → 首帧跑完清理,滞留的 3 帧照常全部被处理(断链未清空业务队列)。
   gate->resolve();
   gate->close();
-  ASSERT_TRUE(pumpFiberUntil([&] { return completed == 1; }, 3000));
-  EXPECT_EQ(completed, 1);
+  ASSERT_TRUE(pumpFiberUntil([&] { return completed == kBusinessFrames; }, 4000));
+  EXPECT_EQ(started, kBusinessFrames);
+  EXPECT_EQ(node->CloseDropCount(), 0u);
 
   ASSERT_TRUE(node->Close());
   EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
   server_txp1->RequestClose();
 }
 
-// P5-3(issue #88):同一断连拓扑,配置 trace_sink → 代际隔离批量 Drain 逐条 RecordDrop,
-// GenerationIsolationDropCount() 与 sink 收到的 TraceEvent 条数一致同步(取舍见 PR 说明:
-// 批量 Drain 逐条归因,而非以 size=N 单次记,以保持与既有精确计数断言一致)。
-TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDropWithSinkEmitsTraceEvents) {
-  // 本用例的断言建立在"交互层观察连接状态并做代际隔离"之上:reactor fiber 经
-  // `dynamic_cast<IConnectionObservable*>` 探测传输后启动,断链时批量终结在途请求、
-  // 清空未启动业务。ADR-0004 D2/D3 撤销了该机制(T5/#109 起 TcpClientTransport 不再
-  // 实现 IConnectionObservable),故旧语义断言已不成立;按新语义重写属 T6(#110)
-  // 的连带修改范围,本处先跳过以免整套用例挂死。
-  GTEST_SKIP() << "代际隔离已由 ADR-0004 D3 撤销,本用例待 #110(T6)按新语义重写";
+// —— ③ P5-3 Trace 面(issue #88 的反向断言):同一断连拓扑配置 trace_sink,断链全程
+// **不产生任何 category=="drop" 的 Trace 事件**——"旧代际业务被丢弃"这一事件已不存在
+// (ADR-0004 D3);业务帧全部被处理,直到 Close 也无 close_drop。 ——
+TEST(ProtocolNodeReconnect, DisconnectEmitsNoDropTraceEvents) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
 
   auto gate = std::make_shared<Coro::Awaitable<void>>();
   int started = 0;
+  int completed = 0;
   CapturingTraceSink sink;
   ProtocolNodeConfig cfg;
   cfg.trace_sink = &sink;
-  cfg.handler = [&started, gate](const Message&, HandlerContext&) -> Status {
+  cfg.handler = [&started, &completed, gate](const Message&,
+                                             HandlerContext&) -> Status {
     ++started;
-    Coro::await(gate);  // 阻塞到测试释放:一帧"正在运行"的 handler。
+    if (started == 1) {
+      Coro::await(gate);  // 仅首帧挂住:一帧"正在运行"的 handler。
+    }
+    ++completed;
     return Status{};
   };
 
@@ -395,35 +393,29 @@ TEST(ProtocolNodeReconnect, QueuedOldGenerationBusinessDropWithSinkEmitsTraceEve
   pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队。
 
   accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil(
-      [&] { return node->GenerationIsolationDropCount() >= 1; }, 4000));
-  EXPECT_EQ(node->GenerationIsolationDropCount(),
-           static_cast<std::size_t>(kBusinessFrames - 1));
+  pumpFiberUntil([] { return false; }, 300);  // 让断链充分传导(确定化)。
 
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), static_cast<std::size_t>(kBusinessFrames - 1));
-  for (const auto& rec : records) {
-    EXPECT_EQ(rec.category, "drop");
-    EXPECT_EQ(rec.message, DropReasonName(DropReason::kGenerationIsolationDrop));
-  }
+  // 断链一条丢弃 Trace 都不产生(sink 仍收 send/recv/decode/handler 等非丢弃事件,
+  // 故按 category 过滤而非断言 Records() 整体为空)。
+  EXPECT_TRUE(DropRecords(sink.Records()).empty())
+      << "断链不得产生任何丢弃归因(ADR-0004 D3)";
 
+  // 释放 gate:滞留业务照常全部处理完 → 直到 Close 仍无 close_drop。
   gate->resolve();
   gate->close();
+  ASSERT_TRUE(pumpFiberUntil([&] { return completed == kBusinessFrames; }, 4000));
 
   ASSERT_TRUE(node->Close());
   EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
+  EXPECT_TRUE(DropRecords(sink.Records()).empty());
   server_txp1->RequestClose();
 }
 
-// —— ③ 旧代际迟到响应到达新代际 → 归因丢弃、不误配(在途已 FailAll 清空)。 ——
-// 覆盖 RT_TCP_RECONNECT_004、验收 4。
+// —— ④ 关联标识在终结前不释放 → 重连后的新请求取不到同一关联键(RT_REQUEST_004 由物理
+// 事实 + 标识不复用共同保证,ADR-0004 D3 正确性依据);旧请求终结后其迟到响应无匹配 →
+// 归因丢弃、不误配。 ——
+// 覆盖 RT_TCP_RECONNECT_004、RT_REQUEST_004/005。
 TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
-  // 本用例的断言建立在"交互层观察连接状态并做代际隔离"之上:reactor fiber 经
-  // `dynamic_cast<IConnectionObservable*>` 探测传输后启动,断链时批量终结在途请求、
-  // 清空未启动业务。ADR-0004 D2/D3 撤销了该机制(T5/#109 起 TcpClientTransport 不再
-  // 实现 IConnectionObservable),故旧语义断言已不成立;按新语义重写属 T6(#110)
-  // 的连带修改范围,本处先跳过以免整套用例挂死。
-  GTEST_SKIP() << "代际隔离已由 ADR-0004 D3 撤销,本用例待 #110(T6)按新语义重写";
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
   const quint16 port = server.serverPort();
@@ -431,7 +423,7 @@ TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
   auto node = MakeClientNode(port);
   ASSERT_TRUE(node->Start());
 
-  // 代际1:沉默对端 → 在途 Request(session 0)挂起。
+  // 链路1:沉默对端(不挂 echo)→ 在途 Request(session 0)挂起,总超时 2500ms。
   QTcpSocket* accepted1 = AcceptNext(server, 4000);
   ASSERT_NE(accepted1, nullptr);
   auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
@@ -440,81 +432,65 @@ TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
   Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
-    outcome = node->Request(MakeRequest(0x0007, {0x01}));
+    outcome = node->Request(MakeRequest(0x0007, {0x01}), Deadline(2500ms));
     done = true;
   });
   ASSERT_TRUE(pumpFiberUntil([&] { return node->PendingCount() == 1u; }, 3000));
 
-  // 断连 → 在途 Request 恰好一次 kConnection、在途清空。
+  // 断连:在途 Request 继续在途(不再被断链终结)。
   accepted1->abort();
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 4000));
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kConnection));
-  EXPECT_EQ(node->PendingCount(), 0u);
+  pumpFiberUntil([] { return false; }, 300);
+  EXPECT_FALSE(done);
+  EXPECT_EQ(node->PendingCount(), 1u);
 
-  // 代际2:重连;对端在新连接上补发旧代际请求(session 0,message_id 0x1007|0x1000)的迟到响应。
+  // 链路2:重连 + echo 对端。此时发**同一命令码**的新请求:因旧请求尚未终结、其 session_id
+  // 未归还空闲集,新请求必得另一个 session_id → 两者关联键不同,旧链路的迟到响应无从完成
+  // 新请求(这正是撤销代际隔离后 RT_REQUEST_004 仍成立的机制依据)。
   QTcpSocket* accepted2 = AcceptNext(server, 5000);
   ASSERT_NE(accepted2, nullptr);
   auto server_txp2 = std::make_shared<TcpTransport>(accepted2);
   ASSERT_TRUE(server_txp2->Start());
+  bool echo2_ended = false;
+  auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
 
+  Result<Message> fresh{make_error_code(TransportErrc::kInternal)};
+  bool fresh_done = false;
+  auto request2 = Coro::makeTask([&] {
+    fresh = node->Request(MakeRequest(0x0007, {0x02}), Deadline(4000ms));
+    fresh_done = true;
+  });
+  ASSERT_TRUE(pumpFiberUntil([&] { return fresh_done; }, 6000));
+  ASSERT_TRUE(fresh) << fresh.error().message();
+  EXPECT_EQ(fresh.value().message_id, 0x1007);
+  EXPECT_EQ(fresh.value().payload, (std::vector<std::uint8_t>{0x02}));
+  EXPECT_NE(fresh.value().session_id, 0)
+      << "旧请求未终结前其 session_id 不得被复用(否则旧响应可误配新请求)";
+  EXPECT_FALSE(done);  // 旧请求仍在途,未被新链路的响应误配。
+
+  // 旧请求由自己的总超时终结,session 0 归还空闲集。
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 4000));
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(node->PendingCount(), 0u);
+  EXPECT_EQ(node->UnmatchedResponseCount(), 0u);
+
+  // 对端在新链路上补发旧请求(session 0,message_id 0x1007)的迟到响应:无匹配在途 →
+  // 归因丢弃、不误配。
   Message stale;
   stale.frm_type = FrameType::kResponse;
   stale.session_id = 0;
   stale.message_id = static_cast<std::uint16_t>(0x0007 | 0x1000);
   stale.payload = {0xDE, 0xAD};
   ServerSend(*server_txp2, stale);
-
-  // 迟到旧代际响应无匹配在途(已 FailAll 清空)→ 归因丢弃、不误配。
   ASSERT_TRUE(
       pumpFiberUntil([&] { return node->UnmatchedResponseCount() == 1u; }, 4000));
-  EXPECT_EQ(node->UnmatchedResponseCount(), 1u);
   EXPECT_EQ(node->PendingCount(), 0u);
 
   ASSERT_TRUE(node->Close());
   EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
-  EXPECT_TRUE(request.get());
   server_txp1->RequestClose();
   server_txp2->RequestClose();
-}
-
-// —— ④ 非 IConnectionObservable 传输(Fake)→ node 无 reactor,行为同 P2(回归)。 ——
-// 覆盖验收 5。
-TEST(ProtocolNodeReconnect, NonObservableTransportHasNoReactor) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
-  ASSERT_TRUE(node.Start());
-
-  // 无 reactor:代际隔离计数恒 0。
-  EXPECT_EQ(node.GenerationIsolationDropCount(), 0u);
-
-  // P2 请求-响应回归:发 Request → 注入匹配响应 → 恰好一次完成。
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    outcome = node.Request(MakeRequest(0x0002, {0x11}));
-    done = true;
-  });
-  ASSERT_TRUE(pumpFiberUntil([&] { return !fake->sent().empty(); }));
-
-  Message resp;
-  resp.frm_type = FrameType::kResponse;
-  resp.session_id = 0;
-  resp.message_id = 0x1002;
-  resp.payload = {0xAB};
-  SystemCodec wire;
-  auto bytes = wire.Encode(resp);
-  ASSERT_TRUE(bytes);
-  Datagram dg;
-  dg.bytes = std::move(bytes).value();
-  fake->Inject(std::move(dg));
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().message_id, 0x1002);
-  EXPECT_EQ(node.GenerationIsolationDropCount(), 0u);  // 全程无代际隔离。
-
-  ASSERT_TRUE(node.Close());
-  EXPECT_TRUE(node.WaitClosed(Deadline(2000ms)));
+  EXPECT_TRUE(pumpFiberUntil([&] { return echo2_ended; }));
+  EXPECT_TRUE(echo2.get());
   EXPECT_TRUE(request.get());
+  EXPECT_TRUE(request2.get());
 }
