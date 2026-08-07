@@ -15,6 +15,13 @@
 - **替代能力**:所有介质同形的链路可用性经 `ITransport::CurrentLinkState()` 获取;连接代际/尝试次数/最近失败/下次尝试时刻等诊断为 `TcpClientTransport` 的具体方法,不构成多态缝。
 - **文档** 同步更新 SDD(GJB438C §4.3.5)、设计说明书 §3 目录分组与 §6 P3 回填记录、README P3 条目;类图 `arch-class`/`sdd-csc-io`/`sdd-csc-layers` 去掉该接口并补 `CurrentLinkState`,图 4-9(`seq-generation-isolation`)改绘为 ADR-0004 D1/D3 后的"断链对交互层完全透明"流程(SVG 一并重渲染)。
 
+### ⚠ 破坏性变更:丢弃归因七项减为六项 —— 删 `DropReason::kGenerationIsolationDrop`(#112)
+> 依据 ADR-0004 **D3(撤销连接代际隔离)**:断链时交互层不再批量终结在途请求、不再清空旧链路排队业务,该归因项的**产生机制已不存在**(其 `ProtocolNode` 侧计数器与访问器已随 #110 删除,计数恒为 0)。本次删除归因项本身并改写 loss=0 harness。
+- **破坏性** 公开枚举 `transport::DropReason` 移除枚举项 `kGenerationIsolationDrop`;`DropReasonName` 不再产生稳定短名 `"generation-isolation-drop"`。下游若对该枚举做穷尽 `switch` 或依赖该短名字符串,需同步调整。**六项**为:业务队列溢出 / DDS 交接溢出 / 坏帧 / 迟到·重复·无匹配响应 / 关闭丢弃 / 无处理器丢弃。
+- **变更** loss=0 harness(`tests/loss_accounting_test.cpp`)按六项改写:删除专为该项而设的"真实 TCP 自动重连"最小介质场景及其 ground truth 常量与配套夹具;`MixedFailureAllSevenReasonsSigmaMatchesGroundTruth` 改名 `MixedFailureAllSixReasonsSigmaMatchesGroundTruth`。**完整性断言强度不变**——`Σ命名原因 == 总丢弃` 与 `drop_records.size() == Σ`(证无多记漏记)两条等式原样保留,只是求和项由七减六。
+- **修复** 解除 #109 遗留的 3 处 `GTEST_SKIP`(该文件已无 skip;全量 skip 数 0)。全量 `--gtest_repeat=3` 三轮一致:290 tests / 289 passed / 0 skipped / 1 failed(唯一失败为既有缺陷 #123,与本次无关)。
+- **文档** SDD(GJB438C)图 4-9 按 ADR-0004 新流程**重绘**,源文件随 ID `MS_LINK_DOWN` 由 `seq-generation-isolation` 更名 **`seq-link-down`**;`dfd-toplevel`/`state-connection` 两图清除代际隔离残留并重渲染;ADR-0003 D13 Q2/Q3 加"已由 ADR-0004 D3 撤销"指向(不改写历史决策);CONTEXT.md「丢弃归因」术语、SDD 路线图 §4 P5/§6 回填、README P5 条目同步。
+
 ### 文档:SRS/SDD 对齐 AsyncTask 范本(GJB 438C ID 体系 + 双向追溯 + 动因型需求)
 > 参考 `third_party/AsyncTask/doc/{需求规格说明,软件设计说明}.md` 的成熟 GJB 438C 惯例,优化 transport 的需求规格说明与设计说明。仅文档,不涉代码。
 - **SDD**(`docs/软件设计说明-GJB438C.md` v2.0)重写为完整 ID 体系:DD-n 设计决策(各映射 RT_*);§4.1 CSC 部件(CSC_CORE/IO/CODEC/NODE)+ 部件依赖图 + 部件类图;§4.2 执行方案 MS_* 图(**新增** DFD 上下文图 + 顶层数据流图 + 数据存储表 D1/D2/D3,复用时序/状态/数据流图并赋 MS_* ID);§4.3 JK 接口(五要素:优先级/接口类型/数据元素/通信方式/协议特征);§5 CSU 详细设计(逐单元);§6 **双向追溯**(§6.1 设计单元→需求 + §6.2 需求→设计单元)。

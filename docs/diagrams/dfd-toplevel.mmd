@@ -6,11 +6,11 @@ flowchart TB
     P2["P2 入站读循环<br/>Read + Decode + Dispatch 分类"]
     P3["P3 请求关联<br/>Register / Resolve / 终结仲裁"]
     P4["P4 业务处理<br/>入队 + 单消费者 handler"]
-    P5["P5 生命周期/连接<br/>三方汇合 + reactor 代际隔离"]
+    P5["P5 生命周期<br/>关闭汇合 + Drain 归因"]
 
     D1[("D1 在途请求表<br/>PendingTable")]
     D2[("D2 业务队列<br/>BoundedQueue")]
-    D3[("D3 交互状态<br/>session 空闲集 / 连接代际")]
+    D3[("D3 交互状态<br/>session 空闲集<br/>（连接代际已移出交互层）")]
 
     APP -->|Request/Send/Publish| P1
     P1 -->|Register key| D1
@@ -29,9 +29,7 @@ flowchart TB
 
     APP -->|Start/Close| P5
     P5 -->|RequestClose + FailAll| D1
-    P5 -->|Close/Drain| D2
-    P5 -->|代际隔离 FailAll不latch| D1
-    MEDIA -->|断连/连接跃迁| P5
+    P5 -->|Close/Drain 归因 close_drop| D2
 
     classDef ext fill:#eef2f7,stroke:#93a4b5,color:#233;
     classDef proc fill:#eef5fb,stroke:#3d6a8c,color:#233;
