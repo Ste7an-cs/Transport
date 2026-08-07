@@ -1,23 +1,21 @@
 sequenceDiagram
     autonumber
-    participant CT as TcpClientTransport
-    participant OBS as IConnectionObservable
-    participant RX as reactor fiber
+    participant PEER as 对端
+    participant CL as connect-loop fiber
+    participant CH as 对外通道
+    participant RD as node 读-分发循环
     participant P as PendingTable
-    participant RT as NodeRuntime
-    participant BQ as BoundedQueue
 
-    Note over CT: Connected（代际 N）
-    CT->>OBS: 物理断连 → 状态 Connected→Reconnecting
-    RX->>OBS: WaitStateChange() 返回新状态
-    RX->>RX: 检测「曾 Connected 且现非 Connected」下降沿
-    Note over RX: —— 代际结束：隔离旧代际 ——
-    RX->>P: FailAll(kConnection, latch=false)<br/>在途请求恰好一次收敛，表不 latch
-    RX->>RT: DrainBusinessQueue()
-    RT->>BQ: Drain() → 未启动旧代际业务
-    RX->>RX: 逐条 RecordDrop(kGenerationIsolationDrop)
-    Note over RX: 正在运行的 handler 让其跑完（不强杀）<br/>node 保持 Running（≠ Close 终态）
+    Note over CL,CH: Connected：读泵把内层字节片投入对外通道
+    RD->>CH: Read() 取字节片（唯一读者）
 
-    CT->>OBS: 退避后重连成功 → 状态 Reconnecting→Connected（代际 N+1）
-    RX->>OBS: WaitStateChange() 返回 Connected
-    RX->>RX: 更新 was_connected=true（新代际就绪，新请求可 Register）
+    PEER-->>CL: 物理断连
+    Note over CL: 内层读取终结 → 退读泵、拆本代际<br/>隔固定间隔重连（ADR-0005 D4）
+    RD->>CH: Read() 挂起（通道无数据，非错误）
+    Note over RD,P: 交互层完全无感：无断链错误、无断链信号<br/>不 FailAll、不清空业务队列、不记丢弃<br/>node 保持 Running（ADR-0004 D1/D3）
+    Note over P: 在途请求由各自总超时（缺省 30s）/取消/关闭终结
+
+    CL->>PEER: 重连成功（新链路，新内层）
+    CL->>CH: 新链路字节片投入同一通道
+    CH-->>RD: 挂起的 Read 被唤醒并继续交付
+    Note over CH,RD: 断链前的残留字节保留并继续交付；<br/>与新链路首字节可能拼成错帧，由编解码器重同步（ADR-0004 D4）
