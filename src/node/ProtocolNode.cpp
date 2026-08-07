@@ -287,7 +287,7 @@ Status HandlerContext::Send(Message msg) { return node_->Send(std::move(msg)); }
 
 Status HandlerContext::RequestClose() {
   // 发起完整关闭拆卸;因当前即 handler 消费者 fiber,runtime.Close 内重入自锁防护只发起、
-  // 不自等,立即返回(RT_LIFECYCLE_005)。节点由 finalizer fiber 在三方汇合后收敛到 Closed。
+  // 不自等,立即返回(RT_LIFECYCLE_005)。节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
   return node_->Close();
 }
 

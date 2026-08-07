@@ -6,24 +6,27 @@ sequenceDiagram
     participant T as ITransport
     participant BQ as BoundedQueue
     participant P as PendingTable
-    participant F as finalizer fiber
-    participant RL as 读循环 / handler fiber
+    participant RL as 读-分发循环 fiber<br/>（兼收敛者）
+    participant H as handler 消费者 fiber
 
     X->>N: Close()
     N->>RT: Close(signal_node_convergence)
     RT->>RT: Running → Closing（立即拒新 Request/Send）
-    Note over RT,RL: 三方汇合信号（锁外）
+    Note over RT,H: 汇合信号（锁外）—— Close 只发信号，不亲自收敛
     RT->>T: RequestClose()
     RT->>BQ: Close()（唤醒在途消费者）
     RT->>RT: handler_cancellation.Cancel()
     RT->>P: FailAll(kClosed, latch) 在途请求恰好一次收敛
-    RT->>F: spawn finalizer fiber
-    RT-->>X: closed_.Wait()（多等待者共享）
+    RT->>RL: close_signalled_.Complete() 放行收敛
+    RT-->>X: closed_.Wait()（多等待者，各自 deadline/取消）
 
-    F->>RL: loop_done_.Wait() 等读循环退出
-    RL-->>F: 读循环收到 kClosed 退出
-    F->>RL: handler_done_.Wait() 等 handler 退出<br/>（超 ~500ms 记 kInternal，不强杀）
-    RL-->>F: handler 消费者退出
-    F->>BQ: Drain() 未启动业务 → 逐条 close_drop 归因
-    F->>RT: lifecycle = Closed + 记关闭时延
-    F-->>X: closed_.Complete → 唤醒全部等待者
+    Note over RL,H: 两条内部工作单元中读循环恒是第一个退出的<br/>故由它兼任收敛者（ADR-0005 D1）
+    T-->>RL: Read() 返 kClosed → 退出读循环
+    RL->>RL: close_signalled_.Wait()（已 Complete，立即返回）
+    RL->>H: handler_done_.Wait() 等 handler 退出<br/>（超 ~500ms 记 kInternal，不强杀）
+    H-->>RL: handler 消费者退出
+    RL->>BQ: Drain() 未启动业务 → 逐条 close_drop 归因
+    RL->>RT: lifecycle = Closed + 记关闭时延
+    RL-->>X: closed_.Complete → 唤醒全部等待者
+
+    Note over RT,RL: 从未 spawn 读循环（Created/starting）时无收敛者，<br/>由 Close 就地 ConvergeToClosed()

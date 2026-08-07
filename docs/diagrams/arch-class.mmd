@@ -36,7 +36,7 @@ classDiagram
         +Start() / Close() / WaitClosed()
         +SpawnReadLoop(fn) / SpawnHandlerLoop(fn)
         +Enqueue() / DrainBusinessQueue()
-        -ConvergeToClosed() / finalizer fiber
+        -ConvergeAfterReadLoop() / ConvergeToClosed()
     }
     class PendingTable~K,T~ {
         <<协议无关机制>>

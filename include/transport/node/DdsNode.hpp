@@ -69,7 +69,7 @@ class DdsHandlerContext {
   /**
    * @brief 请求关闭本节点(非阻塞):发起完整收敛拆卸但不自等待(RT_LIFECYCLE_005)。
    *        委托 DdsNode::Close;因当前即 handler 消费者 fiber,Close 内重入自锁防护只发起
-   *        拆卸、跳过自等待,立即返回;节点由 finalizer fiber 在三方汇合后收敛到 Closed。
+   *        拆卸、跳过自等待,立即返回;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
    */
   Status RequestClose();
 
@@ -146,10 +146,11 @@ class DdsNode {
   /**
    * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
    *
-   * 首个关闭者:Running→Closing(立即拒新 Request/Publish)→ 三方汇合(transport.RequestClose
+   * 首个关闭者:Running→Closing(立即拒新 Request/Publish)→ 汇合信号(transport.RequestClose
    * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed) 令在途 Request
-   * 恰好一次 kClosed 收敛,再起 finalizer fiber 等读循环 +(设 handler 时)消费者 fiber 退出
-   * → 置 Closed。后续关闭者共享 closed_(多等待者);已 Closed 再关直接成功。当前若即 handler
+   * 恰好一次 kClosed 收敛,随后等收敛结果;收敛由读循环兼任(ADR-0005 D1):读循环退出 +
+   * (设 handler 时)等消费者 fiber 退出 → 置 Closed。后续关闭者共享 closed_(多等待者);
+   * 已 Closed 再关直接成功。当前若即 handler
    * 消费者 fiber(重入)→ 只发起拆卸、跳过自等待。关闭后 Request/Publish 一律 kClosed。
    */
   Status Close();
