@@ -3,14 +3,13 @@
 #include <chrono>
 #include <utility>
 
-#include "task/fibertask.h"  // Coro::makeTask —— reactor fiber(其余 fiber 由 NodeRuntime 起)
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
 #include "transport/core/TraceCategories.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
-// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址、reactor 连接观察。协议无关机制
-// (生命周期三方汇合、handler 消费者、业务队列、读循环骨架)组合并驱动 NodeRuntime。
+// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。协议无关机制(生命周期三方汇合、
+// handler 消费者、业务队列、读循环骨架)组合并驱动 NodeRuntime。
 
 namespace transport {
 
@@ -87,8 +86,8 @@ Status ProtocolNode::ValidateConfig() const {
 
 Status ProtocolNode::Start() {
   // 组合并驱动 NodeRuntime 的幂等 Start:runtime 管状态机 / 共享结果 / 三方汇合骨架;
-  // node 提供协议特有的配置校验与首次 bring-up(transport 启动 + 检测连接观察面 + 置
-  // Running + spawn 读循环/handler 消费者/reactor)。
+  // node 提供协议特有的配置校验与首次 bring-up(transport 启动 + 置 Running + spawn
+  // 读循环/handler 消费者)。**无能力探测、无按介质分支的第二条启动路径**(ADR-0004 D2)。
   return runtime_.Start(
       [this] { return ValidateConfig(); },
       [this]() -> Status {
@@ -96,10 +95,6 @@ Status ProtocolNode::Start() {
         if (!started) {
           return started;  // 传输启动失败:runtime 退回 Created 允许重试。
         }
-        // 传输若为可选连接观察面(=自动重连 TCP 客户端)→ 稍后 spawn reactor fiber。介质
-        // 无关:非 IConnectionObservable(Fake/UDP/串口/DDS)→ 不 spawn,行为同 P2。检测在
-        // MarkRunning 前完成。
-        auto* observable = dynamic_cast<IConnectionObservable*>(transport_.get());
         runtime_.MarkRunning();
         // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + 协议特有分类/寻址。
         runtime_.SpawnReadLoop(
@@ -114,23 +109,16 @@ Status ProtocolNode::Start() {
             (void)config_.handler(msg, ctx);
           });
         }
-        // reactor fiber:订阅连接状态跃迁,遇代际结束做代际隔离(ADR-0003 D11 Q1③/Q3④)。
-        // 登记 finalizer 追加汇合点,令关闭时确保 reactor 退出后节点方收敛(不触碰已收敛态)。
-        if (observable) {
-          runtime_.AddFinalizerJoin([this] { reactor_done_.Wait(); });
-          Coro::makeTask([this, observable] { RunReactorLoop(observable); });
-        }
         return Status{};
       });
 }
 
 Status ProtocolNode::Close() {
-  // 驱动 runtime 收敛;node 侧协议特有收敛信号:触发 reactor 取消(WaitStateChange 返
-  // kCancelled 干净退出)+ PendingTable.FailAll(kClosed) 令在途请求恰好一次收敛。
-  return runtime_.Close([this] {
-    reactor_cancellation_.Cancel();
-    pending_.FailAll(make_error_code(TransportErrc::kClosed));
-  });
+  // 驱动 runtime 收敛;node 侧协议特有收敛信号:PendingTable.FailAll(kClosed) 令在途
+  // 请求恰好一次收敛。断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/
+  // 关闭终结)。
+  return runtime_.Close(
+      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
 }
 
 Status ProtocolNode::WaitClosed(OperationOptions options) {
@@ -259,45 +247,6 @@ void ProtocolNode::Dispatch(Message msg) {
             config_.trace_sink);
 }
 
-void ProtocolNode::RunReactorLoop(IConnectionObservable* observable) {
-  // node "观察连接状态但不管理 churn"(ADR-0003 D11 Q1③/Q3④):拉模型订阅状态跃迁,
-  // 遇代际结束(离开 kConnected)做代际隔离。node 保持 Running(≠Close 终态)。
-  OperationOptions options;
-  options.cancellation = reactor_cancellation_.token();  // Close 时取消 → 干净退出。
-  // 代际不进 PendingTable(守 RT_DESIGN_008):以"是否处于 Connected"边沿甄别代际结束——
-  // P3-1 状态机断连时 Connected→Reconnecting(非 kDisconnected,后者仅终态),故用"曾 Connected
-  // 且现非 Connected"的下降沿触发,恰好一次隔离旧代际,契合 D11「遇代际结束」。
-  bool was_connected = (observable->State() == ConnectionState::kConnected);
-  for (;;) {
-    auto changed = observable->WaitStateChange(options);
-    if (!changed) {
-      break;  // kCancelled(Close)→ 退出;无 deadline 不会 kTimeout。
-    }
-    const bool now_connected = (changed.value() == ConnectionState::kConnected);
-    if (was_connected && !now_connected) {
-      // —— 代际结束:隔离旧代际 ——
-      // 在途请求恰好一次 kConnection(不 latch:node 保持 Running,新代际仍可 Register,
-      // RT_TCP_RECONNECT_002)。断连时释放对应在途 session_id 由 Request 的 FailAll 收敛
-      // 路径(handle.Wait 返回后 ReleaseSession)完成,不泄漏。
-      pending_.FailAll(make_error_code(TransportErrc::kConnection),
-                       /*latch_closed=*/false);
-      // 未启动处理的旧代际排队业务 → Drain 丢弃、归因 连接代际隔离丢弃(RT_TCP_RECONNECT
-      // 3.1.7.4)。正在运行的 handler 让其跑完清理(不强杀);其 ctx.Send 重连期返 Connection。
-      // 逐条 RecordDrop(P5-3):与原地 += size() 同一临界区宽度,只是把裸算术换成归因原语。
-      auto drained = runtime_.DrainBusinessQueue();
-      if (!drained.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (std::size_t i = 0; i < drained.size(); ++i) {
-          RecordDrop(DropReason::kGenerationIsolationDrop,
-                    generation_isolation_drop_count_, config_.trace_sink);
-        }
-      }
-    }
-    was_connected = now_connected;
-  }
-  reactor_done_.Complete(Status{});
-}
-
 Status ProtocolNode::Send(Message msg) {
   if (!runtime_.IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
@@ -368,11 +317,6 @@ std::size_t ProtocolNode::CloseDropCount() const {
 
 std::size_t ProtocolNode::HandlerCancelOverrunCount() const {
   return runtime_.HandlerCancelOverrunCount();
-}
-
-std::size_t ProtocolNode::GenerationIsolationDropCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return generation_isolation_drop_count_;
 }
 
 std::size_t ProtocolNode::BadFrameCount() const {

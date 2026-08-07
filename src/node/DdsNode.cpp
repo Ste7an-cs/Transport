@@ -53,8 +53,8 @@ Status DdsNode::ValidateConfig() const {
 
 Status DdsNode::Start() {
   // 组合并驱动 NodeRuntime 幂等 Start:runtime 管状态机 / 共享结果 / 三方汇合骨架;node
-  // 提供 DDS 特有的配置校验与首次 bring-up。无连接(D3′):不检测 IConnectionObservable、
-  // 不 spawn reactor——DdsTransport 断开即致命,由读循环收敛。
+  // 提供 DDS 特有的配置校验与首次 bring-up。三介质(含 DDS)共用同一段无分支读循环
+  // (ADR-0004 D1/D2)——DdsTransport 断开即致命(Read 返 kClosed),由读循环收敛。
   return runtime_.Start(
       [this] { return ValidateConfig(); },
       [this]() -> Status {
