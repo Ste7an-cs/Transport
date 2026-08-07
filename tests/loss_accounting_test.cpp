@@ -6,10 +6,11 @@
 //      (3.6.2 loss=0 字面判据)。配置 CapturingTraceSink 时不断言 Records() 为空——干净
 //      跑本就会产生 send/recv/decode/match/handler/close 等非丢弃事件(P5-4),只断言
 //      "过滤 category=="drop" 后为空"。
-//   ② 混合故障场景:同一测试构造的 7 类 DropReason 各自用最小介质触发(业务队列打满/
-//      迟到响应/关闭丢弃/无 handler/坏帧走 Fake ProtocolNode;DDS 交接溢出走 DdsTransport;
-//      连接代际隔离丢弃走真实 TCP 自动重连 ProtocolNode)→ 逐 reason 核对 + Σ(各 reason
-//      getter)精确等于测试自己持有的 ground truth(不是被测系统自证)。
+//   ② 混合故障场景:同一测试构造的 6 类 DropReason 各自用最小介质触发(业务队列打满/
+//      迟到响应/关闭丢弃/无 handler/坏帧走 Fake ProtocolNode;DDS 交接溢出走 DdsTransport)
+//      → 逐 reason 核对 + Σ(各 reason getter)精确等于测试自己持有的 ground truth
+//      (不是被测系统自证)。原第七项「连接代际隔离丢弃」随 ADR-0004 D3 撤销代际隔离
+//      而删除(#112),其最小介质段落一并移除。
 //   ③ Trace/counter 一致性 + RT_TRACE_002 零影响:配置共享 CapturingTraceSink 时,按
 //      category=="drop" 过滤后逐 reason 核对条数与计数器增量一致;同一场景(用同一批
 //      构造函数、sink=nullptr)再跑一遍,计数结果逐项相同。
@@ -30,11 +31,6 @@
 
 #include <boost/fiber/operations.hpp>
 
-#include <QHostAddress>
-#include <QTcpServer>
-#include <QTcpSocket>
-
-#include "await/awaitable.hpp"
 #include "task/fibertask.h"
 #include "coro_test_util.hpp"
 #include "fake_coro_transport.hpp"
@@ -49,8 +45,6 @@
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/dds/DdsTransport.hpp"
 #include "transport/io/dds/FakeDdsProvider.hpp"
-#include "transport/io/tcp/TcpClientTransport.hpp"
-#include "transport/io/tcp/TcpTransport.hpp"
 #include "transport/node/DdsNode.hpp"
 #include "transport/node/ProtocolNode.hpp"
 
@@ -78,12 +72,8 @@ using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
-using transport::SendUnit;
 using transport::Status;
 using transport::SystemCodec;
-using transport::TcpClientConfig;
-using transport::TcpClientTransport;
-using transport::TcpTransport;
 using transport::TransportErrc;
 using transport::make_error_code;
 using Clock = OperationOptions::Clock;
@@ -179,7 +169,8 @@ class AlwaysFailDecodeCodec : public ICodec {
 // -----------------------------------------------------------------------------
 
 // ProtocolNode(Fake 传输):5 轮请求-响应 + 3 次 fire-and-forget Send + 3 条业务帧全部
-// 被 handler 正常消费,全程(每一步之后)6 个 DropReason getter 保持 0;配置
+// 被 handler 正常消费,全程(每一步之后)node 侧 5 个 DropReason getter 保持 0
+// (第 6 项 kDdsHandoffOverflow 属 DdsTransport,不在 ProtocolNode 上);配置
 // CapturingTraceSink 但只断言"过滤 drop 后为空",不断言 Records() 整体为空(干净跑仍会
 // 产生 send/recv/decode/match/handler/close 等非丢弃事件,这是预期行为)。
 TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
@@ -198,7 +189,6 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
     EXPECT_EQ(node.DroppedNoHandlerCount(), 0u);
     EXPECT_EQ(node.BusinessQueueOverflowCount(), 0u);
     EXPECT_EQ(node.CloseDropCount(), 0u);
-    // kGenerationIsolationDrop 的 node 访问器随 #110(T6)删除(归因项本身待 #112 删)。
     EXPECT_EQ(node.BadFrameCount(), 0u);
   };
   AssertAllZero();
@@ -248,7 +238,7 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
 
   ASSERT_TRUE(node.Close());
   EXPECT_TRUE(node.WaitClosed());
-  AssertAllZero();  // Close 后仍全 0:无未启动排队业务、无代际隔离。
+  AssertAllZero();  // Close 后仍全 0:无未启动排队业务。
 
   const auto records = sink.Records();
   EXPECT_TRUE(DropRecords(records).empty());  // 干净跑:过滤后确无 drop 记录。
@@ -396,7 +386,7 @@ TEST(LossAccounting, CleanRunDdsNodeAllDropCountersStayZero) {
 }
 
 // -----------------------------------------------------------------------------
-// ② 混合故障场景:7 类 DropReason 各自用最小介质触发,测试自己持有 ground truth。
+// ② 混合故障场景:6 类 DropReason 各自用最小介质触发,测试自己持有 ground truth。
 //
 // 场景构造函数按 reason 拆成独立小函数,接收可选 ITraceSink*,复用于「配 sink」与
 // 「不配 sink」两次跑(③ RT_TRACE_002 零影响),避免两份平行代码走漂。
@@ -573,153 +563,26 @@ TEST(LossAccounting, MixedFailureDdsHandoffOverflowMatchesGroundTruth) {
   EXPECT_EQ(CountReason(drop_records, DropReason::kDdsHandoffOverflow), handoff);
 }
 
-namespace {
-
-// 小值确定化配置:短连接超时、小退避、关抖动 → 断连后毫秒级自动重连(同
-// protocol_node_reconnect_test.cpp FastClientConfig)。
-TcpClientConfig FastClientConfig(quint16 port) {
-  TcpClientConfig cfg;
-  cfg.host = "127.0.0.1";
-  cfg.port = port;
-  cfg.connect_timeout = 400ms;
-  cfg.reconnect_interval = 20ms;
-  return cfg;
-}
-
-// 接受下一个入站连接(pump 到就绪),交出所有权供 TcpTransport 管理。
-QTcpSocket* AcceptNext(QTcpServer& server, int budget_ms = 3000) {
-  if (!pumpFiberUntil([&] { return server.hasPendingConnections(); }, budget_ms)) {
-    return nullptr;
-  }
-  QTcpSocket* s = server.nextPendingConnection();
-  if (s) {
-    s->setParent(nullptr);
-  }
-  return s;
-}
-
-// 服务端主动发一帧业务(不经 echo responder)。
-void ServerSend(TcpTransport& transport, const Message& msg) {
-  SystemCodec codec;
-  auto encoded = codec.Encode(msg);
-  EXPECT_TRUE(static_cast<bool>(encoded));
-  if (!encoded) return;
-  EXPECT_TRUE(static_cast<bool>(
-      transport.Write(SendUnit{std::move(encoded).value(), Endpoint::Default()})));
-}
-
-// kGenerationIsolationDrop 最小介质:真实 TCP 自动重连 ProtocolNode(TcpClientTransport
-// 实现 IConnectionObservable,node 内 reactor fiber 观察连接状态)。对端主动推 4 帧业务,
-// handler 卡在首帧(模拟"正在运行"),其余 3 帧滞留队列未启动;物理断连(abort)→
-// reactor 遇代际结束 → Drain 未启动的 3 帧 → kGenerationIsolationDrop=3。
-// 与 protocol_node_reconnect_test.cpp 的
-// QueuedOldGenerationBusinessDropWithSinkEmitsTraceEvents 同拓扑,收敛为可复用 sink 参数
-// 的独立场景构造函数。全程用 EXPECT_(非 ASSERT_)——本函数返回非 void,GTest 的
-// ASSERT_ 宏在此无法使用(裸 return 不合法);同时这也天然规避了"断言写错导致跳过
-// 清理代码而死锁"的风险(清理代码总会执行)。
-std::size_t RunGenerationIsolationScenario(ITraceSink* sink) {
-  QTcpServer server;
-  EXPECT_TRUE(server.listen(QHostAddress::LocalHost, 0));
-
-  auto gate = std::make_shared<Coro::Awaitable<void>>();
-  int started = 0;
-  int completed = 0;
-  ProtocolNodeConfig cfg;
-  cfg.trace_sink = sink;
-  cfg.handler = [&started, &completed, gate](const Message&, HandlerContext&) -> Status {
-    ++started;
-    Coro::await(gate);  // 阻塞到测试释放:一帧"正在运行"的 handler。
-    ++completed;
-    return Status{};
-  };
-
-  auto node = std::make_unique<ProtocolNode>(
-      std::make_unique<TcpClientTransport>(FastClientConfig(server.serverPort())),
-      std::make_unique<SystemCodec>(), std::move(cfg));
-  EXPECT_TRUE(static_cast<bool>(node->Start()));
-
-  QTcpSocket* accepted1 = AcceptNext(server, 4000);
-  EXPECT_NE(accepted1, nullptr);
-  if (!accepted1) return 0;
-  auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
-  EXPECT_TRUE(server_txp1->Start());
-
-  constexpr int kBusinessFrames = 4;
-  for (int i = 0; i < kBusinessFrames; ++i) {
-    Message biz;
-    biz.frm_type = FrameType::kState;
-    biz.message_id = static_cast<std::uint16_t>(0x0350 + i);
-    biz.payload = {static_cast<std::uint8_t>(i)};
-    ServerSend(*server_txp1, biz);
-  }
-
-  pumpFiberUntil([&] { return started == 1; }, 3000);
-  pumpFiberUntil([] { return false; }, 250);  // 让滞留帧全部到达入队(确定化)。
-
-  accepted1->abort();  // 物理断连(旧语义下 reactor 会 Drain 未启动的 3 帧)。
-  // 代际隔离已由 ADR-0004 D3 撤销,其 node 访问器随 #110(T6)删除 → 此处恒为 0。本
-  // harness 连同 kGenerationIsolationDrop 归因项的删除属 #112(T9),届时整体改写;在此
-  // 之前调用方的三个用例均 GTEST_SKIP,本函数不会被执行。
-  pumpFiberUntil([] { return false; }, 250);
-  const std::size_t generation_isolation = 0;
-
-  // 运行中 handler 未被强杀:先放行、等其真正跑完,再 Close(避免"未完成先关"死锁)。
-  gate->resolve();
-  gate->close();
-  pumpFiberUntil([&] { return completed == 1; }, 3000);
-
-  EXPECT_TRUE(node->Close());
-  EXPECT_TRUE(static_cast<bool>(node->WaitClosed(Deadline(2000ms))));
-  server_txp1->RequestClose();
-  return generation_isolation;
-}
-
-}  // namespace
-
-constexpr std::size_t kGenerationIsolationGroundTruth = 3;  // 4 帧:1 条运行中,3 条未启动被隔离丢弃。
-
-// kGenerationIsolationDrop 单独核对:最小介质(真实 TCP 自动重连 ProtocolNode)触发的
-// 丢弃数精确等于 ground truth,配置 sink 时对应 Trace 条数一致。
-TEST(LossAccounting, MixedFailureGenerationIsolationDropMatchesGroundTruth) {
-  // kGenerationIsolationDrop 的产生机制(交互层 reactor 观察断链后 Drain 未启动业务)
-  // 已随 ADR-0004 D2/D3 撤销:T5(#109)起 TcpClientTransport 不再实现
-  // IConnectionObservable,该计数恒为 0,ground truth 3 不再成立。归因项删除与
-  // harness 改写属 T9(#112),本处先跳过。
-  GTEST_SKIP() << "代际隔离归因已撤销,本用例待 #112(T9)改写 loss harness";
-  CapturingTraceSink sink;
-  const std::size_t generation_isolation = RunGenerationIsolationScenario(&sink);
-
-  EXPECT_EQ(generation_isolation, kGenerationIsolationGroundTruth);
-
-  const auto drop_records = DropRecords(sink.Records());
-  EXPECT_EQ(drop_records.size(), generation_isolation);
-  EXPECT_EQ(CountReason(drop_records, DropReason::kGenerationIsolationDrop),
-           generation_isolation);
-}
-
 constexpr std::size_t kAllReasonsTotalGroundTruth =
     kOverflowGroundTruth + kUnmatchedGroundTruth + kCloseDropGroundTruth +
-    kNoHandlerGroundTruth + kBadFrameGroundTruth + kDdsHandoffGroundTruth +
-    kGenerationIsolationGroundTruth;
+    kNoHandlerGroundTruth + kBadFrameGroundTruth + kDdsHandoffGroundTruth;
 
-// 主验收:Σ(全部 7 类 DropReason getter)精确等于测试自己构造的总丢弃事件数
+// 主验收:Σ(全部 6 类 DropReason getter)精确等于测试自己构造的总丢弃事件数
 // (逐 reason 拆解验证,不只验总数,acceptance criteria 第二条)。每个 reason 用能触发它
-// 的最小介质(kDdsHandoffOverflow 用裸 DdsTransport,kGenerationIsolationDrop 用真实 TCP
-// 自动重连 ProtocolNode,其余 5 项用 Fake ProtocolNode),共享同一 CapturingTraceSink,
-// 按 category=="drop" 过滤后逐 reason 核对 Trace 条数与计数器增量一致(acceptance
-// criteria 第三条)。
-TEST(LossAccounting, MixedFailureAllSevenReasonsSigmaMatchesGroundTruth) {
-  // kGenerationIsolationDrop 的产生机制(交互层 reactor 观察断链后 Drain 未启动业务)
-  // 已随 ADR-0004 D2/D3 撤销:T5(#109)起 TcpClientTransport 不再实现
-  // IConnectionObservable,该计数恒为 0,ground truth 3 不再成立。归因项删除与
-  // harness 改写属 T9(#112),本处先跳过。
-  GTEST_SKIP() << "代际隔离归因已撤销,本用例待 #112(T9)改写 loss harness";
+// 的最小介质(kDdsHandoffOverflow 用裸 DdsTransport,其余 5 项用 Fake ProtocolNode),
+// 共享同一 CapturingTraceSink,按 category=="drop" 过滤后逐 reason 核对 Trace 条数与
+// 计数器增量一致(acceptance criteria 第三条)。
+//
+// 原第七项「连接代际隔离丢弃」及其"真实 TCP 自动重连"最小介质段落随 ADR-0004 D3
+// (撤销连接代际隔离)删除(#112):断链时交互层不再清空旧链路排队业务,该归因项的产生
+// 机制已不存在。核心断言强度不变——仍是 Σ命名原因 == 总丢弃 且
+// drop_records.size() == Σ(证无多记漏记),只是原因项由七减六。
+TEST(LossAccounting, MixedFailureAllSixReasonsSigmaMatchesGroundTruth) {
   CapturingTraceSink sink;
   const NodeACounts a = RunNodeAScenario(&sink);
   const std::size_t no_handler = RunNodeBScenario(&sink);
   const std::size_t bad_frame = RunNodeCScenario(&sink);
   const std::size_t handoff = RunDdsHandoffScenario(&sink);
-  const std::size_t generation_isolation = RunGenerationIsolationScenario(&sink);
 
   EXPECT_EQ(a.overflow, kOverflowGroundTruth);
   EXPECT_EQ(a.unmatched, kUnmatchedGroundTruth);
@@ -727,10 +590,9 @@ TEST(LossAccounting, MixedFailureAllSevenReasonsSigmaMatchesGroundTruth) {
   EXPECT_EQ(no_handler, kNoHandlerGroundTruth);
   EXPECT_EQ(bad_frame, kBadFrameGroundTruth);
   EXPECT_EQ(handoff, kDdsHandoffGroundTruth);
-  EXPECT_EQ(generation_isolation, kGenerationIsolationGroundTruth);
 
-  const std::size_t sigma = a.overflow + a.unmatched + a.close_drop + no_handler + bad_frame +
-                            handoff + generation_isolation;
+  const std::size_t sigma =
+      a.overflow + a.unmatched + a.close_drop + no_handler + bad_frame + handoff;
   EXPECT_EQ(sigma, kAllReasonsTotalGroundTruth);
 
   const auto drop_records = DropRecords(sink.Records());
@@ -741,8 +603,6 @@ TEST(LossAccounting, MixedFailureAllSevenReasonsSigmaMatchesGroundTruth) {
   EXPECT_EQ(CountReason(drop_records, DropReason::kNoHandlerConfigured), no_handler);
   EXPECT_EQ(CountReason(drop_records, DropReason::kBadFrame), bad_frame);
   EXPECT_EQ(CountReason(drop_records, DropReason::kDdsHandoffOverflow), handoff);
-  EXPECT_EQ(CountReason(drop_records, DropReason::kGenerationIsolationDrop),
-           generation_isolation);
 }
 
 // -----------------------------------------------------------------------------
@@ -751,16 +611,10 @@ TEST(LossAccounting, MixedFailureAllSevenReasonsSigmaMatchesGroundTruth) {
 // -----------------------------------------------------------------------------
 
 TEST(LossAccounting, MixedFailureCountsUnaffectedWithoutTraceSink) {
-  // kGenerationIsolationDrop 的产生机制(交互层 reactor 观察断链后 Drain 未启动业务)
-  // 已随 ADR-0004 D2/D3 撤销:T5(#109)起 TcpClientTransport 不再实现
-  // IConnectionObservable,该计数恒为 0,ground truth 3 不再成立。归因项删除与
-  // harness 改写属 T9(#112),本处先跳过。
-  GTEST_SKIP() << "代际隔离归因已撤销,本用例待 #112(T9)改写 loss harness";
   const NodeACounts a = RunNodeAScenario(nullptr);
   const std::size_t no_handler = RunNodeBScenario(nullptr);
   const std::size_t bad_frame = RunNodeCScenario(nullptr);
   const std::size_t handoff = RunDdsHandoffScenario(nullptr);
-  const std::size_t generation_isolation = RunGenerationIsolationScenario(nullptr);
 
   EXPECT_EQ(a.overflow, kOverflowGroundTruth);
   EXPECT_EQ(a.unmatched, kUnmatchedGroundTruth);
@@ -768,9 +622,8 @@ TEST(LossAccounting, MixedFailureCountsUnaffectedWithoutTraceSink) {
   EXPECT_EQ(no_handler, kNoHandlerGroundTruth);
   EXPECT_EQ(bad_frame, kBadFrameGroundTruth);
   EXPECT_EQ(handoff, kDdsHandoffGroundTruth);
-  EXPECT_EQ(generation_isolation, kGenerationIsolationGroundTruth);
 
-  const std::size_t sigma = a.overflow + a.unmatched + a.close_drop + no_handler + bad_frame +
-                            handoff + generation_isolation;
+  const std::size_t sigma =
+      a.overflow + a.unmatched + a.close_drop + no_handler + bad_frame + handoff;
   EXPECT_EQ(sigma, kAllReasonsTotalGroundTruth);
 }

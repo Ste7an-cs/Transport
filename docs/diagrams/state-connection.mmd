@@ -19,6 +19,6 @@ stateDiagram-v2
     note right of Connected
         稳定 ≥ stable_reset_after 后
         下次断开重置退避级别；
-        node 侧 reactor 观察本状态机
-        的下降沿做代际隔离
+        代际仅内于本传输记账/诊断，
+        交互层不感知（ADR-0004 D2/D3）
     end note
