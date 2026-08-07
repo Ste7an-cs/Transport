@@ -61,8 +61,8 @@ class HandlerContext {
    *
    * 委托 ProtocolNode::Close;因当前即 handler 消费者 fiber,Close 内的重入自锁防护会
    * 只发起拆卸(置 Closing + RequestClose 传输 + Close 业务队列 + 触发 handler 取消 +
-   * FailAll + 起 finalizer),跳过对 handler_done_/closed_ 的自等待(等自己 = 自锁),
-   * 立即返回。节点由独立 finalizer fiber 在读循环与 handler 均退出后收敛到 Closed。
+   * FailAll),跳过对 closed_ 的自等待(等自己 = 自锁),立即返回。节点由**读循环**在其
+   * 自身退出且 handler 也退出后收敛到 Closed(ADR-0005 D1)。
    */
   Status RequestClose();
 
@@ -176,12 +176,13 @@ class ProtocolNode {
   /**
    * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
    *
-   * 首个关闭者拆卸:Running→Closing(立即拒新 Request/Send)→ 三方汇合(transport.RequestClose
-   * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),再起独立 finalizer
-   * fiber 等读循环退出 +(设 handler 时)消费者 fiber 退出 → Drain 未启动业务归因 close_drop →
-   * 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享 closed_(多等待者);已 Closed
-   * 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只发起拆卸、跳过对 closed_ 的自
-   * 等待(避自锁),节点由 finalizer 收敛。关闭后 Request/Send 一律 kClosed。
+   * 首个关闭者拆卸:Running→Closing(立即拒新 Request/Send)→ 汇合信号(transport.RequestClose
+   * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),随后**等收敛结果**。
+   * 收敛由读循环兼任(ADR-0005 D1):读循环退出 →(设 handler 时)等消费者 fiber 退出 → Drain
+   * 未启动业务归因 close_drop → 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享
+   * closed_(多等待者);已 Closed 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只
+   * 发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。关闭后 Request/Send 一律
+   * kClosed。
    */
   Status Close();
 
