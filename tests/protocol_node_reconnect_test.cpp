@@ -494,3 +494,59 @@ TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
   EXPECT_TRUE(request.get());
   EXPECT_TRUE(request2.get());
 }
+
+// —— ⑤ 致命错误自终的**反向用例**(RT_LIFECYCLE_008 / ADR-0005 D5):TCP 客户端**永不
+// 自终**。它无限重连,`Read` 只在我方 Close 时返 kClosed(ADR-0004 D1),故断链期读循环
+// 挂起而非退出,节点保持 Running(WaitClosed 短 deadline → kTimeout、无 close_drop),
+// 重连后照常收发;唯有显式 Close 才使其 Closing→Closed。 ——
+// 实现上无按介质分支:判据是"读循环退出时 lifecycle 是否仍 Running",TCP 客户端天然落不到。
+TEST(ProtocolNodeReconnect, TcpClientDisconnectDoesNotSelfTerminate) {
+  QTcpServer server;
+  ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
+  const quint16 port = server.serverPort();
+
+  auto node = MakeClientNode(port);
+  ASSERT_TRUE(node->Start());
+
+  // 链路1:接受连接后立即物理断连。
+  QTcpSocket* accepted1 = AcceptNext(server, 4000);
+  ASSERT_NE(accepted1, nullptr);
+  auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
+  ASSERT_TRUE(server_txp1->Start());
+  accepted1->abort();
+  pumpFiberUntil([] { return false; }, 300);  // 让断链充分传导(确定化)。
+
+  // 断链**不触发**自终:节点仍 Running(WaitClosed 超时而非返回成功),无关闭归因。
+  auto wc = node->WaitClosed(Deadline(200ms));
+  ASSERT_FALSE(wc) << "TCP 客户端断链不得自终(它无限重连,读循环未退出)";
+  EXPECT_EQ(wc.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(node->CloseDropCount(), 0u);
+
+  // 链路2:重连后照常收发(同一条未退出的读循环继续交付)。
+  QTcpSocket* accepted2 = AcceptNext(server, 5000);
+  ASSERT_NE(accepted2, nullptr);
+  auto server_txp2 = std::make_shared<TcpTransport>(accepted2);
+  ASSERT_TRUE(server_txp2->Start());
+  bool echo2_ended = false;
+  auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
+
+  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  bool done = false;
+  auto request = Coro::makeTask([&] {
+    outcome = node->Request(MakeRequest(0x0009, {0x5A}), Deadline(4000ms));
+    done = true;
+  });
+  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 6000));
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().message_id, 0x1009);
+
+  // 唯有显式 Close 使其收敛。
+  ASSERT_TRUE(node->Close());
+  EXPECT_TRUE(node->WaitClosed(Deadline(2000ms)));
+
+  server_txp1->RequestClose();
+  server_txp2->RequestClose();
+  EXPECT_TRUE(pumpFiberUntil([&] { return echo2_ended; }));
+  EXPECT_TRUE(echo2.get());
+  EXPECT_TRUE(request.get());
+}

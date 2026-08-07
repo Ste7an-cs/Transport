@@ -29,7 +29,13 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events,
-               config_.business_queue_max_bytes, config_.trace_sink) {}
+               config_.business_queue_max_bytes, config_.trace_sink) {
+  // node 侧 DDS 特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途 Request
+  // 恰好一次收敛。构造期登记一次(节点尚未发布),供**外部 Close 与读循环致命错误自终**
+  // 两个发起点共用——自终发生在读循环内,取不到 Close 的入参,故由 runtime 持有。
+  runtime_.SetNodeConvergenceSignal(
+      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
+}
 
 DdsNode::~DdsNode() { Close(); }
 
@@ -80,10 +86,9 @@ Status DdsNode::Start() {
 }
 
 Status DdsNode::Close() {
-  // 驱动 runtime 收敛;node 侧 DDS 特有收敛信号:PendingTable.FailAll(kClosed) 令在途
-  // Request 恰好一次收敛。无 reactor(无连接),故无额外取消源。
-  return runtime_.Close(
-      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
+  // 驱动 runtime 收敛;node 侧 DDS 特有收敛信号已于构造期登记(见构造函数),Close 与
+  // 致命错误自终共用之。无 reactor(无连接),故无额外取消源。
+  return runtime_.Close();
 }
 
 Status DdsNode::WaitClosed(OperationOptions options) {

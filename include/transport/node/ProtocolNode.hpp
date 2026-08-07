@@ -183,6 +183,11 @@ class ProtocolNode {
    * closed_(多等待者);已 Closed 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只
    * 发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。关闭后 Request/Send 一律
    * kClosed。
+   *
+   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:不具重连能力的传输(UDP / 串口 /
+   * TCP 服务端已接受连接)发生底层致命错误时,读循环退出而节点仍 Running,此时由读循环
+   * **自行**走上述同一条关闭路径(置 Closing + 发同一组汇合信号 + 收敛),宿主无需干预;
+   * 其可观察结果与外部发起关闭一致(SRS §3.1.6.3 第 7 条)。TCP 客户端无限重连,不自终。
    */
   Status Close();
 

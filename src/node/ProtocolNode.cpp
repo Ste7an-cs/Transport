@@ -50,6 +50,12 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events, config_.business_queue_max_bytes,
                config_.trace_sink) {
+  // node 侧协议特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途请求恰好
+  // 一次收敛。构造期登记一次(节点尚未发布),供**外部 Close 与读循环致命错误自终**两个
+  // 发起点共用——自终发生在读循环内,取不到 Close 的入参,故由 runtime 持有。
+  // 断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/关闭终结)。
+  runtime_.SetNodeConvergenceSignal(
+      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
   // 空闲集初值 0..255:分配 pop_front、释放 push_back → FIFO 复用最久释放者(退休窗口
   // 最大化,RT_REQUEST_005)。
   for (std::size_t id = 0; id < kSessionIdSpace; ++id) {
@@ -114,11 +120,9 @@ Status ProtocolNode::Start() {
 }
 
 Status ProtocolNode::Close() {
-  // 驱动 runtime 收敛;node 侧协议特有收敛信号:PendingTable.FailAll(kClosed) 令在途
-  // 请求恰好一次收敛。断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/
-  // 关闭终结)。
-  return runtime_.Close(
-      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
+  // 驱动 runtime 收敛;node 侧协议特有收敛信号已于构造期登记(见构造函数),Close 与
+  // 致命错误自终共用之。
+  return runtime_.Close();
 }
 
 Status ProtocolNode::WaitClosed(OperationOptions options) {
