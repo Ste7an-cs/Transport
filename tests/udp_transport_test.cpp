@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <boost/fiber/operations.hpp>
@@ -148,6 +149,61 @@ TEST(CoroUdpTransport, RejectsOversizedDatagram) {
   const auto sent = sender.Write(ToPort(too_big, receiver.LocalPort()));
   ASSERT_FALSE(sent);
   EXPECT_EQ(sent.error(), make_error_code(TransportErrc::kInvalidArgument));
+}
+
+// AC(RT_TRANSPORT_008 / ADR-0004 D1):socket 级致命 I/O → 读取以 kClosed 收敛。
+// UDP 不重连,链路终结即传输终结,故读侧只能报"传输终结"这一种终止语义;底层成因
+// (kConnection/kIo)降为诊断事实,留在 LastError()。
+// 确定化触发:socket 绑在 IPv4 回环,向 IPv6 地址发一报文 → 内核以 socket 级错误
+// (地址族不匹配,归 NetworkError)拒绝,接收流随之被该 socket 错误终止。这与"拔网线
+// 后 sendto 返 ENETUNREACH"是同一条错误通路,只是可在回环上确定化复现(不依赖路由表)。
+TEST(CoroUdpTransport, FatalSocketErrorYieldsClosed) {
+  UdpTransport t(LoopbackConfig());
+  ASSERT_TRUE(t.Start());
+  ASSERT_EQ(t.CurrentLinkState(), transport::LinkState::kUp);
+
+  // 写路径不改:仍以 kConnection/kIo 报底层故障(ADR-0004 D1:kConnection 此后仅
+  // 存于写路径),绝不是 kClosed。
+  const auto sent = t.Write(SendUnit{{1, 2, 3}, Endpoint::Net("::1", 9)});
+  ASSERT_FALSE(sent) << "预期 socket 级拒绝:IPv4 socket 发往 IPv6 地址";
+  EXPECT_NE(sent.error(), make_error_code(TransportErrc::kClosed));
+
+  // 读路径:致命 → kClosed(不再是 kConnection/kIo)。
+  auto fatal = ReadOne(t, 500);
+  ASSERT_FALSE(fatal);
+  EXPECT_EQ(fatal.error(), make_error_code(TransportErrc::kClosed));
+  // 底层成因降为诊断事实,仍可从 LastError() 取到(非 kClosed)。
+  EXPECT_NE(t.LastError(), std::error_code{});
+  EXPECT_NE(t.LastError(), make_error_code(TransportErrc::kClosed));
+
+  // 传输确已终结:Closing→Closed,后续读恒 kClosed,链路不再可用。
+  EXPECT_TRUE(t.WaitClosed());
+  const auto after = t.Read();
+  ASSERT_FALSE(after);
+  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(t.CurrentLinkState(), transport::LinkState::kDown);
+}
+
+// AC(边界守卫):单次操作的可恢复错误**不是**致命——不得被误改为 kClosed,亦不得
+// 终结传输。非法 destination 只影响本次 Write,传输随后照常收发(SRS §3.1.2.4)。
+TEST(CoroUdpTransport, RecoverableWriteErrorDoesNotTerminateTransport) {
+  UdpTransport sender(LoopbackConfig());
+  UdpTransport receiver(LoopbackConfig());
+  ASSERT_TRUE(sender.Start());
+  ASSERT_TRUE(receiver.Start());
+
+  const auto bad = sender.Write(SendUnit{{9, 9}, Endpoint::Topic("t")});
+  ASSERT_FALSE(bad);
+  EXPECT_EQ(bad.error(), make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_NE(bad.error(), make_error_code(TransportErrc::kClosed));
+
+  // 传输未终结:仍可发、仍可收。
+  EXPECT_EQ(sender.CurrentLinkState(), transport::LinkState::kUp);
+  const std::vector<std::uint8_t> payload{0x11, 0x22};
+  ASSERT_TRUE(sender.Write(ToPort(payload, receiver.LocalPort())));
+  auto got = ReadOne(receiver);
+  ASSERT_TRUE(got) << got.error().message();
+  EXPECT_EQ(got.value().bytes, payload);
 }
 
 // AC:非重连生命周期——RequestClose → Closing→Closed;在途 Read 以 Closed 唤醒。

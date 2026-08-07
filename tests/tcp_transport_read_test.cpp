@@ -1,6 +1,7 @@
 // 协程原生 TcpTransport 读侧契约真实回环集成测试。
 // 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证读侧可观察契约:
-// Datagram.source 为对端地址、对端断开 → Connection、我方 RequestClose → Closed、
+// Datagram.source 为对端地址、对端断开 → Closed(不重连,终止语义单一)、
+// 我方 RequestClose → Closed、
 // 带 deadline 的 Read 超时 → Timeout 且不停流(可再读)、单读者约束(并发第二个
 // Read → InvalidState)。连接建立由测试夹具完成(非本类职责)。
 // 逐读 cancellation 为 out-of-scope(循环级中断靠 RequestClose),本文件不覆盖。
@@ -96,8 +97,9 @@ TEST(CoroTcpTransportRead, SourceIsPeerEndpoint) {
   EXPECT_EQ(r.value().source.port, expected_port);
 }
 
-// 读侧契约:对端断开 → 在途 Read 以 Connection 收敛。
-TEST(CoroTcpTransportRead, PeerDisconnectYieldsConnection) {
+// 读侧契约(RT_TRANSPORT_008 / ADR-0004 D1):本类不重连,连接终结即传输终结,故
+// 对端断开 → 在途 Read 以 Closed 收敛(与我方关闭同一终止语义,调用方停止读取)。
+TEST(CoroTcpTransportRead, PeerDisconnectYieldsClosed) {
   QTcpServer server;
   QTcpSocket* client = nullptr;
   QTcpSocket* accepted = nullptr;
@@ -124,7 +126,7 @@ TEST(CoroTcpTransportRead, PeerDisconnectYieldsConnection) {
 
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
   client->deleteLater();
 }
 

@@ -215,26 +215,29 @@ Result<Datagram> UdpTransport::Read(OperationOptions options) {
   }
 
   if (datagram.error().category() == Coro::detail::socket_error_category()) {
-    // 底层致命 I/O → 非重连:记录事实并 Closing→Closed(ADR-0002 D3′)。
+    // socket 级致命 I/O → 非重连介质,链路终结即传输终结:读取以 kClosed 收敛
+    // (RT_TRANSPORT_008 / ADR-0004 D1——读取失败中仅 kClosed 表示"应停止读取"),
+    // 底层成因(kConnection/kIo)降为诊断事实留在 LastError();并 Closing→Closed。
+    // 注意:单次发送的可恢复失败(报文过大等)由 Write 自行返回,不经本路径。
     std::error_code mapped = MapSocketError(datagram.error());
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
     }
-    result = mapped;
+    result = make_error_code(TransportErrc::kClosed);
     FinishRead(state);
     BeginClose(state);
     return result;
   }
 
-  // 流无错误关闭:我方关闭 → Closed;否则底层正常终止(socket 失效)→ Connection。
+  // 流无错误关闭:我方关闭,或底层正常终止(socket 失效)。二者都是传输终结,对调用
+  // 方同一含义 → kClosed(ADR-0004 D1);后者还须补做 Closing→Closed。
   bool closing;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     closing = state->lifecycle != LifecycleState::kRunning;
   }
-  result = make_error_code(closing ? TransportErrc::kClosed
-                                   : TransportErrc::kConnection);
+  result = make_error_code(TransportErrc::kClosed);
   FinishRead(state);
   if (!closing) {
     BeginClose(state);

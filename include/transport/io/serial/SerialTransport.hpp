@@ -47,8 +47,10 @@ class SerialTransport final : public ITransport {
 
   /// @brief 读一片已到达字节(拉模型,单一顺序读者;流式,一次一任意切片)。
   /// @param options 截止时间(cancellation 逐读 out-of-scope,同 TcpTransport)。
-  /// @return 一片 Datagram(source 为单设备中立目的地);超时 Timeout、设备断开
-  ///         Connection、我方关闭 Closed。
+  /// @return 一片 Datagram(source 为单设备中立目的地);超时 Timeout(可继续的
+  ///         瞬时错误);**传输终结** Closed——串口不重连,故设备致命错误与我方关闭
+  ///         同以 Closed 收敛,调用方应停止读取(RT_TRANSPORT_008 / ADR-0004 D1);
+  ///         底层成因经 LastError() 诊断。
   Result<Datagram> Read(OperationOptions options = {}) override;
 
   /// @brief 发送一帧;仅在整帧字节全部离开框架用户态缓冲、进入设备发送缓冲后才
