@@ -24,7 +24,7 @@
 - **P2 —— 节点加厚(`v0.4.2`):** 协议无关 `BoundedQueue<T>`(双上界/tail-drop/命名归因)、入站业务处理器(组合注册/单消费者 fiber 串行/异常隔离 —— RT_HANDLER 全)、`noresponse` `Send`、256 并发在途 + `session_id` LRU 退休、生命周期硬化(并发幂等 Start/多等待者/三方汇合/重入自锁防护 —— RT_LIFECYCLE 全)。
 - **P3 —— 连接管理(`v0.4.3`):** `TcpClientTransport`(状态机 + 自动重连退避 + 连接代际 + `IConnectionObservable`,组合 P1 内层)、节点集成断连(reactor fiber + Read 透明跨重连)、运行时重配置(`ApplyConfig` 单调版本/校验原子/端点切换 —— RT_TCP_RECONNECT/RECONFIG 全);真实 TCP 断连-重连回环。
 - **P4 —— 其余介质(`v0.4.4`):** `UdpTransport`(报文+地址)/`SerialTransport`(串口字节流)/`DdsTransport`(provider 跨线程有界交接,复用 `BoundedQueue`)、`DdsNode`(pub-sub + 多路请求-应答,correlation_id 键)、`TcpServer` accept(每连接一 node)、`NodeRuntime`(ProtocolNode/DdsNode 共享的协议无关机制)。统一寻址靠 `Endpoint`。**D10 复用证实**(DdsNode 复用 PendingTable 仅一行改动)、**跨线程交接闭合 ADR-0001 未决项**。
-- **P5 —— 观测 + 完整性归因(`v0.4.5`):** 可插拔结构化 Trace(`ITraceSink`,push,9 类 category)+ 命名计数(pull);`DropReason` 七项 + `RecordDrop`/`RecordEvent` 协议无关观测原语;I/O 事实(`LastSendTime`/`LastReceiveTime`/`LastError`)统一为 base `ITransport` 强制接口;补齐请求时延/处理器时长/重连/关闭时延指标。**loss=0 harness** 断言"无静默丢失"结构性可验证(`Σ命名=总丢弃`)。
+- **P5 —— 观测 + 完整性归因(`v0.4.5`):** 可插拔结构化 Trace(`ITraceSink`,push,9 类 category)+ 命名计数(pull);`DropReason` **六项**(P5 交付时为七项,「连接代际隔离丢弃」随 ADR-0004 D3 移除)+ `RecordDrop`/`RecordEvent` 协议无关观测原语;I/O 事实(`LastSendTime`/`LastReceiveTime`/`LastError`)统一为 base `ITransport` 强制接口;补齐请求时延/处理器时长/重连/关闭时延指标。**loss=0 harness** 断言"无静默丢失"结构性可验证(`Σ命名=总丢弃`)。
 
 - **尚未实现(按路线图 P6 推进,勿当作已有):** 五种交互模式精确状态机与 `kFeedback`(TBD-001)、DDS 动态 Subscribe / 判活 QoS、串口自动重连(TBD-005)、性能/容量/两机验收与稳定性/时延基线固化(P6,TBD-004)。
 

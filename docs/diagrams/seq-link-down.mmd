@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant PEER as 对端/介质
+    participant CL as TcpClientTransport<br/>connect-loop fiber
+    participant IN as 内层 TcpTransport
+    participant CH as 对外字节通道
+    participant RD as node 读-分发循环
+    participant P as PendingTable
+
+    Note over CL,IN: Connected（代际 N）：内层收字节 → 推对外通道
+    RD->>CH: Read() 等待下一段字节
+
+    PEER-->>IN: 物理断连
+    CL->>IN: 销毁旧内层（代际 N 结束）
+    Note over CL: 断链完全内于传输层：转入重连，<br/>固定间隔后建新代际（ADR-0004 D2/D7、ADR-0005 D3）
+    Note over CL,RD: 不向交互层发任何断链信号（DD-11）：<br/>对外通道无新数据 → Read() 自然挂起；<br/>node 读循环无断链分支，node 保持 Running
+
+    Note over P: 在途请求不被批量终结 ——<br/>各自由总超时（缺省 30s）/取消/关闭收敛（ADR-0004 D3）
+    Note over RD: 已排队未启动业务不被清空 ——<br/>原「连接代际隔离丢弃」归因项已撤销，<br/>丢弃归因七项减六项（#112）
+
+    CL->>IN: 重连成功 → 新内层（代际 N+1）
+    PEER-->>IN: 新链路首批字节
+    IN->>CH: 推入对外通道
+    CH-->>RD: 唤醒 Read()：重连对交互层透明
+    Note over RD: 断链残尾与新链路首字节可能拼成错帧 →<br/>由编解码器校验/重同步处置，报坏帧（ADR-0004 D4）

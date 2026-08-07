@@ -162,13 +162,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.6 链路断开处置时序（MS_LINK_DOWN，原 MS_GEN_ISOLATION）
 
-**图 4-9（`seq-generation-isolation`）**
+**图 4-9（`seq-link-down`）**
 
-![断连代际隔离时序图](diagrams/seq-generation-isolation.svg)
+![链路断开处置时序图](diagrams/seq-link-down.svg)
 
-**图例说明（ADR-0004 D1/D3/D4 后的新流程；下图 SVG 仍为旧代际隔离流程，待重渲染）**：链路断开对交互层**完全透明**——`TcpClientTransport` 的 connect-loop 转入重连，`Read` 因对外通道无数据而自然挂起，重连成功后新链路数据到达即被唤醒。node 读循环**无任何断链分支**，node 保持 Running。
+**图例说明（ADR-0004 D1/D3/D4 后的新流程；图已按新流程重绘，源文件随 ID 由 `seq-generation-isolation` 更名 `seq-link-down`，#112）**：链路断开对交互层**完全透明**——`TcpClientTransport` 的 connect-loop 转入重连，`Read` 因对外通道无数据而自然挂起，重连成功后新链路数据到达即被唤醒。node 读循环**无任何断链分支**，node 保持 Running。
 
-**不再发生的动作**（原代际隔离）：不批量终结在途请求、不清空旧链路排队业务、无 reactor 协程、无状态下降沿甄别、**不向交互层发任何断链信号**。在途请求由各自总超时（缺省 30 秒）/取消/关闭终结（ADR-0004 D3）。
+**不再发生的动作**（原代际隔离）：不批量终结在途请求、不清空旧链路排队业务、无 reactor 协程、无状态下降沿甄别、**不向交互层发任何断链信号**。在途请求由各自总超时（缺省 30 秒）/取消/关闭终结（ADR-0004 D3）；旧链路排队业务不再被 Drain，故**无「连接代际隔离丢弃」归因**（丢弃归因七项减六项，见 DD-10）。
 
 #### 4.2.7 节点生命周期状态（MS_NODE_LIFECYCLE）
 
@@ -456,7 +456,7 @@ done
 | 图 4-6 | 数据流 | MS_NODE_DATAFLOW | `dataflow.mmd` |
 | 图 4-7 | 时序 | MS_REQ_RESP | `seq-request-response.mmd` |
 | 图 4-8 | 时序 | MS_CLOSE | `seq-close.mmd` |
-| 图 4-9 | 时序 | MS_LINK_DOWN | `seq-generation-isolation.mmd`（**待重渲染**：内容仍为旧代际隔离流程） |
+| 图 4-9 | 时序 | MS_LINK_DOWN | `seq-link-down.mmd`（原名 `seq-generation-isolation.mmd`，#112 改名并按新流程重绘） |
 | 图 4-10 | 状态 | MS_NODE_LIFECYCLE | `state-node-lifecycle.mmd` |
 | 图 4-11 | 状态 | MS_CONNECTION | `state-connection.mmd` |
 | 图 4-12 | 状态 | MS_PENDING | `state-pending-entry.mmd` |
