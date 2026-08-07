@@ -197,7 +197,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.10 对象/线程/协程的动态创建与删除（MS_DYNAMIC_LIFECYCLE）
 
-- **fiber（一个 node 内）**：`Start` 时 spawn 读-分发循环 fiber、handler 消费者 fiber（设 handler 时），**共两条**；`Close` **不再 spawn 任何 fiber**——收敛由读-分发循环 fiber 在其退出后兼任，跑完收敛即终止（ADR-0005 D1）。**reactor fiber 已随 ADR-0004 D2/D3 取消，finalizer fiber 已随 ADR-0005 D1 取消。** 均由 AsyncTask `makeTask` 创建、返回即终止。
+- **fiber（一个 node 内）**：`Start` 时 spawn 读-分发循环 fiber、handler 消费者 fiber（设 handler 时），**共两条**；`Close` **不再 spawn 任何 fiber**——收敛由读-分发循环 fiber 在其退出后兼任（handler 消费者 fiber 的 `FiberTask` 句柄由 runtime 持有至收敛 join 完成，ADR-0005 D2），跑完收敛即终止（ADR-0005 D1）。**reactor fiber 已随 ADR-0004 D2/D3 取消，finalizer fiber 已随 ADR-0005 D1 取消。** 均由 AsyncTask `makeTask` 创建、返回即终止。
 - **传输连接代际（内于传输层）**：`TcpClientTransport` 的 connect-loop fiber 每次成功物理连接创建一个内层 `TcpTransport`（`Generation()`+1），断链销毁旧内层、隔固定间隔（1s）后建新代际；断链**不向交互层发任何信号**（完全透明，DD-11）。交互层不参与。
 - **DDS 交接**：`DdsTransport` `Start` 对每 topic `Subscribe`，listener 回调在外线程构造 `Sample` 非阻塞 `Push`；`RequestClose` 先 `Unsubscribe` 停投递 → 交接边界 `Close` 唤醒在途 `Read` → provider `Shutdown`；迟到回调只捕获交接边界共享句柄、不触碰已销毁对象。
 - **TcpServer 子 node**：每接受一条连接经 NodeFactory 派生 `ProtocolNode` + supervisor fiber；对端断开 → supervisor 驱动该 node `Closing→Closed` 并注销（连接生命=节点生命）。
@@ -306,13 +306,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **单元设计决策（DD-3）**：把多节点共享的协议无关机制收成可组合薄件——①生命周期状态机 + 并发幂等 Start + 收敛（并入读循环，ADR-0005 D1）+ 重入自锁防护；②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离 + close_drop 归因；③读-分发循环骨架 `SpawnReadLoop(fn)`。对 Event 不透明。
 
-**设计约束**：同步纪律（D8）——生命周期状态/计数/`has_handler_` 均入锁，唤醒/回调锁外；重入自锁防护比对 `boost::this_fiber::get_id()`；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
+**设计约束**：同步纪律（D8）——生命周期状态/计数/handler 任务句柄均入锁，唤醒/回调锁外；重入自锁防护比对 `boost::this_fiber::get_id()`；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
 
 **软件逻辑**：见 `node/NodeRuntime.hpp`。
 - **Start(validate, bring_up)**：首个 Start 校验 config → 置 starting → 调 node `bring_up`（transport.Start + MarkRunning + SpawnReadLoop/HandlerLoop）；并发 Start await 同一 `start_done_`。
 - **Close(signal_node_convergence)**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。首个关闭者 Running→Closing → 汇合信号（transport.RequestClose + 业务队列 Close + handler 取消 + node 侧收敛回调）→ `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。重入（当前即 handler fiber）只发起不自等。
-- **SpawnReadLoop(fn)**：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：等 `close_signalled_` → 等 `handler_done_`（超 500ms 记 kInternal 不强杀，仍等实退出）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
-- **SpawnHandlerLoop(consume)**：`Pop → consume 到完成（含 await）→ 下一条`（严格串行）；逃逸异常记 handler_exception。
+- **SpawnReadLoop(fn)**：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：等 `close_signalled_` → 以 `FiberTask::get()` 让出式 join handler 任务（仍等其实际退出、不强杀 fiber）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
+- **SpawnHandlerLoop(consume)**：`Pop → consume 到完成（含 await）→ 下一条`（严格串行）；逃逸异常记 handler_exception。**保留 `FiberTask<void>` 句柄**供收敛者结构化 join（ADR-0005 D2）。
 
 **执行时序/状态**：见 §4.2.5（关闭收敛）、§4.2.7（生命周期状态）。
 

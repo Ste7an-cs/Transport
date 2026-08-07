@@ -23,7 +23,7 @@ sequenceDiagram
     Note over RL,H: 两条内部工作单元中读循环恒是第一个退出的<br/>故由它兼任收敛者（ADR-0005 D1）
     T-->>RL: Read() 返 kClosed → 退出读循环
     RL->>RL: close_signalled_.Wait()（已 Complete，立即返回）
-    RL->>H: handler_done_.Wait() 等 handler 退出<br/>（超 ~500ms 记 kInternal，不强杀）
+    RL->>H: FiberTask::get() join handler<br/>（让出式等待，不强杀）
     H-->>RL: handler 消费者退出
     RL->>BQ: Drain() 未启动业务 → 逐条 close_drop 归因
     RL->>RT: lifecycle = Closed + 记关闭时延

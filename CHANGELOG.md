@@ -8,12 +8,22 @@
 
 ## [Unreleased]
 
+### 重构:handler 汇合改用结构化并发 join,移除处理器取消超时观测(ADR-0005 D2/D8,#119)
+
+> 依 ADR-0005 **D2**(handler 汇合改 `FiberTask::get()`)与 **D8**(删除 500 ms 处理器取消观测)。**关闭路径的行为保证不变**:仍触发 handler 协作取消、仍等待处理器实际退出、仍不强制销毁 fiber;变的是汇合机制与诊断埋点。
+
+- **变更** `SpawnHandlerLoop` 保留 `Coro::FiberTask<void>` 句柄;收敛者以 `get()`(让出式 join)等待 handler 消费者退出,取代手写的 `SharedCompletion<void> handler_done_`。**删除** `handler_done_` 与 `has_handler_`(句柄为空即无 handler)。附带收益:`FiberTask::get()` 的返回由运行时保证(内部 `catch(...)` 归一为 `interrupted`、包装器在正常与异常两条路径上均 `set_value`),故 `closed_.Complete` 在所有路径上必达——手写完成量在 handler 走异常路径时会永不 Complete。
+- **移除** 500 ms 处理器取消超时观测:`kHandlerCancelObservation`、超时记 `kInternal` 的观测分支、累计计数字段。**理由**:该计数自引入起从未被任何测试或示例消费(全仓零命中),且 SRS §3.1.6 本就将"是否单设该计数"列为 P6 待定项;若日后确需"谁拖慢了关闭"的线索,正确落点是在 handler 循环内对**每次回调**计时(可定位到具体回调),而非在收敛处观测总时长。
+- **💥 破坏性** 移除公开访问器 `ProtocolNode::HandlerCancelOverrunCount()`(RT_IF_API,SRS §3.2.2 接口变更登记已同步)。
+- **保持不变** 协作取消机制、SRS §3.1.5.4 对处理器的 500 ms 返回期望(TBD-007 设计目标,亦是 §3.6 关闭时延目标的适用前提)、`closed_`/`start_done_`/`close_signalled_` 仍为 `SharedCompletion`(D3)。
+- **验证** 全量 290 tests `--gtest_repeat=5` 与 master 基线逐轮一致(289 通过 / 1 既有失败 #123),**无挂起**;四个生命周期用例文件 `--gtest_repeat=20` 全绿无挂起。
+
 ### 重构:关闭收敛并入读循环,删除 finalizer fiber(ADR-0005 D1,#118)
 > 依 ADR-0005 **D1** / RT_LIFECYCLE_006。ADR-0004 落地后交互层内部工作单元由三条降为两条(读-分发循环 + handler 消费者),其中**读循环恒是第一个退出的**(我方 `Close` 与不可重连介质的底层致命错误在 ADR-0004 D1 之后同返 `kClosed`),故它天然是收敛的正确位置。公开 API 与可观察行为不变。
 - **变更** `NodeRuntime::Close` 退化为"发汇合信号 + 等待收敛结果":置 `Closing` → `transport.RequestClose` + 业务队列 `Close` + handler 协作取消 + node 侧收敛回调 → 放行读循环收敛 → 等 `closed_`。**不再 spawn 独立 finalizer fiber**;`Close` 时节点内不再新增任何 fiber。
-- **变更** 读-分发循环退出后**兼任收敛者**(`ConvergeAfterReadLoop`):等关闭汇合信号 → 等 handler 退出(超 ~500ms 记 `kInternal`、不强杀,仍等实退出)→ Drain 未启动业务归因 `close_drop` → 置 `Closed` + 记关闭时延 → `closed_.Complete` 唤醒全部等待者。**结构约束**:收敛走内部路径,读循环不得调用公开的 `Close()`(那会等待自身退出)。
+- **变更** 读-分发循环退出后**兼任收敛者**(`ConvergeAfterReadLoop`):等关闭汇合信号 → 等 handler 退出(以 `FiberTask::get()` join,仍等实退出、不强杀)→ Drain 未启动业务归因 `close_drop` → 置 `Closed` + 记关闭时延 → `closed_.Complete` 唤醒全部等待者。**结构约束**:收敛走内部路径,读循环不得调用公开的 `Close()`(那会等待自身退出)。
 - **删除** `loop_done_`(无人再等"读循环已退出"——它自己就是收敛者);新增内部 `close_signalled_` 承接"首个 `Close` 已发出全部汇合信号",使读循环因致命错误先行退出时挂在收敛入口等待外部关闭(致命错误自终属 RT_LIFECYCLE_008 / ADR-0005 D5,另票)。
-- **保持不变** `closed_` / `start_done_` 仍为 `SharedCompletion`(ADR-0005 **D3**:每等待者独立 deadline/取消,不可换共享 `Awaitable`);`handler_done_` 机制、500ms 处理器取消观测、`LastCloseLatency` / `close_drop` 归因 / 多等待者 `WaitClosed` 行为均不变。
+- **保持不变** `closed_` / `start_done_` 仍为 `SharedCompletion`(ADR-0005 **D3**:每等待者独立 deadline/取消,不可换共享 `Awaitable`);`LastCloseLatency` / `close_drop` 归因 / 多等待者 `WaitClosed` 行为均不变。
 - **验证** 全量 291 tests `--gtest_repeat=5` 与 master 基线逐轮一致(287 通过 / 3 skip(#112)/ 1 既有失败 #123),**无挂起**;四个生命周期用例文件 `--gtest_repeat=20` 全绿无挂起。
 - **文档** SDD 新增 **DD-13**、§4.2.5/§4.2.10/§5.4 按新收敛路径重写;SRS §4.4 更新 RT_LIFECYCLE_005/008 的现状描述;时序图 `seq-close` 与状态图 `state-node-lifecycle` 重画并重渲染,`arch-class`/`sdd-csc-node`/`dfd-toplevel` 同步。
 
