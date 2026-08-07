@@ -96,11 +96,7 @@ TcpClientConfig FastConfig(quint16 port, ITraceSink* sink) {
   cfg.host = "127.0.0.1";
   cfg.port = port;
   cfg.connect_timeout = 400ms;
-  cfg.initial_backoff = 20ms;
-  cfg.max_backoff = 80ms;
-  cfg.backoff_multiplier = 2.0;
-  cfg.jitter_enabled = false;
-  cfg.stable_reset_after = 10s;
+  cfg.reconnect_interval = 20ms;
   cfg.trace_sink = sink;
   return cfg;
 }

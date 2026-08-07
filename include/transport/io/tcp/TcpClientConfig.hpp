@@ -2,7 +2,7 @@
 
 /**
  * @file TcpClientConfig.hpp
- * @brief TcpClientTransport 连接管理策略配置——连接超时、退避、稳定重置阈值。
+ * @brief TcpClientTransport 连接管理策略配置——端点、连接超时、固定重连间隔。
  */
 
 #include <chrono>
@@ -14,11 +14,12 @@
 namespace transport {
 
 /**
- * @brief TCP 客户端连接管理配置(ADR-0003 D11 Q4)。
+ * @brief TCP 客户端连接管理配置(ADR-0003 D11 Q4;退避部分由 ADR-0005 D4 取代)。
  *
- * 端点(host/port)+ 连接尝试与退避策略参数。所有时长/阈值均可注入,测试可用小值
- * 确定化退避序列;`jitter_enabled=false` 关闭抖动以断言基础序列,`jitter_seed`
- * 令抖动确定可复现。P3-1 只读取本配置一次(构造时);运行时 `ApplyConfig` 属 P3-3。
+ * 端点(host/port)+ 单次连接超时 + **固定重连间隔**。指数退避已撤销(ADR-0005 D4):
+ * 倍率、上限、抖动、稳定重置四套参数一并作废,重连按固定间隔无限重试直至连上或关闭。
+ * 所有时长可注入,测试用小值确定化时序。热更新范围(RT_TCP_RECONFIG_002)恰为本结构
+ * 的三个策略字段:端点 / 连接超时 / 重连间隔。
  */
 struct TcpClientConfig {
   using Duration = std::chrono::milliseconds;
@@ -29,24 +30,14 @@ struct TcpClientConfig {
   std::uint16_t port = 0;
 
   /// @brief 单次连接尝试超时;超时后显式 abort 底层 socket(corosocket 摩擦 1)。
+  ///        有效范围 100ms–60s(SRS §3.1.7.4)。
   Duration connect_timeout{5000};
 
-  /// @brief 首次退避时长(退避级别初值)。
-  Duration initial_backoff{1000};
-  /// @brief 退避时长上限。
-  Duration max_backoff{30000};
-  /// @brief 退避倍增因子(每次失败后 ×multiplier,不超过 max_backoff)。
-  double backoff_multiplier = 2.0;
-
-  /// @brief 抖动比例(±ratio);Connected 期抖动令并发客户端错峰重连。
-  double jitter_ratio = 0.2;
-  /// @brief 是否启用抖动;测试关闭以断言确定退避序列。
-  bool jitter_enabled = true;
-  /// @brief 抖动随机源种子;非 0 时确定可复现,0 时用 random_device 随机播种。
-  std::uint64_t jitter_seed = 0;
-
-  /// @brief 连接稳定持续 ≥ 本阈值后,下次断开重置退避级别为 initial_backoff。
-  Duration stable_reset_after{60000};
+  /// @brief 相邻两次连接尝试之间的**固定**间隔(SRS §3.1.7.4 缺省 1s,ADR-0005 D4)。
+  ///
+  /// **须为正**:对端主机在而端口未监听时内核立即回 RST,`connect` 微秒级失败,零间隔
+  /// 重连会退化为紧循环(烧 CPU 且向对端刷 SYN)——这正是保留非零间隔的唯一理由。
+  Duration reconnect_interval{1000};
 
   /// @brief 可选 Trace 出口(P5-4,RT_TRACE_001/002):非空则在连接/代际/重连/生命周期
   ///        跃迁边界点上报 `connect`/`generation`/`reconnect`/`close` 事件;为空时
@@ -60,13 +51,7 @@ struct TcpClientConfig {
 inline bool operator==(const TcpClientConfig& a, const TcpClientConfig& b) {
   return a.host == b.host && a.port == b.port &&
          a.connect_timeout == b.connect_timeout &&
-         a.initial_backoff == b.initial_backoff &&
-         a.max_backoff == b.max_backoff &&
-         a.backoff_multiplier == b.backoff_multiplier &&
-         a.jitter_ratio == b.jitter_ratio &&
-         a.jitter_enabled == b.jitter_enabled &&
-         a.jitter_seed == b.jitter_seed &&
-         a.stable_reset_after == b.stable_reset_after;
+         a.reconnect_interval == b.reconnect_interval;
 }
 
 inline bool operator!=(const TcpClientConfig& a, const TcpClientConfig& b) {
