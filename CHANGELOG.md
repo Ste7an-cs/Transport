@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### 破坏性变更:删除 `IConnectionObservable` 接口(ADR-0004 D2/D7 收尾,#111)
+> ADR-0004 **D2**(链路可用性并入 `ITransport`)与 **D7**(连接诊断项降级为具体方法)落地后,该可选观察面接口已无实现者、无调用方,予以删除。交互层不再按介质探测能力接口。
+- **移除**(**破坏性**)公开头文件 `include/transport/io/IConnectionObservable.hpp` 及接口 `transport::IConnectionObservable`。下游若直接包含该头文件,改为包含 `transport/io/tcp/TcpClientTransport.hpp`。
+- **变更** `ConnectionState` 枚举的定义位置随之迁至 `include/transport/io/tcp/TcpClientTransport.hpp`(其唯一使用者)。**命名空间与枚举项不变**(仍为 `transport::ConnectionState::{kDisconnected,kConnecting,kConnected,kReconnecting}`),`TcpClientTransport::State/WaitForState/WaitStateChange` 签名不变;库内所有使用者已包含该头文件,零改动。
+- **替代能力**:所有介质同形的链路可用性经 `ITransport::CurrentLinkState()` 获取;连接代际/尝试次数/最近失败/下次尝试时刻等诊断为 `TcpClientTransport` 的具体方法,不构成多态缝。
+- **文档** 同步更新 SDD(GJB438C §4.3.5)、设计说明书 §3 目录分组与 §6 P3 回填记录、README P3 条目;类图 `arch-class`/`sdd-csc-io`/`sdd-csc-layers` 去掉该接口并补 `CurrentLinkState`,图 4-9(`seq-generation-isolation`)改绘为 ADR-0004 D1/D3 后的"断链对交互层完全透明"流程(SVG 一并重渲染)。
+
 ### 文档:SRS/SDD 对齐 AsyncTask 范本(GJB 438C ID 体系 + 双向追溯 + 动因型需求)
 > 参考 `third_party/AsyncTask/doc/{需求规格说明,软件设计说明}.md` 的成熟 GJB 438C 惯例,优化 transport 的需求规格说明与设计说明。仅文档,不涉代码。
 - **SDD**(`docs/软件设计说明-GJB438C.md` v2.0)重写为完整 ID 体系:DD-n 设计决策(各映射 RT_*);§4.1 CSC 部件(CSC_CORE/IO/CODEC/NODE)+ 部件依赖图 + 部件类图;§4.2 执行方案 MS_* 图(**新增** DFD 上下文图 + 顶层数据流图 + 数据存储表 D1/D2/D3,复用时序/状态/数据流图并赋 MS_* ID);§4.3 JK 接口(五要素:优先级/接口类型/数据元素/通信方式/协议特征);§5 CSU 详细设计(逐单元);§6 **双向追溯**(§6.1 设计单元→需求 + §6.2 需求→设计单元)。

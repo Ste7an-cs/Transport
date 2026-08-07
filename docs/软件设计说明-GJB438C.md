@@ -164,9 +164,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **图 4-9（`seq-generation-isolation`）**
 
-![断连代际隔离时序图](diagrams/seq-generation-isolation.svg)
+![链路断开处置时序图](diagrams/seq-generation-isolation.svg)
 
-**图例说明（ADR-0004 D1/D3/D4 后的新流程；下图 SVG 仍为旧代际隔离流程，待重渲染）**：链路断开对交互层**完全透明**——`TcpClientTransport` 的 connect-loop 转入重连，`Read` 因对外通道无数据而自然挂起，重连成功后新链路数据到达即被唤醒。node 读循环**无任何断链分支**，node 保持 Running。
+**图例说明（ADR-0004 D1/D3/D4 后的新流程）**：链路断开对交互层**完全透明**——`TcpClientTransport` 的 connect-loop 转入重连，`Read` 因对外通道无数据而自然挂起，重连成功后新链路数据到达即被唤醒。node 读循环**无任何断链分支**，node 保持 Running。
 
 **不再发生的动作**（原代际隔离）：不批量终结在途请求、不清空旧链路排队业务、无 reactor 协程、无状态下降沿甄别、**不向交互层发任何断链信号**。在途请求由各自总超时（缺省 30 秒）/取消/关闭终结（ADR-0004 D3）。
 
@@ -246,9 +246,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - 接口类型：C++ 抽象类 `ITransport`（`io/ITransport.hpp`）。
 - 数据元素：`SendUnit{bytes,destination}`、`Datagram{bytes,source}`、`OperationOptions`。
 - 通信方式：协程 await 式拉模型；`Read` 一次一片；`Write` 成功表示帧已交付下层发送通路（**非**"已进内核"、**非**"对端已收"，ADR-0004 D5）。
-- 协议特征：`Start/Read(options)/Write(SendUnit)/RequestClose/WaitClosed` + 强制 I/O 观测面 `LastSendTime/LastReceiveTime/LastError/LinkState`；同实例同一时刻至多一个有效读。
+- 协议特征：`Start/Read(options)/Write(SendUnit)/RequestClose/WaitClosed` + 强制 I/O 观测面 `LastSendTime/LastReceiveTime/LastError/CurrentLinkState`；同实例同一时刻至多一个有效读。
 - **读取终止语义（DD-11）**：`Read` 失败中仅 `kClosed`=传输终结（应停止读），其余为可继续的瞬时错误；可重连传输透明跨越链路中断，不暴露断链事件。**所有介质同形**，交互层无需知道哪种介质会重连。
-- **链路可用性（DD-7）**：`LinkState()` 为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。`IConnectionObservable` 已取消。
+- **链路可用性（DD-7）**：`CurrentLinkState()` 返回 `LinkState`，为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。曾经的可选观察面接口 `IConnectionObservable` 已取消，其头文件 `io/IConnectionObservable.hpp` 已删除（#111）；`ConnectionState` 枚举随之迁至 `io/tcp/TcpClientTransport.hpp`（命名空间不变，仍为 `transport::ConnectionState`）。
 
 #### 4.3.6 DDS provider 抽象（JK_PROVIDER）
 - 优先级：中。
@@ -456,7 +456,7 @@ done
 | 图 4-6 | 数据流 | MS_NODE_DATAFLOW | `dataflow.mmd` |
 | 图 4-7 | 时序 | MS_REQ_RESP | `seq-request-response.mmd` |
 | 图 4-8 | 时序 | MS_CLOSE | `seq-close.mmd` |
-| 图 4-9 | 时序 | MS_LINK_DOWN | `seq-generation-isolation.mmd`（**待重渲染**：内容仍为旧代际隔离流程） |
+| 图 4-9 | 时序 | MS_LINK_DOWN | `seq-generation-isolation.mmd` |
 | 图 4-10 | 状态 | MS_NODE_LIFECYCLE | `state-node-lifecycle.mmd` |
 | 图 4-11 | 状态 | MS_CONNECTION | `state-connection.mmd` |
 | 图 4-12 | 状态 | MS_PENDING | `state-pending-entry.mmd` |
