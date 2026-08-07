@@ -16,7 +16,7 @@ classDiagram
         +Start / Close / WaitClosed
         +SpawnReadLoop / SpawnHandlerLoop
         +Enqueue / DrainBusinessQueue
-        -ConvergeToClosed() / finalizer
+        -ConvergeAfterReadLoop() / ConvergeToClosed()
     }
     class PendingTable~K_T~ {
         +Register(key) Result~Handle~

@@ -3,14 +3,14 @@ stateDiagram-v2
     [*] --> Created
 
     Created --> Created: ValidateConfig 失败<br/>(kConfiguration，可改配重试)
-    Created --> Running: 首个 Start 成功<br/>(transport.Start + MarkRunning<br/>+ spawn 读循环/handler/reactor)
+    Created --> Running: 首个 Start 成功<br/>(transport.Start + MarkRunning<br/>+ spawn 读循环/handler)
     Created --> Created: 并发 Start<br/>(await start_done_，不重复 spawn)
 
     Running --> Running: 再次 Start（幂等成功）
-    Running --> Closing: 首个 Close<br/>(三方汇合信号 + FailAll)
+    Running --> Closing: 首个 Close<br/>(汇合信号 + FailAll<br/>+ 放行读循环收敛)
 
     Closing --> Closing: 后续 Close<br/>(共享 closed_，多等待者)
-    Closing --> Closed: finalizer 汇合完成<br/>(读循环+handler 退出→close_drop→Closed)
+    Closing --> Closed: 读循环收敛完成<br/>(读循环退出→等 handler 退出<br/>→close_drop→Closed)
 
     Closed --> Closed: 再次 Close（直接成功）
     Closed --> [*]
@@ -19,7 +19,7 @@ stateDiagram-v2
         重入自锁防护：若当前即 handler
         消费者 fiber，只发起拆卸、跳过
         对 closed_ 的自等待（避自锁），
-        节点由 finalizer 收敛
+        节点由读循环收敛（ADR-0005 D1）
     end note
 
     note right of Running

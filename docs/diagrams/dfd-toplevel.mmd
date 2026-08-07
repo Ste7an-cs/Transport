@@ -6,7 +6,7 @@ flowchart TB
     P2["P2 入站读循环<br/>Read + Decode + Dispatch 分类"]
     P3["P3 请求关联<br/>Register / Resolve / 终结仲裁"]
     P4["P4 业务处理<br/>入队 + 单消费者 handler"]
-    P5["P5 生命周期<br/>关闭汇合 + Drain 归因"]
+    P5["P5 生命周期<br/>汇合信号 + 读循环收敛"]
 
     D1[("D1 在途请求表<br/>PendingTable")]
     D2[("D2 业务队列<br/>BoundedQueue")]
@@ -30,6 +30,7 @@ flowchart TB
     APP -->|Start/Close| P5
     P5 -->|RequestClose + FailAll| D1
     P5 -->|Close/Drain 归因 close_drop| D2
+    P2 -.->|Read 返 kClosed → 退出并收敛| P5
 
     classDef ext fill:#eef2f7,stroke:#93a4b5,color:#233;
     classDef proc fill:#eef5fb,stroke:#3d6a8c,color:#233;
