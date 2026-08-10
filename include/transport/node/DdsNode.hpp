@@ -6,15 +6,15 @@
  *        RT_IF_DDS / ADR-0003 D10/D12 Q2)。
  *
  * DdsNode **继承 `NodeBase`**(生命周期模板方法:基类管幂等与收敛,本类实现
- * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)`NodeRuntime`
- * (读循环骨架 + handler 消费者小件的过渡持有件)+
+ * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)
  * `DdsTransport`(P4-4 纯字节管道,经 ITransport)+ `DdsCodec`(线缆格式,经 ICodec)+
- * `PendingTable<std::string, Message>`(挂起-应答薄基座),交付 DDS 语义的多路请求-应答与
- * 单向发布订阅。
+ * `PendingTable<std::string, Message>`(挂起-应答薄基座)+ 可选的 `HandlerLoop`
+ * (handler 消费者小件,ADR-0006 D4),**自持**一条读-分发循环(ADR-0006 D5),交付 DDS
+ * 语义的多路请求-应答与单向发布订阅。
  *
  * **D10 可复用性实证**:关联键此处是 **correlation_id 字符串**——`PendingTable<Key,T>`
  * 一行不改,只把 Key 实例化为 std::string(P1 曾实例化为 uint32);`BoundedQueue` /
- * `NodeBase` / `NodeRuntime` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply`
+ * `NodeBase` / `HandlerLoop` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply`
  * 终结判别、topic 寻址、reply_to=inbox——**全部内联本类**;基座保持协议无关
  * (RT_DESIGN_008 红线)。
  *
@@ -35,12 +35,12 @@
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/Cancellation.hpp"
 #include "transport/core/Endpoint.hpp"
+#include "transport/node/HandlerLoop.hpp"
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeBase.hpp"
-#include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -118,7 +118,7 @@ struct DdsNodeConfig {
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
   /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeBase
-  /// (生命周期跃迁 + close_drop 归因)、NodeRuntime 业务队列与本类各丢弃归因点
+  /// (生命周期跃迁 + close_drop 归因)、HandlerLoop 业务队列与本类各丢弃归因点
   /// (kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured),
   /// 并在 send/recv/decode/match/timeout/cancel/handler/close 等边界点上报事件。
   /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,`RecordEvent`/`RecordDrop`
@@ -128,7 +128,7 @@ struct DdsNodeConfig {
 
 /**
  * @brief DDS 交互节点:继承 NodeBase(生命周期)+ 组合 transport + codec + PendingTable +
- *        NodeRuntime,交付 DDS pub-sub 与多路请求-应答。
+ *        HandlerLoop,交付 DDS pub-sub 与多路请求-应答。
  *
  * **生命周期全部由 `NodeBase` 承载**(ADR-0006 D1/D6):`Start()` / `Close()` /
  * `WaitClosed()` / `IsRunning()` / `CloseDropCount()` / `LastCloseLatency()` 一律**继承自
@@ -238,8 +238,28 @@ class DdsNode : public NodeBase {
  private:
   friend class DdsHandlerContext;
 
-  /// @brief 读循环分发回调体(协议特有):Decode 一 sample → 填 source/topic → 逐条 Dispatch。
-  ///        runtime 骨架 Read 成功后调本回调(runtime 不 decode、不分类,守 RT_NODE_003)。
+  /**
+   * @brief spawn 读-分发循环 fiber(ADR-0006 D5:骨架归本类)。
+   *
+   * **三介质同一段读循环、无介质分支、无能力探测**(ADR-0004 D1 / RT_TRANSPORT_008):
+   *
+   * ```
+   * Read() → 成功    → DecodeAndDispatch(解码 + DDS 特有分类/寻址)
+   *        → kClosed → 退出读循环
+   *        → 其它     → 瞬时错误,继续
+   * ```
+   *
+   * `kClosed` 是**唯一**的传输终结信号(我方关闭,或 DDS provider 底层致命错误——DDS 无
+   * 连接、断开即致命);其余失败一律视为可继续的瞬时错误。
+   *
+   * **退出后本 fiber 兼任收敛者**(ADR-0005 D1):读循环恒是第一个退出的内部工作单元,故
+   * 它天然是收敛的正确位置。收敛本身在基类内(ADR-0006 D6),本方法只在循环出口调基类的
+   * `ConvergeAfterReadLoop()`;**不得**改调公开的 `Close()`(那会等自己退出)。
+   */
+  void SpawnReadLoop();
+
+  /// @brief 读循环体内的 DDS 特有处理:Decode 一 sample → 填 source/topic → 逐条 Dispatch
+  ///        (读循环骨架本身不 decode、不分类,守 RT_NODE_003)。
   void DecodeAndDispatch(Datagram datagram);
   /// @brief 单条 Message 的分发(DDS 特有分类,内联):`kReply` → correlation_id 键 Resolve;
   ///        其它(kRequest/kNotify/…)业务 → 入队 handler / 无 handler 归因丢弃。
@@ -256,9 +276,10 @@ class DdsNode : public NodeBase {
   DdsNodeConfig config_;
   /// 关联表:correlation_id 字符串键(D10 实证——PendingTable 一行不改,仅换 Key 类型)。
   PendingTable<std::string, Message> pending_;
-  /// 读-分发循环骨架 + 可选 handler 消费者小件的持有者(过渡件,ADR-0006 D5 / #140 下放
-  /// 本类)。生命周期已上移基类,本件不再持有任何生命周期状态。
-  NodeRuntime<Message> runtime_;
+  /// 入站业务处理器消费者小件(**可选**件,ADR-0006 D4):业务队列 + 消费者 fiber 句柄 +
+  /// 协作取消 + 异常隔离 + 时长计量。未设 `config_.handler`(即未 `Spawn`)时它只是个没人
+  /// 消费的空队列。自守其锁,不进基类(基类只装每个节点都有的东西)。
+  HandlerLoop<Message> handler_loop_;
 
   mutable std::mutex mutex_;  ///< 守 DDS 特有交互状态(correlation 计数、观测计数,D8)。
   std::uint64_t correlation_counter_{0};  ///< 确定性 correlation_id 单调序号。

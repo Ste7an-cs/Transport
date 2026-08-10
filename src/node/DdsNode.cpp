@@ -3,14 +3,16 @@
 #include <string>
 #include <utility>
 
+#include "task/fibertask.h"  // Coro::makeTask —— 读-分发循环 fiber。
+
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
 #include "transport/core/TraceCategories.hpp"
 
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
 // 终结判别、topic 寻址、reply_to=inbox。生命周期(幂等 Start / 关闭仲裁 / 收敛)由基类
-// NodeBase 承载,本类只填 DDS 特有钩子(ADR-0006 D1);读循环骨架与 handler 消费者小件仍由
-// 过渡件 NodeRuntime 持有(ADR-0006 D5,#140 下放本类);关联复用
+// NodeBase 承载,本类只填 DDS 特有钩子(ADR-0006 D1);读-分发循环骨架与 handler 观测计数
+// 归本类(ADR-0006 D5,#140),handler 消费者在可选小件 HandlerLoop(D4);关联复用
 // PendingTable<std::string,Message>。
 
 namespace transport {
@@ -24,15 +26,14 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
       config_(std::move(config)),
       // 关联表:correlation_id 无天然容量语义(≠ session_id 的 uint8 硬顶)→ 纯计数无限
       // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
-      // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      // P5-4:与 handler_loop_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
       pending_(/*max_pending=*/0, config_.trace_sink),
-      // 过渡件组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它
-      // 字段);transport 裸指针供读循环 Read(node 持 unique_ptr)。trace_sink 透传
-      // (P5-3):业务队列满(business_queue_overflow)经它可选上报。
-      runtime_(transport_.get(),
-               [](const Message& msg) { return msg.payload.size(); },
-               config_.business_queue_max_events,
-               config_.business_queue_max_bytes, config_.trace_sink) {}
+      // handler 消费者小件持有业务队列:字节计量注入 payload.size()(D10:小件不读 Message
+      // 其它字段)。trace_sink 透传(P5-3):业务队列满(business_queue_overflow)与 handler
+      // 调用起止点经它可选上报。**未设 handler 时不 Spawn**,它只是个空队列。
+      handler_loop_([](const Message& msg) { return msg.payload.size(); },
+                    config_.business_queue_max_events,
+                    config_.business_queue_max_bytes, config_.trace_sink) {}
 
 // 析构即关闭:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚(见 NodeBase 文档)。
 DdsNode::~DdsNode() { Close(); }
@@ -63,15 +64,13 @@ Status DdsNode::DoStart() {
     return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
   }
   MarkRunning();
-  // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + DDS 特有分类/寻址;循环退出后
-  // 本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
-  runtime_.SpawnReadLoop(
-      [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); },
-      [this] { ConvergeAfterReadLoop(); });
+  // 读-分发循环(本类自持,ADR-0006 D5):Read 骨架 + 内联 decode + DDS 特有分类/寻址;
+  // 循环退出后本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
+  SpawnReadLoop();
   // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列)。
   if (config_.handler) {
-    runtime_.SpawnHandlerLoop([this](Message&& msg) {
-      DdsHandlerContext ctx(this, runtime_.HandlerCancellationToken());
+    handler_loop_.Spawn([this](Message&& msg) {
+      DdsHandlerContext ctx(this, handler_loop_.Token());
       // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
       // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
       (void)config_.handler(msg, ctx);
@@ -84,7 +83,7 @@ Status DdsNode::DoClose() {
   // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
   // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
   transport_->RequestClose();
-  runtime_.CancelAndCloseHandler();  // 业务队列 Close + handler 协作取消(同一顺序)。
+  handler_loop_.CancelAndClose();  // 业务队列 Close + handler 协作取消(同一顺序)。
   // DDS 特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途 Request 恰好一次
   // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
   // 无 reactor(无连接),故无额外取消源。
@@ -92,10 +91,27 @@ Status DdsNode::DoClose() {
   return Status{};
 }
 
-void DdsNode::JoinHandler() { runtime_.JoinHandlerLoop(); }
+void DdsNode::JoinHandler() { handler_loop_.Join(); }
 
 std::size_t DdsNode::DrainUnstartedBusiness() {
-  return runtime_.DrainHandlerForClose();
+  return handler_loop_.DrainForClose();
+}
+
+void DdsNode::SpawnReadLoop() {
+  Coro::makeTask([this] {
+    while (true) {
+      auto datagram = transport_->Read();  // 裸读,无 deadline。
+      if (!datagram) {
+        if (datagram.error() == make_error_code(TransportErrc::kClosed)) {
+          break;  // 传输终结(唯一终止语义)→ 退出读循环。
+        }
+        continue;  // 其它(瞬时错误):丢弃继续。
+      }
+      DecodeAndDispatch(std::move(datagram).value());  // 内联 decode + 分发。
+    }
+    // 读循环兼任收敛者(ADR-0005 D1):走基类内部路径,不得调公开的 Close(会自等)。
+    ConvergeAfterReadLoop();
+  });
 }
 
 std::string DdsNode::NextCorrelationId() {
@@ -198,11 +214,11 @@ void DdsNode::Dispatch(Message msg) {
     }
     return;
   }
-  // 非 kReply 业务消息(kRequest/kNotify/kOneway/kFeedback 延后):设了 handler → 入运行时
-  // 有界队列交单消费者串行处理;满则 tail-drop(business_queue_overflow),读循环不阻塞、
+  // 非 kReply 业务消息(kRequest/kNotify/kOneway/kFeedback 延后):设了 handler → 入有界
+  // 业务队列交单消费者串行处理;满则 tail-drop(business_queue_overflow),读循环不阻塞、
   // 应答匹配照常。未设 handler → 归因 dropped_no_handler。
   if (config_.handler) {
-    (void)runtime_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
+    (void)handler_loop_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
@@ -221,11 +237,11 @@ std::size_t DdsNode::DroppedNoHandlerCount() const {
 }
 
 std::size_t DdsNode::BusinessQueueOverflowCount() const {
-  return runtime_.BusinessQueueOverflowCount();
+  return handler_loop_.BusinessQueueOverflowCount();  // HandlerLoop/队列自守其锁。
 }
 
 std::size_t DdsNode::HandlerExceptionCount() const {
-  return runtime_.HandlerExceptionCount();
+  return handler_loop_.HandlerExceptionCount();  // HandlerLoop 自守其锁。
 }
 
 std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
@@ -240,7 +256,7 @@ DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
 }
 
 DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
-  return runtime_.LastHandlerDuration();
+  return handler_loop_.LastHandlerDuration();  // HandlerLoop 自守其锁。
 }
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————

@@ -6,8 +6,10 @@
  *
  * ProtocolNode **继承 `NodeBase`**(生命周期模板方法:基类管幂等与收敛,本类实现
  * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)`ITransport`
- * (纯字节管道)+ `ICodec`(线缆格式)+ `PendingTable`(挂起-应答薄基座),内联一条
- * 读-分发循环,交付一次 needresponse 的请求-响应。协议特有语义——键派生、frm_type
+ * (纯字节管道)+ `ICodec`(线缆格式)+ `PendingTable`(挂起-应答薄基座)+ 可选的
+ * `HandlerLoop`(handler 消费者小件,ADR-0006 D4),**自持**一条读-分发循环
+ * (ADR-0006 D5:读循环是 node 自己的 `Read → decode → dispatch`,不属任何共享机制),
+ * 交付一次 needresponse 的请求-响应。协议特有语义——键派生、frm_type
  * 盖章、session_id 空闲集
  * LRU 分配、终结帧判别(kResponse/kResult)、未匹配路由——**全部内联在本类**;
  * PendingTable 保持协议无关(ADR-0003 D9/D10 红线)。只经 CorrelationKeyStrategy 开放
@@ -33,12 +35,12 @@
 
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/Cancellation.hpp"
+#include "transport/node/HandlerLoop.hpp"
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeBase.hpp"
-#include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
 #include "transport/core/Result.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -146,7 +148,7 @@ struct ProtocolNodeConfig {
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
   /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeBase
-  /// (生命周期跃迁 + close_drop 归因)、NodeRuntime 业务队列与本类各丢弃归因点
+  /// (生命周期跃迁 + close_drop 归因)、HandlerLoop 业务队列与本类各丢弃归因点
   /// (kBadFrame / kUnmatchedOrLateResponse /
   /// kNoHandlerConfigured),并在 send/recv/decode/match/timeout/cancel/handler/close
   /// 等边界点上报事件。RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,
@@ -277,8 +279,31 @@ class ProtocolNode : public NodeBase {
  private:
   friend class HandlerContext;
 
-  /// @brief 读循环分发回调体(协议特有):Decode 一帧 → 逐条 Dispatch。runtime 骨架 Read
-  ///        成功后调本回调(runtime 不 decode、不分类,守 RT_NODE_003)。
+  /**
+   * @brief spawn 读-分发循环 fiber(ADR-0006 D5:骨架归本类)。
+   *
+   * **三介质同一段读循环、无介质分支、无能力探测**(ADR-0004 D1 / RT_TRANSPORT_008):
+   *
+   * ```
+   * Read() → 成功    → DecodeAndDispatch(解码 + 协议特有分类/寻址)
+   *        → kClosed → 退出读循环
+   *        → 其它     → 瞬时错误,继续
+   * ```
+   *
+   * `kClosed` 是**唯一**的传输终结信号(我方关闭,或不具重连能力的传输发生底层致命错误);
+   * 其余失败一律视为可继续的瞬时错误。具备自动重连的传输在内部透明处理链路中断——`Read`
+   * 在重连期间挂起、重连后于新链路继续交付,读循环**看不到任何链路中断事件**,故此处不再
+   * 有 `kConnection` 分支。
+   *
+   * **退出后本 fiber 兼任收敛者**(ADR-0005 D1):两条内部工作单元中读循环恒是第一个退出
+   * 的,故它天然是收敛的正确位置——无需独立 finalizer fiber,也无人再等"读循环已退出"这
+   * 一事件。收敛本身在基类内(ADR-0006 D6),本方法只在循环出口调基类的
+   * `ConvergeAfterReadLoop()`;**不得**改调公开的 `Close()`(那会等自己退出)。
+   */
+  void SpawnReadLoop();
+
+  /// @brief 读循环体内的协议特有处理:Decode 一帧 → 逐条 Dispatch(读循环骨架本身不
+  ///        decode、不分类,守 RT_NODE_003)。
   void DecodeAndDispatch(Datagram datagram);
   /// 单条 Message 的分发(协议特有分类):响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
   void Dispatch(Message msg);
@@ -325,9 +350,10 @@ class ProtocolNode : public NodeBase {
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
   PendingTable<ProtocolKey, Message> pending_;
-  /// 读-分发循环骨架 + 可选 handler 消费者小件的持有者(过渡件,ADR-0006 D5 / #140 下放
-  /// 本类)。生命周期已上移基类,本件不再持有任何生命周期状态。
-  NodeRuntime<Message> runtime_;
+  /// 入站业务处理器消费者小件(**可选**件,ADR-0006 D4):业务队列 + 消费者 fiber 句柄 +
+  /// 协作取消 + 异常隔离 + 时长计量。未设 `config_.handler`(即未 `Spawn`)时它只是个没人
+  /// 消费的空队列。自守其锁,不进基类(基类只装每个节点都有的东西)。
+  HandlerLoop<Message> handler_loop_;
 
   mutable std::mutex mutex_;  ///< 守协议特有交互状态(session 空闲集、协议计数,D8)。
   /// session_id 空闲集(构造时填 0..255);pop_front 分配、push_back 释放 = FIFO 复用。

@@ -283,7 +283,7 @@ TEST(ProtocolNodeHandler, QueueOverflowTailDropsWhileResponsesStillMatch) {
 }
 
 // P5-3(issue #88):kBusinessQueueOverflow 定义点在 BoundedQueue::Push 内(经
-// NodeRuntime 构造业务队列时透传 config.trace_sink)——配置 trace_sink 时,队列满
+// HandlerLoop 构造业务队列时透传 config.trace_sink)——配置 trace_sink 时,队列满
 // tail-drop 应同步产生可辨识的 TraceEvent,且 BusinessQueueOverflowCount()(代理
 // BoundedQueue::DroppedCount())不变。沿用上一用例(GateBank 卡住消费者)确定化溢出的
 // 拓扑,只是额外挂了 sink 断言。
