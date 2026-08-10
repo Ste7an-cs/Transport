@@ -14,9 +14,11 @@
  *      (ADR-0005 D5 / RT_LIFECYCLE_008:读循环退出时若节点仍 Running 即非我方 Close 所致,
  *      由读循环自行置 Closing 并发同一组汇合信号,再走同一段收敛)+ 多等待者 WaitClosed +
  *      重入自锁防护(比对 handler fiber id)。
- *   2. handler 消费者 fiber + `BoundedQueue<Event>` 集成:入队(Enqueue)/串行消费/异常
- *      隔离(consume 逃逸异常兜住 → 记 handler_exception,不自关)/ close_drop 归因
- *      (Close 时 Drain 未启动业务计数)。
+ *   2. handler 消费者的**持有与驱动**:消费者 fiber + `BoundedQueue<Event>` + 协作取消 +
+ *      异常隔离 + 时长计量已整体下沉到可选小件 `HandlerLoop<Event>`(ADR-0006 D4),
+ *      runtime 持有一个并在生命周期各段驱动它(bring-up 时 Spawn、汇合时 CancelAndClose、
+ *      收敛时 Join + DrainForClose),对外的 handler 面(Enqueue / 取消令牌 / 计数)为转发;
+ *      **close_drop 归因留在 runtime**——"为什么丢"属关闭语义,非 HandlerLoop 之责。
  *   3. 读-分发循环**骨架**:`SpawnReadLoop(decodeAndDispatchFn)` —— runtime 跑
  *      `Read → 错误分类(仅 kClosed 退出、其余继续)→ 调 node 提供的 decodeAndDispatch`
  *      (ADR-0004 D1:读取终止语义单值化,三介质同一段读循环、无介质分支)。
@@ -28,23 +30,20 @@
  * 回调体里,runtime 一律不触及。Event 全程不透明:runtime 不读其任何字段
  * (字节计量靠构造时注入 byte_size_of 回调),不含 frm_type/session_id/correlation/连接概念。
  *
- * 同步纪律(D8):生命周期状态(lifecycle/starting/handler fiber id/计数)由一把
- * std::mutex 守;运行时 await 只出现在 fiber 体内的挂起点,唤醒/回调在锁外调用。
+ * 同步纪律(D8):生命周期状态(lifecycle/starting/关闭计数与时延)由一把 std::mutex 守;
+ * handler 侧状态(fiber 句柄/ id /异常计数/时长)由 `HandlerLoop` 自守其锁;运行时 await
+ * 只出现在 fiber 体内的挂起点,唤醒/回调在锁外调用。
  */
-
-#include <boost/fiber/operations.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <utility>
-#include <vector>
 
-#include "task/fibertask.h"  // Coro::makeTask / Coro::FiberTask —— 读循环 / handler fiber
+#include "task/fibertask.h"  // Coro::makeTask —— 读循环 fiber。
 
-#include "transport/node/BoundedQueue.hpp"
+#include "transport/node/HandlerLoop.hpp"
 #include "transport/core/Cancellation.hpp"
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
@@ -80,17 +79,17 @@ class NodeRuntime {
    * @param max_events    业务队列事件数上界(越界由 BoundedQueue 钳制)。
    * @param max_bytes     业务队列字节数上界(越界由 BoundedQueue 钳制)。
    * @param trace_sink    可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。
-   *                      传给业务队列(归因 kBusinessQueueOverflow)、Close 时的 close_drop
-   *                      批量归因,以及生命周期/handler 的 `RecordEvent`。RT_TRACE_002:为空
-   *                      时不改变任何控制流/计数,`RecordEvent`/`RecordDrop` 仅一次判空。
+   *                      转交 HandlerLoop(业务队列 kBusinessQueueOverflow 归因 + handler
+   *                      调用起止点),并用于 Close 时的 close_drop 批量归因与生命周期
+   *                      `RecordEvent`。RT_TRACE_002:为空时不改变任何控制流/计数,
+   *                      `RecordEvent`/`RecordDrop` 仅一次判空。
    */
   NodeRuntime(ITransport* transport,
-              typename BoundedQueue<Event>::ByteSizeOf byte_size_of,
+              typename HandlerLoop<Event>::ByteSizeOf byte_size_of,
               std::size_t max_events, std::size_t max_bytes,
               ITraceSink* trace_sink = nullptr)
       : transport_(transport),
-        business_queue_(std::move(byte_size_of), max_events, max_bytes,
-                        DropReason::kBusinessQueueOverflow, trace_sink),
+        handler_loop_(std::move(byte_size_of), max_events, max_bytes, trace_sink),
         trace_sink_(trace_sink) {}
 
   NodeRuntime(const NodeRuntime&) = delete;
@@ -195,10 +194,12 @@ class NodeRuntime {
    * → 只发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。
    */
   Status Close() {
-    bool in_handler_fiber = false;
+    // 重入判据自成一体:问的是"**当前 fiber** 是不是那个消费者",与 lifecycle_ 无关,故
+    // 不必与之同锁(HandlerLoop 自守其 fiber id 锁)。且消费者 fiber 一进入 fiber 体、
+    // 早于任何一次 Pop 就已登记其 id,故它调到这里时判据恒已就绪。
+    const bool in_handler_fiber = handler_loop_.IsCurrentFiber();
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      in_handler_fiber = InHandlerFiberLocked();
       if (lifecycle_ == LifecycleState::kClosed) {
         return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
       }
@@ -218,12 +219,14 @@ class NodeRuntime {
     return closed_.Wait();  // 后续关闭者与外部调用者共享同一收敛结果(多等待者)。
   }
 
-  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline/取消)。handler 消费者 fiber 内且
+  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline)。handler 消费者 fiber 内且
   ///        未 Closed 时返 kInvalidState(等自己 = 自锁,RT_LIFECYCLE_005)。
+  ///        取消能力已随 SharedCompletion 轻量化移除(ADR-0006 D3,#137)。
   [[nodiscard]] Status WaitClosed(OperationOptions options = {}) {
+    const bool in_handler_fiber = handler_loop_.IsCurrentFiber();  // 见 Close 的同一注解。
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (InHandlerFiberLocked() && lifecycle_ != LifecycleState::kClosed) {
+      if (in_handler_fiber && lifecycle_ != LifecycleState::kClosed) {
         return make_error_code(TransportErrc::kInvalidState);
       }
     }
@@ -274,85 +277,38 @@ class NodeRuntime {
     });
   }
 
-  // —— handler 消费者 + 业务队列机制 ————————————————————————————————————————
+  // —— handler 消费者 + 业务队列(转发至可选小件 HandlerLoop,ADR-0006 D4)——————
 
   /**
    * @brief spawn 单消费者 handler fiber(串行消费业务队列):出队一条 → 跑 @p consume 到
    *        完成(含其 await)→ 再出下一条(严格串行,RT_HANDLER_003)。
    *
-   * consume 逃逸异常被边界兜住 → 记 handler_exception(转 kInternal 隔离当前事件、不自关
-   * node、继续下一条,RT_HANDLER_006);这是运行时唯一授权的 catch。队列 Close(Pop 返
-   * kClosed)→ 消费者退出。记录本 fiber id 供重入自锁检测。
-   *
-   * **保留 `FiberTask` 句柄供收敛者结构化 join**(ADR-0005 D2):收敛以
-   * `FiberTask::get()` 等 handler 退出(见 ConvergeAfterReadLoop),不再手写完成量——
-   * 完成由运行时保证(fiber 体走异常路径时 makeTask 边界仍会置结果),避免"漏 Complete
-   * → 收敛永久挂死"。
+   * 机制全部在 `HandlerLoop<Event>::Spawn` 内(异常隔离、时长计量、fiber 句柄登记);
+   * 本方法只是 bring-up 期的驱动点。**未调本方法即"未设 handler"**:HandlerLoop 保持无
+   * 消费者状态,收敛时无可汇合者。
    */
   void SpawnHandlerLoop(std::function<void(Event&&)> consume) {
-    auto body = [this, consume = std::move(consume)]() mutable {
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        handler_fiber_id_ = boost::this_fiber::get_id();
-        handler_fiber_id_set_ = true;
-      }
-      for (;;) {
-        auto item = business_queue_.Pop();  // 空则协作 await;Close → kClosed 唤醒退出。
-        if (!item) {
-          break;  // kClosed / kCancelled:队列收敛 → 消费者退出。
-        }
-        Event event = std::move(item).value();
-        RecordEvent(kTraceCategoryHandler, trace_sink_, "start");  // P5-4:调用起点。
-        const Clock::time_point started_at = Clock::now();
-        bool threw = false;
-        try {
-          consume(std::move(event));  // 出队一条跑完再出下一条 = 严格串行。
-        } catch (...) {
-          threw = true;
-          std::lock_guard<std::mutex> lock(mutex_);
-          ++handler_exception_count_;  // RT_HANDLER_006:边界兜住逃逸异常 → kInternal 隔离。
-        }
-        const Clock::duration duration = Clock::now() - started_at;
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          last_handler_duration_ = duration;  // P5-4:处理器时长(简单存最近值)。
-        }
-        RecordEvent(kTraceCategoryHandler, trace_sink_, threw ? "exception" : "end",
-                    {}, {}, {},
-                    static_cast<long>(std::chrono::duration_cast<
-                                       std::chrono::microseconds>(duration)
-                                           .count()));  // P5-4:调用止点。
-      }
-    };
-    // 句柄登记先于 fiber 首次得以运行:makeTask 的 fiber 与本调用同线程亲和
-    // (Affinity::fixed(当前线程)),而 bring-up 自 MarkRunning 至此无挂起点,故收敛者
-    // (读循环 fiber,同线程)不可能观察到"已 spawn handler 但句柄未登记"。同锁发布保留
-    // (#98):不依赖该时序做跨线程可见性保证。
-    auto task =
-        std::make_shared<Coro::FiberTask<void>>(Coro::makeTask(std::move(body)));
-    std::lock_guard<std::mutex> lock(mutex_);
-    handler_task_ = std::move(task);
+    handler_loop_.Spawn(std::move(consume));
   }
 
   /// @brief 入站业务事件入有界队列(满/已 Close 均丢弃、不阻塞);读循环分发业务帧时调。
-  Status Enqueue(Event event) { return business_queue_.Push(std::move(event)); }
+  Status Enqueue(Event event) { return handler_loop_.Enqueue(std::move(event)); }
 
   /// @brief handler 协作取消令牌:Close 时被触发,node 经 HandlerContext 暴露给 handler。
   [[nodiscard]] CancellationToken HandlerCancellationToken() const {
-    return handler_cancellation_.token();
+    return handler_loop_.Token();
   }
 
   // —— 观测计数(机制归因,协议无关)——————————————————————————————————————
 
   /// @brief 业务队列满而 tail-drop 的累计次数(命名归因 business_queue_overflow)。
   [[nodiscard]] std::size_t BusinessQueueOverflowCount() const {
-    return business_queue_.DroppedCount();  // BoundedQueue 自守其锁。
+    return handler_loop_.BusinessQueueOverflowCount();  // HandlerLoop/队列自守其锁。
   }
 
   /// @brief handler consume 逃逸异常被边界兜住、转 kInternal 隔离的累计次数(RT_HANDLER_006)。
   [[nodiscard]] std::size_t HandlerExceptionCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return handler_exception_count_;
+    return handler_loop_.HandlerExceptionCount();  // HandlerLoop 自守其锁。
   }
 
   /// @brief Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
@@ -364,8 +320,7 @@ class NodeRuntime {
   /// @brief 观测:最近一次 handler 单次调用的处理时长(P5-4,RT_DATA_BUFFER)。尚无已
   ///        完成调用时为 0。简单存最近值(非直方图,分布分析留 P6)。
   [[nodiscard]] Clock::duration LastHandlerDuration() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return last_handler_duration_;
+    return handler_loop_.LastHandlerDuration();  // HandlerLoop 自守其锁。
   }
 
   /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
@@ -376,12 +331,6 @@ class NodeRuntime {
   }
 
  private:
-  /// @brief 是否当前 fiber 即 handler 消费者 fiber(重入自锁检测)。自持锁调用。
-  [[nodiscard]] bool InHandlerFiberLocked() const {
-    return handler_fiber_id_set_ &&
-           boost::this_fiber::get_id() == handler_fiber_id_;
-  }
-
   /**
    * @brief 置 Closing 并发出**全部**关闭汇合信号——`Close` 与致命错误自终共用的同一段发起
    *        代码(ADR-0005 D5:正常关闭与自终合并为一条路径,区别仅在"谁先置的 Closing")。
@@ -421,8 +370,7 @@ class NodeRuntime {
     RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closing");
     // 汇合信号(锁外):runtime 侧唤醒读循环 + 消费者 + 触发 handler 取消。
     transport_->RequestClose();
-    business_queue_.Close();
-    handler_cancellation_.Cancel();
+    handler_loop_.CancelAndClose();  // 业务队列 Close + handler 协作取消(同一顺序)。
     if (node_convergence_signal_) {
       node_convergence_signal_();  // node 侧:PendingTable.FailAll 等。
     }
@@ -456,19 +404,10 @@ class NodeRuntime {
   void ConvergeAfterReadLoop() {
     (void)SignalCloseIfFirstCloser(nullptr);  // 仍 Running ⇒ 致命错误自终(D5)。
     close_signalled_.Wait();  // 信号已 Complete(我方 Close 或上一行自终),立即返回。
-    std::shared_ptr<Coro::FiberTask<void>> handler;
-    {
-      // 与写方(SpawnHandlerLoop)同锁,不依赖 bring-up 时序(#98)。
-      std::lock_guard<std::mutex> lock(mutex_);
-      handler = handler_task_;  // 句柄为空 ⇒ 未设 handler,无消费者可汇合。
-    }
-    if (handler) {
-      // 结构化并发 join(ADR-0005 D2):get() 在本 fiber 内让出,直至 handler 消费者
-      // 实际退出(RT_LIFECYCLE_006:不强制销毁 fiber,等其协作返回)。返回值仅表征
-      // 任务是否正常完成(异常/取消 → interrupted),收敛不据此分支——无论哪条路径,
-      // get() 返回即意味着 handler fiber 已不再运行,可安全置 Closed。
-      (void)handler->get();
-    }
+    // 结构化并发 join(ADR-0005 D2):HandlerLoop::Join 在本 fiber 内让出,直至 handler
+    // 消费者实际退出(RT_LIFECYCLE_006:不强制销毁 fiber,等其协作返回);未设 handler
+    // 时立即返回。返回即意味着 handler fiber 已不再运行,可安全置 Closed。
+    handler_loop_.Join();
     ConvergeToClosed();
   }
 
@@ -479,8 +418,10 @@ class NodeRuntime {
     Clock::duration latency{};
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      auto drained = business_queue_.Drain();
-      for (std::size_t i = 0; i < drained.size(); ++i) {
+      // 归因留在 runtime(HandlerLoop 只报条数):close_drop 是关闭语义,与 close 时延、
+      // 置 Closed 同一临界区(与拆件前的加锁范围逐字相同)。
+      const std::size_t drained = handler_loop_.DrainForClose();
+      for (std::size_t i = 0; i < drained; ++i) {
         RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
       }
       lifecycle_ = LifecycleState::kClosed;
@@ -495,14 +436,15 @@ class NodeRuntime {
   }
 
   ITransport* transport_;             ///< 非拥有字节管道(读循环 Read + 收敛 RequestClose)。
-  BoundedQueue<Event> business_queue_;  ///< 入站业务事件队列(协议无关):读循环 Push、消费者 Pop。
-  /// 可选 Trace 出口(非拥有,P5-3/P5-4):业务队列 kBusinessQueueOverflow 归因、Close 时
-  /// close_drop 归因,以及生命周期/handler 的 RecordEvent。写一次(构造)不再变,读不需持锁。
+  /// handler 消费者小件(ADR-0006 D4):业务队列 + 消费者 fiber 句柄 + 协作取消 + 异常隔离
+  /// + 时长计量。**可选**——未 SpawnHandlerLoop 时它只是个没人消费的空队列。自守其锁。
+  HandlerLoop<Event> handler_loop_;
+  /// 可选 Trace 出口(非拥有,P5-3/P5-4):Close 时 close_drop 归因与生命周期 RecordEvent
+  /// (handler 侧那份已转交 HandlerLoop)。写一次(构造)不再变,读不需持锁。
   ITraceSink* trace_sink_{nullptr};
   /// node 侧协议特有收敛信号(PendingTable.FailAll 等):`Close` 与致命错误自终(D5)共用。
   /// 与 trace_sink_ 同纪律:node 构造期写一次(节点尚未发布)、此后只读,读不需持锁。
   std::function<void()> node_convergence_signal_;
-  CancellationSource handler_cancellation_;  ///< handler 协作取消源:Close 时 Cancel。
 
   SharedCompletion<void> start_done_;    ///< 首个 Start 初始化结果(并发 Start 共享)。
   /// 首个关闭者(外部 `Close` 或致命错误自终的读循环自身,D5)已发出全部汇合信号
@@ -510,19 +452,12 @@ class NodeRuntime {
   SharedCompletion<void> close_signalled_;
   SharedCompletion<void> closed_;  ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
 
-  mutable std::mutex mutex_;  ///< 守生命周期状态(D8)。
+  mutable std::mutex mutex_;  ///< 守生命周期状态与关闭归因(D8);handler 侧由 HandlerLoop 自守。
   LifecycleState lifecycle_{LifecycleState::kCreated};
   bool starting_{false};  ///< 首个 Start 正在初始化(并发 Start 据此 await start_done_)。
-  boost::fibers::fiber::id handler_fiber_id_;  ///< handler 消费者 fiber id(重入自锁检测)。
-  bool handler_fiber_id_set_{false};
-  /// handler 消费者 fiber 的结构化并发句柄(ADR-0005 D2);为空即未 spawn handler。
-  /// 收敛者以 `get()` 让出式 join 之(ConvergeAfterReadLoop)。
-  std::shared_ptr<Coro::FiberTask<void>> handler_task_;
-  std::size_t handler_exception_count_{0};
   std::size_t close_drop_count_{0};
   Clock::time_point close_requested_at_{};  ///< P5-4:Close 首个调用者置 Closing 的时刻。
   Clock::duration last_close_latency_{};    ///< P5-4:最近一次关闭时延(简单存最近值)。
-  Clock::duration last_handler_duration_{};  ///< P5-4:最近一次 handler 调用时长(简单存最近值)。
 };
 
 }  // namespace transport
