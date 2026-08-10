@@ -29,12 +29,10 @@
  * 因为"这些事件为什么被丢"属于关闭语义,归 node/收敛者管(与 `BoundedQueue` 把
  * `drop_reason` 交由构造方注入是同一条纪律)。
  *
- * 同步纪律(ADR-0003 D8):消费者 fiber id / 异常计数 / 时长由一把 std::mutex 守;队列
+ * 同步纪律(ADR-0003 D8):消费者 fiber 句柄 / 异常计数 / 时长由一把 std::mutex 守;队列
  * 与取消源各自守其内部状态。**运行时 await 只出现在 fiber 体内的挂起点**——`consume`
  * 一律在锁外调用(其内部可挂起、可回调进 node,持锁调用会与生命周期锁交叉)。
  */
-
-#include <boost/fiber/operations.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -96,7 +94,7 @@ class HandlerLoop {
    *
    * consume 逃逸异常被边界兜住 → 记 handler_exception(转 kInternal 隔离当前事件、不自关
    * node、继续下一条,RT_HANDLER_006);这是本件唯一授权的 catch。队列 Close(Pop 返
-   * kClosed)→ 消费者退出。记录本 fiber id 供调用方做重入自锁检测(`IsCurrentFiber`)。
+   * kClosed)→ 消费者退出。
    *
    * **保留 `FiberTask` 句柄供收敛者结构化 join**(ADR-0005 D2):`Join()` 以
    * `FiberTask::get()` 等 handler 退出,不再手写完成量——完成由运行时保证(fiber 体走异常
@@ -104,11 +102,6 @@ class HandlerLoop {
    */
   void Spawn(std::function<void(Event&&)> consume) {
     auto body = [this, consume = std::move(consume)]() mutable {
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        fiber_id_ = boost::this_fiber::get_id();
-        fiber_id_set_ = true;
-      }
       for (;;) {
         auto item = queue_.Pop();  // 空则协作 await;Close → kClosed 唤醒退出。
         if (!item) {
@@ -216,14 +209,6 @@ class HandlerLoop {
     return last_duration_;
   }
 
-  /// @brief 当前 fiber 是否即本件的消费者 fiber(供调用方做重入自锁检测,
-  ///        RT_LIFECYCLE_005:handler 内调 Close/WaitClosed 等于等自己退出)。
-  ///        未 Spawn 或在其它 fiber/线程上调用均返 false。
-  [[nodiscard]] bool IsCurrentFiber() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return fiber_id_set_ && boost::this_fiber::get_id() == fiber_id_;
-  }
-
  private:
   BoundedQueue<Event> queue_;  ///< 入站业务事件队列:生产者 Push、消费者 Pop。
   /// 可选 Trace 出口(非拥有,P5-3/P5-4):队列 kBusinessQueueOverflow 归因 + handler 调用
@@ -231,11 +216,9 @@ class HandlerLoop {
   ITraceSink* trace_sink_{nullptr};
   CancellationSource cancellation_;  ///< handler 协作取消源:CancelAndClose 时 Cancel。
 
-  mutable std::mutex mutex_;  ///< 守 fiber 句柄/ id / 异常计数 / 时长(ADR-0003 D8)。
+  mutable std::mutex mutex_;  ///< 守 fiber 句柄 / 异常计数 / 时长(ADR-0003 D8)。
   /// 消费者 fiber 的结构化并发句柄(ADR-0005 D2);为空即未 Spawn。`Join()` 让出式 join 之。
   std::shared_ptr<Coro::FiberTask<void>> task_;
-  boost::fibers::fiber::id fiber_id_;  ///< 消费者 fiber id(重入自锁检测)。
-  bool fiber_id_set_{false};
   std::size_t exception_count_{0};
   Clock::duration last_duration_{};  ///< P5-4:最近一次 handler 调用时长(简单存最近值)。
 };

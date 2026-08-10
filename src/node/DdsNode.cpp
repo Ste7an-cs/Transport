@@ -91,6 +91,11 @@ Status DdsNode::Close() {
   return runtime_.Close();
 }
 
+Status DdsNode::SignalClose() {
+  // 同一组汇合信号,只发不等(见 NodeRuntime::SignalClose);供 DdsHandlerContext 使用。
+  return runtime_.SignalClose();
+}
+
 Status DdsNode::WaitClosed(OperationOptions options) {
   return runtime_.WaitClosed(std::move(options));
 }
@@ -263,9 +268,9 @@ Status DdsHandlerContext::Publish(Message msg, Endpoint topic) {
 }
 
 Status DdsHandlerContext::RequestClose() {
-  // 发起完整关闭拆卸;因当前即 handler 消费者 fiber,runtime.Close 内重入自锁防护只发起、
-  // 不自等,立即返回(RT_LIFECYCLE_005)。节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
-  return node_->Close();
+  // 只发汇合信号、不等待(ADR-0006 D8):当前即 handler 消费者 fiber,任何等待收敛的入口
+  // 都等于等自己退出。返回仅表示已受理;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
+  return node_->SignalClose();
 }
 
 }  // namespace transport

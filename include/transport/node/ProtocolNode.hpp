@@ -57,12 +57,18 @@ class HandlerContext {
   [[nodiscard]] Status Send(Message msg);
 
   /**
-   * @brief 请求关闭本节点(非阻塞):发起完整收敛拆卸但不自等待(RT_LIFECYCLE_005)。
+   * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
    *
-   * 委托 ProtocolNode::Close;因当前即 handler 消费者 fiber,Close 内的重入自锁防护会
-   * 只发起拆卸(置 Closing + RequestClose 传输 + Close 业务队列 + 触发 handler 取消 +
-   * FailAll),跳过对 closed_ 的自等待(等自己 = 自锁),立即返回。节点由**读循环**在其
+   * 走框架的发信号路径(`ProtocolNode::SignalClose` → `NodeRuntime::SignalClose`):置
+   * Closing(立即拒新交互)+ 发出全部汇合信号(RequestClose 传输 + Close 业务队列 + 触发
+   * handler 取消 + FailAll),随即返回;**不**调会等待的 `Close()`。节点由**读循环**在其
    * 自身退出且 handler 也退出后收敛到 Closed(ADR-0005 D1)。
+   * 命名与 `ITransport::RequestClose()`(发信号)/ `WaitClosed()`(等待)的既有约定一致。
+   *
+   * @return 仅表示**已受理**(关闭已发起或此前已发起/已完成),**不表示已关完**。处理器
+   *         内**不得**等待本节点关闭完成(等待收敛 = 等自己退出,静默挂死;框架不设运行时
+   *         守卫,ADR-0006 D8)——需要确认关闭完成只能由节点**外部** `WaitClosed()`,或经
+   *         可观测状态旁路观察。
    */
   Status RequestClose();
 
@@ -180,9 +186,11 @@ class ProtocolNode {
    * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),随后**等收敛结果**。
    * 收敛由读循环兼任(ADR-0005 D1):读循环退出 →(设 handler 时)等消费者 fiber 退出 → Drain
    * 未启动业务归因 close_drop → 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享
-   * closed_(多等待者);已 Closed 再关直接成功。当前若就是 handler 消费者 fiber(重入)→ 只
-   * 发起拆卸、跳过对 closed_ 的自等待(避自锁),节点由读循环收敛。关闭后 Request/Send 一律
-   * kClosed。
+   * closed_(多等待者);已 Closed 再关直接成功。关闭后 Request/Send 一律 kClosed。
+   *
+   * **须由节点外部调用**(RT_LIFECYCLE_005 使用契约,ADR-0006 D8):本方法**会等**收敛完成,
+   * 在 handler 内调用等于等自己退出 → 静默挂死;框架不设运行时重入守卫。处理器请求关闭
+   * 走只发信号的 `HandlerContext::RequestClose()`。
    *
    * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:不具重连能力的传输(UDP / 串口 /
    * TCP 服务端已接受连接)发生底层致命错误时,读循环退出而节点仍 Running,此时由读循环
@@ -191,7 +199,9 @@ class ProtocolNode {
    */
   Status Close();
 
-  /// @brief 等待节点收敛到 Closed(复用 SharedCompletion<void>,支持 deadline/取消)。
+  /// @brief 等待节点收敛到 Closed(复用 SharedCompletion<void>,支持 deadline)。
+  ///        同 `Close`:**须由节点外部调用**(handler 内等待收敛 = 等自己退出,静默挂死;
+  ///        无运行时守卫,RT_LIFECYCLE_005 / ADR-0006 D8)。
   [[nodiscard]] Status WaitClosed(OperationOptions options = {});
 
   /**
@@ -266,6 +276,12 @@ class ProtocolNode {
 
  private:
   friend class HandlerContext;
+
+  /// @brief 只发关闭汇合信号、**不等待**收敛(转发 NodeRuntime::SignalClose)。
+  ///        `HandlerContext::RequestClose()` 的实现路径(ADR-0006 D8):内部工作单元唯一
+  ///        被授权的关闭入口,不含任何等待点。返回值仅表示"已受理",不表示"已关完";
+  ///        收敛由读循环完成。不入公开面——外部关闭一律用 `Close()`/`WaitClosed()`。
+  Status SignalClose();
 
   /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
   [[nodiscard]] Status ValidateConfig() const;
