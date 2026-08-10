@@ -67,9 +67,15 @@ class DdsHandlerContext {
   [[nodiscard]] Status Publish(Message msg, Endpoint topic);
 
   /**
-   * @brief 请求关闭本节点(非阻塞):发起完整收敛拆卸但不自等待(RT_LIFECYCLE_005)。
-   *        委托 DdsNode::Close;因当前即 handler 消费者 fiber,Close 内重入自锁防护只发起
-   *        拆卸、跳过自等待,立即返回;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
+   * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
+   *
+   * 走框架的发信号路径(`DdsNode::SignalClose` → `NodeRuntime::SignalClose`):置 Closing
+   * (立即拒新交互)+ 发出全部汇合信号,随即返回;**不**调会等待的 `Close()`。节点由读循环
+   * 在汇合完成后收敛到 Closed(ADR-0005 D1)。命名与 `ITransport::RequestClose()`(发信号)
+   * / `WaitClosed()`(等待)的既有约定一致。
+   *
+   * @return 仅表示**已受理**,**不表示已关完**。处理器内不得等待本节点关闭完成(等自己
+   *         退出,静默挂死;框架不设运行时守卫,ADR-0006 D8)。
    */
   Status RequestClose();
 
@@ -150,8 +156,11 @@ class DdsNode {
    * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed) 令在途 Request
    * 恰好一次 kClosed 收敛,随后等收敛结果;收敛由读循环兼任(ADR-0005 D1):读循环退出 +
    * (设 handler 时)等消费者 fiber 退出 → 置 Closed。后续关闭者共享 closed_(多等待者);
-   * 已 Closed 再关直接成功。当前若即 handler
-   * 消费者 fiber(重入)→ 只发起拆卸、跳过自等待。关闭后 Request/Publish 一律 kClosed。
+   * 已 Closed 再关直接成功。关闭后 Request/Publish 一律 kClosed。
+   *
+   * **须由节点外部调用**(RT_LIFECYCLE_005 使用契约,ADR-0006 D8):本方法**会等**收敛完成,
+   * 在 handler 内调用等于等自己退出 → 静默挂死;框架不设运行时重入守卫。处理器请求关闭走
+   * 只发信号的 `DdsHandlerContext::RequestClose()`。
    *
    * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:DDS 非重连(断开即致命,Read 返
    * kClosed),此时读循环退出而节点仍 Running → 由读循环**自行**走上述同一条关闭路径,
@@ -159,7 +168,9 @@ class DdsNode {
    */
   Status Close();
 
-  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline/取消)。
+  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline)。同 `Close`:**须由节点外部
+  ///        调用**(handler 内等待收敛 = 等自己退出,静默挂死;无运行时守卫,
+  ///        RT_LIFECYCLE_005 / ADR-0006 D8)。
   [[nodiscard]] Status WaitClosed(OperationOptions options = {});
 
   /**
@@ -225,6 +236,12 @@ class DdsNode {
 
  private:
   friend class DdsHandlerContext;
+
+  /// @brief 只发关闭汇合信号、**不等待**收敛(转发 NodeRuntime::SignalClose)。
+  ///        `DdsHandlerContext::RequestClose()` 的实现路径(ADR-0006 D8):内部工作单元
+  ///        唯一被授权的关闭入口,不含任何等待点。返回值仅表示"已受理",不表示"已关完"。
+  ///        不入公开面——外部关闭一律用 `Close()`/`WaitClosed()`。
+  Status SignalClose();
 
   /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
   [[nodiscard]] Status ValidateConfig() const;

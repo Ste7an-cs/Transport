@@ -8,8 +8,10 @@
 //     (可重试,不被污染)(RT_LIFECYCLE_007)。
 //   · Close 协作取消收敛正在运行的 handler(观察 token 返回)、三方汇合后 Closed、多个
 //     WaitClosed 全唤醒(RT_LIFECYCLE_004/006)。
-//   · handler 内经 ctx.RequestClose() / 捕获 node& 调 node.Close() 发起关闭 → 不自锁、
-//     正常收敛(RT_LIFECYCLE_005)。
+//   · handler 内经 ctx.RequestClose() 发起关闭(**只发信号、不等待**,ADR-0006 D8)→
+//     受理即返回、返回时尚未 Closed、其后正常收敛,外部 WaitClosed 唤醒(RT_LIFECYCLE_005)。
+//     注:handler 内直调**等待型**关闭接口(node.Close()/WaitClosed())在 D8 下静默挂死,
+//     属明确接受的违约面(使用契约,无运行时守卫),故无对应用例。
 //   · Close 时未启动的排队业务 → CloseDropCount() 归因(不排空处理,ADR-0001 D5)。
 //   · **致命错误自终**(RT_LIFECYCLE_008 / ADR-0005 D5):不可重连介质底层致命错误
 //     (Read 返 kClosed)而节点仍 Running → 节点自行 Closing→Closed,在途 WaitClosed
@@ -236,33 +238,34 @@ TEST(ProtocolNodeLifecycle, CloseCooperativelyCancelsHandlerAndWakesAllWaiters) 
   EXPECT_TRUE(w3.get());
 }
 
-// RT_LIFECYCLE_005:handler 内经 ctx.RequestClose() 发起关闭 → 不自锁,节点正常收敛到
-// Closed(外部 WaitClosed 完成即证无自等待死锁)。
+// RT_LIFECYCLE_005 / ADR-0006 D8:handler 内经 ctx.RequestClose() 发起关闭 → **只发信号、
+// 不等待**:调用在消费者 fiber 内立即返回(受理:已置 Closing 拒新交互 + 协作取消已触发),
+// 此刻节点**尚未** Closed(收敛还要等本 handler 退出);节点随后由读循环收敛到 Closed,外部
+// WaitClosed 完成(不挂起)即证无自等待死锁。
 TEST(ProtocolNodeLifecycle, HandlerRequestCloseDoesNotSelfDeadlock) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNodeConfig config;
-  config.handler = [](const Message&, HandlerContext& ctx) -> Status {
-    return ctx.RequestClose();  // 消费者 fiber 内发起关闭。
-  };
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
-
-  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  // 节点应自行收敛到 Closed;外部 WaitClosed 完成(不挂起)证实不自锁。
-  EXPECT_TRUE(node.WaitClosed());
-}
-
-// RT_LIFECYCLE_005:handler 捕获 node& 直接调 node.Close() → 重入自锁防护只发起、不自等,
-// 节点正常收敛。
-TEST(ProtocolNodeLifecycle, HandlerNodeCloseDoesNotSelfDeadlock) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
   ProtocolNode* node_ptr = nullptr;
+  std::atomic_bool accepted{false};
+  std::atomic_bool cancelled_on_return{false};
+  std::atomic_bool closed_on_return{true};
+  std::atomic_bool send_rejected_on_return{false};
   ProtocolNodeConfig config;
-  config.handler = [&node_ptr](const Message&, HandlerContext&) -> Status {
-    return node_ptr->Close();  // 消费者 fiber 内直接 Close(重入)。
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+    // 消费者 fiber 内发起关闭:不等待,返回即"已受理"(RequestClose 若等待收敛,本行
+    // 就是等自己退出 → 整个用例挂死)。
+    accepted.store(static_cast<bool>(ctx.RequestClose()));
+    // 受理已生效:汇合信号(协作取消 + 拒新交互)在返回前就已发出。
+    cancelled_on_return.store(ctx.cancellation().IsCancellationRequested());
+    Message probe;
+    probe.frm_type = FrameType::kState;
+    auto sent = ctx.Send(std::move(probe));
+    send_rejected_on_return.store(
+        !sent && sent.error() == make_error_code(TransportErrc::kClosed));
+    // 但**尚未关完**:收敛(置 Closed + 记关闭时延)要等本 handler 退出后由读循环做。
+    closed_on_return.store(node_ptr->LastCloseLatency() !=
+                           OperationOptions::Clock::duration::zero());
+    return Status{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -270,7 +273,43 @@ TEST(ProtocolNodeLifecycle, HandlerNodeCloseDoesNotSelfDeadlock) {
   ASSERT_TRUE(node.Start());
 
   fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  EXPECT_TRUE(node.WaitClosed());  // 收敛不挂起 = 不自锁。
+  // 节点应自行收敛到 Closed;外部 WaitClosed 完成(不挂起)证实不自锁。
+  EXPECT_TRUE(node.WaitClosed());
+  EXPECT_TRUE(accepted.load());                // 受理成功。
+  EXPECT_TRUE(cancelled_on_return.load());     // 返回时汇合信号已发出。
+  EXPECT_TRUE(send_rejected_on_return.load());  // 返回时已拒新交互(Closing)。
+  EXPECT_FALSE(closed_on_return.load());       // 返回时尚未 Closed(只受理,不等待)。
+}
+
+// RT_LIFECYCLE_005 / ADR-0006 D8:`RequestClose()` 的返回值只表示"已受理",不表示"已关完"
+// ——以**外部** WaitClosed 等待者为观察点:handler 内 RequestClose 返回的那一刻等待者尚未
+// 被唤醒(节点未 Closed),其后读循环收敛完成,该外部等待者才正常返回。
+TEST(ProtocolNodeLifecycle, HandlerRequestCloseIsAcceptedButNotYetClosed) {
+  auto fake_owner = std::make_unique<FakeCoroTransport>();
+  FakeCoroTransport* fake = fake_owner.get();
+  std::atomic_int woken{0};
+  std::atomic_int woken_on_request_close_return{-1};
+  ProtocolNodeConfig config;
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+    auto accepted = ctx.RequestClose();
+    woken_on_request_close_return.store(woken.load());  // 快照:此刻外部等待者是否已醒。
+    return accepted;
+  };
+  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
+                    std::move(config));
+  ASSERT_TRUE(node.Start());
+
+  // 外部(非内部工作单元)等待者:唯一被授权等待收敛的一方。
+  auto waiter = Coro::makeTask([&] {
+    (void)node.WaitClosed();
+    woken.fetch_add(1);
+  });
+
+  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
+  ASSERT_TRUE(pumpFiberUntil([&] { return woken.load() == 1; }));  // 收敛完成,等待者醒。
+  EXPECT_EQ(woken_on_request_close_return.load(), 0);  // 受理返回时:尚未 Closed。
+  EXPECT_TRUE(waiter.get());
+  EXPECT_TRUE(node.WaitClosed());  // 已 Closed:后续外部等待立即成功。
 }
 
 // RT_LIFECYCLE / ADR-0001 D5:Close 时未启动的排队业务 → CloseDropCount() 归因,不排空处理。
