@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### 重构:NodeBase 模板方法取代 NodeRuntime 的生命周期职责(ADR-0006 D1/D2/D6,#139)
+
+> 依 ADR-0006 **D1/D2/D6**。生命周期由新基类 `NodeBase`(非模板,实现进 `.cpp`)以**模板方法**承载:基类管幂等保护与关闭仲裁,协议特有的启动/关闭实事下沉为虚钩子。`ProtocolNode` / `DdsNode` 改为**继承** `NodeBase`(推翻 SDD DD-3/DD-4/§4.1.4 原"不继承"的结构结论)。**公开 API 面与可观察行为不变。**
+
+- **新增** `include/transport/node/NodeBase.hpp` + `src/node/NodeBase.cpp`。公开面 `Start()`/`Close()`/`WaitClosed()`/`IsRunning()`,均返 `Status` 而非 `bool`(D2:`bool` 会把"已 `Running`(成功)"与"已 `Closing`/`Closed`(RT_LIFECYCLE_003 要求 `InvalidState`)"压成同值,且 RT_LIFECYCLE_007 要求宿主据错误改配置重试)。
+- **钩子** `ValidateConfig()`(默认成功)、`DoStart()`/`DoClose()`(纯虚)、`JoinHandler()`(默认空)、`DrainUnstartedBusiness()`(默认 0)。`ValidateConfig()` **先于 `starting_` 求值**,故配置校验失败**不 latch `start_done_`**——否则宿主改正配置后重试时并发进来的 `Start` 会共享到陈旧的 `kConfiguration`。后两个钩子使收敛能够到 node 持有的可选 `HandlerLoop`,而不必让基类持有协议类型。
+- **删除** `NodeRuntime::SetNodeConvergenceSignal()` —— node 侧收敛信号改由虚钩子 `DoClose()` 承载。**硬约束**:基类在 `DoClose()` **返回之后**才 `close_signalled_.Complete()`,读循环挡在 `Wait` 上直到全部汇合信号发完才 join handler(否则队列未 `Close`、handler 未取消,join 必然挂死)。
+- **变更** `NodeRuntime` 收缩为**过渡件**(473 → 185 行):生命周期职责全部迁空,不再持有任何生命周期状态与 `std::mutex`;仅余读循环骨架(新增 `on_loop_exit` 出口参数)与 `HandlerLoop` 的持有驱动,待 **#140** 下放各 node 后删除文件。`CloseDropCount()`/`LastCloseLatency()` 随收敛段落上移基类,公开签名与调用点不变。
+- **验证** 全量 292 tests `--gtest_repeat=5` 全绿、生命周期用例 `--gtest_repeat=20` 全绿,**零挂起**。(该段代码正是上一轮生命周期重构挂死并被整体回滚之处,见 ADR-0005 D9。)
+
 ### ⚠ 语义变更:RequestClose 只发信号,撤销重入守卫(ADR-0006 D8,#144)
 
 > 依 ADR-0006 **D8**(**撤销 ADR-0005 D6**)。不设任何运行时重入守卫——不比对 fiber id、不登记内部工作单元身份、不设"半执行"分支;`Close()` 结尾无条件 `closed_.Wait()`。取而代之的是**结构性保证**:内部工作单元不再有任何会等待的入口。
