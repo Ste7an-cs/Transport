@@ -8,35 +8,33 @@
 #include "transport/core/TraceCategories.hpp"
 
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
-// 终结判别、topic 寻址、reply_to=inbox。协议无关机制(生命周期三方汇合、handler 消费者、
-// 业务队列、读循环骨架)组合并驱动 NodeRuntime;关联复用 PendingTable<std::string,Message>。
+// 终结判别、topic 寻址、reply_to=inbox。生命周期(幂等 Start / 关闭仲裁 / 收敛)由基类
+// NodeBase 承载,本类只填 DDS 特有钩子(ADR-0006 D1);读循环骨架与 handler 消费者小件仍由
+// 过渡件 NodeRuntime 持有(ADR-0006 D5,#140 下放本类);关联复用
+// PendingTable<std::string,Message>。
 
 namespace transport {
 
 DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
                  std::unique_ptr<ICodec> codec, DdsNodeConfig config)
-    : transport_(std::move(transport)),
+    // 生命周期基类:共用同一可选 trace_sink(生命周期跃迁 + close_drop 归因)。
+    : NodeBase(config.trace_sink),
+      transport_(std::move(transport)),
       codec_(std::move(codec)),
       config_(std::move(config)),
       // 关联表:correlation_id 无天然容量语义(≠ session_id 的 uint8 硬顶)→ 纯计数无限
       // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
       // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
       pending_(/*max_pending=*/0, config_.trace_sink),
-      // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它字段);
-      // transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。trace_sink
-      // 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的 close_drop 批量
-      // 归因均经它可选上报。
+      // 过渡件组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 其它
+      // 字段);transport 裸指针供读循环 Read(node 持 unique_ptr)。trace_sink 透传
+      // (P5-3):业务队列满(business_queue_overflow)经它可选上报。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events,
-               config_.business_queue_max_bytes, config_.trace_sink) {
-  // node 侧 DDS 特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途 Request
-  // 恰好一次收敛。构造期登记一次(节点尚未发布),供**外部 Close 与读循环致命错误自终**
-  // 两个发起点共用——自终发生在读循环内,取不到 Close 的入参,故由 runtime 持有。
-  runtime_.SetNodeConvergenceSignal(
-      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
-}
+               config_.business_queue_max_bytes, config_.trace_sink) {}
 
+// 析构即关闭:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚(见 NodeBase 文档)。
 DdsNode::~DdsNode() { Close(); }
 
 Status DdsNode::ValidateConfig() const {
@@ -57,47 +55,47 @@ Status DdsNode::ValidateConfig() const {
   return Status{};
 }
 
-Status DdsNode::Start() {
-  // 组合并驱动 NodeRuntime 幂等 Start:runtime 管状态机 / 共享结果 / 三方汇合骨架;node
-  // 提供 DDS 特有的配置校验与首次 bring-up。三介质(含 DDS)共用同一段无分支读循环
-  // (ADR-0004 D1/D2)——DdsTransport 断开即致命(Read 返 kClosed),由读循环收敛。
-  return runtime_.Start(
-      [this] { return ValidateConfig(); },
-      [this]() -> Status {
-        Status started = transport_->Start();  // DdsTransport:Init + 订阅 topic 集。
-        if (!started) {
-          return started;  // 传输启动失败:runtime 退回 Created 允许重试。
-        }
-        runtime_.MarkRunning();
-        // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + DDS 特有分类/寻址。
-        runtime_.SpawnReadLoop(
-            [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); });
-        // 设了 handler → runtime spawn 单消费者 handler fiber(串行消费业务队列)。
-        if (config_.handler) {
-          runtime_.SpawnHandlerLoop([this](Message&& msg) {
-            DdsHandlerContext ctx(this, runtime_.HandlerCancellationToken());
-            // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 runtime
-            // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
-            (void)config_.handler(msg, ctx);
-          });
-        }
-        return Status{};
-      });
+Status DdsNode::DoStart() {
+  // 基类已做完幂等仲裁与配置校验,这里只做 DDS 特有实事。三介质(含 DDS)共用同一段无
+  // 分支读循环(ADR-0004 D1/D2)——DdsTransport 断开即致命(Read 返 kClosed),由读循环收敛。
+  Status started = transport_->Start();  // DdsTransport:Init + 订阅 topic 集。
+  if (!started) {
+    return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
+  }
+  MarkRunning();
+  // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + DDS 特有分类/寻址;循环退出后
+  // 本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
+  runtime_.SpawnReadLoop(
+      [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); },
+      [this] { ConvergeAfterReadLoop(); });
+  // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列)。
+  if (config_.handler) {
+    runtime_.SpawnHandlerLoop([this](Message&& msg) {
+      DdsHandlerContext ctx(this, runtime_.HandlerCancellationToken());
+      // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
+      // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
+      (void)config_.handler(msg, ctx);
+    });
+  }
+  return Status{};
 }
 
-Status DdsNode::Close() {
-  // 驱动 runtime 收敛;node 侧 DDS 特有收敛信号已于构造期登记(见构造函数),Close 与
-  // 致命错误自终共用之。无 reactor(无连接),故无额外取消源。
-  return runtime_.Close();
+Status DdsNode::DoClose() {
+  // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
+  // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
+  transport_->RequestClose();
+  runtime_.CancelAndCloseHandler();  // 业务队列 Close + handler 协作取消(同一顺序)。
+  // DDS 特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途 Request 恰好一次
+  // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
+  // 无 reactor(无连接),故无额外取消源。
+  pending_.FailAll(make_error_code(TransportErrc::kClosed));
+  return Status{};
 }
 
-Status DdsNode::SignalClose() {
-  // 同一组汇合信号,只发不等(见 NodeRuntime::SignalClose);供 DdsHandlerContext 使用。
-  return runtime_.SignalClose();
-}
+void DdsNode::JoinHandler() { runtime_.JoinHandlerLoop(); }
 
-Status DdsNode::WaitClosed(OperationOptions options) {
-  return runtime_.WaitClosed(std::move(options));
+std::size_t DdsNode::DrainUnstartedBusiness() {
+  return runtime_.DrainHandlerForClose();
 }
 
 std::string DdsNode::NextCorrelationId() {
@@ -128,7 +126,7 @@ Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
 
 Result<Message> DdsNode::Request(Message req, Endpoint target,
                                  OperationOptions options) {
-  if (!runtime_.IsRunning()) {
+  if (!IsRunning()) {
     // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
     return make_error_code(TransportErrc::kClosed);
   }
@@ -157,7 +155,7 @@ Result<Message> DdsNode::Request(Message req, Endpoint target,
 }
 
 Status DdsNode::Publish(Message msg, Endpoint topic) {
-  if (!runtime_.IsRunning()) {
+  if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
   // 单向 kNotify fire-and-forget:不登记 PendingTable。
@@ -232,8 +230,6 @@ std::size_t DdsNode::HandlerExceptionCount() const {
 
 std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
 
-std::size_t DdsNode::CloseDropCount() const { return runtime_.CloseDropCount(); }
-
 std::size_t DdsNode::BadFrameCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return bad_frame_count_;
@@ -245,10 +241,6 @@ DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
 
 DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
   return runtime_.LastHandlerDuration();
-}
-
-DdsNode::Clock::duration DdsNode::LastCloseLatency() const {
-  return runtime_.LastCloseLatency();
 }
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————
@@ -270,7 +262,7 @@ Status DdsHandlerContext::Publish(Message msg, Endpoint topic) {
 Status DdsHandlerContext::RequestClose() {
   // 只发汇合信号、不等待(ADR-0006 D8):当前即 handler 消费者 fiber,任何等待收敛的入口
   // 都等于等自己退出。返回仅表示已受理;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
-  return node_->SignalClose();
+  return node_->SignalClose();  // NodeBase 的受保护入口(本类是 DdsNode 的友元)。
 }
 
 }  // namespace transport

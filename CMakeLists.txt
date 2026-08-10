@@ -57,6 +57,7 @@ add_library(transport STATIC
   src/core/version.cpp
   src/core/Error.cpp
   src/core/Cancellation.cpp
+  src/node/NodeBase.cpp
   src/node/ProtocolNode.cpp
   src/node/DdsNode.cpp
   src/io/tcp/TcpTransport.cpp

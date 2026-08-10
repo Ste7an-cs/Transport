@@ -8,8 +8,9 @@
 #include "transport/core/TraceCategories.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
-// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。协议无关机制(生命周期三方汇合、
-// handler 消费者、业务队列、读循环骨架)组合并驱动 NodeRuntime。
+// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
+// 收敛)由基类 NodeBase 承载,本类只填协议特有钩子(ADR-0006 D1);读循环骨架与 handler
+// 消费者小件仍由过渡件 NodeRuntime 持有(ADR-0006 D5,#140 下放本类)。
 
 namespace transport {
 
@@ -34,7 +35,9 @@ constexpr std::size_t kSessionIdSpace = 256;
 
 ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
                            std::unique_ptr<ICodec> codec, ProtocolNodeConfig config)
-    : transport_(std::move(transport)),
+    // 生命周期基类:共用同一可选 trace_sink(生命周期跃迁 + close_drop 归因)。
+    : NodeBase(config.trace_sink),
+      transport_(std::move(transport)),
       codec_(std::move(codec)),
       config_(std::move(config)),
       // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
@@ -42,20 +45,13 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
       // AllocateSession 先行拒绝,此纯计数上限不可达——保留仅为防**自定义键策略**绕过
       // session 预算造出超额在途(RT_DESIGN_008 自定义键开放后的兜底)。
       pending_(kSessionIdSpace, config_.trace_sink),
-      // 运行时组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
-      // 其它字段);transport 裸指针供读循环 Read + 收敛 RequestClose(node 持 unique_ptr)。
-      // trace_sink 透传(P5-3):业务队列满(business_queue_overflow)与 Close 时的
-      // close_drop 批量归因均经它可选上报。
+      // 过渡件组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
+      // 其它字段);transport 裸指针供读循环 Read(node 持 unique_ptr)。trace_sink 透传
+      // (P5-3):业务队列满(business_queue_overflow)经它可选上报。
       runtime_(transport_.get(),
                [](const Message& msg) { return msg.payload.size(); },
                config_.business_queue_max_events, config_.business_queue_max_bytes,
                config_.trace_sink) {
-  // node 侧协议特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途请求恰好
-  // 一次收敛。构造期登记一次(节点尚未发布),供**外部 Close 与读循环致命错误自终**两个
-  // 发起点共用——自终发生在读循环内,取不到 Close 的入参,故由 runtime 持有。
-  // 断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/关闭终结)。
-  runtime_.SetNodeConvergenceSignal(
-      [this] { pending_.FailAll(make_error_code(TransportErrc::kClosed)); });
   // 空闲集初值 0..255:分配 pop_front、释放 push_back → FIFO 复用最久释放者(退休窗口
   // 最大化,RT_REQUEST_005)。
   for (std::size_t id = 0; id < kSessionIdSpace; ++id) {
@@ -63,6 +59,7 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
   }
 }
 
+// 析构即关闭:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚(见 NodeBase 文档)。
 ProtocolNode::~ProtocolNode() { Close(); }
 
 Status ProtocolNode::ValidateConfig() const {
@@ -90,52 +87,52 @@ Status ProtocolNode::ValidateConfig() const {
   return Status{};
 }
 
-Status ProtocolNode::Start() {
-  // 组合并驱动 NodeRuntime 的幂等 Start:runtime 管状态机 / 共享结果 / 三方汇合骨架;
-  // node 提供协议特有的配置校验与首次 bring-up(transport 启动 + 置 Running + spawn
-  // 读循环/handler 消费者)。**无能力探测、无按介质分支的第二条启动路径**(ADR-0004 D2)。
-  return runtime_.Start(
-      [this] { return ValidateConfig(); },
-      [this]() -> Status {
-        Status started = transport_->Start();
-        if (!started) {
-          return started;  // 传输启动失败:runtime 退回 Created 允许重试。
-        }
-        runtime_.MarkRunning();
-        // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + 协议特有分类/寻址。
-        runtime_.SpawnReadLoop(
-            [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); });
-        // 设了 handler → runtime spawn 单消费者 handler fiber(串行消费业务队列);node 在
-        // consume 回调内构造 HandlerContext 并跑业务 handler(协议特有的能力面 + 语义)。
-        if (config_.handler) {
-          runtime_.SpawnHandlerLoop([this](Message&& msg) {
-            HandlerContext ctx(this, runtime_.HandlerCancellationToken());
-            // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 runtime
-            // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
-            (void)config_.handler(msg, ctx);
-          });
-        }
-        return Status{};
-      });
+Status ProtocolNode::DoStart() {
+  // 基类已做完幂等仲裁与配置校验,这里只做协议特有实事。**无能力探测、无按介质分支的
+  // 第二条启动路径**(ADR-0004 D2)。
+  Status started = transport_->Start();
+  if (!started) {
+    return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
+  }
+  MarkRunning();
+  // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + 协议特有分类/寻址;循环退出后
+  // 本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
+  runtime_.SpawnReadLoop(
+      [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); },
+      [this] { ConvergeAfterReadLoop(); });
+  // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列);node 在 consume
+  // 回调内构造 HandlerContext 并跑业务 handler(协议特有的能力面 + 语义)。
+  if (config_.handler) {
+    runtime_.SpawnHandlerLoop([this](Message&& msg) {
+      HandlerContext ctx(this, runtime_.HandlerCancellationToken());
+      // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
+      // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
+      (void)config_.handler(msg, ctx);
+    });
+  }
+  return Status{};
 }
 
-Status ProtocolNode::Close() {
-  // 驱动 runtime 收敛;node 侧协议特有收敛信号已于构造期登记(见构造函数),Close 与
-  // 致命错误自终共用之。
-  return runtime_.Close();
+Status ProtocolNode::DoClose() {
+  // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
+  // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
+  transport_->RequestClose();
+  runtime_.CancelAndCloseHandler();  // 业务队列 Close + handler 协作取消(同一顺序)。
+  // 协议特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途请求恰好一次
+  // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
+  // 断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/关闭终结)。
+  pending_.FailAll(make_error_code(TransportErrc::kClosed));
+  return Status{};
 }
 
-Status ProtocolNode::SignalClose() {
-  // 同一组汇合信号,只发不等(见 NodeRuntime::SignalClose);供 HandlerContext 使用。
-  return runtime_.SignalClose();
-}
+void ProtocolNode::JoinHandler() { runtime_.JoinHandlerLoop(); }
 
-Status ProtocolNode::WaitClosed(OperationOptions options) {
-  return runtime_.WaitClosed(std::move(options));
+std::size_t ProtocolNode::DrainUnstartedBusiness() {
+  return runtime_.DrainHandlerForClose();
 }
 
 Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
-  if (!runtime_.IsRunning()) {
+  if (!IsRunning()) {
     // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
     return make_error_code(TransportErrc::kClosed);
   }
@@ -257,7 +254,7 @@ void ProtocolNode::Dispatch(Message msg) {
 }
 
 Status ProtocolNode::Send(Message msg) {
-  if (!runtime_.IsRunning()) {
+  if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
   // 盖帧只需一个"当前不在途"的 session_id,不需要独占预算:只读空闲集尾部(最新释放者,
@@ -297,7 +294,7 @@ Status HandlerContext::Send(Message msg) { return node_->Send(std::move(msg)); }
 Status HandlerContext::RequestClose() {
   // 只发汇合信号、不等待(ADR-0006 D8):当前即 handler 消费者 fiber,任何等待收敛的入口
   // 都等于等自己退出。返回仅表示已受理;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
-  return node_->SignalClose();
+  return node_->SignalClose();  // NodeBase 的受保护入口(本类是 ProtocolNode 的友元)。
 }
 
 std::size_t ProtocolNode::UnmatchedResponseCount() const {
@@ -320,10 +317,6 @@ std::size_t ProtocolNode::HandlerExceptionCount() const {
 
 std::size_t ProtocolNode::PendingCount() const { return pending_.Size(); }
 
-std::size_t ProtocolNode::CloseDropCount() const {
-  return runtime_.CloseDropCount();
-}
-
 std::size_t ProtocolNode::BadFrameCount() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return bad_frame_count_;
@@ -335,10 +328,6 @@ ProtocolNode::Clock::duration ProtocolNode::LastRequestLatency() const {
 
 ProtocolNode::Clock::duration ProtocolNode::LastHandlerDuration() const {
   return runtime_.LastHandlerDuration();
-}
-
-ProtocolNode::Clock::duration ProtocolNode::LastCloseLatency() const {
-  return runtime_.LastCloseLatency();
 }
 
 }  // namespace transport
