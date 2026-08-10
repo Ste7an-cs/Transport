@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 重构:读循环与 handler 计数下放各 node,删除 NodeRuntime(ADR-0006 D5,#140)
+
+> 依 ADR-0006 **D5**,ADR-0006 重构链收尾。**公开 API 面与可观察行为不变**;`NodeBase` **零改动**,`loss_accounting_test.cpp` **零改动**、两条等式(`Σ命名原因 == 总丢弃`、`drop_records.size() == Σ`)原样通过。
+
+- **删除** `include/transport/node/NodeRuntime.hpp`。全库代码/测试/CMake 无残留。至此该件的四项职责各归其位:生命周期 → `NodeBase`(#139)、handler 队列 → `HandlerLoop`(#138)、读循环与 handler 计数 → 各 node(本次)。
+- **变更** 读-分发循环回归各 node 的私有 `SpawnReadLoop()`,循环体逐字不变(仅 `kClosed` 退出、其余瞬时错误继续、出口调基类 `ConvergeAfterReadLoop()`)。过渡期的两个 `std::function` 参数(`decode_and_dispatch` / `on_loop_exit`)随跨件接缝一并消失——直接调本类 `DecodeAndDispatch()` 与基类 `ConvergeAfterReadLoop()`,少两次间接与两次堆分配,行为等价。
+- **变更** `HandlerLoop` 由各 node 直接持有;三个 handler 观测计数(`BusinessQueueOverflowCount` / `HandlerExceptionCount` / `LastHandlerDuration`)改为一行转发。`CloseDropCount()` / `LastCloseLatency()` 仍继承自 `NodeBase`(#139 已上移)。**公开签名与语义一律未动。**
+- **新增** `tests/handler_loop_test.cpp`(11 例),补上与兄弟小件 `BoundedQueue` / `PendingTable` 对齐的独立覆盖(#138 当时以"生命周期尚未稳定"为由未做):串行消费 + FIFO、逃逸异常隔离不自关、队列满 tail-drop 归因(含 sink)、`Join()` 在 consume 卡于 await 时确实挡住、未 Spawn 时 `Join()` 立即返回、`CancelAndClose` 幂等、`DrainForClose` 条数、时长与起止 Trace、协议无关。
+- **明确接受的重复**(ADR-0006 D5):两个 node 的 `SpawnReadLoop()` 13 行、两个叶子钩子与三个计数转发现在逐字相同。第三个 node 出现前不宜再抽共享件;届时可考虑一个**不含任何协议知识**的 `ReadLoop(ITransport&, fn)` 自由函数,但那是新决策、须走 ADR。
+- **验证** 全量 303 tests `--gtest_repeat=5` 全绿(292 基线 + 11 新增),**零挂起**;`HandlerLoop` 单测 ×20 全绿。`ProtocolNodeReconnect` 的时间预算断言在基线与本分支各 ×40 均为 2 次抖动(约 5%),为既有问题、非本次引入。
+
 ### 重构:NodeBase 模板方法取代 NodeRuntime 的生命周期职责(ADR-0006 D1/D2/D6,#139)
 
 > 依 ADR-0006 **D1/D2/D6**。生命周期由新基类 `NodeBase`(非模板,实现进 `.cpp`)以**模板方法**承载:基类管幂等保护与关闭仲裁,协议特有的启动/关闭实事下沉为虚钩子。`ProtocolNode` / `DdsNode` 改为**继承** `NodeBase`(推翻 SDD DD-3/DD-4/§4.1.4 原"不继承"的结构结论)。**公开 API 面与可观察行为不变。**

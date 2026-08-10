@@ -30,7 +30,7 @@
 
 - **D4（handler 队列拆为 `HandlerLoop<Message>` 小件）：** 拥有 `BoundedQueue<Message>` + `FiberTask` 句柄 + 协作取消令牌 + 逃逸异常隔离 + 时长计量。对外仅 `Spawn(consume)` / `Enqueue(e)` / `Join()` / `CancelAndClose()` 与几个计数。由 node 持有，不进基类——**它是可选的**（未设 handler 的节点没有），而基类应只装每个节点都有的东西。
 
-- **D5（读循环骨架与观测计数并入各 node）：** 13 行的读循环回到它本来的归属（node 自己的 `Read → decode → dispatch`）；五个观测计数成为各 node 的成员。二者都不构成需要共享的机制。
+- **D5（读循环骨架与观测计数并入各 node）〔已由 #140 实施；`NodeRuntime.hpp` 随之删除〕：** 13 行的读循环回到它本来的归属（node 自己的 `Read → decode → dispatch`）；五个观测计数成为各 node 的成员。二者都不构成需要共享的机制。
 
 - **D6（收敛留在基类）：** 收敛（读循环退出 → join handler → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 广播唤醒）留在 `NodeBase`。
   理由：这是本轮改造中唯一**不可下放**的部分。`Awaitable` 是通知原语——`close()` 只保证等待者被唤醒，不保证被唤醒的 fiber 已经跑完并不再触碰 `this`；安全释放要的是后者，只能靠 join。ADR-0005 的 D1/D5 行为结论（读循环兼任收敛者、致命错误自终）**原样保留**，只是承载类改名换姓；其 D6（重入守卫）由本 ADR **D8 撤销**。
