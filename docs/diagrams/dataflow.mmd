@@ -14,7 +14,7 @@ flowchart TB
     subgraph IN["入站（读循环 fiber）"]
         direction LR
         RD["ITransport.Read<br/>一次一片 Datagram"]
-        SK["NodeRuntime 读循环骨架<br/>错误分类 kClosed/kConnection→退出"]
+        SK["node 读循环<br/>错误分类 仅 kClosed→退出并收敛"]
         DEC["ICodec.Decode<br/>字节 → 0..N Message"]
         DSP{"Dispatch（内联）<br/>终结判别 + 键派生"}
         RD --> SK --> DEC --> DSP

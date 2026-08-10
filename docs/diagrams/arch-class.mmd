@@ -31,12 +31,16 @@ classDiagram
         +Publish(Message, topic)
         -Dispatch(kReply) / NextCorrelationId()
     }
-    class NodeRuntime~Event~ {
-        <<协议无关机制>>
+    class NodeBase {
+        <<生命周期基类>>
         +Start() / Close() / WaitClosed()
-        +SpawnReadLoop(fn) / SpawnHandlerLoop(fn)
-        +Enqueue() / DrainBusinessQueue()
+        #DoStart()* / DoClose()*
         -ConvergeAfterReadLoop() / ConvergeToClosed()
+    }
+    class HandlerLoop~Event~ {
+        <<协议无关机制>>
+        +Spawn(consume) / Enqueue(e)
+        +Join() / CancelAndClose()
     }
     class PendingTable~K,T~ {
         <<协议无关机制>>
@@ -91,13 +95,13 @@ classDiagram
     ProtocolNode *-- ITransport : 组合
     ProtocolNode *-- ICodec : 组合
     ProtocolNode *-- PendingTable : 组合
-    ProtocolNode *-- NodeRuntime : 组合
+    NodeBase <|-- ProtocolNode : 继承
     DdsNode *-- ITransport : 组合
     DdsNode *-- ICodec : 组合
     DdsNode *-- PendingTable : 组合
-    DdsNode *-- NodeRuntime : 组合
-    NodeRuntime *-- BoundedQueue : 拥有
+    NodeBase <|-- DdsNode : 继承
+    HandlerLoop *-- BoundedQueue : 拥有
     PendingTable ..> SharedCompletion : 复用
     ProtocolNode ..> HandlerContext : 构造传入
     TcpServer ..> ProtocolNode : 每连接派生
-    NodeRuntime ..> ITraceSink : 可选出口
+    NodeBase ..> ITraceSink : 可选出口

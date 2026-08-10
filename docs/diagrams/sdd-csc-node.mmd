@@ -12,11 +12,17 @@ classDiagram
         +Publish(Message, topic)
         -Dispatch(kReply) / NextCorrelationId()
     }
-    class NodeRuntime~Event~ {
-        +Start / Close / WaitClosed
-        +SpawnReadLoop / SpawnHandlerLoop
-        +Enqueue / DrainBusinessQueue
+    class NodeBase {
+        +Start() Status
+        +Close() Status
+        +WaitClosed(options) Status
+        #DoStart()* Status
+        #DoClose()* Status
         -ConvergeAfterReadLoop() / ConvergeToClosed()
+    }
+    class HandlerLoop~Event~ {
+        +Spawn(consume) / Enqueue(e)
+        +Join() / CancelAndClose()
     }
     class PendingTable~K_T~ {
         +Register(key) Result~Handle~
@@ -32,11 +38,13 @@ classDiagram
         +Send / cancellation
     }
 
-    ProtocolNode *-- NodeRuntime : 组合
+    NodeBase <|-- ProtocolNode : 继承
     ProtocolNode *-- PendingTable : 组合
-    DdsNode *-- NodeRuntime : 组合
+    NodeBase <|-- DdsNode : 继承
     DdsNode *-- PendingTable : 组合
-    NodeRuntime *-- BoundedQueue : 拥有
+    ProtocolNode *-- HandlerLoop : 组合
+    DdsNode *-- HandlerLoop : 组合
+    HandlerLoop *-- BoundedQueue : 拥有
     ProtocolNode ..> HandlerContext : 构造传入
     DdsNode ..> HandlerContext : 构造传入
     note for PendingTable "entry = 裸 Coro::Awaitable~T~ 信箱\n表锁 find+erase 作唯一仲裁点"
