@@ -1,5 +1,7 @@
 # ADR-0005：收敛并入读循环、固定间隔重连与重入守卫
 
+> **注（2026-08-08）**：本 ADR 的 **D6（重入守卫）已由 ADR-0006 D8 撤销**——改为使用契约 + 不提供等待型入口，不设运行时守卫。其余决策不受影响。
+
 **状态：** Accepted
 **日期：** 2026-08-07
 **关联：** ADR-0004（传输语义统一——本 ADR 建立在其 D1/D2/D3 之上）；SRS `docs/需求规格说明书-协程原生.md`（落点：RT_TCP_RECONNECT §3.1.7.3/§3.1.7.4、RT_TCP_RECONFIG_002、RT_LIFECYCLE_005/008/009）；ADR-0003 D11（连接管理分层——本 ADR 改其退避部分）。
@@ -35,7 +37,7 @@ ADR-0004 落地后（#106–#112），交互层的内部工作单元由三条降
 - **D5（致命错误自终，落地 RT_LIFECYCLE_008）：** 读循环退出时若节点仍 `Running`（即非我方 `Close` 所致），自行置 `Closing` + 发汇合信号，再走**同一段**收敛代码。正常关闭与自终由此**合并为一条路径**，区别仅在"谁先置的 `Closing`"。
   注意：**TCP 客户端永不自终**——它无限重连，`Read` 只在我方 `Close` 时返 `kClosed`（ADR-0004 D1）。自终只对 UDP / 串口 / 已接受的 TCP 连接生效。
 
-- **D6（重入守卫，RT_LIFECYCLE_005 的最小版本）：** 删除"handler 内 Close 只发起不自等"的半执行分支；改为**内部工作单元（读循环 / handler）调用 `Close`/`WaitClosed` 一律返 `kInvalidState`**。同时移除 `HandlerContext::RequestClose` / `DdsHandlerContext::RequestClose`（RT_IF_API 破坏性变更，SRS 已登记）。
+- **D6（重入守卫，RT_LIFECYCLE_005 的最小版本）—— 已由 ADR-0006 D8 撤销（2026-08-08），下述内容仅存档：** 删除"handler 内 Close 只发起不自等"的半执行分支；改为**内部工作单元（读循环 / handler）调用 `Close`/`WaitClosed` 一律返 `kInvalidState`**。同时移除 `HandlerContext::RequestClose` / `DdsHandlerContext::RequestClose`（RT_IF_API 破坏性变更，SRS 已登记）。
   依据：项目已确认 handler 不调 `Close`，故该守卫从"支撑真实场景"退化为**防呆**——但仍必要：调用方能捕获 `node*` 硬调，全删则违约后果由"半执行但能收敛"变为**静默挂死**（`Close` 等收敛 → 收敛等 handler 退出 → handler 卡在 `Close` 里）。且 D1 之后读循环成了收敛者，它若调 `Close` 同样自等——同一守卫一并挡住。
 
 - **D7（析构语义 RT_LIFECYCLE_009 不做额外工作）：** 当前 `~ProtocolNode() { Close(); }` 且 `Close` 对外部调用者等待至收敛完成，**"析构等价于 Close + WaitClosed"主干已满足**。需求中"不得在节点自身的内部工作单元中析构该节点"在 C++ 中无廉价强制手段（真那么做即 use-after-free），属**使用契约**，写入 API 注释即可。
@@ -50,7 +52,7 @@ ADR-0004 落地后（#106–#112），交互层的内部工作单元由三条降
 
 ## 影响（Consequences）
 
-- **正面：** 少一条临时 fiber（finalizer）与三个同步原语（`loop_done_`、`handler_done_`、`kHandlerCancelObservation` 观测）；`AddFinalizerJoin`/`finalizer_joins_` 整体删除；**正常关闭与致命自终合并为一条收敛路径**；收敛处只剩一种等待机制（`FiberTask::get()`）；`TcpClientConfig` 由五个连接参数缩为两个（端点 + 连接超时 + 重连间隔常量）；违约调用由静默挂死变为明确错误码。
+- **正面：** 少一条临时 fiber（finalizer）与三个同步原语（`loop_done_`、`handler_done_`、`kHandlerCancelObservation` 观测）；`AddFinalizerJoin`/`finalizer_joins_` 整体删除；**正常关闭与致命自终合并为一条收敛路径**；收敛处只剩一种等待机制（`FiberTask::get()`）；`TcpClientConfig` 由五个连接参数缩为两个（端点 + 连接超时 + 重连间隔常量）；违约调用由静默挂死变为明确错误码（**该项已随 D6 被 ADR-0006 D8 撤销**）。
 - **负面（明确接受）：** ① 固定间隔失去"重连风暴错峰"能力（抖动取消），大规模部署需重新评审；② `RT_TCP_RECONFIG` 可热更新的内容显著缩小（仅端点/连接超时/重连间隔）；③ 失去"handler 不配合协作取消"的唯一现成信号，关闭偏慢时无内建线索（D8）；④ 移除 `HandlerCancelOverrunCount()` 为破坏性 API 变更；⑤ 带着上次挂死的未解之谜前进（D9）。
 - **对 ADR-0003：** 其 **D11** 中的退避策略部分被本 ADR **D4** 取代；分层结论不变。
 - **对 ADR-0004：** 本 ADR 建立在其 D1/D2/D3 之上，不修改其任何决策。
@@ -61,6 +63,6 @@ ADR-0004 落地后（#106–#112），交互层的内部工作单元由三条降
 - **用 `AutoDisconnect` 或裸 `Awaitable` 替换全部 `SharedCompletion`**：否决——前者无 join 语义；后者会使一个等待者的取消殃及全部等待者（D3）。
 - **无延迟重连**：否决——对端端口未监听时退化为紧循环（D4）。
 - **保留指数退避**：否决——与本轮简化目标相悖，四套参数换一个常量（D4）。
-- **全删重入机器、契约纯靠文档**：否决——违约后果由错误码变为静默挂死，排查成本极高（D6）。
+- **全删重入机器、契约纯靠文档**：当时否决（理由：违约后果由错误码变为静默挂死，排查成本极高，D6）——**该否决已被 ADR-0006 D8 推翻，此方案现为采纳方案**。
 - **给 `Coro::FiberTask` 补 `wait_for` 转发、以两行保留 500 ms 观测**：技术上完全可行（AsyncTask 为自有库，`boost::fibers::future` 已具备该能力），但否决——理由不是代价，而是**该计数从未被任何代码消费**，保留它等于维护一个无人读取的埋点（D8）。
 - **先重写上次的实现以诊断挂死根因**：否决——代码已不可恢复，重写等于重做一遍明知有雷的东西，收益仅为知识（D9）。

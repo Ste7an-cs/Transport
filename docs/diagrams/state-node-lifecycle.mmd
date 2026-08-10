@@ -17,11 +17,11 @@ stateDiagram-v2
     Closed --> [*]
 
     note right of Closing
-        重入守卫（ADR-0005 D6）：调用方若身处
-        任一内部工作单元 fiber（读-分发循环 /
-        handler 消费者），Close / WaitClosed
-        一律返 kInvalidState，不发起任何拆卸
-        （RT_LIFECYCLE_005：关闭仅外部发起）
+        无重入守卫（ADR-0006 D8）：Close 结尾
+        无条件等 closed_。内部工作单元不走这里
+        —— 处理器经 RequestClose 只发信号不等待，
+        读循环收敛走内部路径。捕获 node* 硬调
+        Close 会挂死，属使用契约（RT_LIFECYCLE_005）
     end note
 
     note right of Running

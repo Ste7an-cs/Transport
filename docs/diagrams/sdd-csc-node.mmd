@@ -35,7 +35,7 @@ classDiagram
         +双上界 tail-drop
     }
     class HandlerContext {
-        +Send / cancellation
+        +Send / RequestClose(只发信号) / cancellation
     }
 
     NodeBase <|-- ProtocolNode : 继承
