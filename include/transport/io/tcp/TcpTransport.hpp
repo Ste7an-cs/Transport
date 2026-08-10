@@ -68,7 +68,7 @@ class TcpTransport final : public ITransport {
   Status RequestClose() override;
 
   /// @brief 等待完全关闭(支持多等待者)。
-  /// @param options 取消信号与截止时间。
+  /// @param options 仅 `deadline` 生效;取消令牌已随共享完成量轻量化移除(ADR-0006 D3)。
   Status WaitClosed(OperationOptions options = {}) override;
 
   // 发送侧可观测——I/O 事实,非"连接健康"裁决(判活留给协议层)。

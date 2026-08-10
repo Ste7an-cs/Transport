@@ -351,35 +351,24 @@ TEST(CoroFakeTransport, RequestCloseWakesHeldWriteAndCompletesAfterItExits) {
   EXPECT_EQ(fake.state(), LifecycleState::kClosed);
 }
 
-TEST(CoroFakeTransport, WaiterTimeoutAndCancellationAreLocal) {
+// 由 WaiterTimeoutAndCancellationAreLocal 拆出:取消部分随 WaitClosed 的取消令牌
+// 支持一并移除(ADR-0006 D3),超时局部性在广播完成量上依然成立,故原样保留。
+TEST(CoroFakeTransport, WaiterTimeoutIsLocal) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
-  CancellationSource source;
-  OperationOptions cancelled_options;
-  cancelled_options.cancellation = source.token();
   OperationOptions timeout_options;
   timeout_options.deadline = OperationOptions::Clock::now() - 1ms;
-  Status cancelled{make_error_code(TransportErrc::kInternal)};
   Status survivor{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
-  auto cancelled_waiter = Coro::makeTask([&] {
-    entered.resolve();
-    cancelled = fake.WaitClosed(cancelled_options);
-  });
   auto survivor_waiter = Coro::makeTask([&] {
     entered.resolve();
     survivor = fake.WaitClosed();
   });
   ASSERT_TRUE(entered.await());
-  ASSERT_TRUE(entered.await());
 
   const auto timed_out = fake.WaitClosed(timeout_options);
   ASSERT_FALSE(timed_out);
   EXPECT_EQ(timed_out.error(), make_error_code(TransportErrc::kTimeout));
-  EXPECT_TRUE(source.Cancel());
-  EXPECT_TRUE(cancelled_waiter.get());
-  ASSERT_FALSE(cancelled);
-  EXPECT_EQ(cancelled.error(), make_error_code(TransportErrc::kCancelled));
 
   EXPECT_TRUE(fake.RequestClose());
   EXPECT_TRUE(survivor_waiter.get());
