@@ -439,7 +439,7 @@ TEST(DdsNode, BadFrameDecodeFailureCountedAndTraced) {
   node->Close();
 }
 
-// kBusinessQueueOverflow(DdsNode 经 NodeRuntime 组合的业务队列):满 tail-drop 时,
+// kBusinessQueueOverflow(DdsNode 经 HandlerLoop 组合的业务队列):满 tail-drop 时,
 // 配置 trace_sink → 逐条 RecordDrop,计数与 Trace 条数同步。
 TEST(DdsNode, BusinessQueueOverflowWithSinkEmitsDropTrace) {
   Cluster c;
@@ -481,7 +481,7 @@ TEST(DdsNode, BusinessQueueOverflowWithSinkEmitsDropTrace) {
   subscriber->Close();
 }
 
-// kCloseDrop(DdsNode 经 NodeRuntime 组合的业务队列 Close 批量归因):未启动的排队业务
+// kCloseDrop(DdsNode 经 HandlerLoop 组合的业务队列 Close 批量归因):未启动的排队业务
 // → Close 时逐条 RecordDrop,配置 trace_sink → 收到对应事件。
 TEST(DdsNode, CloseDropWithSinkEmitsTraceEvents) {
   Cluster c;

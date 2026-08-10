@@ -3,14 +3,16 @@
 #include <chrono>
 #include <utility>
 
+#include "task/fibertask.h"  // Coro::makeTask —— 读-分发循环 fiber。
+
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Observability.hpp"
 #include "transport/core/TraceCategories.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
-// 收敛)由基类 NodeBase 承载,本类只填协议特有钩子(ADR-0006 D1);读循环骨架与 handler
-// 消费者小件仍由过渡件 NodeRuntime 持有(ADR-0006 D5,#140 下放本类)。
+// 收敛)由基类 NodeBase 承载,本类只填协议特有钩子(ADR-0006 D1);读-分发循环骨架与
+// handler 观测计数归本类(ADR-0006 D5,#140),handler 消费者在可选小件 HandlerLoop(D4)。
 
 namespace transport {
 
@@ -40,18 +42,17 @@ ProtocolNode::ProtocolNode(std::unique_ptr<ITransport> transport,
       transport_(std::move(transport)),
       codec_(std::move(codec)),
       config_(std::move(config)),
-      // P5-4:与 runtime_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
+      // P5-4:与 handler_loop_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
       // max_pending=256 与 session 空闲集是同一上限的双重执法(#98 注):默认键策略下
       // AllocateSession 先行拒绝,此纯计数上限不可达——保留仅为防**自定义键策略**绕过
       // session 预算造出超额在途(RT_DESIGN_008 自定义键开放后的兜底)。
       pending_(kSessionIdSpace, config_.trace_sink),
-      // 过渡件组合业务队列:字节计量注入 payload.size()(D10:runtime 不读 Message 任何
-      // 其它字段);transport 裸指针供读循环 Read(node 持 unique_ptr)。trace_sink 透传
-      // (P5-3):业务队列满(business_queue_overflow)经它可选上报。
-      runtime_(transport_.get(),
-               [](const Message& msg) { return msg.payload.size(); },
-               config_.business_queue_max_events, config_.business_queue_max_bytes,
-               config_.trace_sink) {
+      // handler 消费者小件持有业务队列:字节计量注入 payload.size()(D10:小件不读 Message
+      // 任何其它字段)。trace_sink 透传(P5-3):业务队列满(business_queue_overflow)与
+      // handler 调用起止点经它可选上报。**未设 handler 时不 Spawn**,它只是个空队列。
+      handler_loop_([](const Message& msg) { return msg.payload.size(); },
+                    config_.business_queue_max_events,
+                    config_.business_queue_max_bytes, config_.trace_sink) {
   // 空闲集初值 0..255:分配 pop_front、释放 push_back → FIFO 复用最久释放者(退休窗口
   // 最大化,RT_REQUEST_005)。
   for (std::size_t id = 0; id < kSessionIdSpace; ++id) {
@@ -95,16 +96,14 @@ Status ProtocolNode::DoStart() {
     return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
   }
   MarkRunning();
-  // 读-分发循环:runtime 跑 Read 骨架,node 内联 decode + 协议特有分类/寻址;循环退出后
-  // 本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
-  runtime_.SpawnReadLoop(
-      [this](Datagram datagram) { DecodeAndDispatch(std::move(datagram)); },
-      [this] { ConvergeAfterReadLoop(); });
+  // 读-分发循环(本类自持,ADR-0006 D5):Read 骨架 + 内联 decode + 协议特有分类/寻址;
+  // 循环退出后本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
+  SpawnReadLoop();
   // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列);node 在 consume
   // 回调内构造 HandlerContext 并跑业务 handler(协议特有的能力面 + 语义)。
   if (config_.handler) {
-    runtime_.SpawnHandlerLoop([this](Message&& msg) {
-      HandlerContext ctx(this, runtime_.HandlerCancellationToken());
+    handler_loop_.Spawn([this](Message&& msg) {
+      HandlerContext ctx(this, handler_loop_.Token());
       // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
       // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
       (void)config_.handler(msg, ctx);
@@ -117,7 +116,7 @@ Status ProtocolNode::DoClose() {
   // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
   // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
   transport_->RequestClose();
-  runtime_.CancelAndCloseHandler();  // 业务队列 Close + handler 协作取消(同一顺序)。
+  handler_loop_.CancelAndClose();  // 业务队列 Close + handler 协作取消(同一顺序)。
   // 协议特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途请求恰好一次
   // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
   // 断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/关闭终结)。
@@ -125,10 +124,27 @@ Status ProtocolNode::DoClose() {
   return Status{};
 }
 
-void ProtocolNode::JoinHandler() { runtime_.JoinHandlerLoop(); }
+void ProtocolNode::JoinHandler() { handler_loop_.Join(); }
 
 std::size_t ProtocolNode::DrainUnstartedBusiness() {
-  return runtime_.DrainHandlerForClose();
+  return handler_loop_.DrainForClose();
+}
+
+void ProtocolNode::SpawnReadLoop() {
+  Coro::makeTask([this] {
+    while (true) {
+      auto datagram = transport_->Read();  // 裸读,无 deadline。
+      if (!datagram) {
+        if (datagram.error() == make_error_code(TransportErrc::kClosed)) {
+          break;  // 传输终结(唯一终止语义)→ 退出读循环。
+        }
+        continue;  // 其它(瞬时错误):丢弃继续。
+      }
+      DecodeAndDispatch(std::move(datagram).value());  // 内联 decode + 分发。
+    }
+    // 读循环兼任收敛者(ADR-0005 D1):走基类内部路径,不得调公开的 Close(会自等)。
+    ConvergeAfterReadLoop();
+  });
 }
 
 Result<Message> ProtocolNode::Request(Message req, OperationOptions options) {
@@ -241,11 +257,11 @@ void ProtocolNode::Dispatch(Message msg) {
     }
     return;
   }
-  // 非响应业务帧:设了 handler → 入运行时有界队列交单消费者串行处理;满则 tail-drop
+  // 非响应业务帧:设了 handler → 入有界业务队列交单消费者串行处理;满则 tail-drop
   // (business_queue_overflow),读循环不阻塞、响应匹配照常(RT_HANDLER_004)。未设 handler
   // → 维持 P1 行为归因 dropped_no_handler。
   if (config_.handler) {
-    (void)runtime_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
+    (void)handler_loop_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
@@ -308,11 +324,11 @@ std::size_t ProtocolNode::DroppedNoHandlerCount() const {
 }
 
 std::size_t ProtocolNode::BusinessQueueOverflowCount() const {
-  return runtime_.BusinessQueueOverflowCount();
+  return handler_loop_.BusinessQueueOverflowCount();  // HandlerLoop/队列自守其锁。
 }
 
 std::size_t ProtocolNode::HandlerExceptionCount() const {
-  return runtime_.HandlerExceptionCount();
+  return handler_loop_.HandlerExceptionCount();  // HandlerLoop 自守其锁。
 }
 
 std::size_t ProtocolNode::PendingCount() const { return pending_.Size(); }
@@ -327,7 +343,7 @@ ProtocolNode::Clock::duration ProtocolNode::LastRequestLatency() const {
 }
 
 ProtocolNode::Clock::duration ProtocolNode::LastHandlerDuration() const {
-  return runtime_.LastHandlerDuration();
+  return handler_loop_.LastHandlerDuration();  // HandlerLoop 自守其锁。
 }
 
 }  // namespace transport

@@ -439,7 +439,7 @@ TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminatesAndWakesWaiters) {
 
 // RT_LIFECYCLE_008 + SRS §3.1.6.3 第 3 条:自终路径必须发出**与 Close 相同**的 node 侧收敛
 // 信号(PendingTable.FailAll)——在途请求恰好一次以 kClosed 终结,而不是苦等各自的总超时。
-// (该回调此前只作为 Close 的入参传入,自终取不到;故改由 runtime 于 node 构造期持有。)
+// (该信号此前只作为 Close 的入参传入,自终取不到;故改由 node 的 `DoClose()` 钩子承载。)
 TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminationFailsInFlightRequest) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();

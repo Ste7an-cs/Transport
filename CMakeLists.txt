@@ -106,6 +106,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/shared_completion_test.cpp
     tests/pending_table_test.cpp
     tests/bounded_queue_test.cpp
+    tests/handler_loop_test.cpp
     tests/observability_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_handler_test.cpp
