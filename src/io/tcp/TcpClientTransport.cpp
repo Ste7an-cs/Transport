@@ -14,6 +14,7 @@
 #include <boost/fiber/channel_op_status.hpp>
 
 #include <QAbstractSocket>
+#include <QNetworkProxy>
 #include <QPointer>
 #include <QString>
 #include <QTcpSocket>
@@ -268,6 +269,12 @@ void RunConnectLoop(StatePtr s) {
 
     // 在本 fiber 内创建 socket(亲和纪律:socket 归属本执行域线程)。
     auto* sock = new QTcpSocket();
+    // 显式禁用代理(#123):部分发行版的 Qt 以 `QT_USE_SYSTEM_PROXIES` 构建(如 Ubuntu),
+    // `QTcpSocket` 会解析 `http_proxy` / `all_proxy` 等环境变量,把本应直连 host:port 的
+    // TCP 连接改走 HTTP CONNECT / SOCKS5 隧道。此时"连上"的是代理而非目标端点,连接
+    // 成败、超时与失败归因全部失真(代理即刻接受再断开 → 空代际 + 无失败记账)。本层
+    // 契约是"到指定端点的纯字节管道",不承载任何环境级代理策略,故一律直连。
+    sock->setProxy(QNetworkProxy::NoProxy);
     std::size_t attempt_no = 0;
     bool closing_before_connect = false;
     {
