@@ -177,7 +177,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![节点生命周期状态图](diagrams/state-node-lifecycle.svg)
 
-**图例说明**：`Created→Running→Closing→Closed`。并发幂等 Start 共享 `start_done_` 不重复 spawn；多等待者共享 `closed_`；重入自锁防护比对 handler fiber id。
+**图例说明**：`Created→Running→Closing→Closed`。并发幂等 Start 共享 `start_done_` 不重复 spawn；多等待者共享 `closed_`；**重入守卫**比对内部工作单元 fiber id（读-分发循环 / handler 消费者），命中即返 `kInvalidState`（ADR-0005 D6 / RT_LIFECYCLE_005）。
 
 #### 4.2.8 TCP 连接状态机（MS_CONNECTION）
 
@@ -304,13 +304,14 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ### 5.4 节点运行时详细设计（CSU_NODERUNTIME）
 
-**单元设计决策（DD-3）**：把多节点共享的协议无关机制收成可组合薄件——①生命周期状态机 + 并发幂等 Start + 收敛（并入读循环，ADR-0005 D1）+ 重入自锁防护；②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离 + close_drop 归因；③读-分发循环骨架 `SpawnReadLoop(fn)`。对 Event 不透明。
+**单元设计决策（DD-3）**：把多节点共享的协议无关机制收成可组合薄件——①生命周期状态机 + 并发幂等 Start + 收敛（并入读循环，ADR-0005 D1）+ 重入守卫（ADR-0005 D6）；②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离 + close_drop 归因；③读-分发循环骨架 `SpawnReadLoop(fn)`。对 Event 不透明。
 
-**设计约束**：同步纪律（D8）——生命周期状态/计数/handler 任务句柄均入锁，唤醒/回调锁外；重入自锁防护比对 `boost::this_fiber::get_id()`；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
+**设计约束**：同步纪律（D8）——生命周期状态/计数/handler 任务句柄均入锁，唤醒/回调锁外；重入守卫比对 `boost::this_fiber::get_id()` 与**两条内部工作单元 fiber id**（读循环、handler 消费者），二者均在各自 fiber 首次运行时同锁登记；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
 
 **软件逻辑**：见 `node/NodeRuntime.hpp`。
 - **Start(validate, bring_up)**：首个 Start 校验 config → 置 starting → 调 node `bring_up`（transport.Start + MarkRunning + SpawnReadLoop/HandlerLoop）；并发 Start await 同一 `start_done_`。
-- **Close()**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。发起段抽为共用的 `SignalCloseIfFirstCloser()`——首个关闭者 Running→Closing → 汇合信号（transport.RequestClose + 业务队列 Close + handler 取消 + **构造期登记的** node 侧收敛回调）→ `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。node 侧收敛回调由 `SetNodeConvergenceSignal()` 在 node 构造期登记而非作为 `Close` 入参，因致命错误自终路径（D5）无从取得入参却须发出**完全相同**的一组信号。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。重入（当前即 handler fiber）只发起不自等。
+- **Close()**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。发起段抽为共用的 `SignalCloseIfFirstCloser()`——首个关闭者 Running→Closing → 汇合信号（transport.RequestClose + 业务队列 Close + handler 取消 + **构造期登记的** node 侧收敛回调）→ `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。node 侧收敛回调由 `SetNodeConvergenceSignal()` 在 node 构造期登记而非作为 `Close` 入参，因致命错误自终路径（D5）无从取得入参却须发出**完全相同**的一组信号。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。
+  **重入守卫（ADR-0005 D6 / RT_LIFECYCLE_005）**：调用方若身处任一内部工作单元 fiber（读-分发循环或 handler 消费者），`Close()` 与 `WaitClosed()` **一律直接返 `kInvalidState`，不发起任何拆卸**——不存在"半执行"分支。理由：读循环兼任收敛者，调 `Close` 即等待自身退出；handler 调 `Close` 则成环（关闭等收敛 → 收敛 join handler → handler 卡在关闭里）。二者若不拒绝即静默挂死，故以明确错误码暴露违约。项目已确认 handler 不调 `Close`，该守卫为**防呆**，但仍必要：调用方可捕获 `node*` 硬调。
 - **SpawnReadLoop(fn)**：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：先做**致命错误自终判定**（D5，见下）→ 等 `close_signalled_` → 以 `FiberTask::get()` 让出式 join handler 任务（仍等其实际退出、不强杀 fiber）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
 - **致命错误自终（ADR-0005 **D5** / RT_LIFECYCLE_008）**：读循环退出有两种成因，ADR-0004 D1 之后同为 `kClosed`、读循环无从区分——我方 `Close`，或不具重连能力的传输发生底层致命错误而节点仍 `Running`。后者由读循环**自行**调 `SignalCloseIfFirstCloser()` 置 `Closing` 并发出与 `Close` 完全相同的一组汇合信号，再走**同一段**收敛代码；正常关闭与自终由此合并为一条路径，区别仅在"谁先置的 `Closing`"。判据只是"读循环退出时是否仍 `Running`"，**无需按介质分支**：TCP 客户端无限重连、`Read` 只在我方 `Close` 后返 `kClosed`，彼时 lifecycle 已非 `Running`，天然落不到自终分支。仲裁点仍是 `lifecycle_` 单点，故并发的 `Close` 与自终之间恒只有一个发起者。
 - **SpawnHandlerLoop(consume)**：`Pop → consume 到完成（含 await）→ 下一条`（严格串行）；逃逸异常记 handler_exception。**保留 `FiberTask<void>` 句柄**供收敛者结构化 join（ADR-0005 D2）。
@@ -328,6 +329,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **session_id**：空闲集 `deque<uint8>`（0..255），Request `pop_front` 取最久释放者（FIFO 退休窗口 RT_REQUEST_005），`SessionLease` RAII 归还；256 全在途 `kResourceExhausted`。Send 只读空闲集尾部盖帧、不出队（不扰 FIFO、不占预算）。
 - **Dispatch**：`kResponse`/`kResult`=响应帧→`Resolve`（未命中归因 kUnmatchedOrLateResponse）；否则业务帧入队/丢弃（无 handler 归因 kNoHandlerConfigured）。
 - **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
+- **处理器能力面（RT_LIFECYCLE_005 / ADR-0005 D6）**：`HandlerContext` 与 `DdsHandlerContext` **不提供关闭本节点的入口**——`RequestClose()` 已移除（RT_IF_API 破坏性变更）。处理器可用的节点交互能力限于发送与协作取消令牌；其识别出的协议级终止条件经处理结果与可观测状态上报，由宿主裁决是否关闭。
 
 **软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。
 
