@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### ⚠ 语义变更:RequestClose 只发信号,撤销重入守卫(ADR-0006 D8,#144)
+
+> 依 ADR-0006 **D8**(**撤销 ADR-0005 D6**)。不设任何运行时重入守卫——不比对 fiber id、不登记内部工作单元身份、不设"半执行"分支;`Close()` 结尾无条件 `closed_.Wait()`。取而代之的是**结构性保证**:内部工作单元不再有任何会等待的入口。
+
+- **⚠ 行为变更**(**破坏性**) 调用方若捕获节点引用、在入站业务处理器内**直接调用**等待型的 `Close()` / `WaitClosed()`,此前得到 `kInvalidState`(半执行分支),现在将**静默挂死**。ADR-0005 D6 当初正是以此为由否决该方案,D8 推翻该权衡并记录了理由:守卫的唯一价值是给一个**已确认不会发生**的违约提供诊断,代价却是在生命周期这段最难的代码里常驻两处 fiber id 登记/注销与一个跨锁判据。该约束现为**使用契约**(SRS RT_LIFECYCLE_005),已写入 API 注释。
+- **变更** `HandlerContext::RequestClose()` / `DdsHandlerContext::RequestClose()` **签名不变、语义收窄为"只发起、不等待"**:内部改调框架的发信号路径(node 私有 `SignalClose()` → `NodeRuntime::SignalClose()`),**受理即返回**,收敛由读-分发循环完成。返回值仅表示"已受理",**不表示"已关完"**。命名与 `ITransport::RequestClose()`(发信号)/ `WaitClosed()`(等待)的既有约定一致。原登记的"应移除这两个入口"(SRS §3.2.2)**已撤销**——二者保留。
+- **删除** `NodeRuntime::Close()` 的 `in_handler_fiber` 半执行分支与 `WaitClosed()` 的同类分支;`HandlerLoop::IsCurrentFiber()` 及其 fiber id 成员随之删除(无使用者)。`Close()` 现即 `SignalClose() + closed_.Wait()`。
+- **测试变动**(随能力变更,**非断言放松**) 删除 `ProtocolNodeLifecycle.HandlerNodeCloseDoesNotSelfDeadlock`(该场景在新语义下必挂死,属已接受的违约面,测试文件头已注明为何无用例);加强 `HandlerRequestCloseDoesNotSelfDeadlock`(断言受理即返回、协作取消已触发、`LastCloseLatency()` 仍为 0、其后正常收敛);新增 `HandlerRequestCloseIsAcceptedButNotYetClosed`(以外部 `WaitClosed()` 等待者为观察点,证明受理 ≠ 关完)。
+- **验证** 全量 292 tests `--gtest_repeat=5` 全绿,无挂起。
+
 ### ⚠ 能力移除:SharedCompletion 轻量化为广播完成量(ADR-0006 D3,#137)
 
 > 依 ADR-0006 **D3**。`SharedCompletion<T>` 由「waiter map + 每等待者独立 `Awaitable`」改为「**存结果 + 一条共享 `Awaitable` + `close()` 广播**」,类体 92 → 48 行(整文件 124 → 60 行)。全仓 12+ 处实例(7 个传输的 `closed`、`TcpServer` 3 处、node 侧 3 处)**调用代码零改动**。
