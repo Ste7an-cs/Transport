@@ -4,9 +4,11 @@
  * @file ProtocolNode.hpp
  * @brief 最小外部协议交互节点 ProtocolNode(RT_NODE_003 / RT_REQUEST / ADR-0003 D8/D9)。
  *
- * ProtocolNode **组合**(不继承、不共享引擎)`ITransport`(纯字节管道)+ `ICodec`
- * (线缆格式)+ `PendingTable`(挂起-应答薄基座),内联一条读-分发循环,交付一次
- * needresponse 的请求-响应。协议特有语义——键派生、frm_type 盖章、session_id 空闲集
+ * ProtocolNode **继承 `NodeBase`**(生命周期模板方法:基类管幂等与收敛,本类实现
+ * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)`ITransport`
+ * (纯字节管道)+ `ICodec`(线缆格式)+ `PendingTable`(挂起-应答薄基座),内联一条
+ * 读-分发循环,交付一次 needresponse 的请求-响应。协议特有语义——键派生、frm_type
+ * 盖章、session_id 空闲集
  * LRU 分配、终结帧判别(kResponse/kResult)、未匹配路由——**全部内联在本类**;
  * PendingTable 保持协议无关(ADR-0003 D9/D10 红线)。只经 CorrelationKeyStrategy 开放
  * KeyOf 注入,IsTerminal / RouteUnmatched 内联锁死。
@@ -35,6 +37,7 @@
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
+#include "transport/node/NodeBase.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
 #include "transport/core/Result.hpp"
@@ -59,7 +62,7 @@ class HandlerContext {
   /**
    * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
    *
-   * 走框架的发信号路径(`ProtocolNode::SignalClose` → `NodeRuntime::SignalClose`):置
+   * 走框架的发信号路径(`NodeBase::SignalClose`):置
    * Closing(立即拒新交互)+ 发出全部汇合信号(RequestClose 传输 + Close 业务队列 + 触发
    * handler 取消 + FailAll),随即返回;**不**调会等待的 `Close()`。节点由**读循环**在其
    * 自身退出且 handler 也退出后收敛到 Closed(ADR-0005 D1)。
@@ -142,8 +145,9 @@ struct ProtocolNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
-  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeRuntime
-  /// 业务队列与本类各丢弃归因点(kBadFrame / kUnmatchedOrLateResponse /
+  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeBase
+  /// (生命周期跃迁 + close_drop 归因)、NodeRuntime 业务队列与本类各丢弃归因点
+  /// (kBadFrame / kUnmatchedOrLateResponse /
   /// kNoHandlerConfigured),并在 send/recv/decode/match/timeout/cancel/handler/close
   /// 等边界点上报事件。RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,
   /// `RecordEvent`/`RecordDrop` 仅一次判空。
@@ -151,58 +155,36 @@ struct ProtocolNodeConfig {
 };
 
 /**
- * @brief 最小外部协议交互节点:组合 transport + codec + PendingTable,交付请求-响应。
+ * @brief 最小外部协议交互节点:继承 NodeBase(生命周期)+ 组合 transport + codec +
+ *        PendingTable,交付请求-响应。
  *
- * 生命周期:Created→Running(Start)→Closing→Closed(Close)。不可拷贝、不可移动
- * (读-分发循环 fiber 捕获 this)。
+ * **生命周期全部由 `NodeBase` 承载**(ADR-0006 D1/D6):`Start()` / `Close()` /
+ * `WaitClosed()` / `IsRunning()` / `CloseDropCount()` / `LastCloseLatency()` 一律**继承自
+ * 基类**,本类只实现协议特有的钩子(`ValidateConfig` / `DoStart` / `DoClose` /
+ * `JoinHandler` / `DrainUnstartedBusiness`)。Created→Running(Start)→Closing→Closed(Close)。
+ * - `Close()` 只发汇合信号 + 等收敛结果;收敛由读循环兼任(ADR-0005 D1)。关闭后
+ *   Request/Send 一律 kClosed。**须由节点外部调用**(RT_LIFECYCLE_005 使用契约,
+ *   ADR-0006 D8):它**会等**收敛完成,在 handler 内调用等于等自己退出 → 静默挂死;框架不设
+ *   运行时重入守卫。处理器请求关闭走只发信号的 `HandlerContext::RequestClose()`。
+ * - **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:不具重连能力的传输(UDP / 串口 /
+ *   TCP 服务端已接受连接)发生底层致命错误时,读循环退出而节点仍 Running,此时由读循环
+ *   **自行**走同一条关闭路径(置 Closing + 发同一组汇合信号 + 收敛),宿主无需干预;其可
+ *   观察结果与外部发起关闭一致(SRS §3.1.6.3 第 7 条)。TCP 客户端无限重连,不自终。
+ *
+ * 不可拷贝、不可移动(读-分发循环 fiber 捕获 this)。
  */
-class ProtocolNode {
+class ProtocolNode : public NodeBase {
  public:
   using Clock = OperationOptions::Clock;
 
   ProtocolNode(std::unique_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
                ProtocolNodeConfig config = {});
-  ~ProtocolNode();
+  /// @brief 析构即关闭:在**本类**析构体内调 `Close()`——彼时动态类型仍是 ProtocolNode,
+  ///        虚钩子可用、成员尚存(基类析构不得收敛,见 `NodeBase::~NodeBase`)。
+  ~ProtocolNode() override;
 
   ProtocolNode(const ProtocolNode&) = delete;
   ProtocolNode& operator=(const ProtocolNode&) = delete;
-
-  /**
-   * @brief 并发安全幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
-   *
-   * 首个 Start 先校验 config(队列上界落 [1,65536] / [64KiB,256MiB]、key_strategy 非空、
-   * default_request_timeout 为正)
-   * → 失败返 kConfiguration、停在 Created、允许改配重试;通过则置 starting、做实事(transport
-   * Start + spawn 读循环/handler fiber)、Complete start_done_。初始化期间并发进来的 Start
-   * await 同一 start_done_ 结果、不重复 spawn。已 Running 再启 → 成功;Closing/Closed →
-   * kInvalidState。
-   */
-  Status Start();
-
-  /**
-   * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
-   *
-   * 首个关闭者拆卸:Running→Closing(立即拒新 Request/Send)→ 汇合信号(transport.RequestClose
-   * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed),随后**等收敛结果**。
-   * 收敛由读循环兼任(ADR-0005 D1):读循环退出 →(设 handler 时)等消费者 fiber 退出 → Drain
-   * 未启动业务归因 close_drop → 置 Closed → closed_.Complete。后续关闭者不重复拆资源、共享
-   * closed_(多等待者);已 Closed 再关直接成功。关闭后 Request/Send 一律 kClosed。
-   *
-   * **须由节点外部调用**(RT_LIFECYCLE_005 使用契约,ADR-0006 D8):本方法**会等**收敛完成,
-   * 在 handler 内调用等于等自己退出 → 静默挂死;框架不设运行时重入守卫。处理器请求关闭
-   * 走只发信号的 `HandlerContext::RequestClose()`。
-   *
-   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:不具重连能力的传输(UDP / 串口 /
-   * TCP 服务端已接受连接)发生底层致命错误时,读循环退出而节点仍 Running,此时由读循环
-   * **自行**走上述同一条关闭路径(置 Closing + 发同一组汇合信号 + 收敛),宿主无需干预;
-   * 其可观察结果与外部发起关闭一致(SRS §3.1.6.3 第 7 条)。TCP 客户端无限重连,不自终。
-   */
-  Status Close();
-
-  /// @brief 等待节点收敛到 Closed(复用 SharedCompletion<void>,支持 deadline)。
-  ///        同 `Close`:**须由节点外部调用**(handler 内等待收敛 = 等自己退出,静默挂死;
-  ///        无运行时守卫,RT_LIFECYCLE_005 / ADR-0006 D8)。
-  [[nodiscard]] Status WaitClosed(OperationOptions options = {});
 
   /**
    * @brief 交付一次 needresponse 请求-响应。
@@ -254,9 +236,6 @@ class ProtocolNode {
   /// @brief 观测:当前在途(已登记未终结)请求数(≤256);背压 / 关联清理判据。
   [[nodiscard]] std::size_t PendingCount() const;
 
-  /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
-  [[nodiscard]] std::size_t CloseDropCount() const;
-
   /// @brief 观测:读循环单次 `codec_->Decode` 调用返回错误(坏帧 / codec 语义错误,该次
   ///        收到的整段字节判为不可解析而整体丢弃)的累计次数(P5-3,ADR-0003 D13;命名
   ///        归因 kBadFrame)。
@@ -270,21 +249,33 @@ class ProtocolNode {
   ///        完成调用时为 0。
   [[nodiscard]] Clock::duration LastHandlerDuration() const;
 
-  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
-  ///        关闭完成时为 0。
-  [[nodiscard]] Clock::duration LastCloseLatency() const;
+ protected:
+  // —— NodeBase 生命周期钩子(协议特有实事,ADR-0006 D1)————————————————————
+
+  /// @brief 校验 config(RT_LIFECYCLE_007):队列上界落 [1,65536] / [64KiB,256MiB]、
+  ///        key_strategy 两支非空、default_request_timeout 为正。非法返 kConfiguration
+  ///        (停 Created、不 latch start_done_、允许改配重试)。
+  Status ValidateConfig() const override;
+
+  /// @brief 首个 Start 的实事:transport.Start → `MarkRunning()` → spawn 读-分发循环 +
+  ///        (设了 handler 时)handler 消费者。**无能力探测、无按介质分支的第二条启动
+  ///        路径**(ADR-0004 D2)。传输启动失败即原样返回,基类退回 Created 允许重试。
+  Status DoStart() override;
+
+  /// @brief 关闭汇合信号(首个关闭者独占执行一次,`Close` 与致命错误自终共用):按序
+  ///        transport.RequestClose → 业务队列 Close + handler 协作取消 →
+  ///        PendingTable.FailAll(kClosed)(令在途请求恰好一次收敛)。
+  ///        断链**不是**收敛信号(ADR-0004 D3:在途请求只由总超时/取消/关闭终结)。
+  Status DoClose() override;
+
+  /// @brief 收敛:让出式 join handler 消费者 fiber(未设 handler 时立即返回)。
+  void JoinHandler() override;
+
+  /// @brief 收敛:Drain 业务队列内未启动的排队业务,返回条数(归因 close_drop 在基类)。
+  std::size_t DrainUnstartedBusiness() override;
 
  private:
   friend class HandlerContext;
-
-  /// @brief 只发关闭汇合信号、**不等待**收敛(转发 NodeRuntime::SignalClose)。
-  ///        `HandlerContext::RequestClose()` 的实现路径(ADR-0006 D8):内部工作单元唯一
-  ///        被授权的关闭入口,不含任何等待点。返回值仅表示"已受理",不表示"已关完";
-  ///        收敛由读循环完成。不入公开面——外部关闭一律用 `Close()`/`WaitClosed()`。
-  Status SignalClose();
-
-  /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
-  [[nodiscard]] Status ValidateConfig() const;
 
   /// @brief 读循环分发回调体(协议特有):Decode 一帧 → 逐条 Dispatch。runtime 骨架 Read
   ///        成功后调本回调(runtime 不 decode、不分类,守 RT_NODE_003)。
@@ -334,8 +325,8 @@ class ProtocolNode {
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
   PendingTable<ProtocolKey, Message> pending_;
-  /// 协议无关运行时机制(组合并驱动,ADR-0003 D10/D12):生命周期状态机 + 三方汇合 +
-  /// handler 消费者 fiber + 业务队列 + 读循环骨架。node 内联协议特有语义驱动它。
+  /// 读-分发循环骨架 + 可选 handler 消费者小件的持有者(过渡件,ADR-0006 D5 / #140 下放
+  /// 本类)。生命周期已上移基类,本件不再持有任何生命周期状态。
   NodeRuntime<Message> runtime_;
 
   mutable std::mutex mutex_;  ///< 守协议特有交互状态(session 空闲集、协议计数,D8)。

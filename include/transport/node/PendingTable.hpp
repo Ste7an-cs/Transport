@@ -20,7 +20,7 @@
  *
  * 简化沿革(#98 后续):此前每个 entry 背一个 `SharedCompletion<T>`(自带第二把 mutex +
  * 多等待者 waiter-map + 广播)。单等待者场景用不到多等待者机制;改用裸 `Awaitable<T>` +
- * 表锁作唯一仲裁点后,去掉该层。`SharedCompletion` 仍供 NodeRuntime 等多等待者 void 事件用。
+ * 表锁作唯一仲裁点后,去掉该层。`SharedCompletion` 仍供 NodeBase 等多等待者 void 事件用。
  */
 
 #include <chrono>

@@ -81,7 +81,7 @@ class BoundedQueue {
    * @param max_bytes    字节数上限,越界钳制到 [kMinBytes, kMaxBytes](默认 16 MiB)。
    * @param drop_reason  tail-drop 时的命名归因(P5-3,ADR-0003 D13 Q3);调用方按其归属
    *                     语义传入(如 `kBusinessQueueOverflow`/`kDdsHandoffOverflow`),
-   *                     默认 `kBusinessQueueOverflow`(最常见的调用方,NodeRuntime 业务队列)。
+   *                     默认 `kBusinessQueueOverflow`(最常见的调用方,HandlerLoop 业务队列)。
    * @param sink         可选 Trace 出口(RT_TRACE_002:为空时行为/计数不受影响,只少一次
    *                     判空之外的开销)。
    */

@@ -5,15 +5,18 @@
  * @brief DDS 交互节点 DdsNode(pub-sub + 多路请求-应答;RT_NODE_003 / RT_REQUEST /
  *        RT_IF_DDS / ADR-0003 D10/D12 Q2)。
  *
- * DdsNode **组合**(不继承、不共享引擎)`NodeRuntime`(P4-1 协议无关机制)+
+ * DdsNode **继承 `NodeBase`**(生命周期模板方法:基类管幂等与收敛,本类实现
+ * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)`NodeRuntime`
+ * (读循环骨架 + handler 消费者小件的过渡持有件)+
  * `DdsTransport`(P4-4 纯字节管道,经 ITransport)+ `DdsCodec`(线缆格式,经 ICodec)+
  * `PendingTable<std::string, Message>`(挂起-应答薄基座),交付 DDS 语义的多路请求-应答与
  * 单向发布订阅。
  *
  * **D10 可复用性实证**:关联键此处是 **correlation_id 字符串**——`PendingTable<Key,T>`
  * 一行不改,只把 Key 实例化为 std::string(P1 曾实例化为 uint32);`BoundedQueue` /
- * `NodeRuntime` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply` 终结判别、topic
- * 寻址、reply_to=inbox——**全部内联本类**;基座保持协议无关(RT_DESIGN_008 红线)。
+ * `NodeBase` / `NodeRuntime` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply`
+ * 终结判别、topic 寻址、reply_to=inbox——**全部内联本类**;基座保持协议无关
+ * (RT_DESIGN_008 红线)。
  *
  * **无连接**(D3′):无连接状态机 / 重连;底层 provider 致命 → 传输 Read 返 kClosed
  * (ADR-0004 D1 单一终止语义)→ 读循环退出 → Closing→Closed。判活(Liveliness/
@@ -36,6 +39,7 @@
 #include "transport/core/ITraceSink.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
+#include "transport/node/NodeBase.hpp"
 #include "transport/node/NodeRuntime.hpp"
 #include "transport/node/PendingTable.hpp"
 #include "transport/core/Result.hpp"
@@ -69,7 +73,7 @@ class DdsHandlerContext {
   /**
    * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
    *
-   * 走框架的发信号路径(`DdsNode::SignalClose` → `NodeRuntime::SignalClose`):置 Closing
+   * 走框架的发信号路径(`NodeBase::SignalClose`):置 Closing
    * (立即拒新交互)+ 发出全部汇合信号,随即返回;**不**调会等待的 `Close()`。节点由读循环
    * 在汇合完成后收敛到 Closed(ADR-0005 D1)。命名与 `ITransport::RequestClose()`(发信号)
    * / `WaitClosed()`(等待)的既有约定一致。
@@ -113,8 +117,9 @@ struct DdsNodeConfig {
   std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
   /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
   std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
-  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeRuntime
-  /// 业务队列与本类各丢弃归因点(kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured),
+  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeBase
+  /// (生命周期跃迁 + close_drop 归因)、NodeRuntime 业务队列与本类各丢弃归因点
+  /// (kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured),
   /// 并在 send/recv/decode/match/timeout/cancel/handler/close 等边界点上报事件。
   /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,`RecordEvent`/`RecordDrop`
   /// 仅一次判空。
@@ -122,56 +127,35 @@ struct DdsNodeConfig {
 };
 
 /**
- * @brief DDS 交互节点:组合 transport + codec + PendingTable + NodeRuntime,交付 DDS
- *        pub-sub 与多路请求-应答。
+ * @brief DDS 交互节点:继承 NodeBase(生命周期)+ 组合 transport + codec + PendingTable +
+ *        NodeRuntime,交付 DDS pub-sub 与多路请求-应答。
  *
- * 生命周期:Created→Running(Start)→Closing→Closed(Close)。不可拷贝、不可移动
- * (读-分发循环 fiber 捕获 this)。
+ * **生命周期全部由 `NodeBase` 承载**(ADR-0006 D1/D6):`Start()` / `Close()` /
+ * `WaitClosed()` / `IsRunning()` / `CloseDropCount()` / `LastCloseLatency()` 一律**继承自
+ * 基类**,本类只实现 DDS 特有的钩子(`ValidateConfig` / `DoStart` / `DoClose` /
+ * `JoinHandler` / `DrainUnstartedBusiness`)。Created→Running(Start)→Closing→Closed(Close)。
+ * - `Close()` 只发汇合信号 + 等收敛结果;收敛由读循环兼任(ADR-0005 D1)。关闭后
+ *   Request/Publish 一律 kClosed。**须由节点外部调用**(RT_LIFECYCLE_005 使用契约,
+ *   ADR-0006 D8):它**会等**收敛完成,在 handler 内调用等于等自己退出 → 静默挂死;框架不设
+ *   运行时重入守卫。处理器请求关闭走只发信号的 `DdsHandlerContext::RequestClose()`。
+ * - **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:DDS 非重连(断开即致命,Read 返
+ *   kClosed),此时读循环退出而节点仍 Running → 由读循环**自行**走同一条关闭路径,宿主
+ *   无需干预;可观察结果与外部发起关闭一致。
+ *
+ * 不可拷贝、不可移动(读-分发循环 fiber 捕获 this)。
  */
-class DdsNode {
+class DdsNode : public NodeBase {
  public:
   using Clock = OperationOptions::Clock;
 
   DdsNode(std::unique_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
           DdsNodeConfig config);
-  ~DdsNode();
+  /// @brief 析构即关闭:在**本类**析构体内调 `Close()`——彼时动态类型仍是 DdsNode,虚钩子
+  ///        可用、成员尚存(基类析构不得收敛,见 `NodeBase::~NodeBase`)。
+  ~DdsNode() override;
 
   DdsNode(const DdsNode&) = delete;
   DdsNode& operator=(const DdsNode&) = delete;
-
-  /**
-   * @brief 并发安全幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
-   *
-   * 首个 Start 先校验 config(inbox_topic/node_id 非空、队列上界落法定区间)→ 失败返
-   * kConfiguration、停 Created、允许改配重试;通过则做实事(transport.Start 订阅 topic 集
-   * + 置 Running + spawn 读循环/handler fiber)。无连接:不 spawn reactor(D3′)。已 Running
-   * 再启幂等成功;Closing/Closed 返 kInvalidState。
-   */
-  Status Start();
-
-  /**
-   * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006)。
-   *
-   * 首个关闭者:Running→Closing(立即拒新 Request/Publish)→ 汇合信号(transport.RequestClose
-   * + 业务队列 Close + 触发 handler 取消)+ PendingTable.FailAll(kClosed) 令在途 Request
-   * 恰好一次 kClosed 收敛,随后等收敛结果;收敛由读循环兼任(ADR-0005 D1):读循环退出 +
-   * (设 handler 时)等消费者 fiber 退出 → 置 Closed。后续关闭者共享 closed_(多等待者);
-   * 已 Closed 再关直接成功。关闭后 Request/Publish 一律 kClosed。
-   *
-   * **须由节点外部调用**(RT_LIFECYCLE_005 使用契约,ADR-0006 D8):本方法**会等**收敛完成,
-   * 在 handler 内调用等于等自己退出 → 静默挂死;框架不设运行时重入守卫。处理器请求关闭走
-   * 只发信号的 `DdsHandlerContext::RequestClose()`。
-   *
-   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:DDS 非重连(断开即致命,Read 返
-   * kClosed),此时读循环退出而节点仍 Running → 由读循环**自行**走上述同一条关闭路径,
-   * 宿主无需干预;可观察结果与外部发起关闭一致。
-   */
-  Status Close();
-
-  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline)。同 `Close`:**须由节点外部
-  ///        调用**(handler 内等待收敛 = 等自己退出,静默挂死;无运行时守卫,
-  ///        RT_LIFECYCLE_005 / ADR-0006 D8)。
-  [[nodiscard]] Status WaitClosed(OperationOptions options = {});
 
   /**
    * @brief 交付一次请求-应答(多路并发在途,各自 correlation_id 互不串)。
@@ -215,9 +199,6 @@ class DdsNode {
   /// @brief 观测:当前在途(已登记未终结)Request 数;关联清理判据。
   [[nodiscard]] std::size_t PendingCount() const;
 
-  /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
-  [[nodiscard]] std::size_t CloseDropCount() const;
-
   /// @brief 观测:读循环 `codec_->Decode` 失败(坏 sample / codec 语义错误)而丢弃的累计
   ///        次数(P5-3,ADR-0003 D13;命名归因 kBadFrame)。
   [[nodiscard]] std::size_t BadFrameCount() const;
@@ -230,21 +211,32 @@ class DdsNode {
   ///        完成调用时为 0。
   [[nodiscard]] Clock::duration LastHandlerDuration() const;
 
-  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
-  ///        关闭完成时为 0。
-  [[nodiscard]] Clock::duration LastCloseLatency() const;
+ protected:
+  // —— NodeBase 生命周期钩子(DDS 特有实事,ADR-0006 D1)——————————————————————
+
+  /// @brief 校验 config(RT_LIFECYCLE_007):inbox_topic / node_id 非空、队列上界落法定
+  ///        区间。非法返 kConfiguration(停 Created、不 latch start_done_、可改配重试)。
+  Status ValidateConfig() const override;
+
+  /// @brief 首个 Start 的实事:transport.Start(Init + 订阅 topic 集)→ `MarkRunning()` →
+  ///        spawn 读-分发循环 +(设了 handler 时)handler 消费者。**无连接**:不 spawn
+  ///        reactor(D3′)。三介质(含 DDS)共用同一段无分支读循环(ADR-0004 D1/D2)。
+  Status DoStart() override;
+
+  /// @brief 关闭汇合信号(首个关闭者独占执行一次,`Close` 与致命错误自终共用):按序
+  ///        transport.RequestClose → 业务队列 Close + handler 协作取消 →
+  ///        PendingTable.FailAll(kClosed)(令在途 Request 恰好一次 kClosed 收敛)。
+  ///        无 reactor(无连接),故无额外取消源。
+  Status DoClose() override;
+
+  /// @brief 收敛:让出式 join handler 消费者 fiber(未设 handler 时立即返回)。
+  void JoinHandler() override;
+
+  /// @brief 收敛:Drain 业务队列内未启动的排队业务,返回条数(归因 close_drop 在基类)。
+  std::size_t DrainUnstartedBusiness() override;
 
  private:
   friend class DdsHandlerContext;
-
-  /// @brief 只发关闭汇合信号、**不等待**收敛(转发 NodeRuntime::SignalClose)。
-  ///        `DdsHandlerContext::RequestClose()` 的实现路径(ADR-0006 D8):内部工作单元
-  ///        唯一被授权的关闭入口,不含任何等待点。返回值仅表示"已受理",不表示"已关完"。
-  ///        不入公开面——外部关闭一律用 `Close()`/`WaitClosed()`。
-  Status SignalClose();
-
-  /// @brief 校验 config(RT_LIFECYCLE_007);非法返 kConfiguration(停 Created 可重试)。
-  [[nodiscard]] Status ValidateConfig() const;
 
   /// @brief 读循环分发回调体(协议特有):Decode 一 sample → 填 source/topic → 逐条 Dispatch。
   ///        runtime 骨架 Read 成功后调本回调(runtime 不 decode、不分类,守 RT_NODE_003)。
@@ -264,8 +256,8 @@ class DdsNode {
   DdsNodeConfig config_;
   /// 关联表:correlation_id 字符串键(D10 实证——PendingTable 一行不改,仅换 Key 类型)。
   PendingTable<std::string, Message> pending_;
-  /// 协议无关运行时机制(组合并驱动,ADR-0003 D10/D12):生命周期状态机 + 三方汇合 +
-  /// handler 消费者 fiber + 业务队列 + 读循环骨架。node 内联 DDS 特有语义驱动它。
+  /// 读-分发循环骨架 + 可选 handler 消费者小件的持有者(过渡件,ADR-0006 D5 / #140 下放
+  /// 本类)。生命周期已上移基类,本件不再持有任何生命周期状态。
   NodeRuntime<Message> runtime_;
 
   mutable std::mutex mutex_;  ///< 守 DDS 特有交互状态(correlation 计数、观测计数,D8)。

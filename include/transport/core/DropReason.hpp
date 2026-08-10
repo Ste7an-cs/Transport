@@ -23,7 +23,7 @@ namespace transport {
 /// - `kDdsHandoffOverflow`      -> `DdsTransport` listener 交接满
 /// - `kBadFrame`                -> 各 node 读循环 `codec.Decode` 失败
 /// - `kUnmatchedOrLateResponse` -> 各 node `Dispatch` 的 `PendingTable::Resolve` 返回 false
-/// - `kCloseDrop`               -> `NodeRuntime` 关闭 drain
+/// - `kCloseDrop`               -> `NodeBase` 收敛 drain
 /// - `kNoHandlerConfigured`     -> 各 node `Dispatch` 未设 handler
 ///
 /// 原第七项「连接代际隔离丢弃」(`ProtocolNode` reactor 断连收敛)随 ADR-0004 D3
