@@ -275,6 +275,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **Endpoint**：`kDefault`（config 默认目的地）/`kNet(ip,port)`/`kTopic(name)`，经 `SendUnit.destination`/`Datagram.source` 统一寻址。
 - **Cancellation**：`CancellationSource.token()` 派发 `CancellationToken`；`Register(cb)` 返回 `CancellationRegistration`（RAII，`Reset` 解注册）；`Cancel` 触发全部回调。
 - **SharedCompletion<T>**：共享 `State{mutex; StoredResult completion; Awaitable<void> broadcast}`；`Complete` 锁内首胜置结果、锁外 `close()` **广播唤醒全部等待者**；`Wait` 已完成即返，否则 `await`/`await_for(deadline)`，醒来读已存结果，超时置 kTimeout。**仅供多等待者 void 事件**（`NodeBase`/各传输 closed/TcpServer），PendingTable 不再用它。
+  **正确性依据（关键）**：`Coro::Awaitable` 底层 `FiberChannel` 的 `closed_` 是**持久 latch**（`std::atomic_bool`，`close()` 幂等置一次、不复位，随后 `notify_all()`；`pop`/`pop_wait_for` 的谓词均含 `closed_.load()`）。故"查已存结果落空 → 尚未 `await`"这段窗口内发生的 `Complete` **不会丢唤醒**——随后的 `await` 在已关闭通道上立即返回。若 `close()` 只是无 latch 的 `notify_all`，此处即为丢唤醒窗口。`await_for` 超时只 `return timeout`、不触碰 `closed_`，故超时不殃及其他等待者。
   **变更（ADR-0006 D3）**：原实现为每等待者分配独立 `Awaitable` 并维护 `map<id, weak_ptr>`（124 行），其唯一必要性是**每等待者独立取消**——deadline 不需要它（`Awaitable::await_for` 超时返回 `timed_out` 而不关闭 channel），而 `Awaitable::close()` 本就是广播。全仓生产代码无一处向 `WaitClosed` 传取消令牌，故取消能力连同 waiter map 一并移除（约 30 行取代 124 行）。
 - **观测**：`RecordDrop(reason, counter, sink)`（计数 pull + 可选 Trace push，持锁调用）；`RecordEvent(category, sink, ...)`（仅 push）；`DropReason` **六项**（原七项，`kGenerationIsolationDrop` 随 ADR-0004 D3 撤销代际隔离而移除）；`TraceCategories` 九类常量单一权威。
 

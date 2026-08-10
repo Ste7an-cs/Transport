@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### ⚠ 能力移除:SharedCompletion 轻量化为广播完成量(ADR-0006 D3,#137)
+
+> 依 ADR-0006 **D3**。`SharedCompletion<T>` 由「waiter map + 每等待者独立 `Awaitable`」改为「**存结果 + 一条共享 `Awaitable` + `close()` 广播**」,类体 92 → 48 行(整文件 124 → 60 行)。全仓 12+ 处实例(7 个传输的 `closed`、`TcpServer` 3 处、node 侧 3 处)**调用代码零改动**。
+
+- **⚠ 能力移除**(**破坏性**) `WaitClosed(OperationOptions)` 不再支持 **`cancellation` 取消令牌**;传入的令牌被**静默忽略**。`deadline` 支持不变。依据:全仓生产代码无任何一处向 `WaitClosed` 传取消令牌;`Awaitable::await_for` 超时返回 `timed_out` 而**不关闭 channel**,故 deadline 本就不需要为每等待者分配独立通道。SRS §3.2.2 接口变更登记已记。
+- **测试变动**(随能力移除,**非断言放松**) 删除 `CoroSharedCompletion.CancellationOnlyEndsTheCancelledWaiter` 与 `PreCancelledWaitReturnsCancelled`(后者在新实现下会永久挂起);`CoroFakeTransport.WaiterTimeoutAndCancellationAreLocal` 拆分,保留超时局部性部分并改名 `WaiterTimeoutIsLocal`。**新增** `TimedOutWaitLeavesCompletionUsableForLaterWaiters`,覆盖共享通道特有的新风险(超时若误关通道,其后**新进场**的等待者将等不到广播)。`CompleteBeforeCancelReturnsCompletedValue` 等保留,现作为"令牌被静默忽略"的护栏。
+- **正确性依据** 底层 `FiberChannel::closed_` 是**持久 latch**(`close()` 幂等置一次、不复位;`pop`/`pop_wait_for` 谓词均含 `closed_.load()`),故"查结果落空 → 尚未 await"窗口内发生的 `Complete` 不会丢唤醒。此依据 ADR-0006 初稿未点明,已回填 SDD §5.1。
+- **验证** 全量 292 tests `--gtest_repeat=3` 三轮一致(291 通过 / 1 既有失败 #123),无挂起;`CoroSharedCompletion.*:CoroFakeTransport.*` ×20 轮全绿。
+
 ### 功能:致命错误自终,落地 RT_LIFECYCLE_008(ADR-0005 D5,#120)
 
 > 依 ADR-0005 **D5** / RT_LIFECYCLE_008。此前节点因底层致命错误而收发终止后会停留在 `Running`,读-分发循环退出后常驻在收敛入口等待外部关闭,`WaitClosed` 的等待者永不被唤醒(僵尸节点)。本次消除该状态。
@@ -34,7 +43,7 @@
 - **变更** `NodeRuntime::Close` 退化为"发汇合信号 + 等待收敛结果":置 `Closing` → `transport.RequestClose` + 业务队列 `Close` + handler 协作取消 + node 侧收敛回调 → 放行读循环收敛 → 等 `closed_`。**不再 spawn 独立 finalizer fiber**;`Close` 时节点内不再新增任何 fiber。
 - **变更** 读-分发循环退出后**兼任收敛者**(`ConvergeAfterReadLoop`):等关闭汇合信号 → 等 handler 退出(以 `FiberTask::get()` join,仍等实退出、不强杀)→ Drain 未启动业务归因 `close_drop` → 置 `Closed` + 记关闭时延 → `closed_.Complete` 唤醒全部等待者。**结构约束**:收敛走内部路径,读循环不得调用公开的 `Close()`(那会等待自身退出)。
 - **删除** `loop_done_`(无人再等"读循环已退出"——它自己就是收敛者);新增内部 `close_signalled_` 承接"首个 `Close` 已发出全部汇合信号",使读循环因致命错误先行退出时挂在收敛入口等待外部关闭(致命错误自终属 RT_LIFECYCLE_008 / ADR-0005 D5,另票)。
-- **保持不变** `closed_` / `start_done_` 仍为 `SharedCompletion`(ADR-0005 **D3**:每等待者独立 deadline/取消,不可换共享 `Awaitable`);`LastCloseLatency` / `close_drop` 归因 / 多等待者 `WaitClosed` 行为均不变。
+- **保持不变** `closed_` / `start_done_` 仍为 `SharedCompletion`(ADR-0005 **D3**:每等待者独立 deadline/取消,不可换共享 `Awaitable`——**该理由已由 ADR-0006 D3 修正并取代**,见本文件 #137 条目);`LastCloseLatency` / `close_drop` 归因 / 多等待者 `WaitClosed` 行为均不变。
 - **验证** 全量 291 tests `--gtest_repeat=5` 与 master 基线逐轮一致(287 通过 / 3 skip(#112)/ 1 既有失败 #123),**无挂起**;四个生命周期用例文件 `--gtest_repeat=20` 全绿无挂起。
 - **文档** SDD 新增 **DD-13**、§4.2.5/§4.2.10/§5.4 按新收敛路径重写;SRS §4.4 更新 RT_LIFECYCLE_005/008 的现状描述;时序图 `seq-close` 与状态图 `state-node-lifecycle` 重画并重渲染,`arch-class`/`sdd-csc-node`/`dfd-toplevel` 同步。
 
