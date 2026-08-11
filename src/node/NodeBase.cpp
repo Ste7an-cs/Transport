@@ -19,6 +19,9 @@ NodeBase::NodeBase(ITraceSink* trace_sink) : trace_sink_(trace_sink) {}
 NodeBase::~NodeBase() = default;
 
 Status NodeBase::Start() {
+  // 本次启动**尝试**的完成量。并发者在临界区内捕获它,故只会拿到自己加入的那次
+  // 尝试的结果;下一次尝试另起一个,失败结果不跨尝试泄漏(#150)。
+  std::shared_ptr<SharedCompletion<void>> attempt;
   bool do_init = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -30,27 +33,37 @@ Status NodeBase::Start() {
         return make_error_code(TransportErrc::kInvalidState);
       case LifecycleState::kCreated:
         if (starting_) {
-          break;  // 已有 Start 在初始化 → 出临界区 await 同一 start_done_,不重复 spawn。
+          // 已有 Start 在初始化 → 加入**该次**尝试,不重复 spawn。
+          // 不变式:starting_ ⇒ start_attempt_ 非空(二者同锁置位/清空)。
+          attempt = start_attempt_;
+          break;
         }
-        // 首个 Start:先校验(失败停 Created、start_done_ 不 latch、可重试)。
+        // 首个 Start:先校验(失败停 Created、不建尝试完成量、可改配后重试)。
         if (auto valid = ValidateConfig(); !valid) {
           return valid;
         }
         starting_ = true;
         do_init = true;
+        start_attempt_ = std::make_shared<SharedCompletion<void>>();
+        attempt = start_attempt_;
         break;
     }
   }
   if (!do_init) {
-    return start_done_.Wait();  // 并发 Start:共享首个 Start 的结果,不重复创建资源。
+    return attempt->Wait();  // 共享**本次**尝试的结果。
   }
 
   Status started = DoStart();  // 子实事:失败时未 MarkRunning、仍在 Created。
-  if (!started) {
+  {
     std::lock_guard<std::mutex> lock(mutex_);
-    starting_ = false;  // 退回 Created 允许重试;并发 await 者共享此失败结果。
+    if (!started) {
+      starting_ = false;  // 退回 Created 允许重试。
+    }
+    // 本次尝试就此了结:清空成员,使下一次 Start 另建完成量。已在等待的并发者持
+    // 有 shared_ptr、不受影响,它们等到的正是本次结果。
+    start_attempt_.reset();
   }
-  start_done_.Complete(started);
+  attempt->Complete(started);  // 唤醒锁外(D8 同步纪律)。
   return started;
 }
 

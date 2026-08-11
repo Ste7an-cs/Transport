@@ -36,6 +36,7 @@
  */
 
 #include <cstddef>
+#include <memory>
 #include <mutex>
 
 #include "transport/core/ITraceSink.hpp"
@@ -227,7 +228,9 @@ class NodeBase {
   /// 写一次(构造)不再变,读不需持锁。
   ITraceSink* trace_sink_{nullptr};
 
-  SharedCompletion<void> start_done_;  ///< 首个 Start 初始化结果(并发 Start 共享)。
+  /// 本次启动**尝试**的完成量(并发 Start 共享它,不重复创建资源)。
+  /// 非空 ⇔ 有一次尝试正在进行;每次尝试另建一个,故失败结果不跨尝试泄漏(#150)。
+  std::shared_ptr<SharedCompletion<void>> start_attempt_;
   /// 首个关闭者(外部 `Close` 或致命错误自终的读循环自身,D5)已发出全部汇合信号
   /// (读循环退出后据此放行收敛;D1)。
   SharedCompletion<void> close_signalled_;

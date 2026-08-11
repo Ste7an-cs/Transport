@@ -25,7 +25,11 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <system_error>
 #include <vector>
+
+#include <boost/fiber/operations.hpp>
 
 #include "await/awaitable.hpp"
 #include "task/fibertask.h"
@@ -33,7 +37,12 @@
 #include "transport/core/DropReason.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/core/TransportTypes.hpp"
+#include <QHostAddress>
+#include <QUdpSocket>
+
 #include "transport/codec/SystemCodec.hpp"
+#include "transport/io/ITransport.hpp"
+#include "transport/io/udp/UdpTransport.hpp"
 #include "coro_test_util.hpp"
 #include "fake_coro_transport.hpp"
 
@@ -52,6 +61,8 @@ using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Status;
 using transport::SystemCodec;
+using transport::UdpConfig;
+using transport::UdpTransport;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -466,4 +477,104 @@ TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminationFailsInFlightRequest) {
   EXPECT_EQ(node.PendingCount(), 0u);
   EXPECT_TRUE(request.get());
   EXPECT_TRUE(node.WaitClosed());  // 已自行收敛:不挂起。
+}
+
+// -----------------------------------------------------------------------------
+// RT_LIFECYCLE_003 / issue #150:启动尝试的结果**不得跨尝试泄漏**。
+//
+// `start_done_` 曾是节点级的一次性完成量:首次 DoStart 失败会把失败 latch 住,此后
+// 宿主排障重试并成功,**重试期间并发进来的** Start 仍会从该完成量取到那次陈旧失败
+// (直接调用者不受影响——它拿的是 DoStart 的实时返回值)。后果是"报错与事实相反":
+// 并发方认定节点没起来,可能告警、降级、甚至反手 Close 一个正常运行的节点。
+//
+// 载体用 **UDP 端口冲突**(真实介质、无外设依赖):占住端口使 bind 失败,释放后重试。
+// TCP 客户端产生不了 DoStart 失败(ADR-0004:Start 不要求首次连接已建立),不适用。
+//
+// **为什么要注入一次让出**:`UdpTransport::Start()` 全程无挂起点,而 `Coro::makeTask`
+// 默认 `Affinity::fixed(当前线程)`。单线程协作调度下第二条 fiber 只能等第一条跑完才
+// 运行,那时 `lifecycle_` 已是 `Running`、直接早返,**永远走不到并发等待者那条路径**,
+// 用例就失去判别力(修与不修都通过——我先写出的版本正是如此)。真实宿主上该窗口
+// 由 M:N 的跨线程并行提供(DD-2;RT_CORO_RUNTIME_005 允许从任意 fiber 调用),测试里
+// 以下面这层**只注入让出、不改任何 UDP 行为**的委托传输等价地造出该窗口。
+// -----------------------------------------------------------------------------
+namespace {
+
+// 透明委托给内层传输,仅在 Start() 内让出一次,把"DoStart 进行中"变成可被并发观察
+// 到的状态。其余方法逐一直传,不改变任何语义。
+class YieldOnStartTransport final : public transport::ITransport {
+ public:
+  explicit YieldOnStartTransport(std::unique_ptr<transport::ITransport> inner)
+      : inner_(std::move(inner)) {}
+
+  Status Start() override {
+    boost::this_fiber::yield();  // 唯一的注入点:制造 DoStart 进行中的调度窗口。
+    return inner_->Start();
+  }
+  transport::Result<transport::Datagram> Read(OperationOptions o = {}) override {
+    return inner_->Read(std::move(o));
+  }
+  Status Write(transport::SendUnit unit) override {
+    return inner_->Write(std::move(unit));
+  }
+  Status RequestClose() override { return inner_->RequestClose(); }
+  [[nodiscard]] Status WaitClosed(OperationOptions o = {}) override {
+    return inner_->WaitClosed(std::move(o));
+  }
+  [[nodiscard]] std::optional<transport::ITransport::Clock::time_point>
+  LastSendTime() const override {
+    return inner_->LastSendTime();
+  }
+  [[nodiscard]] std::optional<transport::ITransport::Clock::time_point>
+  LastReceiveTime() const override {
+    return inner_->LastReceiveTime();
+  }
+  [[nodiscard]] std::error_code LastError() const override {
+    return inner_->LastError();
+  }
+  [[nodiscard]] transport::LinkState CurrentLinkState() const override {
+    return inner_->CurrentLinkState();
+  }
+
+ private:
+  std::unique_ptr<transport::ITransport> inner_;
+};
+
+}  // namespace
+
+TEST(ProtocolNodeLifecycle, StartAttemptResultDoesNotLeakAcrossRetries) {
+  QUdpSocket occupier;
+  ASSERT_TRUE(occupier.bind(QHostAddress(QHostAddress::LocalHost), quint16{0}));
+  const quint16 port = occupier.localPort();
+
+  UdpConfig cfg;
+  cfg.local_addr = "127.0.0.1";
+  cfg.local_port = port;
+  ProtocolNode node(
+      std::make_unique<YieldOnStartTransport>(std::make_unique<UdpTransport>(cfg)),
+      std::make_unique<SystemCodec>());
+
+  // ① 首个 Start:bind 撞上被占端口 → 失败,节点停在 Created(RT_LIFECYCLE_007)。
+  const Status first = node.Start();
+  ASSERT_FALSE(first) << "端口被占用时 bind 应失败";
+  ASSERT_FALSE(node.IsRunning());
+
+  // ② 排障:释放端口。此后重试应当成功。
+  occupier.close();
+
+  // ③ 重试与并发 Start 同时在途:retrier 在注入的让出点交出执行权,joiner 此时
+  //    观察到 starting_ == true 而成为**本次尝试**的等待者。两者都必须看到本次
+  //    结果(成功),而不是第 ① 步那次已结束尝试的失败。
+  Status retry{make_error_code(TransportErrc::kInternal)};
+  Status concurrent{make_error_code(TransportErrc::kInternal)};
+  auto retrier = Coro::makeTask([&] { retry = node.Start(); });
+  auto joiner = Coro::makeTask([&] { concurrent = node.Start(); });
+  ASSERT_TRUE(retrier.get());
+  ASSERT_TRUE(joiner.get());
+
+  EXPECT_TRUE(retry) << "排障后重试应成功:" << retry.error().message();
+  EXPECT_TRUE(concurrent)
+      << "并发 Start 拿到了上一次尝试的陈旧失败:" << concurrent.error().message();
+  EXPECT_TRUE(node.IsRunning());
+
+  EXPECT_TRUE(node.Close());
 }
