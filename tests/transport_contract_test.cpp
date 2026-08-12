@@ -1,8 +1,10 @@
 #include <chrono>
+#include <memory>
 #include <type_traits>
 
 #include <gtest/gtest.h>
 
+#include "await/awaitable.hpp"
 #include "transport/io/ITransport.hpp"
 
 using transport::Endpoint;
@@ -36,8 +38,11 @@ TEST(CoroTransportContract, InterfaceIsInternalPolymorphicSeam) {
   static_assert(std::has_virtual_destructor_v<ITransport>);
   static_assert(std::is_same_v<decltype(&ITransport::Start),
                                transport::Status (ITransport::*)()>);
-  static_assert(std::is_same_v<decltype(&ITransport::Read),
-                               transport::Result<Datagram> (ITransport::*)(OperationOptions)>);
+  // Read 交出 read_queue 的等待器句柄,且**不接受 OperationOptions**(ADR-0007 D4)。
+  static_assert(
+      std::is_same_v<decltype(&ITransport::Read),
+                     std::shared_ptr<Coro::Awaitable<Datagram>> (
+                         ITransport::*)()>);
   static_assert(std::is_same_v<decltype(&ITransport::Write),
                                transport::Status (ITransport::*)(SendUnit)>);
   static_assert(std::is_same_v<decltype(&ITransport::RequestClose),

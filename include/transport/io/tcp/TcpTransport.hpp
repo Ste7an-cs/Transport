@@ -22,6 +22,10 @@ namespace transport {
  * 连接建立、自动重连、运行时重配置不在本类职责(见连接管理 spec);构造时接管一个
  * 已连接的 QAbstractSocket,客户端与服务端已接受连接共享本实现,不向用户暴露
  * corosocket。发送路径遵守 ITransport 契约的可观察发送完成语义。
+ *
+ * 读侧为泵形态(ADR-0007 D1/D4):`Start()` 起数据泵 fiber 把 readAll 流的每片字节转成
+ * `Datagram` 投入内部 `read_queue`,`Read()` 只交出该队列句柄。写侧仍是同步背压语义
+ * (`write_queue` 见 ADR-0007 D3,留后续票)。
  */
 // 发送路径可观察语义细则:
 //   * RT_TRANSPORT_008 一次发送在帧字节全部离开框架用户态发送缓冲、进入操作系统
@@ -50,13 +54,14 @@ class TcpTransport final : public ITransport {
   /// @return 成功;非法生命周期或无 socket 返回 InvalidState。
   Status Start() override;
 
-  /// @brief 读一片已到达字节(拉模型,单一顺序读者;流式,一次一任意切片)。
-  /// @param options 取消信号与截止时间。
-  /// @return 一片 Datagram;超时 Timeout、取消 Cancelled(均为可继续的瞬时错误);
-  ///         **传输终结** Closed——本类不重连,故对端断开/底层致命错误与我方关闭
-  ///         同以 Closed 收敛,调用方应停止读取(RT_TRANSPORT_008 / ADR-0004 D1);
-  ///         底层成因经 LastError() 诊断。
-  Result<Datagram> Read(OperationOptions options = {}) override;
+  /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);每个元素是一片已到达字节
+  ///        (流式,一次一任意切片)。
+  /// @return `read_queue` 句柄:deadline/取消/是否 `shared()` 扇出由调用方自理,
+  ///         传输层不设单读守卫。**传输终结**表现为队列被 `close(kClosed)`——本类
+  ///         不重连,故对端断开/底层致命错误与我方关闭同以 kClosed 收敛,调用方
+  ///         `await` 得到它后应停止读取(RT_TRANSPORT_008 / ADR-0004 D1 经 D4 改写);
+  ///         底层成因经 LastError() 诊断。未 Start 时给出以 kInvalidState 关闭的句柄。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override;
 
   /// @brief 发送一帧;仅在帧字节全部离开框架用户态缓冲、进入操作系统发送缓冲后
   ///        才报告成功(RT_TRANSPORT_008)。并发写按到达顺序排队串行化。

@@ -209,8 +209,10 @@ TEST(ProtocolNodeLifecycle, CloseCooperativelyCancelsHandlerAndWakesAllWaiters) 
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();
   std::atomic_bool handler_returned{false};
+  std::atomic_bool handler_entered{false};
   ProtocolNodeConfig config;
-  config.handler = [&handler_returned](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+    handler_entered.store(true);
     ctx.cancellation().Wait();  // 协作取消:阻塞至 Close 触发令牌再返回。
     handler_returned.store(true);
     return Status{};
@@ -219,9 +221,10 @@ TEST(ProtocolNodeLifecycle, CloseCooperativelyCancelsHandlerAndWakesAllWaiters) 
                     std::move(config));
   ASSERT_TRUE(node.Start());
 
-  // 一帧业务被消费者取走并卡在协作取消等待点(handler 正在运行)。
+  // 一帧业务被消费者取走并卡在协作取消等待点(handler 正在运行)。同步点由"读循环回到
+  // 在途读"改为"handler 已进入"(单读守卫随 ADR-0007 D4 删除,ActiveRead 观测面消失)。
   fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  ASSERT_TRUE(pumpFiberUntil([&] { return fake->ActiveRead(); }));
+  ASSERT_TRUE(pumpFiberUntil([&] { return handler_entered.load(); }));
 
   // 多个 WaitClosed 等待者。
   std::atomic_int woken{0};

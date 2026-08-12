@@ -19,13 +19,17 @@ namespace transport {
 /**
  * @brief 协程原生 UDP 传输——无连接、报文式字节管道(ITransport 实现)。
  *
- * 基于 AsyncTask `coroudpsocket`:`Read()` 收一条完整报文,`source` 填发送方地址
- * (from 可变);`Write(SendUnit)` 按 `destination`(须为 `kNet`)发往不同地址,
- * 一次一报文。UDP 无连接:不构造伪连接状态,只暴露 I/O 事实(最近收发时间戳、
- * 单操作错误,RT_NODE_006/ADR-0002 D3);底层致命 I/O 使生命周期 `Closing→Closed`
- * 而非重连(ADR-0002 D3′),读取以 `Closed` 收敛(ADR-0004 D1)。socket 在调用
- * `Start()` 的 fiber(节点执行域)内创建
- * 并绑定,守亲和纪律。
+ * 基于 AsyncTask `coroudpsocket`:`Start()` 起**数据泵** fiber,反复取报文投入内部
+ * `read_queue`(ADR-0007 D1);`Read()` 只**交出该队列的等待器句柄**,每个元素是一条
+ * 完整报文、`source` 填发送方地址(from 可变);`Write(SendUnit)` 按 `destination`
+ * (须为 `kNet`)发往不同地址,一次一报文。UDP 无连接:不构造伪连接状态,只暴露 I/O
+ * 事实(最近收发时间戳、单操作错误,RT_NODE_006/ADR-0002 D3);底层致命 I/O 使生命
+ * 周期 `Closing→Closed` 而非重连(ADR-0002 D3′),终止表现为 `read_queue` 被
+ * `close(kClosed)`(ADR-0004 D1,表达经 ADR-0007 D4 改写)。socket 在调用 `Start()`
+ * 的 fiber(节点执行域)内创建并绑定,守亲和纪律。
+ *
+ * 本轮只做读侧句柄化:外层 socket 管理循环(bind 失败无限重试、UDP 不自终)与
+ * `write_queue` 见 ADR-0007 D2/D3,留后续票。
  */
 // 与 TCP 的差异:UDP `writeDatagram` 是同步非阻塞的单报文原子发送——要么整报文
 // 进入操作系统发送缓冲、要么失败,无短写/部分写、无背压刷缓冲循环、无写槽串行化。
@@ -46,13 +50,15 @@ class UdpTransport final : public ITransport {
   /// @return 成功;非法生命周期 InvalidState;bind 失败 Io。
   Status Start() override;
 
-  /// @brief 收一条完整报文(拉模型,单一顺序读者);source 填发送方地址(from 可变)。
-  /// @param options 截止时间(取消见 TCP 读侧同理:持久单流不逐读取消)。
-  /// @return 一条 Datagram;超时 Timeout(可继续的瞬时错误);**传输终结** Closed
-  ///         ——UDP 不重连,故 socket 级致命 I/O 与我方关闭同以 Closed 收敛,调用方
-  ///         应停止读取(RT_TRANSPORT_008 / ADR-0004 D1);底层成因经 LastError()
-  ///         诊断。单次发送的可恢复失败不经本路径(见 Write)。
-  Result<Datagram> Read(OperationOptions options = {}) override;
+  /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);每个元素是一条完整报文,
+  ///        `source` 填发送方地址(from 可变)。
+  /// @return `read_queue` 句柄:deadline/取消/是否 `shared()` 扇出由调用方自理,
+  ///         传输层不设单读守卫。**传输终结**表现为队列被 `close(kClosed)`——UDP
+  ///         不重连,故 socket 级致命 I/O 与我方关闭同以 kClosed 收敛,调用方
+  ///         `await` 得到它后应停止读取(RT_TRANSPORT_008 / ADR-0004 D1 经 D4 改写);
+  ///         底层成因经 LastError() 诊断。单次发送的可恢复失败不经本路径(见 Write)。
+  ///         未 Start 时给出以 kInvalidState 关闭的句柄。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override;
 
   /// @brief 发一条报文;一次一完整报文。寻址:`kDefault` → 解析为 UdpConfig 默认目的地
   ///        (remote_addr/multicast_group + remote_port,让 ProtocolNode 等恒发 Default 的

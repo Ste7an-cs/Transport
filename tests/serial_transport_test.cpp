@@ -104,7 +104,7 @@ std::vector<std::uint8_t> ReadTransport(SerialTransport& t, std::size_t n,
   while (got.size() < n && OperationOptions::Clock::now() < stop) {
     OperationOptions opts;
     opts.deadline = OperationOptions::Clock::now() + 200ms;
-    auto r = t.Read(opts);
+    auto r = testutil::ReadOnce(t, opts);
     if (r) {
       got.insert(got.end(), r.value().bytes.begin(), r.value().bytes.end());
     } else if (r.error() != make_error_code(TransportErrc::kTimeout)) {
@@ -148,7 +148,7 @@ TEST(CoroSerialTransport, PeerWriteReachesTransport) {
 
   OperationOptions opts;
   opts.deadline = OperationOptions::Clock::now() + 3s;
-  auto first = t.Read(opts);
+  auto first = testutil::ReadOnce(t, opts);
   ASSERT_TRUE(first) << first.error().message();
   EXPECT_EQ(first.value().source.kind, Endpoint::Kind::kDefault);
   std::vector<std::uint8_t> got(first.value().bytes.begin(),
@@ -226,7 +226,7 @@ TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
     entered.resolve();
     OperationOptions opts;
     opts.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = t.Read(opts);
+    auto r = testutil::ReadOnce(t, opts);
     read_ok = static_cast<bool>(r);
     if (!r) read_err = r.error();
   });
@@ -243,7 +243,7 @@ TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
   OperationOptions wopts;
   wopts.deadline = OperationOptions::Clock::now() + 2s;
   EXPECT_TRUE(t.WaitClosed(wopts));
-  auto after = t.Read();
+  auto after = testutil::ReadOnce(t);
   EXPECT_FALSE(after);
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
 }
@@ -265,7 +265,7 @@ TEST(CoroSerialTransport, RequestCloseWakesPendingReadWithClosed) {
     entered.resolve();
     OperationOptions opts;
     opts.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = t.Read(opts);
+    auto r = testutil::ReadOnce(t, opts);
     read_ok = static_cast<bool>(r);
     if (!r) read_err = r.error();
   });
@@ -280,8 +280,10 @@ TEST(CoroSerialTransport, RequestCloseWakesPendingReadWithClosed) {
   ::close(pty.master);
 }
 
-// 单读者:已有在途 Read 时并发第二个 Read → InvalidState。
-TEST(CoroSerialTransport, ConcurrentSecondReadIsInvalidState) {
+// ADR-0007 D4:单读守卫已删除——已有在途读者时,并发第二个读者**不再被拒**
+// (此前返 kInvalidState):两者同挂在 read_queue 上,无数据则各按自己的 deadline
+// 以 kTimeout 收敛(抢占式共读,socket 的 read 本就如此)。
+TEST(CoroSerialTransport, ConcurrentSecondReadIsNotRejected) {
   PtyPair pty = MakePty();
   ASSERT_TRUE(pty.ok);
   SerialConfig cfg;
@@ -296,18 +298,19 @@ TEST(CoroSerialTransport, ConcurrentSecondReadIsInvalidState) {
     entered.resolve();
     OperationOptions opts;
     opts.deadline = OperationOptions::Clock::now() + 300ms;
-    auto r = t.Read(opts);
+    auto r = testutil::ReadOnce(t, opts);
     first_ok = static_cast<bool>(r);
     if (!r) first_err = r.error();
   });
   ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让第一个 Read 占住读槽。
+  boost::this_fiber::sleep_for(30ms);  // 让第一个读者先挂到 read_queue 上。
 
   OperationOptions opts;
-  opts.deadline = OperationOptions::Clock::now() + 3s;
-  auto second = t.Read(opts);
+  opts.deadline = OperationOptions::Clock::now() + 200ms;
+  auto second = testutil::ReadOnce(t, opts);
   ASSERT_FALSE(second);
-  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kTimeout));
 
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(first_ok);
@@ -327,7 +330,7 @@ TEST(CoroSerialTransport, DeadlineTimeoutDoesNotStopStream) {
 
   OperationOptions timeout_opts;
   timeout_opts.deadline = OperationOptions::Clock::now() + 60ms;
-  auto timed_out = t.Read(timeout_opts);
+  auto timed_out = testutil::ReadOnce(t, timeout_opts);
   ASSERT_FALSE(timed_out);
   EXPECT_EQ(timed_out.error(), make_error_code(TransportErrc::kTimeout));
 
@@ -448,7 +451,7 @@ TEST(CoroSerialTransport, OperationsBeforeStartAreInvalidState) {
   SerialConfig cfg;
   cfg.device = "/dev/null";
   SerialTransport t(cfg);
-  auto r = t.Read();
+  auto r = testutil::ReadOnce(t);
   EXPECT_FALSE(r);
   EXPECT_EQ(r.error(), make_error_code(TransportErrc::kInvalidState));
   auto w = t.Write(Frame({1, 2, 3}));

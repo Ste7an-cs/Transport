@@ -87,7 +87,7 @@ std::vector<std::uint8_t> ReadExact(TcpTransport& t, std::size_t n,
   while (buf.size() < n && OperationOptions::Clock::now() < deadline) {
     OperationOptions options;
     options.deadline = deadline;
-    auto r = t.Read(options);
+    auto r = testutil::ReadOnce(t, options);
     if (!r) {
       break;
     }
@@ -262,7 +262,7 @@ TEST(CoroTcpTransport, PeerCloseWakesPendingReadWithClosed) {
     entered.resolve();
     OperationOptions options;
     options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = receiver.Read(options);
+    auto r = testutil::ReadOnce(receiver, options);
     read_ok = static_cast<bool>(r);
     if (!r) {
       read_err = r.error();

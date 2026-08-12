@@ -2,8 +2,8 @@
 // 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证读侧可观察契约:
 // Datagram.source 为对端地址、对端断开 → Closed(不重连,终止语义单一)、
 // 我方 RequestClose → Closed、
-// 带 deadline 的 Read 超时 → Timeout 且不停流(可再读)、单读者约束(并发第二个
-// Read → InvalidState)。连接建立由测试夹具完成(非本类职责)。
+// 带 deadline 的读超时 → Timeout 且不停流(可再读)、单读守卫已删除(并发第二个读者
+// 不再被拒,ADR-0007 D4)。连接建立由测试夹具完成(非本类职责)。
 // 逐读 cancellation 为 out-of-scope(循环级中断靠 RequestClose),本文件不覆盖。
 #include <chrono>
 #include <cstdint>
@@ -90,7 +90,7 @@ TEST(CoroTcpTransportRead, SourceIsPeerEndpoint) {
 
   OperationOptions options;
   options.deadline = OperationOptions::Clock::now() + 3s;
-  auto r = receiver.Read(options);
+  auto r = testutil::ReadOnce(receiver, options);
   ASSERT_TRUE(r) << r.error().message();
   EXPECT_EQ(r.value().source.kind, Endpoint::Kind::kNet);
   EXPECT_EQ(r.value().source.host, expected_host);
@@ -114,7 +114,7 @@ TEST(CoroTcpTransportRead, PeerDisconnectYieldsClosed) {
     entered.resolve();
     OperationOptions options;
     options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = receiver.Read(options);
+    auto r = testutil::ReadOnce(receiver, options);
     read_ok = static_cast<bool>(r);
     if (!r) {
       read_err = r.error();
@@ -146,7 +146,7 @@ TEST(CoroTcpTransportRead, RequestCloseWakesPendingReadWithClosed) {
     entered.resolve();
     OperationOptions options;
     options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = receiver.Read(options);
+    auto r = testutil::ReadOnce(receiver, options);
     read_ok = static_cast<bool>(r);
     if (!r) {
       read_err = r.error();
@@ -177,7 +177,7 @@ TEST(CoroTcpTransportRead, DeadlineTimeoutDoesNotStopStream) {
   // 无数据到达 → 短 deadline 的 Read 超时。
   OperationOptions timeout_opts;
   timeout_opts.deadline = OperationOptions::Clock::now() + 60ms;
-  auto timed_out = receiver.Read(timeout_opts);
+  auto timed_out = testutil::ReadOnce(receiver, timeout_opts);
   ASSERT_FALSE(timed_out);
   EXPECT_EQ(timed_out.error(), make_error_code(TransportErrc::kTimeout));
 
@@ -186,7 +186,7 @@ TEST(CoroTcpTransportRead, DeadlineTimeoutDoesNotStopStream) {
   ASSERT_TRUE(sender.Write(Frame(frame)));
   OperationOptions read_opts;
   read_opts.deadline = OperationOptions::Clock::now() + 3s;
-  auto again = receiver.Read(read_opts);
+  auto again = testutil::ReadOnce(receiver, read_opts);
   ASSERT_TRUE(again) << again.error().message();
   std::vector<std::uint8_t> got(again.value().bytes.begin(),
                                 again.value().bytes.end());
@@ -194,7 +194,7 @@ TEST(CoroTcpTransportRead, DeadlineTimeoutDoesNotStopStream) {
   while (got.size() < frame.size()) {
     OperationOptions more;
     more.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = receiver.Read(more);
+    auto r = testutil::ReadOnce(receiver, more);
     ASSERT_TRUE(r) << r.error().message();
     got.insert(got.end(), r.value().bytes.begin(), r.value().bytes.end());
   }
@@ -202,8 +202,9 @@ TEST(CoroTcpTransportRead, DeadlineTimeoutDoesNotStopStream) {
   client->deleteLater();
 }
 
-// 读侧契约:单读者约束——已有在途 Read 时并发第二个 Read → InvalidState。
-TEST(CoroTcpTransportRead, ConcurrentSecondReadIsInvalidState) {
+// 读侧契约(ADR-0007 D4):单读守卫已删除——已有在途读者时并发第二个读者**不再被拒**,
+// 两者同挂在 read_queue 上抢占式共读,无数据则各按自己的 deadline 以 kTimeout 收敛。
+TEST(CoroTcpTransportRead, ConcurrentSecondReadIsNotRejected) {
   QTcpServer server;
   QTcpSocket* client = nullptr;
   QTcpSocket* accepted = nullptr;
@@ -219,23 +220,24 @@ TEST(CoroTcpTransportRead, ConcurrentSecondReadIsInvalidState) {
     entered.resolve();
     OperationOptions options;
     options.deadline = OperationOptions::Clock::now() + 300ms;
-    auto r = receiver.Read(options);
+    auto r = testutil::ReadOnce(receiver, options);
     first_ok = static_cast<bool>(r);
     if (!r) {
       first_err = r.error();
     }
   });
   ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让第一个 Read 挂起、占住读槽。
+  boost::this_fiber::sleep_for(30ms);  // 让第一个读者先挂到 read_queue 上。
 
-  // 并发第二个 Read 立即被单读者约束拒绝。
+  // 并发第二个读者:不再返 kInvalidState,而是同样挂起、按自己的 deadline 超时。
   OperationOptions options;
-  options.deadline = OperationOptions::Clock::now() + 3s;
-  auto second = receiver.Read(options);
+  options.deadline = OperationOptions::Clock::now() + 200ms;
+  auto second = testutil::ReadOnce(receiver, options);
   ASSERT_FALSE(second);
-  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kTimeout));
 
-  // 收尾:第一个读者超时返回(读槽释放),不影响流语义。
+  // 收尾:第一个读者超时返回,不影响流语义。
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(first_ok);
   EXPECT_EQ(first_err, make_error_code(TransportErrc::kTimeout));
