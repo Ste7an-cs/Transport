@@ -140,8 +140,10 @@ template <typename Responder>
 auto SpawnEcho(TcpTransport& transport, Responder responder, bool& ended) {
   return Coro::makeTask([&transport, responder, &ended] {
     SystemCodec codec;
+    // 取一次 read_queue 句柄,循环 await(ADR-0007 D4)。
+    const auto rx = transport.Read();
     while (true) {
-      auto datagram = transport.Read();  // 裸读,无 deadline。
+      auto datagram = testutil::AwaitRead(rx);
       if (!datagram) {
         const auto error = datagram.error();
         if (error == make_error_code(TransportErrc::kClosed) ||

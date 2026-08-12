@@ -5,6 +5,8 @@
 #include <mutex>
 #include <utility>
 
+#include <boost/fiber/channel_op_status.hpp>
+
 #include <QByteArray>
 #include <QPointer>
 #include <QSerialPort>
@@ -12,6 +14,7 @@
 
 #include "await/awaitable.hpp"
 #include "await/coroiodevice.hpp"
+#include "task/fibertask.h"  // Coro::makeTask —— 数据泵 fiber。
 #include "transport/core/Error.hpp"
 #include "transport/core/SharedCompletion.hpp"
 
@@ -63,8 +66,13 @@ struct SerialTransport::State {
   // 唯一的 readAll 流:持有一条、反复 await 取下一片(RT_TRANSPORT_003 流式一次一
   // 切片)。在 Start 建立,复用 coroiodevice 读原语。
   std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
+  // 对外 read_queue(ADR-0007 D1/D4):数据泵是唯一生产者,`Read()` 只交出本句柄。
+  // 构造即建、整个生命周期只此一条。容量策略未定(TBD-009):沿用 AsyncTask 默认;
+  // **字节流介质丢中段即帧错乱**,该默认是已登记的活跃隐患(#152 / ADR-0007 D6),
+  // 本轮不处置——泵一取到切片就立刻转投,常态队深约 1。
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue{
+      std::make_shared<Coro::Awaitable<Datagram>>()};
   LifecycleState lifecycle{LifecycleState::kCreated};
-  bool active_read{false};
   bool active_write{false};
   std::size_t send_waiters{0};
   // 并发写按到达顺序排队等待写槽(RT_TRANSPORT_004/007 串行化,不拒绝)。
@@ -83,11 +91,14 @@ struct SerialTransport::State {
 
 namespace {
 
-// 关闭一次:进入 Closing、关设备(止住错误风暴与设备句柄)、唤醒在途读/写等待者;
-// 无在途操作时直接落 Closed 并完成 closed。有在途操作则由其收尾时落 Closed。
-void BeginClose(const std::shared_ptr<SerialTransport::State>& state) {
+// 关闭一次:进入 Closing、关设备(止住错误风暴与设备句柄)、关读流令数据泵退出、以
+// kClosed 关 read_queue 唤醒全部读者与在途写等待者;无在途写时直接落 Closed 并完成
+// closed(有在途写则由 ExitWrite 落)。读侧不再有"在途读"(单读守卫随 ADR-0007 D4 删除)。
+void BeginClose(const std::shared_ptr<SerialTransport::State>& state,
+                bool discard_residual = true) {
   QPointer<QSerialPort> port;
   std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
   std::shared_ptr<Coro::Awaitable<void>> flush;
   std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
   bool complete = false;
@@ -99,9 +110,10 @@ void BeginClose(const std::shared_ptr<SerialTransport::State>& state) {
     state->lifecycle = LifecycleState::kClosing;
     port = state->port;
     read_stream = state->read_stream;
+    read_queue = state->read_queue;
     flush = state->active_flush;
     queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
-    if (!state->active_read && !state->active_write) {
+    if (!state->active_write) {
       state->lifecycle = LifecycleState::kClosed;
       complete = true;
     }
@@ -110,7 +122,15 @@ void BeginClose(const std::shared_ptr<SerialTransport::State>& state) {
     port->close();  // 关设备:止住 errorOccurred 风暴,断句柄。
   }
   if (read_stream) {
-    read_stream->close(make_error_code(TransportErrc::kClosed));  // 唤醒在途 Read。
+    read_stream->close(make_error_code(TransportErrc::kClosed));  // 令数据泵退出。
+  }
+  // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,调用方 await 得到它。
+  // discard_residual:我方 Close 路径丢弃残留(改造前关闭后发起的读一律得 kClosed);
+  // 设备致命断开的收敛路径不丢——残留先被取尽,再观察到终止原因(同改造前)。
+  if (discard_residual) {
+    CloseDatagramQueue(read_queue, make_error_code(TransportErrc::kClosed));
+  } else {
+    read_queue->close(make_error_code(TransportErrc::kClosed));
   }
   if (flush) {
     flush->close(make_error_code(TransportErrc::kClosed));  // 唤醒在途写刷空等待者。
@@ -145,22 +165,40 @@ void OnDeviceError(const std::shared_ptr<SerialTransport::State>& state,
     act = true;
   }
   if (act) {
-    BeginClose(state);
+    BeginClose(state, /*discard_residual=*/false);  // 残留字节仍先交付,再报终止。
   }
 }
 
-void FinishRead(const std::shared_ptr<SerialTransport::State>& state) {
-  bool complete = false;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->active_read = false;
-    if (state->lifecycle == LifecycleState::kClosing && !state->active_write) {
-      state->lifecycle = LifecycleState::kClosed;
-      complete = true;
+// 数据泵(ADR-0007 D1 内层循环):反复 await readAll 流,把每片字节转成 Datagram 投入
+// read_queue,直至流终止。串口不重连:设备致命断开(OnDeviceError→BeginClose)与我方
+// 关闭都表现为流关闭,二者对调用方同一含义——以 kClosed 关 read_queue(RT_TRANSPORT_008
+// / ADR-0004 D1,表达经 ADR-0007 D4 改写);底层成因降为 LastError() 诊断。
+void RunReadPump(const std::shared_ptr<SerialTransport::State>& state,
+                 const std::shared_ptr<Coro::Awaitable<QByteArray>>& stream,
+                 const std::shared_ptr<Coro::Awaitable<Datagram>>& read_queue) {
+  const auto channel = read_queue->channel();
+  for (;;) {
+    Coro::Result<QByteArray, std::error_code> chunk = Coro::await(stream);
+    if (!chunk) {
+      read_queue->close(make_error_code(TransportErrc::kClosed));
+      return;
     }
-  }
-  if (complete) {
-    state->closed.Complete(Status{});
+    const QByteArray& bytes = chunk.value();
+    Datagram datagram;
+    datagram.bytes.assign(
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+        reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
+            bytes.size());
+    // 单设备无寻址:source 用中立默认目的地(destination 亦被忽略,收发同一设备)。
+    datagram.source = Endpoint::Default();
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->last_recv = OperationOptions::Clock::now();
+    }
+    if (channel->push(std::move(datagram)) !=
+        boost::fibers::channel_op_status::success) {
+      return;  // read_queue 已关闭(我方 Close)→ 停止投递。
+    }
   }
 }
 
@@ -178,10 +216,8 @@ void ExitWrite(const std::shared_ptr<SerialTransport::State>& state) {
     if (state->lifecycle == LifecycleState::kClosing) {
       state->active_write = false;
       closed_gates.swap(state->write_queue);
-      if (!state->active_read) {
-        state->lifecycle = LifecycleState::kClosed;
-        complete = true;
-      }
+      state->lifecycle = LifecycleState::kClosed;  // 读侧已无在途操作可等。
+      complete = true;
     } else if (!state->write_queue.empty()) {
       next_gate = state->write_queue.front();  // 写槽移交队首,active_write 保持真。
       state->write_queue.pop_front();
@@ -227,102 +263,67 @@ SerialTransport::~SerialTransport() {
 
 Status SerialTransport::Start() {
   const auto state = state_;
-  std::lock_guard<std::mutex> lock(state->mutex);
-  if (state->lifecycle == LifecycleState::kRunning) {
-    return Status{};
-  }
-  if (state->lifecycle != LifecycleState::kCreated) {
-    return make_error_code(TransportErrc::kInvalidState);
-  }
+  std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->lifecycle == LifecycleState::kRunning) {
+      return Status{};
+    }
+    if (state->lifecycle != LifecycleState::kCreated) {
+      return make_error_code(TransportErrc::kInvalidState);
+    }
 
-  // 在节点执行域 fiber 内创建并打开设备(同 TCP 的 socket 于执行域内建立)。
-  auto* port = new QSerialPort();
-  port->setPortName(QString::fromStdString(state->config.device));
-  if (!port->open(QIODevice::ReadWrite)) {
-    port->deleteLater();
-    return make_error_code(TransportErrc::kConnection);
-  }
-  // 应用参数:任一失败即视为配置错误,关设备回退。
-  if (!port->setBaudRate(static_cast<qint32>(state->config.baud_rate)) ||
-      !ApplyDataBits(*port, state->config.data_bits) ||
-      !ApplyStopBits(*port, state->config.stop_bits) ||
-      !ApplyParity(*port, state->config.parity)) {
-    port->close();
-    port->deleteLater();
-    return make_error_code(TransportErrc::kConfiguration);
-  }
+    // 在节点执行域 fiber 内创建并打开设备(同 TCP 的 socket 于执行域内建立)。
+    auto* port = new QSerialPort();
+    port->setPortName(QString::fromStdString(state->config.device));
+    if (!port->open(QIODevice::ReadWrite)) {
+      port->deleteLater();
+      return make_error_code(TransportErrc::kConnection);
+    }
+    // 应用参数:任一失败即视为配置错误,关设备回退。
+    if (!port->setBaudRate(static_cast<qint32>(state->config.baud_rate)) ||
+        !ApplyDataBits(*port, state->config.data_bits) ||
+        !ApplyStopBits(*port, state->config.stop_bits) ||
+        !ApplyParity(*port, state->config.parity)) {
+      port->close();
+      port->deleteLater();
+      return make_error_code(TransportErrc::kConfiguration);
+    }
 
-  state->port = port;
-  // 断开检测:coroiodevice 只连 readyRead/aboutToClose,设备致命错误(拔线)只经
-  // errorOccurred 暴露,故此处显式监听(实测断开时连发 ResourceError)。
-  QObject::connect(port, &QSerialPort::errorOccurred, port,
-                   [state](QSerialPort::SerialPortError error) {
-                     OnDeviceError(state, error);
-                   });
-  state->lifecycle = LifecycleState::kRunning;
-  // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 收下订阅前已到达字节。
-  // coroiodevice.readAll() 按值返回 Awaitable(区别于 corosocket 的 shared_ptr),
-  // 故包一层 shared_ptr 以便被 State 长期持有、被 BeginClose 关闭。
-  state->read_stream = std::make_shared<Coro::Awaitable<QByteArray>>(
-      Coro::coro(port).readAll());
+    state->port = port;
+    // 断开检测:coroiodevice 只连 readyRead/aboutToClose,设备致命错误(拔线)只经
+    // errorOccurred 暴露,故此处显式监听(实测断开时连发 ResourceError)。
+    QObject::connect(port, &QSerialPort::errorOccurred, port,
+                     [state](QSerialPort::SerialPortError error) {
+                       OnDeviceError(state, error);
+                     });
+    state->lifecycle = LifecycleState::kRunning;
+    // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 收下订阅前已到达字节。
+    // coroiodevice.readAll() 按值返回 Awaitable(区别于 corosocket 的 shared_ptr),
+    // 故包一层 shared_ptr 以便被 State 长期持有、被 BeginClose 关闭。
+    state->read_stream = std::make_shared<Coro::Awaitable<QByteArray>>(
+        Coro::coro(port).readAll());
+    stream = state->read_stream;
+    read_queue = state->read_queue;
+  }
+  // 起数据泵(ADR-0007 D1):在本执行域 fiber 内反复取字节片投 read_queue。句柄不留存:
+  // 泵只触碰以 shared_ptr 持有的 State / 流 / 队列,故本类析构后仍安全收敛。
+  Coro::makeTask([state, stream, read_queue] {
+    RunReadPump(state, stream, read_queue);
+  });
   return Status{};
 }
 
-Result<Datagram> SerialTransport::Read(OperationOptions options) {
-  const auto state = state_;
-  std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (state->lifecycle != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);
-    }
-    if (state->active_read) {  // 单读:同一时刻至多一个有效读(RT_TRANSPORT_004)。
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    state->active_read = true;
-    stream = state->read_stream;
+// 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
+// 自理。未 Start 时给一个以 kInvalidState 关闭的句柄;设备断开或我方关闭后 read_queue
+// 已被以 kClosed 关闭,await 即得终止原因。
+std::shared_ptr<Coro::Awaitable<Datagram>> SerialTransport::Read() {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->lifecycle == LifecycleState::kCreated) {
+    return ClosedDatagramQueue(make_error_code(TransportErrc::kInvalidState));
   }
-
-  if (!stream) {
-    FinishRead(state);
-    return make_error_code(TransportErrc::kInternal);
-  }
-
-  // 复用持有的 readAll 流:每次 Read await 下一片(channel FIFO 保序)。读侧最小
-  // 能力:以 deadline 界定单次读;要中断在途 Read 请 RequestClose(不逐读取消,
-  // 与超时不停流不对称,同 TcpTransport)。
-  Coro::Result<QByteArray, std::error_code> chunk =
-      options.deadline
-          ? Coro::await_for(stream, *options.deadline - Clock::now())
-          : Coro::await(stream);
-
-  Result<Datagram> result{make_error_code(TransportErrc::kInternal)};
-  if (chunk) {
-    const QByteArray& bytes = chunk.value();
-    Datagram datagram;
-    datagram.bytes.assign(
-        reinterpret_cast<const std::uint8_t*>(bytes.constData()),
-        reinterpret_cast<const std::uint8_t*>(bytes.constData()) + bytes.size());
-    // 单设备无寻址:source 用中立默认目的地(destination 亦被忽略,收发同一设备)。
-    datagram.source = Endpoint::Default();
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_recv = Clock::now();
-    }
-    result = Result<Datagram>{std::move(datagram)};
-  } else if (chunk.error() == std::make_error_code(std::errc::timed_out)) {
-    result = make_error_code(TransportErrc::kTimeout);  // 超时不停流,可再读。
-  } else {
-    // 流关闭:设备致命断开(disconnect_error 已记)或我方关闭。串口不重连,二者对
-    // 调用方同一含义——传输终结、停止读取 → kClosed(RT_TRANSPORT_008 / ADR-0004
-    // D1)。底层成因降为诊断事实,留在 LastError()(见 OnDeviceError)。
-    result = make_error_code(TransportErrc::kClosed);
-  }
-  FinishRead(state);
-  return result;
+  return state_->read_queue;
 }
 
 Status SerialTransport::Write(SendUnit unit) {

@@ -46,8 +46,9 @@ struct TcpClientTransport::Impl {
   ConnectionState conn{ConnectionState::kDisconnected};
   bool closing{false};
 
-  // 对外通道(ADR-0004 D6):connect-loop 的读泵是唯一生产者,`Read` 是消费者。整个生命
-  // 周期只此一条——**跨重连不重建**,故断链前的残留字节保留并继续交付(ADR-0004 D4)。
+  // 对外 read_queue(ADR-0004 D6 / ADR-0007 D1):connect-loop 的读泵是唯一生产者,
+  // `Read()` 只交出本句柄(ADR-0007 D4)。整个生命周期只此一条——**跨重连不重建**,
+  // 故断链前的残留字节保留并继续交付(ADR-0004 D4)。
   //
   // **已知缺口(本轮明确接受,留待性能硬化期)**:该通道**无界**(`FiberChannel` 底层
   // 为 `std::deque`)。若调用方消费慢于对端发送速率,通道可无界增长。字节流不能
@@ -55,7 +56,6 @@ struct TcpClientTransport::Impl {
   // 背压经操作系统回传对端;本轮不实现(ADR-0004 D6 / SRS §3.4.4)。
   std::shared_ptr<Coro::Awaitable<Datagram>> rx{
       std::make_shared<Coro::Awaitable<Datagram>>()};
-  bool active_read{false};  // 单读守卫(RT_TRANSPORT_004):并发 Read 返 kInvalidState。
 
   // 诊断/观察面。配置版本与连接代际两轴独立递增(RT_DATA_STATE)。
   std::uint64_t generation{0};
@@ -220,15 +220,18 @@ bool ReconnectWait(const StatePtr& s) {
   return !IsClosing(s);
 }
 
-// 读泵(ADR-0004 D6):反复从本代际内层取一片字节投入对外通道,直至本代际读取终结。
+// 读泵(ADR-0004 D6):反复从本代际内层的 read_queue 取一片字节投入对外 read_queue,
+// 直至本代际读取终结。
 //
-// 内层 `Read` 的失败一律是 `kClosed`(ADR-0004 D1:已连接 socket 上的致命错误与对端
-// 关闭同码),含义即"本物理连接结束"——**此处不向调用方转发任何断链信号**,只退出读泵
-// 令 connect-loop 转入重连(断链完全透明)。对外通道无界,风险见 `Impl::rx` 注释。
+// 内层 read_queue 的终止原因一律是 `kClosed`(ADR-0004 D1:已连接 socket 上的致命错误
+// 与对端关闭同码,表达经 ADR-0007 D4 改写为"队列被 close 并带终止原因"),含义即"本物理
+// 连接结束"——**此处不向调用方转发任何断链信号**,只退出读泵令 connect-loop 转入重连
+// (断链完全透明)。对外通道无界,风险见 `Impl::rx` 注释。
 void PumpReceivedBytes(const StatePtr& s, TcpTransport& inner) {
   const auto channel = s->rx->channel();
+  const auto inner_rx = inner.Read();  // 取一次内层句柄,循环 await(ADR-0007 D4)。
   for (;;) {
-    Result<Datagram> piece = inner.Read();  // 裸读,无 deadline:断链即返 kClosed。
+    Coro::Result<Datagram, std::error_code> piece = Coro::await(inner_rx);
     if (!piece) {
       return;  // 本代际读取终结 → 拆代际、转重连(调用方无感)。
     }
@@ -455,12 +458,6 @@ WaitOutcome AwaitGate(const std::shared_ptr<Coro::Awaitable<void>>& gate,
   return WaitOutcome::kWoken;  // 其它关闭(如跃迁广播的 no_message)→ 重新判定。
 }
 
-// 归还单读守卫。
-void FinishRead(const StatePtr& s) {
-  std::lock_guard<std::mutex> lock(s->mutex);
-  s->active_read = false;
-}
-
 }  // namespace
 
 TcpClientTransport::TcpClientTransport(TcpClientConfig config)
@@ -500,45 +497,18 @@ Status TcpClientTransport::Start() {
   return Status{};
 }
 
-Result<Datagram> TcpClientTransport::Read(OperationOptions options) {
-  const auto s = state_;
-  // 只从对外通道取,与连接状态机完全解耦——**断链完全透明**(ADR-0004 D1/D6):
-  // 断链期间通道无数据故在此挂起,重连后读泵投入新链路字节即被唤醒。本函数**不返回
-  // 任何断链错误**;唯一的终止失败是我方 RequestClose 后的 kClosed。
-  std::shared_ptr<Coro::Awaitable<Datagram>> rx;
-  {
-    std::lock_guard<std::mutex> lock(s->mutex);
-    if (s->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (s->closing || s->lifecycle != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);  // 唯一退出:Close/RequestClose。
-    }
-    if (s->active_read) {  // 单读:同一时刻至多一个有效读(RT_TRANSPORT_004)。
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    s->active_read = true;
-    rx = s->rx;
+// 交出对外 read_queue 的句柄(ADR-0007 D4)——**无需转发泵**:connect-loop 的读泵本就
+// 以本队列为出口,元素已是 `Datagram`,故直接交出即等价。
+//
+// 与连接状态机完全解耦——**断链完全透明**(ADR-0004 D1/D6):断链期间队列无数据故调用方
+// 在句柄上挂起,重连后读泵投入新链路字节即被唤醒。本队列**不因断链关闭**;唯一的终止是
+// 我方 RequestClose 后的 `close(kClosed)`。未 Start 时给出以 kInvalidState 关闭的句柄。
+std::shared_ptr<Coro::Awaitable<Datagram>> TcpClientTransport::Read() {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->lifecycle == LifecycleState::kCreated) {
+    return ClosedDatagramQueue(make_error_code(TransportErrc::kInvalidState));
   }
-
-  // 逐读 cancellation 为 out-of-scope(同 TcpTransport):持久单通道被逐读取消 close
-  // 会永久终止交付,与超时(不关通道、可再读)不对称。循环级中断用 RequestClose。
-  Coro::Result<Datagram, std::error_code> piece =
-      options.deadline
-          ? Coro::await_for(rx, *options.deadline - Clock::now())
-          : Coro::await(rx);
-
-  FinishRead(s);
-
-  if (piece) {
-    return Result<Datagram>{std::move(piece).value()};
-  }
-  if (piece.error() == std::make_error_code(std::errc::timed_out)) {
-    // deadline 只结束本次等待(后台连接/重连继续),调用方可再读。
-    return make_error_code(TransportErrc::kTimeout);
-  }
-  // 通道关闭 = 我方 RequestClose(读泵从不关它)→ 传输终结。
-  return make_error_code(TransportErrc::kClosed);
+  return state_->rx;
 }
 
 Status TcpClientTransport::Write(SendUnit unit) {
@@ -619,7 +589,9 @@ Status TcpClientTransport::RequestClose() {
     inner->RequestClose();
   }
   if (rx) {
-    rx->close(make_error_code(TransportErrc::kClosed));
+    // 终止表达(ADR-0007 D4):以 kClosed 关对外 read_queue 并丢弃残留——改造前
+    // `Read` 在 closing 下先判生命周期返 kClosed,取不到残留,此处与之等价。
+    CloseDatagramQueue(rx, make_error_code(TransportErrc::kClosed));
   }
   if (never_started) {
     {

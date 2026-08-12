@@ -1,8 +1,10 @@
 // 协程原生 UdpTransport 真实 UDP 回环集成测试。
 // 在 fiber 调度器(coro_test_main)内用本机 UDP loopback 验证:报文边界保持、
 // source 填发送方地址(from 可变)、按 destination 发往不同地址、非法目的地/过大
-// 报文 → 结构化错误、非重连生命周期(RequestClose→Closing→Closed、单读者约束),
+// 报文 → 结构化错误、非重连生命周期(RequestClose→Closing→Closed;单读守卫已随
+// ADR-0007 D4 删除,改验多消费者抢占),
 // 以及经 DatagramCodec 的裸端到端收发。短超时确定化。
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -50,12 +52,12 @@ SendUnit ToPort(std::vector<std::uint8_t> bytes, std::uint16_t port) {
   return SendUnit{std::move(bytes), Endpoint::Net(kLoopback, port)};
 }
 
-// 以短 deadline 读一条报文;超时返回错误 Result(不永久挂起)。
+// 在 read_queue 句柄上以短 deadline 取一条报文;超时返回错误 Result(不永久挂起)。
 transport::Result<Datagram> ReadOne(UdpTransport& t, int budget_ms = 2000) {
   OperationOptions options;
   options.deadline =
       OperationOptions::Clock::now() + std::chrono::milliseconds(budget_ms);
-  return t.Read(options);
+  return testutil::ReadOnce(t, options);
 }
 
 }  // namespace
@@ -178,7 +180,7 @@ TEST(CoroUdpTransport, FatalSocketErrorYieldsClosed) {
 
   // 传输确已终结:Closing→Closed,后续读恒 kClosed,链路不再可用。
   EXPECT_TRUE(t.WaitClosed());
-  const auto after = t.Read();
+  const auto after = testutil::ReadOnce(t);
   ASSERT_FALSE(after);
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(t.CurrentLinkState(), transport::LinkState::kDown);
@@ -218,7 +220,7 @@ TEST(CoroUdpTransport, RequestCloseWakesPendingReadAndReachesClosed) {
     entered.resolve();
     OperationOptions options;
     options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = receiver.Read(options);
+    auto r = testutil::ReadOnce(receiver, options);
     read_ok = static_cast<bool>(r);
     if (!r) read_err = r.error();
   });
@@ -235,29 +237,40 @@ TEST(CoroUdpTransport, RequestCloseWakesPendingReadAndReachesClosed) {
   const auto after = receiver.Write(ToPort({1}, 65000));
   ASSERT_FALSE(after);
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
-  const auto read_after = receiver.Read();
+  const auto read_after = testutil::ReadOnce(receiver);
   ASSERT_FALSE(read_after);
   EXPECT_EQ(read_after.error(), make_error_code(TransportErrc::kClosed));
 }
 
-// AC:单读者约束——在途 Read 时并发第二 Read 立即返回 InvalidState。
-TEST(CoroUdpTransport, RejectsConcurrentSecondReader) {
+// AC(ADR-0007 D4):单读守卫已删除——两个消费者共读同一 read_queue **天然抢占**,
+// 第二个读者不再被拒(不返 kInvalidState),两条报文各归其一、不重复不丢失。
+TEST(CoroUdpTransport, ConcurrentReadersPreemptInsteadOfBeingRejected) {
+  UdpTransport sender(LoopbackConfig());
   UdpTransport receiver(LoopbackConfig());
+  ASSERT_TRUE(sender.Start());
   ASSERT_TRUE(receiver.Start());
 
+  transport::Result<Datagram> first{make_error_code(TransportErrc::kInternal)};
+  transport::Result<Datagram> second{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
-  auto reader = Coro::makeTask([&] {
+  auto reader_a = Coro::makeTask([&] {
     entered.resolve();
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 500ms;
-    (void)receiver.Read(options);  // 挂起(无人发)→ 超时收敛。
+    first = ReadOne(receiver);
   });
   ASSERT_TRUE(entered.await());
-  ASSERT_TRUE(testutil::pumpFiberUntil([&] {
-    const auto r = receiver.Read();  // 已有在途读者 → 立即拒。
-    return !r && r.error() == make_error_code(TransportErrc::kInvalidState);
-  }));
-  EXPECT_TRUE(reader.get());
+  auto reader_b = Coro::makeTask([&] { second = ReadOne(receiver); });
+
+  ASSERT_TRUE(sender.Write(ToPort({0xA1}, receiver.LocalPort())));
+  ASSERT_TRUE(sender.Write(ToPort({0xA2}, receiver.LocalPort())));
+
+  EXPECT_TRUE(reader_a.get());
+  EXPECT_TRUE(reader_b.get());
+  ASSERT_TRUE(first) << first.error().message();
+  ASSERT_TRUE(second) << second.error().message();
+  std::vector<std::vector<std::uint8_t>> got{first.value().bytes,
+                                             second.value().bytes};
+  std::sort(got.begin(), got.end());  // 谁先取到由调度决定,只断言集合。
+  EXPECT_EQ(got, (std::vector<std::vector<std::uint8_t>>{{0xA1}, {0xA2}}));
 }
 
 // AC(可选):裸 node 经 UdpTransport + DatagramCodec 端到端收发。

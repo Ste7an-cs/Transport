@@ -99,13 +99,16 @@ std::size_t DdsNode::DrainUnstartedBusiness() {
 
 void DdsNode::SpawnReadLoop() {
   Coro::makeTask([this] {
+    // 取一次 read_queue 句柄,循环 await(ADR-0007 D4):不设 deadline、不接令牌
+    // ——循环级中断靠传输的 RequestClose 关队列。
+    auto rx = transport_->Read();
     while (true) {
-      auto datagram = transport_->Read();  // 裸读,无 deadline。
+      Coro::Result<Datagram, std::error_code> datagram = Coro::await(rx);
       if (!datagram) {
-        if (datagram.error() == make_error_code(TransportErrc::kClosed)) {
-          break;  // 传输终结(唯一终止语义)→ 退出读循环。
-        }
-        continue;  // 其它(瞬时错误):丢弃继续。
+        // 等待器给出终止错误 = read_queue 被 close 并携带终止原因 = 传输终结(唯一
+        // 终止语义,ADR-0004 D1 经 ADR-0007 D4 改写表达)→ 退出读循环。可继续的瞬时
+        // 错误由传输内部的泵就地消化,不出现在本句柄上。
+        break;
       }
       DecodeAndDispatch(std::move(datagram).value());  // 内联 decode + 分发。
     }

@@ -45,9 +45,10 @@ enum class ConnectionState {
  * 3. 内层读取终结(断链)即退出读泵、拆掉本代际,**隔固定间隔**(ADR-0005 D4)重连;
  * 4. 仅 `RequestClose` 使循环退出并收敛。
  *
- * `Read()` 只从对外通道取,与连接状态机完全解耦——**断链对调用方完全透明**(ADR-0004
- * D1):断链期间通道无数据故自然挂起,重连后新链路字节到达即被唤醒,`Read` 期间**不返回
- * 任何断链错误**;唯一的失败终止是我方 `RequestClose` 的 `kClosed`。断链前残留在通道里
+ * `Read()` 只**交出对外 `read_queue` 的等待器句柄**(ADR-0007 D4),与连接状态机完全
+ * 解耦——**断链对调用方完全透明**(ADR-0004 D1):断链期间队列无数据故自然挂起,重连后
+ * 新链路字节到达即被唤醒,**队列不因断链关闭**;唯一的终止是我方 `RequestClose` 的
+ * `close(kClosed)`。断链前残留在通道里
  * 的字节保留并继续交付(其与新链路首字节可能拼成错帧,由编解码器重同步处置,ADR-0004 D4)。
  *
  * `Write()` **直操当前代际内层**、不经通道:链路不可用时立即返 `kConnection`,不缓存等待
@@ -70,21 +71,22 @@ class TcpClientTransport final : public ITransport {
   ///        (RT_LIFECYCLE 3.1.6.3),状态进 Connecting。重复调用幂等。
   Status Start() override;
 
-  /// @brief 从对外通道取一片字节:**断链完全透明**(ADR-0004 D1/D6,RT_TRANSPORT_008)。
+  /// @brief 交出对外 `read_queue` 的等待器句柄(ADR-0007 D4):**断链完全透明**
+  ///        (ADR-0004 D1/D6,RT_TRANSPORT_008)。
   ///
-  /// 通道无数据则挂起(断链期间即如此),重连后新链路字节到达即被唤醒——**不返回任何
-  /// 断链错误**。唯一的终止失败是我方 `RequestClose` 后的 `kClosed`;调用方 deadline
-  /// 只结束本次等待并返 `kTimeout`(后台重连继续)。逐读取消令牌为 out-of-scope(同
-  /// `TcpTransport`:持久单通道被逐读取消关闭会永久终止交付),循环级中断用 `RequestClose`。
-  /// 同一时刻至多一个有效读(RT_TRANSPORT_004),并发读返 `kInvalidState`。
-  Result<Datagram> Read(OperationOptions options = {}) override;
+  /// 队列无数据则调用方挂起(断链期间即如此),重连后新链路字节到达即被唤醒——**队列
+  /// 不因断链关闭**。唯一的终止是我方 `RequestClose` 后的 `close(kClosed)`;调用方在
+  /// 句柄上自行 `await_for` 设 deadline(超时只结束本次等待,后台重连继续)、自行
+  /// `shared()` 扇出。传输层不设单读守卫(RT_TRANSPORT_004 的该约束已随 D4 删除)。
+  /// 未 Start 时给出以 kInvalidState 关闭的句柄。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override;
 
   /// @brief 发送一帧:直操当前代际内层;链路不可用(未连上/重连中)立即返 `kConnection`
   ///        (不缓存等待重连,RT_TCP_RECONNECT_003)。我方已关闭则返 `kClosed`。
   Status Write(SendUnit unit) override;
 
-  /// @brief 请求关闭(幂等):停 connect-loop、掐断当前尝试、关闭当前内层与对外通道
-  ///        (使在途 `Read` 返 `kClosed`)。
+  /// @brief 请求关闭(幂等):停 connect-loop、掐断当前尝试、关闭当前内层与对外
+  ///        `read_queue`(以 `kClosed` 关闭,在途读者 await 得到该终止原因)。
   Status RequestClose() override;
 
   /// @brief 等待完全关闭(connect-loop 退出;支持多等待者)。

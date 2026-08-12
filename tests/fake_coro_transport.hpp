@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,21 +32,23 @@ class FakeCoroTransport final : public transport::ITransport {
   struct State {
     std::mutex mutex;
     LifecycleState lifecycle{LifecycleState::kCreated};
-    bool active_read{false};
     bool active_write{false};
     bool hold_writes{false};
-    std::deque<Result<Datagram>> queued_reads;
-    std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
+    // 对外 read_queue(ADR-0007 D1/D4):Inject 是生产者,`Read()` 只交出本句柄。
+    // 构造即建,故未 Inject 时读者在其上挂起;InjectError / 关闭以终止原因 close 它。
+    // **无需转发泵**:本假件没有底层流,注入本身就是生产端(ADR-0007 D4 的"可不引入泵"情形)。
+    std::shared_ptr<Coro::Awaitable<Datagram>> read_queue{
+        std::make_shared<Coro::Awaitable<Datagram>>()};
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
     // 并发写按到达顺序排队等待写槽(RT_TRANSPORT_004/007 串行化,不拒绝)。
     std::deque<std::shared_ptr<Coro::Awaitable<void>>> write_queue;
     std::optional<std::pair<std::error_code, bool>> next_write_error;
-    std::function<void()> before_timeout_arbitration;
     std::size_t send_waiters{0};
     std::vector<SendUnit> sent;
     transport::SharedCompletion<void> closed;
-    // I/O 事实(ADR-0003 D13 / ITransport 契约):Write 成功记 last_send;Read 成功
-    // 记 last_recv;Write/Read 失败记 last_error(与生产传输的记账口径对齐)。
+    // I/O 事实(ADR-0003 D13 / ITransport 契约):Write 成功记 last_send;数据投入
+    // read_queue 记 last_recv;Write 失败 / 注入的读错误记 last_error(与生产传输
+    // 的泵侧记账口径对齐——生产传输同样在投队时记 last_recv,不等消费者取走)。
     std::optional<Clock::time_point> last_send;
     std::optional<Clock::time_point> last_recv;
     std::error_code last_error;
@@ -73,75 +74,17 @@ class FakeCoroTransport final : public transport::ITransport {
     return transport::make_error_code(TransportErrc::kInvalidState);
   }
 
-  Result<Datagram> Read(OperationOptions options = {}) override {
+  // 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方自理。
+  // 未 Start 时给一个以 kInvalidState 关闭的句柄;关闭中/已关闭时 read_queue 已被
+  // BeginClose 以 kClosed 关闭,await 即得终止原因。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override {
     const auto state = state_;
-    std::shared_ptr<Coro::Awaitable<Datagram>> waiter;
-    std::optional<Result<Datagram>> queued;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      if (state->lifecycle == LifecycleState::kCreated) {
-        return transport::make_error_code(TransportErrc::kInvalidState);
-      }
-      if (state->lifecycle != LifecycleState::kRunning) {
-        return transport::make_error_code(TransportErrc::kClosed);
-      }
-      if (state->active_read) {
-        return transport::make_error_code(TransportErrc::kInvalidState);
-      }
-      state->active_read = true;
-      if (!state->queued_reads.empty()) {
-        queued.emplace(std::move(state->queued_reads.front()));
-        state->queued_reads.pop_front();
-      } else {
-        waiter = std::make_shared<Coro::Awaitable<Datagram>>();
-        state->read_waiter = waiter;
-      }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->lifecycle == LifecycleState::kCreated) {
+      return transport::ClosedDatagramQueue(
+          transport::make_error_code(TransportErrc::kInvalidState));
     }
-
-    if (queued) {
-      auto result = std::move(*queued);
-      FinishRead(state, nullptr);
-      RecordReadOutcome(state, result);
-      return result;
-    }
-
-    auto registration = options.cancellation.Register([state, waiter] {
-      CloseReadWaiter(
-          state, waiter,
-          transport::make_error_code(TransportErrc::kCancelled));
-    });
-    Result<Datagram> notification =
-        options.deadline
-            ? Coro::await_for(waiter,
-                              *options.deadline - OperationOptions::Clock::now())
-            : Coro::await(waiter);
-    if (!notification &&
-        notification.error() ==
-            std::make_error_code(std::errc::timed_out)) {
-      auto before_arbitration = TakeBeforeTimeoutArbitration(state);
-      if (before_arbitration) {
-        before_arbitration();
-      }
-      if (!CloseReadWaiter(
-              state, waiter,
-              transport::make_error_code(TransportErrc::kTimeout))) {
-        notification = Coro::await(waiter);
-      }
-    }
-    registration.Reset();
-    FinishRead(state, waiter);
-
-    Result<Datagram> outcome = std::move(notification);
-    if (!outcome) {
-      if (outcome.error() == std::make_error_code(std::errc::timed_out)) {
-        outcome = transport::make_error_code(TransportErrc::kTimeout);
-      } else if (outcome.error().category() !=
-                 transport::transport_error_category()) {
-        outcome = transport::make_error_code(TransportErrc::kInternal);
-      }
-    }
-    RecordReadOutcome(state, outcome);
-    return outcome;
+    return state->read_queue;
   }
 
   Status Write(SendUnit unit) override {
@@ -206,7 +149,7 @@ class FakeCoroTransport final : public transport::ITransport {
 
     Status result{};
     bool partial_failure = false;
-    std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
+    std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle != LifecycleState::kRunning) {
@@ -218,16 +161,15 @@ class FakeCoroTransport final : public transport::ITransport {
         state->next_write_error.reset();
         if (partial_failure) {
           state->lifecycle = LifecycleState::kClosing;
-          read_waiter = state->read_waiter;
-          state->read_waiter.reset();
+          read_queue = state->read_queue;  // 部分写失败即关传输:读侧以 kClosed 收敛。
         }
       } else {
         state->sent.push_back(std::move(unit));
       }
     }
-    if (read_waiter) {
-      read_waiter->close(
-          transport::make_error_code(TransportErrc::kClosed));
+    if (read_queue) {
+      transport::CloseDatagramQueue(
+          read_queue, transport::make_error_code(TransportErrc::kClosed));
     }
     ExitWrite(state);
     RecordWriteOutcome(state, result);
@@ -250,12 +192,36 @@ class FakeCoroTransport final : public transport::ITransport {
     return state->closed.Wait(std::move(options));
   }
 
+  /// @brief 投一条数据进 read_queue(Running 期才生效);记 last_recv。
+  ///        无消费者时留在队列里,由下一个 await 取走(channel FIFO 保序)。
   void Inject(Datagram datagram) {
-    DeliverRead(Result<Datagram>{std::move(datagram)});
+    const auto state = state_;
+    std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->lifecycle != LifecycleState::kRunning) {
+        return;
+      }
+      read_queue = state->read_queue;
+      state->last_recv = Clock::now();
+    }
+    (void)read_queue->channel()->push(std::move(datagram));
   }
 
+  /// @brief 以 `error` 为终止原因关闭 read_queue(ADR-0007 D4 的终止表达);记 last_error。
+  ///        已排队的数据仍先被取尽,之后消费者得到该终止错误。
   void InjectError(std::error_code error) {
-    DeliverRead(Result<Datagram>{error});
+    const auto state = state_;
+    std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->lifecycle != LifecycleState::kRunning) {
+        return;
+      }
+      read_queue = state->read_queue;
+      state->last_error = error;
+    }
+    read_queue->close(error);
   }
 
   void HoldWrites() {
@@ -283,18 +249,6 @@ class FakeCoroTransport final : public transport::ITransport {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     state->next_write_error = std::make_pair(error, partial);
-  }
-
-  void SetBeforeTimeoutArbitration(std::function<void()> hook) {
-    const auto state = state_;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->before_timeout_arbitration = std::move(hook);
-  }
-
-  bool ActiveRead() const {
-    const auto state = state_;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    return state->active_read;
   }
 
   bool ActiveWrite() const {
@@ -330,14 +284,15 @@ class FakeCoroTransport final : public transport::ITransport {
     return state->last_send;
   }
 
-  /// @brief 最近一次 Read 成功返回数据的时刻(尚无则空)。
+  /// @brief 最近一次数据投入 read_queue 的时刻(尚无则空);与生产传输的泵侧
+  ///        记账口径一致——投队即记,不等消费者取走。
   std::optional<Clock::time_point> LastReceiveTime() const override {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     return state->last_recv;
   }
 
-  /// @brief 最近一次 Write/Read 操作错误(无则默认构造的 error_code)。
+  /// @brief 最近一次 Write 失败 / 注入的读终止原因(无则默认构造的 error_code)。
   std::error_code LastError() const override {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -371,27 +326,6 @@ class FakeCoroTransport final : public transport::ITransport {
   }
 
  private:
-  static void FinishRead(
-      const std::shared_ptr<State>& state,
-      const std::shared_ptr<Coro::Awaitable<Datagram>>& waiter) {
-    bool complete_close = false;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->active_read = false;
-      if (!waiter || state->read_waiter == waiter) {
-        state->read_waiter.reset();
-      }
-      if (state->lifecycle == LifecycleState::kClosing &&
-          !state->active_write) {
-        state->lifecycle = LifecycleState::kClosed;
-        complete_close = true;
-      }
-    }
-    if (complete_close) {
-      state->closed.Complete(Status{});
-    }
-  }
-
   // 写槽持有者收尾:回退等待者计数,并把写槽移交队首等待者(FIFO 串行化);关闭中
   // 则唤醒全部排队者以 kClosed 收敛,不再移交。
   // 注:写槽 FIFO 语义(EnterWrite/ExitWrite/LeaveWriteQueue/BeginClose)与生产
@@ -409,10 +343,8 @@ class FakeCoroTransport final : public transport::ITransport {
       if (state->lifecycle == LifecycleState::kClosing) {
         state->active_write = false;
         closed_gates.swap(state->write_queue);
-        if (!state->active_read) {
-          state->lifecycle = LifecycleState::kClosed;
-          complete_close = true;
-        }
+        state->lifecycle = LifecycleState::kClosed;  // 读侧已无在途操作可等。
+        complete_close = true;
       } else if (!state->write_queue.empty()) {
         next_gate = state->write_queue.front();  // 写槽移交队首,active_write 保持真。
         state->write_queue.pop_front();
@@ -452,19 +384,8 @@ class FakeCoroTransport final : public transport::ITransport {
     }
   }
 
-  // I/O 事实记账:Read 成功记 last_recv,失败记 last_error。
-  static void RecordReadOutcome(const std::shared_ptr<State>& state,
-                                const Result<Datagram>& outcome) {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (outcome) {
-      state->last_recv = Clock::now();
-    } else {
-      state->last_error = outcome.error();
-    }
-  }
-
   static void BeginClose(const std::shared_ptr<State>& state) {
-    std::shared_ptr<Coro::Awaitable<Datagram>> read_waiter;
+    std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
     std::shared_ptr<Coro::Awaitable<void>> write_gate;
     std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
     bool complete_close = false;
@@ -474,20 +395,19 @@ class FakeCoroTransport final : public transport::ITransport {
         return;
       }
       state->lifecycle = LifecycleState::kClosing;
-      read_waiter = state->read_waiter;
+      read_queue = state->read_queue;
       write_gate = state->write_gate;
-      state->read_waiter.reset();
       state->write_gate.reset();
       queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
-      if (!state->active_read && !state->active_write) {
+      if (!state->active_write) {
         state->lifecycle = LifecycleState::kClosed;
         complete_close = true;
       }
     }
-    if (read_waiter) {
-      read_waiter->close(
-          transport::make_error_code(TransportErrc::kClosed));
-    }
+    // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因;我方关闭同时丢弃
+    // 残留(改造前关闭后发起的读一律得 kClosed、取不到残留)。
+    transport::CloseDatagramQueue(
+        read_queue, transport::make_error_code(TransportErrc::kClosed));
     if (write_gate) {
       write_gate->close(
           transport::make_error_code(TransportErrc::kClosed));
@@ -498,57 +418,6 @@ class FakeCoroTransport final : public transport::ITransport {
     if (complete_close) {
       state->closed.Complete(Status{});
     }
-  }
-
-  void DeliverRead(Result<Datagram> result) {
-    const auto state = state_;
-    std::shared_ptr<Coro::Awaitable<Datagram>> waiter;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      if (state->lifecycle != LifecycleState::kRunning) {
-        return;
-      }
-      waiter = state->read_waiter;
-      if (!waiter) {
-        state->queued_reads.push_back(std::move(result));
-        return;
-      }
-      state->read_waiter.reset();
-    }
-    if (result) {
-      waiter->resolve(std::move(result).value());
-      waiter->close();
-    } else {
-      waiter->close(result.error());
-    }
-  }
-
-  static bool CloseReadWaiter(
-      const std::shared_ptr<State>& state,
-      const std::shared_ptr<Coro::Awaitable<Datagram>>& waiter,
-      std::error_code error) {
-    bool claimed = false;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      if (state->read_waiter == waiter) {
-        state->read_waiter.reset();
-        claimed = true;
-      }
-    }
-    if (claimed) {
-      waiter->close(error);
-    }
-    return claimed;
-  }
-
-  static std::function<void()> TakeBeforeTimeoutArbitration(
-      const std::shared_ptr<State>& state) {
-    std::function<void()> hook;
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      hook = std::move(state->before_timeout_arbitration);
-    }
-    return hook;
   }
 
   std::shared_ptr<State> state_;

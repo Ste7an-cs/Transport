@@ -3,6 +3,10 @@
 #include <mutex>
 #include <utility>
 
+#include <boost/fiber/channel_op_status.hpp>
+
+#include "await/awaitable.hpp"
+#include "task/fibertask.h"  // Coro::makeTask —— 转发泵 fiber。
 #include "transport/node/BoundedQueue.hpp"
 #include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
@@ -29,9 +33,14 @@ struct DdsTransport::State {
   std::unique_ptr<IDdsProvider> provider;
   DdsConfig config;
   std::vector<std::string> subscribe_topics;
-  // 跨线程有界交接边界:listener 线程 Push、Read 侧 fiber Pop(BoundedQueue 内部
+  // 跨线程有界交接边界:listener 线程 Push、转发泵 fiber Pop(BoundedQueue 内部
   // std::mutex 守表 + Awaitable 唤醒,底层 boost.fiber channel 跨线程安全)。
   BoundedQueue<Sample> handoff;
+  // 对外 read_queue(ADR-0007 D1/D4):转发泵是唯一生产者,`Read()` 只交出本句柄。
+  // 交接边界(有界 + kDdsHandoffOverflow 归因)仍在其上游不变;本队列容量策略未定
+  // (TBD-009),沿用 AsyncTask 默认,本轮不处置(#152)。
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue{
+      std::make_shared<Coro::Awaitable<Datagram>>()};
   LifecycleState lifecycle{LifecycleState::kCreated};
   SharedCompletion<void> closed;
 
@@ -45,12 +54,13 @@ struct DdsTransport::State {
 namespace {
 
 // 关闭一次(幂等):进入 Closing → 先 Unsubscribe 停投递 → Shutdown 释放 provider 侧
-// 回调(连带释放其持有的交接队列共享句柄)→ 交接边界 Close 唤醒在途 Read → 落 Closed
-// 并完成 closed。迟到的在途回调(Dispatch 已取快照)仍只对交接队列 Push,返 kClosed 丢弃,
-// 不触碰 State(RT_NODE_005 防碰已销毁对象)。
+// 回调(连带释放其持有的交接队列共享句柄)→ 交接边界 Close(令转发泵退出)→ read_queue
+// 以 kClosed 关闭唤醒全部读者 → 落 Closed 并完成 closed。迟到的在途回调(Dispatch 已取
+// 快照)仍只对交接队列 Push,返 kClosed 丢弃,不触碰 State(RT_NODE_005 防碰已销毁对象)。
 void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
   std::vector<std::string> topics;
   IDdsProvider* provider = nullptr;
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kClosing ||
@@ -60,6 +70,7 @@ void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
     state->lifecycle = LifecycleState::kClosing;
     topics = state->subscribe_topics;
     provider = state->provider.get();
+    read_queue = state->read_queue;
   }
   if (provider) {
     for (const auto& topic : topics) {
@@ -67,12 +78,57 @@ void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
     }
     provider->Shutdown();  // 释放回调(连带其交接队列共享句柄)。
   }
-  state->handoff.Close();  // 唤醒在途 Read(以 kClosed 收敛)。
+  state->handoff.Close();  // 令转发泵退出。
+  // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,调用方 await 得到它;
+  // 同时丢弃残留——与改造前 BoundedQueue「Close 先于取元素、残留不再经 Read 交付」
+  // 逐字对齐(残留样本的归因口径亦不变:本就不计入任何丢弃计数)。
+  CloseDatagramQueue(read_queue, make_error_code(TransportErrc::kClosed));
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->lifecycle = LifecycleState::kClosed;
   }
   state->closed.Complete(Status{});
+}
+
+// 转发泵(ADR-0007 D1 的 DDS 形态):反复从交接边界 Pop 一条 Sample,转成 Datagram 投入
+// read_queue,直至交接边界 Close。DDS 无 socket,故只有内层数据泵、无外层管理循环。
+//
+// 错误处置与改造前 `Read` 逐字对齐:kClosed = 我方关闭 → 关 read_queue 并退出;其余
+// (kInternal 等)是可继续的瞬时错误 → 记 LastError 后继续下一轮(改造前由调用方的读
+// 循环 `continue`,现由泵就地消化,不外泄到 read_queue)。kTimeout/kCancelled 不会出现
+// ——泵不带 deadline、不接令牌(它们是调用方在句柄上自理的事,ADR-0007 D4)。
+void RunReadPump(const std::shared_ptr<DdsTransport::State>& state,
+                 const std::shared_ptr<Coro::Awaitable<Datagram>>& read_queue) {
+  const auto channel = read_queue->channel();
+  for (;;) {
+    Result<Sample> sample = state->handoff.Pop();
+    if (!sample) {
+      const auto error = sample.error();
+      if (error == make_error_code(TransportErrc::kClosed)) {
+        read_queue->close(make_error_code(TransportErrc::kClosed));
+        return;
+      }
+      // 非终止失败:记为故障事实(kTimeout/kClosed/kCancelled 才是正常控制流结果,
+      // 不稀释 LastError——同改造前 Read 的口径,ADR-0003 D13、RT_NODE_006)。
+      if (error != make_error_code(TransportErrc::kTimeout) &&
+          error != make_error_code(TransportErrc::kCancelled)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->last_error = error;
+      }
+      continue;
+    }
+    Datagram datagram;
+    datagram.bytes = std::move(sample.value().bytes);
+    datagram.source = Endpoint::Topic(std::move(sample.value().topic));
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->last_recv = OperationOptions::Clock::now();
+    }
+    if (channel->push(std::move(datagram)) !=
+        boost::fibers::channel_op_status::success) {
+      return;  // read_queue 已关闭(我方 Close)→ 停止投递。
+    }
+  }
 }
 
 }  // namespace
@@ -125,49 +181,27 @@ Status DdsTransport::Start() {
     }
   }
 
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->lifecycle = LifecycleState::kRunning;
+    read_queue = state->read_queue;
   }
+  // 起转发泵(ADR-0007 D1):把交接边界的样本转成 Datagram 投 read_queue。句柄不留存:
+  // 泵只触碰以 shared_ptr 持有的 State 与队列,故本类析构后仍安全收敛。
+  Coro::makeTask([state, read_queue] { RunReadPump(state, read_queue); });
   return Status{};
 }
 
-Result<Datagram> DdsTransport::Read(OperationOptions options) {
-  const auto state = state_;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (state->lifecycle != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);
-    }
+// 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
+// 自理。未 Start 时给一个以 kInvalidState 关闭的句柄;关闭后 read_queue 已被以 kClosed
+// 关闭,await 即得终止原因。
+std::shared_ptr<Coro::Awaitable<Datagram>> DdsTransport::Read() {
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  if (state_->lifecycle == LifecycleState::kCreated) {
+    return ClosedDatagramQueue(make_error_code(TransportErrc::kInvalidState));
   }
-
-  // 出队交接边界:空则 fiber 协作 await,被 listener 线程 Push 或 Close 唤醒。错误类别
-  // (kClosed/kTimeout/kCancelled)由 BoundedQueue 直接透传。kTimeout(无数据到达)/
-  // kClosed(我方主动关闭)/kCancelled(调用方取消)是正常操作结果,不是故障事实,
-  // 不计入 LastError——同 TCP/UDP/Serial 惯例,保持 LastError 作为"真故障"信号,
-  // 不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
-  Result<Sample> sample = state->handoff.Pop(std::move(options));
-  if (!sample) {
-    const auto error = sample.error();
-    if (error != make_error_code(TransportErrc::kTimeout) &&
-        error != make_error_code(TransportErrc::kClosed) &&
-        error != make_error_code(TransportErrc::kCancelled)) {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_error = error;
-    }
-    return error;
-  }
-  Datagram datagram;
-  datagram.bytes = std::move(sample.value().bytes);
-  datagram.source = Endpoint::Topic(std::move(sample.value().topic));
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->last_recv = Clock::now();
-  }
-  return Result<Datagram>{std::move(datagram)};
+  return state_->read_queue;
 }
 
 Status DdsTransport::Write(SendUnit unit) {

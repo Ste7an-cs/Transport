@@ -91,7 +91,7 @@ std::vector<std::uint8_t> ReadExactly(TcpClientTransport& client,
   while (got.size() < want && Clock::now() < end) {
     OperationOptions o;
     o.deadline = end;
-    auto r = client.Read(o);
+    auto r = testutil::ReadOnce(client, o);
     if (!r) {
       break;
     }
@@ -190,7 +190,7 @@ TEST(CoroTcpClientTransport, ReadIsTransparentAcrossDisconnectAndReconnect) {
   accepted1->abort();
   accepted1->deleteLater();
   for (int i = 0; i < 3; ++i) {
-    auto during = client.Read(Deadline(120ms));
+    auto during = testutil::ReadOnce(client, Deadline(120ms));
     ASSERT_FALSE(during) << "断链期间不应有数据";
     EXPECT_EQ(during.error(), make_error_code(TransportErrc::kTimeout))
         << "断链只使读取挂起(kTimeout 由调用方 deadline 产生),不得暴露断链错误";
@@ -285,7 +285,7 @@ TEST(CoroTcpClientTransport, RequestCloseWakesInFlightReadWithClosed) {
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
-    out = client.Read();  // 无 deadline:唯有关闭能使其失败返回。
+    out = testutil::ReadOnce(client);  // 无 deadline:唯有关闭能使其失败返回。
     done = true;
   });
   ASSERT_TRUE(entered.await());
@@ -302,8 +302,9 @@ TEST(CoroTcpClientTransport, RequestCloseWakesInFlightReadWithClosed) {
   accepted->deleteLater();
 }
 
-// 同一时刻至多一个有效读(RT_TRANSPORT_004):并发第二个 Read 返 kInvalidState。
-TEST(CoroTcpClientTransport, ConcurrentReadIsRejected) {
+// ADR-0007 D4:单读守卫已删除——并发第二个读者**不再被拒**(不返 kInvalidState),
+// 与第一个读者同挂在对外 read_queue 上抢占式共读,无数据则按自己的 deadline 超时。
+TEST(CoroTcpClientTransport, ConcurrentReadIsNotRejected) {
   QTcpServer server;
   ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
 
@@ -316,15 +317,16 @@ TEST(CoroTcpClientTransport, ConcurrentReadIsRejected) {
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
-    (void)client.Read();
+    (void)testutil::ReadOnce(client);
     done = true;
   });
   ASSERT_TRUE(entered.await());
   boost::this_fiber::sleep_for(30ms);
 
-  auto second = client.Read(Deadline(200ms));
+  auto second = testutil::ReadOnce(client, Deadline(200ms));
   ASSERT_FALSE(second);
-  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kTimeout));
 
   client.RequestClose();
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return done; }, 3000));

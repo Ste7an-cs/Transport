@@ -117,8 +117,10 @@ TEST(ProtocolNodeTcpSmoke, HandlerReceivesBusinessRepliesAndClosesEndToEnd) {
   std::vector<Message> replies;
   bool peer_ended = false;
   auto peer_reader = Coro::makeTask([&] {
+    // 取一次 read_queue 句柄,循环 await(ADR-0007 D4)。
+    const auto peer_rx = peer.Read();
     while (true) {
-      auto datagram = peer.Read();  // 裸读,无 deadline。
+      auto datagram = testutil::AwaitRead(peer_rx);
       if (!datagram) {
         const auto error = datagram.error();
         if (error == make_error_code(TransportErrc::kClosed) ||

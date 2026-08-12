@@ -36,9 +36,10 @@ struct Sample {
  *
  * 收侧:构造期给定订阅 topic 集,`Start` 对每个 topic `Subscribe`;provider 在 listener
  * 线程触发回调 → **非阻塞 `Push`** 交接边界(满 tail-drop 丢最新 + 命名计数
- * `dds_handoff_overflow`,不阻塞 listener,RT_NODE_007)。`Read` = 出队交接边界(空则
- * fiber 协作 await)→ `Datagram{bytes, source=Endpoint::Topic(topic)}`,同 topic 保接受
- * 顺序(FIFO,RT_NODE_005)。**跨线程唤醒**靠 AsyncTask `Awaitable` 的 boost.fiber
+ * `dds_handoff_overflow`,不阻塞 listener,RT_NODE_007)。`Start` 另起**转发泵** fiber:
+ * 出队交接边界 → `Datagram{bytes, source=Endpoint::Topic(topic)}` → 投入 `read_queue`
+ * (ADR-0007 D1);`Read()` 只交出该队列句柄,同 topic 保接受顺序(FIFO,RT_NODE_005)。
+ * **跨线程唤醒**靠 AsyncTask `Awaitable` 的 boost.fiber
  * channel 跨线程安全性(闭合 ADR-0001「裸 fiber channel 外线程 push」未决项 = 安全)。
  *
  * 发侧:`Write(SendUnit)` = `provider.Publish(destination.topic, bytes)`(destination 须
@@ -84,10 +85,12 @@ class DdsTransport final : public ITransport {
   /// @return 成功;非法生命周期返回 kInvalidState;provider Init/Subscribe 失败返其错误。
   Status Start() override;
 
-  /// @brief 出队一条交接样本(空则协作 await),填 `Datagram.source = Endpoint::Topic(topic)`。
-  /// @param options 截止时间与取消令牌。
-  /// @return 一条 Datagram;超时 kTimeout、取消 kCancelled、关闭 kClosed、未 Start kInvalidState。
-  Result<Datagram> Read(OperationOptions options = {}) override;
+  /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);转发泵把交接样本转成
+  ///        `Datagram{bytes, source=Endpoint::Topic(topic)}` 投入其中。
+  /// @return `read_queue` 句柄:deadline/取消/是否 `shared()` 扇出由调用方自理。
+  ///         **传输终结**表现为队列被 `close(kClosed)`(我方关闭);未 Start 时给出
+  ///         以 kInvalidState 关闭的句柄。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override;
 
   /// @brief 发送一条样本:`provider.Publish(destination.topic, bytes)`。
   /// @param unit 待发送样本;`destination` 须为 `Endpoint::Topic`,否则 kInvalidArgument。

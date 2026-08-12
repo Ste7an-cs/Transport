@@ -105,7 +105,7 @@ TEST(DdsTransport, PublishToTopicDeliversDatagramWithTopicSource) {
 
   ASSERT_TRUE(static_cast<bool>(f.tx.Publish("t", {1, 2, 3})));
 
-  auto dg = rx->Read(Deadline(2000ms));
+  auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
   ASSERT_TRUE(static_cast<bool>(dg));
   EXPECT_EQ(dg.value().bytes, (std::vector<std::uint8_t>{1, 2, 3}));
   EXPECT_EQ(dg.value().source.kind, Endpoint::Kind::kTopic);
@@ -125,7 +125,7 @@ TEST(DdsTransport, MultiTopicEachArrivesAndSameTopicKeepsOrder) {
 
   std::vector<int> a_seq, b_seq;
   for (int k = 0; k < 10; ++k) {
-    auto dg = rx->Read(Deadline(2000ms));
+    auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
     ASSERT_TRUE(static_cast<bool>(dg));
     if (dg.value().source.topic == "a")
       a_seq.push_back(Dec(dg.value().bytes));
@@ -150,7 +150,7 @@ TEST(DdsTransport, HandoffFullTailDropsAndCountsWithoutBlockingListener) {
 
   // 保留的是最早的 3 条(FIFO,tail-drop 丢新不丢旧)。
   for (int i = 0; i < 3; ++i) {
-    auto dg = rx->Read(Deadline(2000ms));
+    auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
     ASSERT_TRUE(static_cast<bool>(dg));
     EXPECT_EQ(Dec(dg.value().bytes), i);
   }
@@ -233,12 +233,12 @@ TEST(DdsTransport, WriteNonTopicDestinationIsInvalidArgument) {
 TEST(DdsTransport, ReadBeforeStartIsInvalidStateAndAfterCloseIsClosed) {
   Fixture f;
   auto rx = f.MakeRx({"t"});
-  auto before = rx->Read(Deadline(200ms));
+  auto before = testutil::ReadOnce(*rx, Deadline(200ms));
   EXPECT_EQ(before.error(), make_error_code(TransportErrc::kInvalidState));
 
   ASSERT_TRUE(static_cast<bool>(rx->Start()));
   ASSERT_TRUE(static_cast<bool>(rx->RequestClose()));
-  auto after = rx->Read(Deadline(200ms));
+  auto after = testutil::ReadOnce(*rx, Deadline(200ms));
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
   // WaitClosed 立即完成。
   EXPECT_TRUE(static_cast<bool>(rx->WaitClosed(Deadline(2000ms))));
@@ -281,7 +281,7 @@ TEST(DdsTransport, CrossThreadListenerPushFiberPopStress) {
   std::vector<int> seq;
   seq.reserve(kN);
   for (int i = 0; i < kN; ++i) {
-    auto dg = rx->Read(Deadline(5000ms));
+    auto dg = testutil::ReadOnce(*rx, Deadline(5000ms));
     ASSERT_TRUE(static_cast<bool>(dg))  // 丢唤醒会在此转成 kTimeout。
         << "Read #" << i << " failed: " << dg.error().message();
     seq.push_back(Dec(dg.value().bytes));
@@ -310,7 +310,7 @@ TEST(DdsTransport, CrossThreadCloseRacesWithListenerPush) {
 
   // 先取几条(fiber 与 listener 真并发),再关闭,验证 Read 收敛到 kClosed。
   for (int k = 0; k < 5; ++k) {
-    auto dg = rx->Read(Deadline(5000ms));
+    auto dg = testutil::ReadOnce(*rx, Deadline(5000ms));
     ASSERT_TRUE(static_cast<bool>(dg)) << "drain read failed: " << dg.error().message();
   }
   ASSERT_TRUE(static_cast<bool>(rx->RequestClose()));
@@ -318,7 +318,7 @@ TEST(DdsTransport, CrossThreadCloseRacesWithListenerPush) {
   listener.join();
 
   // 关闭后 Read 返 kClosed(不挂起)。
-  auto after = rx->Read(Deadline(2000ms));
+  auto after = testutil::ReadOnce(*rx, Deadline(2000ms));
   EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
 }
 
@@ -350,7 +350,7 @@ TEST(DdsTransport, HandoffSampleUpdatesLastReceiveTime) {
 
   const auto before = OperationOptions::Clock::now();
   ASSERT_TRUE(static_cast<bool>(f.tx.Publish("t", {1, 2, 3})));
-  auto dg = rx->Read(Deadline(2000ms));
+  auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
   const auto after = OperationOptions::Clock::now();
   ASSERT_TRUE(static_cast<bool>(dg));
 
@@ -385,7 +385,7 @@ TEST(DdsTransport, ReadTimeoutDoesNotUpdateLastError) {
   // 空队列、短 deadline:handoff.Pop 必然超时。kTimeout 是正常操作结果(无数据
   // 到达),不是故障事实——同 TCP/UDP/Serial 惯例,不计入 LastError,保持它作为
   // "真故障"信号不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
-  auto dg = rx->Read(Deadline(20ms));
+  auto dg = testutil::ReadOnce(*rx, Deadline(20ms));
   ASSERT_FALSE(static_cast<bool>(dg));
   EXPECT_EQ(dg.error(), make_error_code(TransportErrc::kTimeout));
   EXPECT_FALSE(rx->LastError());
