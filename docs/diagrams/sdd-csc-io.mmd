@@ -2,7 +2,8 @@ classDiagram
     direction TB
     class ITransport {
         <<interface>>
-        +Start() / Read(options) / Write(SendUnit)
+        +Start() / Write(SendUnit)
+        +Read() shared_ptr~Awaitable~Datagram~~
         +RequestClose() / WaitClosed(options)
         +LastSendTime / LastReceiveTime / LastError
         +CurrentLinkState()

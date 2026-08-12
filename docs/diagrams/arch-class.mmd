@@ -4,8 +4,8 @@ classDiagram
     class ITransport {
         <<interface>>
         +Start() Status
-        +Read(options) Result~Datagram~
         +Write(SendUnit) Status
+        +Read() 交出 read_queue 句柄
         +RequestClose() Status
         +WaitClosed(options) Status
         +LastSendTime() time_point
