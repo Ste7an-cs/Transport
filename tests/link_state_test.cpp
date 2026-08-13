@@ -220,8 +220,10 @@ TEST(LinkState, UdpDownBeforeStartUpWhenBoundDownAfterClose) {
   EXPECT_EQ(transport.CurrentLinkState(), LinkState::kDown);
 }
 
-// bind 失败(端口被独占绑定)不进 Running:链路仍不可用。
-TEST(LinkState, UdpDownWhenBindFails) {
+// bind 失败(端口被独占绑定):**Start() 仍成功**(ADR-0007 D2:首次 bind 未成不算启动
+// 失败,泵进无限重试),但此刻 socket 未绑定 → 链路不可用。UDP 无连接,退避期间也**不报**
+// kEstablishing(那是连接管理策略,不经本查询暴露)。
+TEST(LinkState, UdpDownWhileBindRetrying) {
   UdpConfig first;
   first.mode = transport::UdpMode::kUnicast;
   first.local_addr = kLoopback;
@@ -232,9 +234,13 @@ TEST(LinkState, UdpDownWhenBindFails) {
   UdpConfig conflicting = first;
   conflicting.local_port = holder.LocalPort();  // 与已绑定端口冲突。
   UdpTransport transport(conflicting);
-  EXPECT_FALSE(transport.Start());
+  ASSERT_TRUE(transport.Start());  // 语义变更(ADR-0007 D2):bind 失败不再使 Start 返错。
   EXPECT_EQ(transport.CurrentLinkState(), LinkState::kDown);
+  EXPECT_NE(transport.LastError(), std::error_code{});  // bind 失败降为诊断事实。
 
+  ASSERT_TRUE(transport.RequestClose());
+  ASSERT_TRUE(transport.WaitClosed(Deadline(2000ms)));
+  EXPECT_EQ(transport.CurrentLinkState(), LinkState::kDown);
   ASSERT_TRUE(holder.RequestClose());
 }
 
