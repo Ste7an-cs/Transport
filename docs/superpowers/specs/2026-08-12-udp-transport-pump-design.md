@@ -140,7 +140,7 @@ void WritePump() {
         // 不变式：状态检查到写出之间【无挂起点】
         qint64 n = socket->writeDatagram(item->bytes, addr, port);
         { lock; (n < 0) ? last_error = ... : last_send = Clock::now(); }
-        RecordEvent(send / send_error);       // 失败不回传调用方（fire-and-forget）
+        // 失败不回传调用方（fire-and-forget），只落 last_error
         break;
       }
       socket_ready->channel()->discard_pending();   // 清历史 resolve 的陈旧事件
@@ -159,6 +159,7 @@ Status Start() {
   { lock; if (lifecycle != Created) return kInvalidState; lifecycle = Running; }
   socket = new QUdpSocket();
   socket->setProxy(QNetworkProxy::NoProxy);   // #123：不继承环境代理
+  BindOnce();                                 // ★ 就地尝试一次，忽略结果
   write_pump = spawn(WritePump);
   spawn(SocketPump);
   return Status{};                            // 首次 bind 未成不算启动失败
@@ -190,6 +191,8 @@ Status WaitClosed(OperationOptions o) { return closed.Wait(o); }
 
 **四处打断缺一不可** —— 泵可能停在退避或读等待，写泵可能停在两个阻塞点之一。漏一处即一次收敛挂死。
 
+**为什么 `Start()` 要就地 bind 一次（修正，2026-08-14）**：本文初稿写的是"起泵后即返回"，不做就地 bind。**该写法不可行** —— `makeTask` 起的 fiber 要等调用方让出才运行，故 `Start()` 返回时 `LocalPort()` 恒为 0、`CurrentLinkState()` 恒 `kDown`，而既有测试中有 **26 处**在 `Start()` 后立刻取 `LocalPort()` 或断言 `kUp`。就地 bind **不改变任何语义承诺**：失败仍不返错、仍由泵无限重试；泵首轮见 `BoundState` 即跳过重 bind 直接进读循环，不会重复 bind。
+
 ---
 
 ## 7. 三条不变式
@@ -217,4 +220,5 @@ Status WaitClosed(OperationOptions o) { return closed.Wait(o); }
 - **队列容量与丢弃归因（TBD-009 / #152）**：沿用 AsyncTask 默认「有界 1024 + 静默丢最旧」。丢弃**无归因**，冲击 §3.6 的 loss=0 等式。**不要自行决定容量策略，也不要在别处加补偿逻辑。**
 - **静默超时**（#156）、**UDP 不自终在 node 侧的落地**（#157）。
 - **`LastSendTime` / `LastReceiveTime`**：曾议删除（生产代码零消费，仅 4 个测试文件约 15 处断言在读），**本轮保留**。
+- **写侧 Trace（修正，2026-08-14）**：本文初稿的写泵伪代码含 `RecordEvent(send / send_error)`，**无法实现** —— `UdpConfig` 没有 `trace_sink` 字段（全仓只有 `TcpClientConfig` 与 `DdsTransport` 有）。加该字段属配置面变更且需同步 SDD，本轮不做；写侧失败目前只落 `LastError()`。
 - **临时端口漂移**：`local_port` 配 0 时每次重 bind 会拿到**不同**端口（实测 43752 → 43724）。对端若记着源端口会失联。是否需要"重 bind 时沿用上次端口"未定，本轮不处理。
