@@ -59,17 +59,9 @@ add_library(transport STATIC
   src/core/Cancellation.cpp
   src/node/NodeBase.cpp
   src/node/ProtocolNode.cpp
-  src/node/DdsNode.cpp
-  src/io/tcp/TcpTransport.cpp
   src/io/udp/UdpTransport.cpp
-  src/io/tcp/TcpClientTransport.cpp
-  src/io/serial/SerialTransport.cpp
-  src/io/tcp/TcpServer.cpp
-  src/io/dds/DdsTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
-  src/io/dds/DdsProviderRegistry.cpp
-  src/io/dds/FakeDdsProvider.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -77,8 +69,9 @@ target_compile_features(transport PUBLIC cxx_std_17)
 target_link_libraries(transport PUBLIC asynctask Qt5::Core Qt5::Network Qt5::SerialPort Threads::Threads)
 
 find_package(fastcdr QUIET)
+# redesign 分支:工程收窄到 UDP + ProtocolNode,DDS provider 一并排除。
 find_package(fastrtps QUIET)
-if(fastrtps_FOUND AND fastcdr_FOUND)
+if(FALSE)  # redesign: 暂时禁用 FastDDS(DdsTransport 已排除)
   set(TRANSPORT_HAS_FASTDDS ON)
   message(STATUS "Fast DDS found: enabling FastDdsProvider")
   target_sources(transport PRIVATE src/io/dds/FastDdsRawType.cpp src/io/dds/FastDdsProvider.cpp)
@@ -112,35 +105,17 @@ if(TRANSPORT_BUILD_TESTS)
     tests/protocol_node_handler_test.cpp
     tests/protocol_node_lifecycle_test.cpp
     tests/protocol_node_capacity_test.cpp
-    tests/protocol_node_tcp_loopback_test.cpp
-    tests/protocol_node_tcp_smoke_test.cpp
-    tests/protocol_node_reconnect_test.cpp
     tests/transport_contract_test.cpp
-    tests/link_state_test.cpp
     tests/coro_harness_test.cpp
     tests/fake_coro_transport_test.cpp
     tests/send_semantics_fake_test.cpp
-    tests/tcp_transport_send_test.cpp
-    tests/tcp_transport_read_test.cpp
-    tests/serial_transport_test.cpp
     tests/udp_transport_test.cpp
     tests/protocol_node_udp_test.cpp
-    tests/tcp_client_transport_test.cpp
-    tests/tcp_client_reconfig_test.cpp
-    tests/tcp_client_e2e_test.cpp
-    tests/tcp_server_accept_test.cpp
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp
-    tests/codec/dds_codec_test.cpp
-    tests/dds/dds_registry_test.cpp
-    tests/dds/fake_dds_provider_test.cpp
-    tests/dds/dds_transport_test.cpp
-    tests/dds/dds_node_test.cpp
-    tests/trace_wiring_test.cpp
-    tests/loss_accounting_test.cpp
   )
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
