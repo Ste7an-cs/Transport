@@ -1,5 +1,7 @@
 # ADR-0006：以 NodeBase 模板方法取代 NodeRuntime，并将共享完成量轻量化
 
+> **注（2026-08-19）**：本 ADR 的 **D1（NodeBase 模板方法形态）、D3（轻量 SharedCompletion）、D4（HandlerLoop 内件构成）、D6（收敛不可下放）、D8（重入守卫之争）已由 ADR-0008 推翻或作废**——`SharedCompletion`/`BoundedQueue` 已删除，`Close()` 改为只发信号后重入问题根本不再存在。保留的只有「node 生命周期由一个基类承载」这一条。
+
 **状态：** Accepted
 **日期：** 2026-08-08
 **关联：** ADR-0005（生命周期收敛——本 ADR 保留其 D1/D5 的**行为结论**、只改承载结构，并以 **D8 撤销其 D6**）；SDD `docs/软件设计说明-GJB438C.md` **DD-3 / DD-4 / §4.1.4**（"组合 `NodeRuntime`，不继承"——本 ADR **推翻**其中的结构结论）；SRS RT_LIFECYCLE_003/004/006/007。

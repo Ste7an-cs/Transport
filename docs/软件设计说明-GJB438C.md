@@ -31,11 +31,29 @@
 
 ## 3. CSCI 级设计决策
 
+> ### 变更说明（ADR-0008，2026-08-19）
+>
+> 本章及第 4、5 章的下列内容已被 **ADR-0008「接口重设计」** 推翻或改写，阅读时以 ADR 为准：
+>
+> | 本文位置 | 变更 |
+> |---|---|
+> | DD-3 / DD-4 的"协议无关基座"清单 | `PendingTable`、`BoundedQueue`、`SharedCompletion` **已删除** |
+> | DD-8（挂起-应答仲裁） | 由 `Dispatcher`（按键分配）取代，见 §5.2 |
+> | DD-13（收敛并入读循环） | **推翻**：`Close()` 改为只发信号，收敛由 `WaitClosed()` 的调用方经 `DoJoin()` 自上而下 join |
+> | §4.3.5（传输内部接口） | `ITransport` 收窄至七个方法，签名全改 |
+> | §5.2 / §5.3 | `CSU_PENDINGTABLE` / `CSU_BOUNDEDQUEUE` 已删除，代之以 `CSU_DISPATCHER` |
+> | §5.4（NodeBase） | 五个反向回调删除，公开面收为 4 方法 + 3 钩子 |
+> | 全文的 `Result`/`Status`/`OperationOptions`/`SendUnit` | 分别改为 `Coro::Result<T>` / `Coro::Result<void>` / `std::chrono::milliseconds` / 合并进 `Datagram` |
+>
+> 当前编译面收窄为 **UDP + ProtocolNode**；TCP / 串口 / DDS 及其节点按同一形态后续跟进，
+> 其相关小节暂保留原文（描述的是重设计之前的形态）。
+
 从设计视角说明各构件如何满足需求及其设计原则；每条决策标注所满足的 SRS 需求，可回溯 ADR（REF-2 决策编号 Dn）。
 
 - **DD-1 三层解耦 + 内部缝（满足 RT_IN_INTERFACE_001/002、RT_DESIGN_006）：** 传输（纯字节管道）/ 编解码（线缆格式）/ 交互节点三层，以可测替换的**缝**衔接。`ITransport` 是内部缝（非用户 API），`ICodec` 是公共扩展点，编程主入口是交互层 node。原则：各层职责单一、可独立替换与单测。
 - **DD-2 AsyncTask 强制运行时（满足 RT_CORO_RUNTIME_001..005、RT_DESIGN_002）：** 不设独立 `IExecutor`/`ThreadExecutor` 业务调度体系；M:N 协作式；同一节点交互状态串行访问，以一把 `std::mutex` 守临界区实现，运行时 await 只出现在 fiber 挂起点，唤醒/回调在锁外调用。**依赖性**：节点所属执行域首次启动后稳定、不迁移（RT_CORO_RUNTIME_003）。
 - **DD-3 无共享交互引擎（满足 RT_DESIGN_003、RT_NODE_003）：** 不设独立 `InteractionEngine`/`InteractionPolicy` 层；协议特有语义（键派生、终结判别、寻址、帧盖章）内联各 node。公共只抽出**协议无关机制**：`PendingTable`、`BoundedQueue`、`HandlerLoop`、`SharedCompletion`，以及承载生命周期的基类 `NodeBase`。原则：语义归属清晰、不造上帝对象。
+  **变更（ADR-0008 D6/D8）**：清单已改为 **`Dispatcher`（按键分配）、`HandlerLoop`、`NodeBase`** 三件。`PendingTable` 由 `Dispatcher` 取代；`BoundedQueue` 与 `SharedCompletion` 删除——前者是 `FiberChannel` 的手工重造，后者是 `Awaitable::close()` 广播的手工重造。
   **变更（ADR-0006 D1）**：原 `NodeRuntime<Event>` **已删除**（#139 迁空生命周期职责，#140 下放读循环与 handler 驱动后删除文件）——它把生命周期、handler 队列、读循环骨架与观测计数四件事装进一个 528 行模板，恰是本决策所反对的上帝对象。生命周期上移基类 `NodeBase`（模板方法：基类管幂等与收敛，子类实现 `DoStart`/`DoClose`），handler 队列下沉为可选小件 `HandlerLoop`，读循环骨架与观测计数回归各 node。
 - **DD-4 协议无关基座可复用（满足 RT_DESIGN_008、D10）：** `PendingTable<Key,T>`/`BoundedQueue<T>`/`HandlerLoop<Message>` 对协议类型不透明，经模板参数/注入回调解耦。**变更（ADR-0006 D1）**：`NodeRuntime<Event>` 的模板参数从未被变化过（两处实例化均为 `NodeRuntime<Message>`），泛型代价（头文件实现、`byte_size_of` 回调注入）全部白付，故随其删除一并取消；`NodeBase` 为非模板。DdsNode 复用它们：仅把 Key 从 `uint32` 换为 `std::string`，基座一行不改（实证）。
 - **DD-5 结果承载错误、不抛异常（满足 RT_ERROR_001/002/003、RT_DESIGN_005）：** 预期失败用 `Result<T>`/`Status`（`[[nodiscard]]`）+ 机器可判别 `TransportErrc` 类别，不靠解析字符串前缀。唯一授权的 `catch` 在 handler 消费者边界（隔离第三方逃逸异常）。
@@ -43,8 +61,11 @@
 - **DD-7 两个独立生命周期轴 + 链路可用性上移（满足 RT_LIFECYCLE_001/002、RT_TRANSPORT_009；ADR-0004 D2）：** 节点生命周期 `Created→Running→Closing→Closed`（全介质通用）与 TCP 物理连接状态（仅 TCP 客户端，Running 内子状态）正交。**连接管理**（状态机/重连间隔/重连策略/代际推进）不下沉纯字节管道；但**当前链路可用性**作为与 `LastSendTime`/`LastError` 同类的 I/O 事实**上移至 `ITransport` 基类**，所有介质同形作答——交互层因此不再按介质探测可选能力接口（`IConnectionObservable` 取消）。此为 ADR-0002 D3′ 的边界重划。
 - **DD-11 读取终止语义单一化 + 重连完全透明（满足 RT_TRANSPORT_008；ADR-0004 D1）：** `Read` 失败中仅 `kClosed` = 传输终结（我方关闭，或不可重连传输的底层致命错误），其余为可继续的瞬时错误。不可重连介质（UDP/串口/已接受的 TCP 连接）致命错误统一返 `kClosed`；**可重连传输在内部透明处理链路中断**，不向交互层暴露断链事件。`kConnection` 此后仅存于写路径（RT_TCP_RECONNECT_003）。**交互层因此对三介质使用同一段读循环，且无链路中断分支**。
 - **DD-12 撤销连接代际隔离（满足 RT_TCP_RECONNECT_002 改写；ADR-0004 D3/D4）：** 断链时交互层不再批量终结在途请求、不再清空旧链路排队业务，"代际"概念自交互层消失。在途请求由各自总超时（**缺省值 30 秒，强制项**）、取消或关闭终结。RT_REQUEST_004"旧代际响应不得完成新请求"由物理事实保证（旧 socket 已关，字节不跨链路投递；在途关联标识未释放，新请求取不到同键）。**不引入编解码器重置**（ADR-0004 D4 撤销）：断链残尾与新链路首字节可能拼成错帧，由编解码器既有校验与重同步处置（报坏帧后恢复）。
-- **DD-13 收敛并入读循环（满足 RT_LIFECYCLE_004/006；ADR-0005 D1）：** 关闭收敛**不另起 fiber**——读-分发循环退出后兼任收敛者（等 handler 退出 → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 唤醒全部关闭等待者），`Close()` 退化为"发汇合信号 + 等待收敛结果"。依据：两条内部工作单元（读循环 / handler）中**读循环恒是第一个退出的**——无论我方 `Close` 使 `Read` 返 `kClosed`，还是不可重连介质的底层致命错误使其返 `kClosed`（DD-11 之后二者同码），故它天然是收敛的正确位置。独立 finalizer fiber 与其汇合点 `loop_done_` 随之取消；**结构约束**：读循环收敛走内部路径，不得调用公开的 `Close()`（那会等待自身退出）。多等待者通知仍用 `SharedCompletion`（**ADR-0006 D3 后为"存结果 + `close()` 广播"的轻量实现**：支持每等待者独立 deadline，不再支持每等待者取消——ADR-0005 D3 关于"必须为每等待者分配独立 `Awaitable`"的理由已被修正，那只在需要 per-waiter 取消时成立）。
+- **DD-13 收敛并入读循环（满足 RT_LIFECYCLE_004/006；ADR-0005 D1）：**
+  > **已推翻（ADR-0008 D2/D3）**：`Close()` 改为**只发信号**，收敛移出内部 fiber——由 `WaitClosed()` 的调用方经 `DoJoin()` 自上而下 join 全部内部 fiber。"读循环兼任收敛者"、`close_signalled_` 握手、`SharedCompletion` 多等待者通知一并取消。下段描述的是重设计之前的形态。
+ 关闭收敛**不另起 fiber**——读-分发循环退出后兼任收敛者（等 handler 退出 → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 唤醒全部关闭等待者），`Close()` 退化为"发汇合信号 + 等待收敛结果"。依据：两条内部工作单元（读循环 / handler）中**读循环恒是第一个退出的**——无论我方 `Close` 使 `Read` 返 `kClosed`，还是不可重连介质的底层致命错误使其返 `kClosed`（DD-11 之后二者同码），故它天然是收敛的正确位置。独立 finalizer fiber 与其汇合点 `loop_done_` 随之取消；**结构约束**：读循环收敛走内部路径，不得调用公开的 `Close()`（那会等待自身退出）。多等待者通知仍用 `SharedCompletion`（**ADR-0006 D3 后为"存结果 + `close()` 广播"的轻量实现**：支持每等待者独立 deadline，不再支持每等待者取消——ADR-0005 D3 关于"必须为每等待者分配独立 `Awaitable`"的理由已被修正，那只在需要 per-waiter 取消时成立）。
 - **DD-8 恰好一次终结的挂起-应答仲裁（满足 RT_REQUEST_001..005）：** 请求↔响应关联复用 `PendingTable`，每个在途 entry 一个等待者、以裸 `Coro::Awaitable<T>` 为信箱，**表锁 `find+erase` 作唯一仲裁点**（Resolve/超时/取消/FailAll 谁先摘除谁胜）。原则：恰好一次不靠状态枚举而靠单点抢占，竞态面小。
+  **变更（ADR-0008 D6）**：改由 `Dispatcher` 承担。仲裁点从"表锁 find+erase"变为"**订阅凭据的生存期**"：凭据析构即注销，故一个订阅在其生存期内可接收多条消息（分段交互所需），而请求的"恰好一次终结"由 `Request` 内 `Wait` 一次后凭据即析构来保证。**投递语义同时从"独占"改为"全部键匹配者各得一份"**——多消费者与旁路监听由此成立，唯一性改由协议在键的设计上保证。
 - **DD-9 底层回调不碰节点状态（满足 RT_HANDLER_002、RT_NODE_004、RT_IN_INTERFACE_003）：** Qt I/O 回调在 socket QThread、DDS 样本在 provider listener 线程，均须安全转交节点执行域；DDS 经跨线程有界交接边界（`BoundedQueue<Sample>`）转交，跨线程唤醒靠 boost.fiber channel 跨线程安全。
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**六项** `DropReason` 之一（原七项，`kGenerationIsolationDrop` 随 ADR-0004 D3 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
 
@@ -62,10 +83,10 @@
 
 | 部件 | 目录 | 主要内容 | 响应需求 |
 |---|---|---|---|
-| **CSC_CORE** | `core/` | `Result`/`Status`、`TransportErrc`、`Message`、`Endpoint`、`Cancellation`、`SharedCompletion`、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories` | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
+| **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`TcpClientTransport`、`TcpServer`、`IDdsProvider` | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
-| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`DdsNode`、`HandlerLoop`、`PendingTable`、`BoundedQueue`、`HandlerContext` | RT_NODE、RT_REQUEST、RT_HANDLER、RT_LIFECYCLE、RT_DESIGN_003/008 |
+| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`DdsNode`、`HandlerLoop`、`HandlerContext`（**ADR-0008**：`PendingTable`/`BoundedQueue` 已删除） | RT_NODE、RT_REQUEST、RT_HANDLER、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
@@ -134,8 +155,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 | 存储 | 实现 | 读者 ← 写者 | 一致性保护 |
 |---|---|---|---|
-| D1 在途请求表 | `PendingTable`：`map<Key, Entry{Awaitable<T> mailbox, ...}>` | P1 等待者 ← P2 Resolve / P5 FailAll | 一把 `std::mutex`；`find+erase` 单点仲裁 |
-| D2 业务队列 | `BoundedQueue`：`deque<Item>` + 双上界 | P4 消费者 Pop ← P2 Push | 一把 `std::mutex`；满 tail-drop |
+| D1 订阅索引 | `Dispatcher`：`map<Mask, map<Values, vector<Entry{Awaitable<T> mailbox}>>>` | P1 等待者 ← P2 Dispatch / P5 CloseAll | 无锁（单线程 fiber 协作，ADR-0008 D9）；凭据生存期即仲裁 |
+| D2 业务队列 | `Coro::Awaitable<Message>` + `setCapacity` | P4 消费者 await ← P2 push | `FiberChannel` 自守；满则**静默丢最旧**（无归因，#152） |
 | D3 交互状态 | session 空闲集 `deque<uint8>`（**连接代际已移出交互层**，ADR-0004 D3） | node 各方法 | 一把 `std::mutex`（node 私有） |
 
 #### 4.2.3 请求-响应节点数据流（MS_NODE_DATAFLOW）
@@ -256,15 +277,26 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 #### 4.3.5 传输内部接口（JK_TRANSPORT）
 - 优先级：高（框架正确性核心，内部缝）。
 - 接口类型：C++ 抽象类 `ITransport`（`io/ITransport.hpp`）。
-- 数据元素：`SendUnit{bytes,destination}`、`Datagram{bytes,source}`。
+- 数据元素：`Datagram{bytes, peer}`（读写共用；原 `SendUnit` 已随 ADR-0008 D8 合并进本类型，字段 `source` 更名 `peer`）。
 - 通信方式：**队列式**（ADR-0007 D1）。传输内部持两条 `Coro::Awaitable` 队列——`read_queue`（传输作**生产者**，把 I/O 收到的数据投入）与 `write_queue`（传输作**消费者**，取出待写 I/O 的数据）。socket 的创建、重建与关闭由传输内部的管理泵负责，对两端**完全透明**。
-- 协议特征：`Start / Read() / Write(SendUnit) / RequestClose / WaitClosed` + 强制 I/O 观测面 `LastSendTime / LastReceiveTime / LastError / CurrentLinkState`。
-- **`Read()` 交出等待器句柄（ADR-0007 D4）**：签名为 `std::shared_ptr<Coro::Awaitable<Datagram>> Read()`，**返回 `read_queue` 的句柄而非一份数据**，且**不接受 `OperationOptions`**——deadline 与取消由调用方自行在句柄上 `await_for` / 接令牌。
+- 协议特征（**ADR-0008 D1**：七个方法，分三组）：
+
+  | 组 | 方法 | 语义 |
+  |---|---|---|
+  | 任务 | `Start()` / `Close()` / `WaitClosed()` | 起泵后即返回 / **只发信号，不等待收敛** / join 全部内部工作单元 |
+  | 数据 | `AsyncRead()` / `AsyncWrite(Datagram)` | 交出读队列的等待器句柄 / 送入一份数据 |
+  | 观测 | `LastError()` / `CurrentLinkState()` | 每种介质都答得出的最小公分母 I/O 事实 |
+
+- **读写刻意不对称**：读是"数据什么时候来"，只能交出等待器，由调用方自行决定超时、取消与是否扇出；写是"把这份数据发到那里去"，调用方给完即返回。因此**写队列是纯内部的**，调用方不感知其存在，也不需要知道它装的是什么。
+- **`AsyncRead()` 交出等待器句柄**：签名为 `std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead()`，**返回 `read_queue` 的句柄而非一份数据**，不接受任何超时参数——超时与取消由调用方自行在句柄上 `await_for` / 接令牌。
   - **是否共享由调用方决定**：需要多消费者扇出时调用方自行 `shared()`；不共享则多个消费者天然抢占——socket 的读取本就是抢占式的。传输层因此**不设单读守卫**（RT_TRANSPORT_004 的该约束已删除）。
-  - 扇出策略（谁该收到、是否复制）属调用方语义，传输层无从判断，故不下沉。
-- **`Write()` 只入队即返（ADR-0007 D3）**：把整包投入 `write_queue` 后立即返回，**不等待实际发出**；发送失败**不作为返回值**，只进 `LastError()` 与 Trace（fire-and-forget）。链路不可用时数据**留在队列中等待恢复**，不拒绝、不丢弃；恢复后按序全部发出（**接受对端可能收到过期数据**，见 ADR-0007 D3 定案）。
+  - 未 `Start()` 时交出一个**已以 `kInvalidState` 关闭**的句柄——句柄式接口没有返回错误码的位置，故把该错误作为队列的终止原因交出。
+- **`AsyncWrite()` 彻底 fire-and-forget（ADR-0008 D4）**：只判两件事——生命周期是否允许写、是否真的入队；返回成功仅表示"已受理并入队"，**不表示已发出**。目的地能否解析、报文是否超长、socket 是否写成，一律**不回传**，只落 `LastError()`。链路不可用时数据**留在队列中等待恢复**，不拒绝、不丢弃；恢复后按序全部发出（**接受对端可能收到过期数据**）。
+  - `Datagram::peer` 在写侧读作**目的地**；`Endpoint::Default()` 表示"发往本传输配置的默认对端"，由实现自行解析，故传输无关的调用方恒可传它。
+- **`Close()` / `WaitClosed()` 分工（ADR-0008 D2/D3）**：`Close()` 只发信号即返回、幂等，**不含任何等待点**；`WaitClosed()` join 全部内部工作单元，**不设时限也不返回结果**——`Awaitable::close()` 只保证唤醒等待者，而"可安全释放"要求 fiber 已跑完，只有 `Coro::FiberTask::get()` 给得了，它没有超时，故二者二选一。
 - **读取终止语义（DD-11，表达经 ADR-0007 D4 改写）**：传输终结表现为 **`read_queue` 被 `close()` 并携带终止原因**，调用方在等待器上得到该终止错误后应停止读取；其余读取失败为可继续的瞬时错误。**"仅我方 `Close` 才终止"的语义不变**——具备重连能力的传输在内部透明重建，不向调用方暴露链路中断。
 - **链路可用性（DD-7）**：`CurrentLinkState()` 返回 `LinkState`，为所有介质同形的当前 I/O 事实；连接管理策略不经本接口暴露。
+- **删除的观测面（ADR-0008 D1）**：`LastSendTime()` / `LastReceiveTime()` 已删除——二者无人消费，且与 `LastError()`/`CurrentLinkState()` 不同，它们不是"此刻的 I/O 事实"而是历史记录。
 - **待定（TBD-009）**：两条队列的容量上限与超限处置未定。硬约束：任何丢弃**必须归因**；**字节流介质不得丢弃**（丢流中段即帧错乱，正解为有界且满时阻塞生产者）。当前 AsyncTask 默认「有界 1024 + 静默丢最旧」为活跃隐患（#152）。
 
 #### 4.3.6 DDS provider 抽象（JK_PROVIDER）
@@ -296,47 +328,76 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **执行时序/数据流**：见 §4.2.2（D1/D2/D3 一致性保护）；SharedCompletion 参与 §4.2.5 关闭汇合。
 
-### 5.2 挂起-应答详细设计（CSU_PENDINGTABLE）
+### 5.2 按键分配详细设计（CSU_DISPATCHER）
 
-**单元设计决策（DD-8）**：entry 单等待者 → 信箱退化为裸 `Coro::Awaitable<T>`（底层一条 FiberChannel），**唯一仲裁点 = 表锁 `find+erase` 抢占终结权**；去掉此前 `SharedCompletion<T>` 的多等待者层（未使用），对齐 AsyncTask《使用说明》§6.3 一次性等待范式。
+> 本节取代原 **CSU_PENDINGTABLE**（`node/PendingTable.hpp`，已删除）。ADR-0008 D6。
 
-**设计约束**：恰好一次终结（RT_REQUEST_003）；`Resolve` 锁外投递（唤醒不在表临界区，D8）；`FailAll(latch=false)` 断连语义不 latch、表继续可用（RT_TCP_RECONNECT_002）；`T` 须可默认构造且可拷贝。
+**单元设计决策**：请求↔响应关联由协议无关的 `Dispatcher<T, Fields...>`（`core/Dispatcher.hpp`）承担。调用方只提供**键提取函数**（给出一条消息各匹配字段的具体值），订阅时不参与匹配的字段填 `kAny`——**部分匹配由本单元实现**，调用方不写通配逻辑、不用哨兵值、不枚举字段组合。
 
-**软件逻辑**：见 `node/PendingTable.hpp`。`Entry{shared_ptr<Awaitable<T>> mailbox; time_point registered_at}`；`Shared{mutex; map<Key,shared_ptr<Entry>>; closed; sink; last_request_latency}`。
-- `Register(key)`：锁内查 closed/max_pending/重复键，建 entry（信箱自动创建）入 map，返回 Handle。
-- `Resolve(key,value)`：锁内 `find+erase` 抢占（唯一仲裁）→ 锁外 `mailbox->resolve(value)`（push）+ `close()`；未找到返 false（迟到/重复/无匹配 → 归因 kUnmatchedOrLateResponse）。
-- `FailAll(error,latch)`：锁内摘除全部（可选 latch closed）→ 锁外逐个 `mailbox->close(error)`。
-- `Handle::Wait(options)`：`await`/`await_for` 信箱——收到值即 Resolve 抢先；本地超时经 `ClaimTerminal` 抢占，抢到即 kTimeout，抢输则 `await` 一次 drain 出对方结果；close_error 分支采 cancel/FailAll 的 error。终结点记时延 + 按结果分类 Trace（match/timeout/cancel）。取消经 `Register([]{ ClaimTerminal 后 close(kCancelled) })`。
+**设计约束**：
+- `kAny` 以 `std::optional` 的持值状态表达，**不占用字段值域**，故 `session_id` 这类 0..255 全用满的字段同样可以通配；`kAny` 与"该字段须等于 0"是两种不同的约束。
+- 一条消息投给**全部**键匹配的订阅者，各得一份副本（`T` 须可拷贝）；单个订阅只关联一个键，故同一订阅者不会因一条消息收到多份。**不提供"独占投递"模式**——唯一性应由协议在键的设计上保证。
+- 单条消息成本 **O(在用 mask 种数 + 收件人数)**，与订阅者总数无关。
+- 单线程 fiber 协作，**不加锁**（ADR-0008 D9）：`Subscribe` / `Dispatch` / `~Ticket` 内均无挂起点；`Dispatch` 中的 `resolve` 仅入队并标记等待者就绪、不引发 fiber 切换，故索引在遍历期间保持稳定。键提取函数内不得回调本件。
 
-**执行时序/状态**：见 §4.2.4（请求-响应时序）、§4.2.9（entry 抢占仲裁状态）。
+**软件逻辑**：见 `core/Dispatcher.hpp`。
+- 索引为两层：`unordered_map<Mask, unordered_map<Values, vector<Entry>>>`。`Mask` 是"哪些字段被约束"的位图，`Values` 是按该 mask 投影后的键值（未约束的字段置同一占位值）。**外层只保留存在订阅的 mask**，故探测次数随订阅情况自动收敛，既不枚举 2ⁿ 种字段组合，也不逐个求值谓词。
+- `Subscribe(Key)`：推导 mask 与投影键值 → 建信箱 → 入索引 → 返回 `Ticket`。已 `CloseAll` 时返回一张信箱已关闭的凭据。
+- `Dispatch(const T&)`：跑键提取函数得完整键 → 遍历在用 mask、逐个投影查表 → 命中桶内每个订阅者各 `resolve` 一份 → 返回投递份数。**返回 0 表示无匹配订阅，此时入参未被修改**，调用方可自行处置（转交处理器、归因丢弃）。
+- `CloseAll(error)`：关闭全部信箱并置终止标记，令在途 `Wait` 恰好终结一次。
+- `Ticket`：持一个信箱 + 析构注销，仅可移动；内部以**弱引用**持有索引，故允许在 `Dispatcher` 析构之后再析构。`Wait(timeout)` 让出式等待，信箱为队列语义——**同一凭据可多次等待**，一次交互需分段等待多条报文时，各段各自登记、各自设定时限。
 
-### 5.3 有界业务队列详细设计（CSU_BOUNDEDQUEUE）
+**执行时序/状态**：见 §4.2.4（请求-响应时序）。
 
-**单元设计决策**：协议无关（对 T 不透明，字节计量注入 `byte_size_of`）；双上界 tail-drop（丢正到达元素，已入队不受影响）；`drop_reason`/`sink` 构造注入。
+### 5.3 入站业务队列（原 CSU_BOUNDEDQUEUE，已删除）
 
-**设计约束**：`Push` 不阻塞；`RecordDrop` 在 tail-drop 分支持锁调用（与原地 `++dropped` 同临界区）；供 DdsTransport（`kDdsHandoffOverflow`）与 `HandlerLoop`（`kBusinessQueueOverflow`）复用。
+> **已删除（ADR-0008 D8）**：`node/BoundedQueue.hpp` 是 AsyncTask `FiberChannel` 的手工重造（双端队列 + 等待者队列 + 互斥量 + 容量 + 丢弃），故取消，业务队列直接用 `Coro::Awaitable<Event>` + `setCapacity`。
 
-**软件逻辑**：见 `node/BoundedQueue.hpp`。`Push`（满则 `RecordDrop`+`kResourceExhausted`，否则入队唤醒一个消费者）；`Pop`（空则消费者协作 await；Close→kClosed、deadline→kTimeout、取消→kCancelled）；`Close`（latch，唤醒在途消费者）；`Drain`（取尽剩余供 close_drop 归因）。上界 `max_events`[1,65536]/`max_bytes`[64KiB,256MiB]，越界钳制。
+**由此产生的语义变化（一并接受，见 #152）**：
+- 满时的行为从 **tail-drop**（拒绝正到达的元素并归因计数）变为 **静默丢弃队首最旧的值**——对业务帧而言是"丢老留新"，与原语义相反；
+- **字节数上界消失**，只剩事件数；
+- 丢弃**既无计数也无归因**——AsyncTask 不提供丢弃计数，容量是唯一的调节手段。§3.6 的 loss=0 等式因此不再可直接验证。
 
-**执行时序/数据流**：见 §4.2.2（D2）、§4.2.5（Close 时 Drain 归因 close_drop）。
+`DdsTransport` 的跨线程有界交接（原 `BoundedQueue<Sample>`）按同一形态后续跟进。
 
 ### 5.4 节点基类详细设计（CSU_NODEBASE）
 
-**单元设计决策（DD-3）**：本单元只装**每个节点都有的**生命周期机制——状态机 + 并发幂等 Start + 关闭仲裁 + 收敛（并入读循环，ADR-0005 D1；含 `close_drop` 归因，它属关闭语义）。**不在本单元**：②handler 消费者 fiber + `BoundedQueue` 集成 + 异常隔离已下沉可选小件 `HandlerLoop`（ADR-0006 D4，见 §5.4a）；③读-分发循环骨架归各 node（ADR-0006 D5，#140 已下放）。基类**非模板**、不持 `ITransport*`、对协议类型无感知。
+> 本节已按 **ADR-0008 D2/D3** 重写。原形态（模板方法 + 收敛并入读循环 + 五个反向回调）见 ADR-0005 D1/D2 与 ADR-0006 D1/D6。
 
-**设计约束**：同步纪律（D8）——生命周期状态与关闭时延/归因计数入基类那把锁，唤醒/回调锁外；handler 任务句柄**不在**基类锁下（由 `HandlerLoop` 自守其锁）；**`DoClose()` 的信号顺序即契约**——基类在 `DoClose()` **返回之后**才 `close_signalled_.Complete()`，读循环挡在 `Wait` 上直到全部汇合信号发完才 join handler（否则队列未 `Close`、handler 未取消，join 必然挂死）；**不设重入守卫**（ADR-0006 D8）——不比对 fiber id、不登记内部工作单元身份；handler 逃逸异常为运行时唯一授权 catch（转 kInternal 隔离，不自关）。
+**单元设计决策**：本单元只装**每个节点都有的**生命周期机制——状态机 `Created→Running→Closing→Closed`、幂等 `Start`、关闭仲裁与汇合。基类**非模板**、不持 `ITransport*`、对协议类型无感知；**不 include 任何协议或消息类型**。
 
-**软件逻辑**：见 `node/NodeBase.hpp` / `node/NodeBase.cpp`。基类以**模板方法**承载生命周期。公开面：`Start()`/`Close()`/`WaitClosed()`/`IsRunning()`，另含随收敛段落一并上移的 `CloseDropCount()`/`LastCloseLatency()`（签名与调用点不变）。子类钩子：`ValidateConfig()`（默认成功）、`DoStart()`/`DoClose()`（纯虚）、`JoinHandler()`（默认空）、`DrainUnstartedBusiness()`（默认 0）——后两者使收敛能够到 node 持有的可选 `HandlerLoop`，而不必让基类持有协议类型。受保护动作：`MarkRunning()`/`SignalClose()`/`ConvergeAfterReadLoop()`。公开接口返回 `Status` 而非 `bool`——`bool` 会把"已 `Running`（成功）"与"已 `Closing`/`Closed`（RT_LIFECYCLE_003 要求 `InvalidState`）"压成同值，且 RT_LIFECYCLE_007 要求校验失败可据错误改配置重试（ADR-0006 D2）。
-- **Start()**：`ValidateConfig()` → 置 `starting_` → `DoStart()`（子实事：transport.Start + `MarkRunning()` + spawn 读循环/handler）；并发 Start await 同一 `start_done_`。**`ValidateConfig()` 先于 `starting_` 求值**，故校验失败**不 latch `start_done_`**——否则宿主改正配置后重试时，并发进来的 Start 会共享到陈旧的 `kConfiguration`，违反 RT_LIFECYCLE_007。`DoStart()` 失败则退回 `Created` 允许重试。
-- **Close()**：**只发汇合信号 + 等收敛结果，不亲自收敛**（ADR-0005 D1）。发起段抽为共用的 `SignalCloseIfFirstCloser()`——首个关闭者 Running→Closing → 汇合信号由虚钩子 **`DoClose()`** 发出（transport.RequestClose + 业务队列 Close + handler 取消 + PendingTable.FailAll 等协议特有项）→ 其返回后基类 `close_signalled_.Complete` 放行读循环收敛 → 等 `closed_`。以虚钩子而非 `Close` 入参承载，因致命错误自终路径（D5）无从取得入参却须发出**完全相同**的一组信号（原 `SetNodeConvergenceSignal()` 构造期登记的做法已由 `DoClose()` 取代）。从未 spawn 读循环（Created/starting）时无收敛者，就地 `ConvergeToClosed()`。
-  **无重入守卫（ADR-0006 D8）**：`Close()` 结尾无条件 `closed_.Wait()`，不比对 fiber id、不设"半执行"分支。内部工作单元不会走到这里——处理器经 `RequestClose()` 走**只发信号**的内部路径（`SignalCloseIfFirstCloser()`，不等待），读循环的收敛走 `ConvergeAfterReadLoop()`（同样不经公开接口）。**违约面**：调用方捕获 `node*` 在处理器内直接调 `Close()`/`WaitClosed()` 将静默挂死，属使用契约范畴（RT_LIFECYCLE_005），已写入 API 注释。
-- **读-分发循环**（**不在基类**——ADR-0006 D5：位于各 node 的私有 `SpawnReadLoop()`，直接调本类 `DecodeAndDispatch()` 与基类 `ConvergeAfterReadLoop()`，无跨件回调参数）：`Read → 错误分类（仅 kClosed 退出，其它继续）→ 调 node 的 decode+dispatch`（ADR-0004 D1：三介质同一段读循环、无 `kConnection` 分支）。**退出后本 fiber 兼任收敛者**（ADR-0005 D1，`ConvergeAfterReadLoop`）：先做**致命错误自终判定**（D5，见下）→ 等 `close_signalled_` → 以 `FiberTask::get()` 让出式 join handler 任务（仍等其实际退出、不强杀 fiber）→ `ConvergeToClosed()`（Drain close_drop + 置 Closed + 记时延）→ `closed_.Complete` 唤醒全部等待者。收敛走内部路径，**不得调公开的 `Close()`**（那会等自身退出）。
-- **致命错误自终（ADR-0005 **D5** / RT_LIFECYCLE_008）**：读循环退出有两种成因，ADR-0004 D1 之后同为 `kClosed`、读循环无从区分——我方 `Close`，或不具重连能力的传输发生底层致命错误而节点仍 `Running`。后者由读循环**自行**调 `SignalCloseIfFirstCloser()` 置 `Closing` 并发出与 `Close` 完全相同的一组汇合信号，再走**同一段**收敛代码；正常关闭与自终由此合并为一条路径，区别仅在"谁先置的 `Closing`"。判据只是"读循环退出时是否仍 `Running`"，**无需按介质分支**：TCP 客户端无限重连、`Read` 只在我方 `Close` 后返 `kClosed`，彼时 lifecycle 已非 `Running`，天然落不到自终分支。仲裁点仍是 `lifecycle_` 单点，故并发的 `Close` 与自终之间恒只有一个发起者。
-- **handler 消费者**（**不在基类**——在可选小件 `HandlerLoop`，ADR-0006 D4，由各 node 直接持有与驱动）：`Pop → consume 到完成（含 await）→ 下一条`（严格串行）；逃逸异常记 handler_exception；保留 `FiberTask<void>` 句柄供收敛者经 `JoinHandler()` 结构化 join（ADR-0005 D2）。
+**关键决策：`Close()` 只发信号，`WaitClosed()` 单独汇合。** 旧形态的 `Close()` 结尾无条件等待收敛，内部工作单元调用它即等于等自己退出、静默挂死，为此先后尝试过运行时重入守卫（ADR-0005 D6）与使用契约（ADR-0006 D8）。拆开之后：
 
-**执行时序/状态**：见 §4.2.5（关闭收敛）、§4.2.7（生命周期状态）。
+- `Close()` **不含任何等待点**，因此**任何 fiber 都可调用**，包括节点自己的读-分发循环与入站业务处理器；
+- 收敛不再由内部 fiber 自行完成，而由 `WaitClosed()` 的调用方经 `DoJoin()` **自上而下** join。
+
+由此删除五个"子类在钩子中途回调基类"的反向动作——`MarkRunning()`、`SignalClose()`、`ConvergeAfterReadLoop()`、`JoinHandler()`、`DrainUnstartedBusiness()`；基类不再反向驱动子类，也不再需要 `close_signalled_` 握手。
+
+**公开面（4）**：`Start()` / `Close()` / `WaitClosed()` / `IsRunning()`。返回 `Coro::Result<void>` 而非 `bool`——`bool` 会把"已 `Running`（成功）"与"已 `Closing`/`Closed`（RT_LIFECYCLE_003 要求 `InvalidState`）"压成同值，且 RT_LIFECYCLE_007 要求校验失败可据错误改配置重试（ADR-0006 D2 保留）。观测接口 `CloseDropCount()` / `LastCloseLatency()` **已删除**（ADR-0008 D10）。
+
+**子类钩子（3）**：`DoStart()`（配置校验 + 传输就绪 + spawn 各 fiber）、`DoClose()`（发出全部汇合信号，**只发信号、不得等待任何 fiber**）、`DoJoin()`（join 本节点 spawn 的全部 fiber）。原 `ValidateConfig()` 并入 `DoStart()` 开头——它此前独立存在的唯一理由是绕开 `start_done_` 那个一次性 latch，latch 删除后两者行为一致。
+
+**成员（4）**：`mutex_` / `lifecycle_` / `starting_` / `joined_`。原 `SharedCompletion` 三例（`start_done_` / `close_signalled_` / `closed_`）、`close_drop_count_`、`close_requested_at_`、`last_close_latency_` 全部删除。
+
+**设计约束**：**持 `mutex_` 期间不调任何钩子、不出现挂起点**——三个钩子一律锁外调用，故基类不需要向子类下达"实现不得取锁、不得挂起"这类反向约束（旧形态的 `DrainUnstartedBusiness()` 正是持锁调用的虚函数）。
+
+**软件逻辑**：见 `node/NodeBase.hpp` / `node/NodeBase.cpp`（89 行）。
+- **`Start()`**：临界区内判生命周期并置 `starting_` → **锁外**调 `DoStart()` → 成功则由**基类**置 `Running`。**不承诺并发调用共享同一次初始化结果**：另一次 `Start()` 正在初始化时返 `kInvalidState`。旧形态用一次性 `SharedCompletion` 共享首次结果，而它 latch 后不再更新，第二轮重试的调用方会拿到上一轮的陈旧失败（#150）；启动是宿主调一次的动作，不值得为此保留一个坏 latch。
+- **`Close()`**：首个关闭者 `Running→Closing` → **锁外**调 `DoClose()` 发出全部汇合信号即返回。从未 `Start()` 过则直接落 `Closed`（无 fiber 可汇合，不调 `DoClose()`）。幂等，仲裁点为 `lifecycle_` 单点。
+- **`WaitClosed()`**：`joined_` 闩保证幂等（`FiberTask::get()` 是一次性的，第二个等待者会立刻拿到假的"已收敛"）→ **锁外**调 `DoJoin()` 让出式 join → 置 `Closed`。返回即意味着全部内部 fiber 已不再运行、不再触碰节点成员——这是"可安全析构"的充分条件。
+- **致命错误自终（原 ADR-0005 D5）**：不再是独立分支。读-分发循环退出时**无条件调公开的 `Close()`**——我方 `Close` 所致时是幂等空操作，传输终结所致时即自终。两条路径由此合并为一条，不需要"退出时是否仍 `Running`"的判据。
+- **析构**：基类析构时子类已析构完毕、虚派发已退回基类（纯虚 ⇒ UB），故每个具体 node 在**自身**析构函数体内调 `Close()` 后再 `WaitClosed()`。
+
+**执行时序/状态**：见 §4.2.5（关闭收敛）、§4.2.7（生命周期状态）——两图仍描述重设计之前的形态，待重绘。
 
 ### 5.5 交互节点详细设计（CSU_PROTOCOLNODE / CSU_DDSNODE）
+
+> **变更（ADR-0008 D5/D6/D7）**：`ProtocolNode` 已重写，下文中与之冲突处以本注为准。
+> - **不再拥有、也不启停传输**：改为按引用借用，宿主负责传输的 `Start` / `Close` / `WaitClosed`；读侧走 `AsyncRead()->shared()` 取独立订阅，`DoClose()` 只关闭该订阅，源队列与其它订阅者不受影响。由此一条传输可被多个节点共用。
+> - **请求关联改由 `Dispatcher`**：`PendingTable`、`CorrelationKeyStrategy`、`ProtocolKey`、`kResponseMarker` 及"响应命令码归一化"全部删除。键提取收为一行 `make_tuple(session_id, message_id, frm_type)`——帧类型成为键的独立字段后，请求与回应可直接区分。新增公开的 `Subscribe(Key)` 供分段交互与旁路监听。
+> - **`session_id` 简化为自增计数器**：`std::uint8_t` 每次取用后自增、越过 255 自然回绕。0..255 空闲集、FIFO 退休窗口、RAII 租约与 `kResourceExhausted` 边界一并删除（推翻 RT_REQUEST_005/006）。
+> - **八个观测接口全部删除**，丢弃只经 `ITraceSink` 上报。
+> - 公开面收为 5 个：构造 / 析构 / `Request(Message, milliseconds)` / `Send(Message)` / `Subscribe(Key)`，另继承基类的四个生命周期方法。
 
 **单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ITransport`+`ICodec`+`PendingTable`+`HandlerLoop`，协议特有语义全内联本类；DdsNode 复用同套基座仅换 Key 类型（D10 实证）。
 

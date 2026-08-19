@@ -2,11 +2,58 @@
 
 本项目的所有重要变更记录于此。格式借鉴 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-权威参考：[需求规格说明书（SRS）](docs/需求规格说明书-协程原生.md) · [设计说明书 + 路线图（SDD）](docs/设计说明书-协程原生.md)。as-built（0.3.0）需求/设计文档存档于 git tag `v0.3.0`。
+权威参考：[需求规格说明书（SRS）](docs/需求规格说明书-协程原生.md) · [软件设计说明（SDD, GJB438C）](docs/软件设计说明-GJB438C.md) · [架构决策记录（ADR）](docs/adr/)。as-built（0.3.0）需求/设计文档存档于 git tag `v0.3.0`。
 
 ---
 
 ## [Unreleased]
+
+### 重设计:传输/节点接口收窄、请求关联改为按键分配、手搓同步件一律换用 AsyncTask 原语(ADR-0008)
+
+> **破坏性变更。** 依 ADR-0008,`ITransport` / `NodeBase` / `ProtocolNode` 的接口面一次性重画,六个与 AsyncTask 重复的手搓件删除。当前编译面收窄为 **UDP + ProtocolNode**;TCP / 串口 / DDS 及其节点按同一形态后续跟进。全量 **112 tests** 通过(`--gtest_repeat=6` 无抖动)。
+
+**接口变更（破坏性）**
+
+- **变更** `ITransport` 收窄至七个方法:`Start()` / `Close()` / `WaitClosed()` + `AsyncRead()` / `AsyncWrite(Datagram)` + `LastError()` / `CurrentLinkState()`。
+  - `Read()` → `AsyncRead()`(签名不变,仍交出读队列句柄);`Write(SendUnit)` → `AsyncWrite(Datagram)`;`RequestClose()` → `Close()`;`WaitClosed(OperationOptions)` → `WaitClosed()`(无参、无返回值)。
+  - **删除** `LastSendTime()` / `LastReceiveTime()`——无人消费,且不是"此刻的 I/O 事实"而是历史记录。
+- **变更** `NodeBase` 的 `Close()` 改为**只发信号**,等待收敛移入 `WaitClosed()`。`Close()` 因此不含任何等待点、**任何 fiber 都可调用**——旧形态为规避自等待而设的 `SignalClose()` / `ConvergeAfterReadLoop()` / `MarkRunning()` / `JoinHandler()` / `DrainUnstartedBusiness()` 五个反向回调,连同"内部工作单元不得调 `Close()`"的使用契约一并**删除**。公开面 6→4、钩子 5→3(`DoStart`/`DoClose`/`DoJoin`)、成员 10→4。
+- **变更** `ProtocolNode` **不再拥有、也不启停传输**:改为按引用借用,宿主负责传输的 `Start`/`Close`/`WaitClosed`;读侧走 `AsyncRead()->shared()` 取独立订阅,节点关闭只断自己这一路。由此一条传输可被多个节点共用。公开面 11→5。
+
+**新增**
+
+- **新增** `include/transport/core/Dispatcher.hpp` —— 协议无关的按键分配器 `Dispatcher<T, Fields...>`。调用方只提供键提取函数,订阅时不参与匹配的字段填 `kAny`;**部分匹配由本件实现**,无需哨兵值或字段组合枚举。一条消息投给全部键匹配的订阅者、各得一份(支持多消费者与旁路监听);内部按 mask 分层索引,单条消息成本 O(在用 mask 种数 + 收件人数),与订阅者总数无关。
+- **新增** `ProtocolNode::Subscribe(Key)` —— 供一次交互分段等待多条报文(各段各自设定时限)与旁路监听。
+- **新增** `UdpConfig::silence_timeout`(默认 5s)—— 读超时(心跳超时),**同时**是 bind 失败后的重试间隔。
+
+**删除**
+
+- **删除** `core/SharedCompletion.hpp` → `Awaitable::close()` 广播 + `FiberTask::get()` 汇合。
+- **删除** `node/BoundedQueue.hpp` → `Coro::Awaitable` + `setCapacity`(`FiberChannel` 本就是有界 FIFO)。
+- **删除** `node/PendingTable.hpp` → `Dispatcher`。
+- **删除** `OperationOptions` → 超时直接用 `std::chrono::milliseconds`。
+- **删除** `transport::Result<T>` / `transport::Status` → `Coro::Result<T>` / `Coro::Result<void>`(前者本就只是别名,`core/Result.hpp` 一并删除)。
+- **删除** `SendUnit` → 与 `Datagram` 结构相同,合并;字段 `Datagram::source` 更名 **`peer`**(读侧为发送方、写侧为目的地,方向由接口决定)。
+- **删除** `CorrelationKeyStrategy` / `DefaultProtocolKeyStrategy` / `ProtocolKey` / `kResponseMarker` —— 键提取收为一行 `make_tuple(session_id, message_id, frm_type)`。
+- **删除** 全部观测计数接口:`NodeBase::CloseDropCount()` / `LastCloseLatency()`、`ProtocolNode` 的八个 getter、`HandlerLoop` 的三个计数。观测只剩 `ITraceSink` 一条出口。
+
+**能力回退（明确接受，不留隐性欠账）**
+
+- **写侧无任何同步错误**:除生命周期外,目的地非法、报文超长、socket 写失败一律只落 `LastError()`。SRS §3.1.3"超出允许大小应在发送前失败"作废。(背压能力此前已随 ADR-0004 的需求重审丧失,本轮不变。)
+- **业务队列失去字节上界与 tail-drop**:改为静默丢**最旧**且无计数、无归因,与原 tail-drop 语义相反。§3.6 的 loss=0 等式不再可直接验证(#152)。
+- **`Request` 失去取消令牌**:在途请求只能等超时。
+- **在途交互超过 256 时 `session_id` 重复**:`session_id` 简化为 `uint8` 自增计数器(推翻 RT_REQUEST_005/006),重复的键会让一条响应同时投给两个订阅。
+- **UDP 临时端口在重建后换号**:`local_port = 0` 且静默超时默认 5s 时,空闲链路会周期性重建并更换源端口。
+
+**测试**
+
+- **新增** `tests/dispatcher_test.cpp`(19)、`tests/protocol_node_test.cpp`(23)、`tests/fake_transport.hpp`(实现新 `ITransport` 的假传输);UDP 用例 18 → 22。
+- **暂排除** 八个仍在旧接口上的用例(`protocol_node_handler` / `protocol_node_lifecycle` / `protocol_node_capacity` / `protocol_node_udp` / `transport_contract` / `fake_coro_transport` / `send_semantics_fake` / `handler_loop`),清单记在 `CMakeLists.txt` 注释中。
+
+**文档**
+
+- **新增** `docs/adr/0008-interface-redesign-and-key-based-dispatch.md`;ADR-0004/0005/0006/0007 各加变更注记。
+- **更新** `CONTEXT.md`(术语:`Datagram`/匹配键/发送完成语义/读-分发循环/`NodeBase`/`HandlerLoop`/丢弃归因,新增按键分配、`kAny`、订阅凭据)、`README.md`(传输契约与状态说明)、`docs/软件设计说明-GJB438C.md`(§3 变更说明、§4.1/4.3.5、§5.2 改 `CSU_DISPATCHER`、§5.3 标注删除、§5.4 重写、§5.5 变更注)、`docs/需求规格说明书-协程原生.md`(RT_REQUEST_005/006、RT_LIFECYCLE_005、`WaitClosed` 接口登记、统计面四处变更登记)。
 
 ### 重构:读循环与 handler 计数下放各 node,删除 NodeRuntime(ADR-0006 D5,#140)
 

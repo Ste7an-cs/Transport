@@ -2,7 +2,7 @@
 
 一个 C++17 通信中间件库,把**传输**、**编解码**、**交互**三层彻底解耦,以 **AsyncTask 协程运行时**为强制异步运行环境:
 
-- **Transport（纯字节管道）** —— 跨 TCP / UDP / 串口 / DDS 搬运原始字节或样本,不解释消息类型、请求关联或 payload 语义。介质无关的协程拉模型:`Read` 一次一片(流式任意切片 / 报文一整报)。
+- **Transport（纯字节管道）** —— 跨 TCP / UDP / 串口 / DDS 搬运原始字节或样本,不解释消息类型、请求关联或 payload 语义。介质无关的协程模型:内部一条管理泵负责 socket 的建立、重建与重试,对外只交出读队列的等待器句柄(`AsyncRead`)、收下待发数据(`AsyncWrite`)。
 - **ICodec（线缆格式）** —— 在收发边界把逻辑 `Message` ↔ 线缆字节(分帧 + 序列化 + 校验 + 重同步);流式跨切片拼帧、报文式保边界。**应用可提供并装配的公共扩展点。**
 - **node（交互层）** —— 在前两层之上组合请求关联、入站分发、超时、连接状态与协议交互。**薄壳组合,不共享交互引擎**:协议可观察语义由各 node 自实现,公共只复用协议无关的挂起-应答纪律与生命周期收敛。
 
@@ -12,9 +12,28 @@
 
 ## 当前状态（诚实说明）
 
-本仓库正按 SDD 路线图(`docs/设计说明书-协程原生.md` §4)做**协程原生清洁重建**。
+本仓库正按 SDD 路线图做**协程原生清洁重建**。已交付 **P0–P5**(tag `v0.4.0`–`v0.4.5`)。
 
-已交付 **P0–P5**(tag `v0.4.0`–`v0.4.5`);全量 270 tests 全绿。逐条 RT_* 追溯见 SDD §7 追溯矩阵。
+> ### ⚠️ 接口重设计进行中（`redesign` 分支，ADR-0008）
+>
+> P0–P5 的接口面正在被一次性重画,**下面 P0–P5 的描述反映的是重设计之前的形态**,其中
+> 若干条已被推翻:
+>
+> - `ITransport` 收窄至七个方法(`Start`/`Close`/`WaitClosed` + `AsyncRead`/`AsyncWrite`
+>   + `LastError`/`CurrentLinkState`);写改为**彻底的 fire-and-forget**(连"目的地非法"这类
+>   参数错误也不再同步作答),`LastSendTime`/`LastReceiveTime` 删除;
+> - `NodeBase` 的 `Close()` 改为只发信号、`WaitClosed()` 单独 join;节点**不再启停传输**,
+>   改为按引用借用;
+> - 请求关联由新的 `Dispatcher`(按键分配 + 部分匹配 + 多消费者)承担,`PendingTable`、
+>   `CorrelationKeyStrategy`、`session_id` 空闲集与 `kResourceExhausted` 边界一并删除;
+> - `SharedCompletion` / `BoundedQueue` / `PendingTable` / `OperationOptions` /
+>   `transport::Result` / `SendUnit` 六个手搓件删除,一律换用 AsyncTask 原语。
+>
+> 该分支当前的编译面收窄为 **UDP + ProtocolNode**,112 tests 全绿;TCP / 串口 / DDS 及其
+> 节点、以及八个仍在旧接口上的用例暂排除,清单在 `CMakeLists.txt` 注释中。完整取舍与已知
+> 能力回退见 **`docs/adr/0008-interface-redesign-and-key-based-dispatch.md`**。
+
+逐条 RT_* 追溯见 SDD §7 追溯矩阵。
 
 - **P0 —— 目标骨架落位(`v0.4.0`):**
   - `transport::TcpTransport`(已建立连接的 TCP 字节管道):发送完成语义(帧字节全部进内核发送缓冲才报成功 + 协程背压 —— RT_TRANSPORT_008)、并发写按节点执行域到达顺序串行化(RT_TRANSPORT_007)、复用 `readAll` 流的读路径。
@@ -34,24 +53,43 @@
 
 ## 内部传输契约（`ITransport`,内部缝 —— 非用户 API）
 
-`ITransport` 是介质无关的内部缝(RT_IN_INTERFACE_002),协程 await 式拉模型:
+`ITransport` 是介质无关的内部缝(RT_IN_INTERFACE_002),七个方法分三组(ADR-0008 D1):
 
 ```cpp
 class ITransport {
  public:
-  virtual Status          Start() = 0;
-  virtual Result<Datagram> Read(OperationOptions options = {}) = 0;  // 一次一片
-  virtual Status          Write(SendUnit unit) = 0;                  // 帧进内核才成功
-  virtual Status          RequestClose() = 0;
-  virtual Status          WaitClosed(OperationOptions options = {}) = 0;
+  // 任务
+  virtual Coro::Result<void> Start()  = 0;   // 起内部管理泵后即返回
+  virtual Coro::Result<void> Close()  = 0;   // 只发信号，不等待收敛。幂等
+  virtual void               WaitClosed() = 0;   // join 全部内部工作单元
+
+  // 数据
+  virtual std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead() = 0;
+  virtual Coro::Result<void> AsyncWrite(Datagram datagram) = 0;
+
+  // 观测
+  virtual std::error_code LastError()        const = 0;
+  virtual LinkState       CurrentLinkState() const = 0;
 };
 ```
 
-- `Read` 返回一片 `Datagram{bytes, source}`;`Write` 收 `SendUnit{bytes, destination}`,并发写在节点执行域串行化,单帧字节不与另一帧交错。
-- 同一实例同一时刻至多一个有效读操作;`OperationOptions` 携带可选 `deadline` 与 `CancellationToken`。
-- 可失败操作一律返回 `Result<T>` / `Status`(标 `[[nodiscard]]`),不抛异常表达预期失败。
+**读写刻意不对称。** 读是"数据什么时候来",只能交出等待器句柄,由调用方自行决定超时、
+取消与是否 `shared()` 扇出——传输层不设单读守卫,多个消费者直接 await 同一句柄是抢占关系。
+写是"把这份数据发到那里去",调用方给完即返回,故写队列是**纯内部**的、调用方不感知。
 
-> **用户面定位:** 编程主入口将是**交互层 node**(组合装配,P1+ 落地),而非 `ITransport`;codec 是应用可提供的公共扩展点。
+**写为彻底的 fire-and-forget**(ADR-0008 D4):`AsyncWrite` 只判生命周期与入队,返回成功
+仅表示已受理;目的地能否解析、socket 是否写成一律不回传,只落 `LastError()`。链路不可用时
+数据留在内部队列等待恢复,不拒绝、不丢弃。**由此不提供背压**。
+
+`Datagram{bytes, peer}` 读写共用:读到的 `peer` 是发送方,写出的 `peer` 是目的地
+(`Endpoint::Default()` 表示"发往本传输配置的默认对端",故传输无关的调用方恒可传它)。
+
+`WaitClosed()` 不设时限也不返回结果:`Awaitable::close()` 只保证唤醒等待者,而"可安全释放"
+要求 fiber 已跑完,只有 `FiberTask::get()` 给得了——二者二选一。
+
+> **用户面定位:** 编程主入口是**交互层 node**(组合装配),而非 `ITransport`;codec 是应用
+> 可提供的公共扩展点。**节点不管传输的生命周期**——宿主创建、启动并关闭传输,节点按引用
+> 借用(ADR-0008 D5),故一条传输可被多个节点共用。
 
 ---
 

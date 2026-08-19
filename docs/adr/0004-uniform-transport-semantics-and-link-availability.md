@@ -1,5 +1,7 @@
 # ADR-0004：传输语义统一、链路可用性上移与发送完成语义撤销
 
+> **注（2026-08-19）**：本 ADR 的 **D1（终止表达）已由 ADR-0007 D4 改写**、**D2 的观测面（`LastSendTime`/`LastReceiveTime`）已由 ADR-0008 D1 删除**；其撤销「发送完成语义」的结论则被 ADR-0008 **D4 推向彻底的 fire-and-forget**。其余决策不受影响。
+
 **状态：** Accepted
 **日期：** 2026-08-06
 **关联：** `docs/需求规格说明书-协程原生.md`（本 ADR 落点：RT_TRANSPORT_008/009、RT_REQUEST 总超时缺省、RT_TCP_RECONNECT_002/005、RT_IN_INTERFACE_002）；ADR-0002（**本 ADR 撤销其 D2、重划其 D3′**）；ADR-0003（D11 连接管理分层——本 ADR 改其观察面部分）。

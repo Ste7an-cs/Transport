@@ -17,9 +17,9 @@
 
 - **逻辑消息** —— 编解码边界上的消息语义：`payload` + 当前协议所需的类别、关联、来源和目的信息；不要求 TCP/UDP/串口/DDS 共用一个包含所有字段的 C++ 结构。
 - **Endpoint** —— 中立寻址值类型:`Default` / `Net(ip,port)` / `Topic(name)`。
-- **Datagram** —— **[target]** `ITransport::Read()` 的返回负载 `{bytes, from}`。UDP/DDS 一次一完整报文(`from` 可变);TCP/串口一次一任意字节切片(`from` 恒为对端)。
+- **Datagram** —— **[target]** 传输层数据面的**唯一**载荷类型 `{bytes, peer}`,读写共用:`AsyncRead()` 交出的队列里 `peer` 是**发送方**,`AsyncWrite()` 送入的 `peer` 是**目的地**——方向由使用它的接口决定,不需要两个结构相同的类型来编码(原 `SendUnit` 已于 ADR-0008 D8 合并进本类型)。UDP/DDS 一次一完整报文(`peer` 可变);TCP/串口一次一任意字节切片(`peer` 恒为对端)。
 - **错误类别** —— 用户可机器判别的稳定失败语义：`InvalidArgument`、`InvalidState`、`Configuration`、`Connection`、`Closed`、`Timeout`、`Cancelled`、`Io`、`Frame`、`Codec`、`ResourceExhausted`、`Unsupported`、`Internal`；可附带诊断文本。具体错误码、枚举和结果载体属于 API/设计说明，调用方不得依靠解析文本前缀分类。
-- **匹配键（Key）** —— 请求↔应答配对键:外部协议 = `(session_id, message_id)`;DDS = `correlation_id`。
+- **匹配键（Key）** —— 请求↔应答配对键。**[target]** 不再是压成单值的机器键,而是 `Dispatcher` 的**订阅模式**:逐字段给出约束或 `kAny`(外部协议 = `(session_id, message_id, frm_type)`;DDS = `correlation_id`)。见「按键分配」。
 - **判别符** —— 帧类型:外部协议 `FrameType`(COMMAND/RESPONSE/RESULT/STATE/HEARTBEAT);DDS `MessageKind`。
 
 ## 机制
@@ -36,12 +36,17 @@
 - **coro socket** —— **[target]** AsyncTask 封装的协程 I/O:`corosocket`(QAbstractSocket 流式读写)、`coroiodevice`(QIODevice/串口)、`corotcpserver`(accept)、`coroudpsocket`(保持边界和地址 metadata 的 UDP datagram)。目标 Transport 复用这些 awaitable；DDS provider 的非 Qt listener 仍需单独的线程交接边界。
 - **DDS provider 交接边界** —— **[target]** DDS provider listener 样本安全进入节点所属执行域的行为边界；必须有界、非阻塞 listener、同 topic 保持框架接受顺序。它不要求存在名为 `DdsBridge` 的组件；具体投递机制、容量和溢出策略属于设计说明及尚未关闭的需求项。本地已经丢弃的样本不能由 DDS Reliable 自动恢复。
 - **provider** —— DDS 底层库的抽象适配(`IDdsProvider`):Fast DDS / 进程内 `FakeDdsProvider`。
-- **发送完成语义** —— **[target]** 一次发送以"该帧字节全部离开框架/Qt 用户态发送缓冲、进入操作系统发送缓冲"为完成判据(非"对端已收")。由此每连接用户态写缓冲至多驻留一个在写帧,背压经协程 `await` 传导回发起方;**不采用 fire-and-forget**(写入即返回、无界缓冲吸收)。见 SRS RT_TRANSPORT_008。
+- **发送完成语义** —— **[target]** **已于 ADR-0008 D4 改为彻底的 fire-and-forget**:`AsyncWrite()` 只判"生命周期是否允许写、是否真的入队",返回成功仅表示已受理,**不表示已发出**;目的地能否解析、socket 是否写成一律不回传,只落 `LastError()`。链路不可用时数据留在内部队列等待恢复,不拒绝、不丢弃。「帧字节进入操作系统发送缓冲才算完成 + 协程背压」早在 2026-08-06 需求重审(ADR-0004)即已删除,框架自那时起就无背压;ADR-0008 D4 取消的是**剩下的同步作答口子**(目的地非法、报文超长等参数错误),故写侧现已无任何同步错误面。
 - **发送排序** —— **[target]** = **节点执行域到达顺序**:单 fiber 程序序必被保持;跨 fiber 并发发送取得某个一致全序,但不可由调用方墙钟时序预测。非"跨调用方全局 FIFO"。见 RT_TRANSPORT_007。
-- **读-分发循环** —— **[target]** node 内联的一条长寿 fiber(非独立引擎):`ITransport.Read() → ICodec.Decode() → 优先请求响应匹配(PendingTable)→ 未匹配业务消息入有界队列 → 处理器串行消费`。是"无共享引擎、语义内联各 node"(RT_DESIGN_003 / ADR-0001 D2)的落地形态;一代际一条。
-- **NodeBase** —— 交互节点的生命周期基类(非模板)。以**模板方法**承载 `Created→Running→Closing→Closed` 状态机、并发幂等 `Start`/`Close`、关闭仲裁与**收敛**(读循环退出后 join handler → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 唤醒全部等待者);协议特有的启动/关闭实事由子类经虚钩子 `DoStart()`/`DoClose()` 提供。`ProtocolNode`/`DdsNode` **继承**它。**不设重入守卫**——内部工作单元不等待本节点关闭这一点由使用契约保证(见 ADR-0006 D8)。取代原 `NodeRuntime`——后者已于 ADR-0006 D1/D5 拆除并删除。
-- **HandlerLoop** —— 入站业务处理的**可选**小件:单消费者 fiber + `BoundedQueue` + 协作取消令牌 + 逃逸异常隔离 + 时长计量。由 node **直接持有**(未设处理器的节点没有它),故**不进** `NodeBase`——基类只装每个节点都有的东西(ADR-0006 D4)。
-- **丢弃归因** —— 框架每一次本地丢弃/重复抑制都归因到**恰好一个命名且计数的原因**(**六项**:业务队列溢出、DDS 交接溢出、坏帧、迟到/重复/无匹配响应、关闭丢弃、无处理器丢弃),无静默丢失。原列于此的「连接代际隔离丢弃」随 ADR-0004 D3(撤销连接代际隔离)移除,「无处理器丢弃」由 ADR-0003 D13 Q2 补入。"框架丢失/重复 = 0"的可验证判据:无外部故障 + 负载 ≤ 容量时损失类计数器全 0。迟到/重复/坏帧属**过滤非丢失**。
+- **读-分发循环** —— **[target]** node 内联的一条长寿 fiber(非独立引擎):`await(自己的读订阅) → ICodec.Decode() → Dispatcher 按键投递 → 无人认领的终结帧归因丢弃、其余业务帧入队交处理器串行消费`。是"无共享引擎、语义内联各 node"(RT_DESIGN_003 / ADR-0001 D2)的落地形态。读订阅取自 `AsyncRead()->shared()`,节点关闭时只断自己这一路,不波及传输与其它订阅者(ADR-0008 D5)。
+- **NodeBase** —— 交互节点的生命周期基类(非模板),四个公开方法 + 三个钩子:`Start()` / `Close()`(**只发信号**) / `WaitClosed()`(join,无时限) / `IsRunning()`,协议特有实事由子类经 `DoStart()` / `DoClose()` / `DoJoin()` 提供。`ProtocolNode`/`DdsNode` **继承**它。
+  `Close()` 不含等待点,故**任何 fiber 都可调用**(含节点自己的读循环与业务处理器)——旧形态的 `SignalClose()` / `ConvergeAfterReadLoop()` / `MarkRunning()` 与"内部工作单元不得调 Close"的使用契约一并作废(ADR-0008 D2)。取代原 `NodeRuntime`(ADR-0006 D1/D5 已拆除删除)。
+- **HandlerLoop** —— 入站业务处理的**可选**小件:单消费者 fiber + 一条 `Coro::Awaitable` 业务队列 + 协作取消令牌 + 逃逸异常隔离。由 node **直接持有**(未设处理器的节点没有它),故**不进** `NodeBase`。队列的容量语义即 `FiberChannel` 的语义——**满时静默丢弃队首最旧的事件**,无计数、无归因,字节上界不再存在(ADR-0008 D8;见 #152)。
+- **丢弃归因** —— 框架每一次本地丢弃/重复抑制都归因到**恰好一个命名的原因**(六项:业务队列溢出、DDS 交接溢出、坏帧、迟到/重复/无匹配响应、关闭丢弃、无处理器丢弃),经 `ITraceSink` 上报。
+  **[已回退]** ADR-0008 D10 删除了全部计数接口,归因只剩 trace 一条出口;"Σ 命名原因 == 总丢弃"的 loss=0 等式因此不再可直接验证,须改由 sink 侧统计重建(未实施,见 #152)。同轮 `BoundedQueue` 换成 `FiberChannel` 后,业务队列的丢弃**既无计数也无归因**。迟到/重复/坏帧属**过滤非丢失**。
+- **按键分配（Dispatcher）** —— **[target]** 协议无关的入站消息路由器 `Dispatcher<T, Fields...>`(`transport/core/Dispatcher.hpp`),取代原 `PendingTable` 与 `CorrelationKeyStrategy`。调用方只提供**键提取函数**(给出一条消息各匹配字段的具体值),订阅时不参与匹配的字段填 `kAny`。一条消息投给**全部**键匹配的订阅者、各得一份,故支持多消费者与旁路监听;单条消息成本 O(在用 mask 种数 + 收件人数),与订阅者总数无关。见 ADR-0008 D6。
+- **kAny（通配）** —— **[target]** 订阅模式中标注"该字段不参与匹配"的具名标记。以 `std::optional` 的持值状态表达,**不占用字段值域**——故 `session_id` 这类 0..255 全用满的字段同样可以通配。`kAny` 与"该字段须等于 0"是两种不同的约束。
+- **订阅凭据（Ticket）** —— **[target]** `Dispatcher::Subscribe()` 的返回值:持有一个信箱并在析构时注销该订阅。信箱为队列语义,同一凭据可多次 `Wait()`——一次交互需分段等待多条报文时,各段各自登记、各自设定时限。
 
 ## 边界与非目标
 
