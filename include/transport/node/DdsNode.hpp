@@ -26,6 +26,8 @@
  * fiber 调度器、无 affinity(D8/Q9)。
  */
 
+#include "detail/result.hpp"
+
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -42,7 +44,6 @@
 #include "transport/core/Message.hpp"
 #include "transport/node/NodeBase.hpp"
 #include "transport/node/PendingTable.hpp"
-#include "transport/core/Result.hpp"
 #include "transport/core/TransportTypes.hpp"
 
 namespace transport {
@@ -65,10 +66,10 @@ class DdsHandlerContext {
    * `Endpoint::Topic(request.reply_to)`(请求方 inbox)。request 非 `kRequest` 或其
    * reply_to 为空时返 kInvalidArgument(无从回送)。
    */
-  [[nodiscard]] Status Reply(const Message& request, Message reply);
+  [[nodiscard]] Coro::Result<void> Reply(const Message& request, Message reply);
 
   /// @brief 从本节点单向发布一条 `kNotify`(fire-and-forget);委托到 DdsNode::Publish。
-  [[nodiscard]] Status Publish(Message msg, Endpoint topic);
+  [[nodiscard]] Coro::Result<void> Publish(Message msg, Endpoint topic);
 
   /**
    * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
@@ -81,7 +82,7 @@ class DdsHandlerContext {
    * @return 仅表示**已受理**,**不表示已关完**。处理器内不得等待本节点关闭完成(等自己
    *         退出,静默挂死;框架不设运行时守卫,ADR-0006 D8)。
    */
-  Status RequestClose();
+  Coro::Result<void> RequestClose();
 
   /// @brief 节点所属执行域的协作取消令牌(Close 时被触发);handler 可据它提前收手。
   [[nodiscard]] const CancellationToken& cancellation() const {
@@ -98,9 +99,9 @@ class DdsHandlerContext {
 };
 
 /// 入站业务处理器(组合注入,RT_HANDLER_001):对一条入站业务消息(kRequest/kNotify/…)
-/// 返回结构化结果(仅记录,框架不据此自动应答,避 TBD-001);预期失败用 Status 表达,不抛
+/// 返回结构化结果(仅记录,框架不据此自动应答,避 TBD-001);预期失败用 Coro::Result<void> 表达,不抛
 /// 异常(RT_HANDLER_005)。回送应答由 handler 经 DdsHandlerContext::Reply 显式发起。
-using DdsInboundHandler = std::function<Status(const Message&, DdsHandlerContext&)>;
+using DdsInboundHandler = std::function<Coro::Result<void>(const Message&, DdsHandlerContext&)>;
 
 /// DdsNode 配置:inbox topic(reply_to)+ 节点标识(correlation_id 前缀)+ 可选入站
 /// 业务处理器 + 业务队列上界。
@@ -170,7 +171,7 @@ class DdsNode : public NodeBase {
    * @param options 截止时间与取消令牌。
    * @return 匹配的 kReply Message,或机器可判别错误(kClosed / kTimeout / kCancelled / …)。
    */
-  [[nodiscard]] Result<Message> Request(Message req, Endpoint target,
+  [[nodiscard]] Coro::Result<Message> Request(Message req, Endpoint target,
                                         OperationOptions options = {});
 
   /**
@@ -182,7 +183,7 @@ class DdsNode : public NodeBase {
    * @param msg   出站 Message(payload 由调用方填)。
    * @param topic 目标 topic(须为 `Endpoint::Topic`)。
    */
-  [[nodiscard]] Status Publish(Message msg, Endpoint topic);
+  [[nodiscard]] Coro::Result<void> Publish(Message msg, Endpoint topic);
 
   /// @brief 观测:`kReply` 无匹配在途 Request(迟到 / 无匹配 correlation_id)而归因丢弃的累计数。
   [[nodiscard]] std::size_t UnmatchedReplyCount() const;
@@ -216,18 +217,18 @@ class DdsNode : public NodeBase {
 
   /// @brief 校验 config(RT_LIFECYCLE_007):inbox_topic / node_id 非空、队列上界落法定
   ///        区间。非法返 kConfiguration(停 Created、不 latch start_done_、可改配重试)。
-  Status ValidateConfig() const override;
+  Coro::Result<void> ValidateConfig() const override;
 
   /// @brief 首个 Start 的实事:transport.Start(Init + 订阅 topic 集)→ `MarkRunning()` →
   ///        spawn 读-分发循环 +(设了 handler 时)handler 消费者。**无连接**:不 spawn
   ///        reactor(D3′)。三介质(含 DDS)共用同一段无分支读循环(ADR-0004 D1/D2)。
-  Status DoStart() override;
+  Coro::Result<void> DoStart() override;
 
   /// @brief 关闭汇合信号(首个关闭者独占执行一次,`Close` 与致命错误自终共用):按序
   ///        transport.RequestClose → 业务队列 Close + handler 协作取消 →
   ///        PendingTable.FailAll(kClosed)(令在途 Request 恰好一次 kClosed 收敛)。
   ///        无 reactor(无连接),故无额外取消源。
-  Status DoClose() override;
+  Coro::Result<void> DoClose() override;
 
   /// @brief 收敛:让出式 join handler 消费者 fiber(未设 handler 时立即返回)。
   void JoinHandler() override;
@@ -266,7 +267,7 @@ class DdsNode : public NodeBase {
   void Dispatch(Message msg);
 
   /// @brief 盖 kind、Encode、transport.Write 到 @p dest 的内部收口(Request/Publish/Reply 共用)。
-  [[nodiscard]] Status WriteFramed(Message msg, MessageKind kind, Endpoint dest);
+  [[nodiscard]] Coro::Result<void> WriteFramed(Message msg, MessageKind kind, Endpoint dest);
 
   /// @brief 生成确定性 correlation_id(`node_id:序号`,单调递增)。自持锁。
   [[nodiscard]] std::string NextCorrelationId();

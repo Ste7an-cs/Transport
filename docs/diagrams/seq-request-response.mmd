@@ -2,28 +2,30 @@ sequenceDiagram
     autonumber
     actor C as 调用方 fiber
     participant N as ProtocolNode
-    participant P as PendingTable
+    participant D as Dispatcher
     participant K as ICodec
     participant T as ITransport
-    participant R as 读循环 fiber
+    participant R as 读-分发循环 fiber
 
-    C->>N: Request(req, options)
-    N->>N: AllocateSession() → session_id<br/>（SessionLease 接管，析构自动归还）
-    N->>N: 盖章 frm_type/protocol_id/session_id
-    N->>P: Register(request_key) → Handle
+    C->>N: Request(req, timeout)
+    N->>N: NextSession() → session_id（uint8 自增，越 255 回绕）
+    N->>N: 盖章 frm_type=kCommand / protocol_id / session_id
+    Note over N,D: **先登记订阅、再发出请求**<br/>反之则回应可能先于订阅到达而被丢弃
+    N->>D: Subscribe(ResponseTo(req))<br/>{session_id, message_id, kResponse} → Ticket
     N->>K: Encode(req) → bytes
-    N->>T: Write(SendUnit) 帧进内核才成功
-    Note over C,N: 背压经 await 传导；Write 成功后
-    N->>P: Handle.Wait(options) 挂起
+    N->>T: AsyncWrite({bytes, Endpoint::Default()})
+    Note over N,T: fire-and-forget：入队即返，写出结果不回传<br/>故 timeout 是本调用唯一的兜底终结源
+    N->>D: Ticket.Wait(timeout - 已耗时)
     Note over C: 调用方 fiber 在此挂起等待
 
-    T-->>R: 对端回送响应字节到达
-    R->>T: Read() → Datagram
+    T-->>R: 对端回送的响应报文进入 read_queue
+    R->>T: await(自己的读订阅 rx_) → Datagram
     R->>K: Decode(bytes) → Message[]
     R->>N: DecodeAndDispatch → Dispatch(msg)
-    N->>N: IsTerminal? kResponse/kResult → response_key
-    N->>P: Resolve(key, msg)
-    Note over P: Resolve / 超时 / 取消 / FailAll<br/>四方抢同一原子首胜 Complete
-    P-->>C: 唤醒 Handle.Wait → Result~Message~
-    N->>N: SessionLease 析构 → ReleaseSession
-    N-->>C: return Result~Message~
+    N->>D: Dispatch(msg)
+    Note over D: 按 {session_id, message_id, frm_type} 三字段定位<br/>投给全部键匹配的订阅者，各得一份副本
+    D-->>C: 唤醒 Ticket.Wait → Coro::Result~Message~
+    N->>D: Ticket 析构 → 自动注销订阅
+    N-->>C: return Coro::Result~Message~
+
+    Note over D,N: 投递份数为 0 时：终结帧归因 unmatched-or-late-response 丢弃，<br/>其余业务帧交 HandlerLoop

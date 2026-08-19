@@ -55,7 +55,6 @@ using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
 using transport::SendUnit;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
@@ -210,7 +209,7 @@ TEST(ProtocolNodeReconnect, InFlightRequestSurvivesDisconnectThenReconnectResume
   auto echo1 = SpawnEcho(*server_txp1, silent, echo1_ended);
 
   // 显式总超时:断链已不再终结在途请求,总超时是它唯一的终结源(ADR-0004 D3)。
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node->Request(MakeRequest(0x0002, {0x01}), Deadline(2500ms));
@@ -241,7 +240,7 @@ TEST(ProtocolNodeReconnect, InFlightRequestSurvivesDisconnectThenReconnectResume
   auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
 
   // 重连后新请求正常完成 → 证读循环跨重连续命(响应经同一未退出的读循环路由)。
-  Result<Message> outcome2{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome2{make_error_code(TransportErrc::kInternal)};
   bool done2 = false;
   auto request2 = Coro::makeTask([&] {
     outcome2 = node->Request(MakeRequest(0x0004, {0xAB}), Deadline(4000ms));
@@ -289,13 +288,13 @@ TEST(ProtocolNodeReconnect, QueuedBusinessSurvivesDisconnectRunningHandlerComple
   int completed = 0;
   ProtocolNodeConfig cfg;
   cfg.handler = [&started, &completed, gate](const Message&,
-                                             HandlerContext&) -> Status {
+                                             HandlerContext&) -> Coro::Result<void> {
     ++started;
     if (started == 1) {
       Coro::await(gate);  // 仅首帧挂住:一帧"正在运行"的 handler。
     }
     ++completed;
-    return Status{};
+    return Coro::Result<void>{};
   };
 
   auto node = MakeClientNode(port, std::move(cfg));
@@ -365,13 +364,13 @@ TEST(ProtocolNodeReconnect, DisconnectEmitsNoDropTraceEvents) {
   ProtocolNodeConfig cfg;
   cfg.trace_sink = &sink;
   cfg.handler = [&started, &completed, gate](const Message&,
-                                             HandlerContext&) -> Status {
+                                             HandlerContext&) -> Coro::Result<void> {
     ++started;
     if (started == 1) {
       Coro::await(gate);  // 仅首帧挂住:一帧"正在运行"的 handler。
     }
     ++completed;
-    return Status{};
+    return Coro::Result<void>{};
   };
 
   auto node = MakeClientNode(port, std::move(cfg));
@@ -431,7 +430,7 @@ TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
   auto server_txp1 = std::make_shared<TcpTransport>(accepted1);
   ASSERT_TRUE(server_txp1->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node->Request(MakeRequest(0x0007, {0x01}), Deadline(2500ms));
@@ -455,7 +454,7 @@ TEST(ProtocolNodeReconnect, StaleOldGenerationResponseAttributedNotMisrouted) {
   bool echo2_ended = false;
   auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
 
-  Result<Message> fresh{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> fresh{make_error_code(TransportErrc::kInternal)};
   bool fresh_done = false;
   auto request2 = Coro::makeTask([&] {
     fresh = node->Request(MakeRequest(0x0007, {0x02}), Deadline(4000ms));
@@ -532,7 +531,7 @@ TEST(ProtocolNodeReconnect, TcpClientDisconnectDoesNotSelfTerminate) {
   bool echo2_ended = false;
   auto echo2 = SpawnEcho(*server_txp2, EchoResponder, echo2_ended);
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node->Request(MakeRequest(0x0009, {0x5A}), Deadline(4000ms));

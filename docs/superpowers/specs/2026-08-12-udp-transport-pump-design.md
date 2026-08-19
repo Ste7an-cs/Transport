@@ -222,3 +222,26 @@ Status WaitClosed(OperationOptions o) { return closed.Wait(o); }
 - **`LastSendTime` / `LastReceiveTime`**：曾议删除（生产代码零消费，仅 4 个测试文件约 15 处断言在读），**本轮保留**。
 - **写侧 Trace（修正，2026-08-14）**：本文初稿的写泵伪代码含 `RecordEvent(send / send_error)`，**无法实现** —— `UdpConfig` 没有 `trace_sink` 字段（全仓只有 `TcpClientConfig` 与 `DdsTransport` 有）。加该字段属配置面变更且需同步 SDD，本轮不做；写侧失败目前只落 `LastError()`。
 - **临时端口漂移**：`local_port` 配 0 时每次重 bind 会拿到**不同**端口（实测 43752 → 43724）。对端若记着源端口会失联。是否需要"重 bind 时沿用上次端口"未定，本轮不处理。
+
+## redesign 分支的编译范围收窄(2026-08-16)
+
+为重新设计 `ITransport` / node 接口,本分支**暂时把工程收窄到 UDP + ProtocolNode**。
+被排除的是**构建列表**,源文件一律保留在仓库里,恢复只需改回 `CMakeLists.txt`。
+
+**库源排除(8)**:`DdsNode` / `TcpTransport` / `TcpClientTransport` / `SerialTransport` /
+`TcpServer` / `DdsTransport` / `DdsProviderRegistry` / `FakeDdsProvider`;FastDDS 可选块禁用。
+
+**测试排除(18)**:上述实现的专属用例,外加三个跨介质用例——
+`link_state_test`、`trace_wiring_test`、**`loss_accounting_test`**。
+
+### ⚠️ 必须记住的覆盖损失
+
+`loss_accounting_test` 是 loss=0 的招牌资产,它守着两条等式:
+`Σ命名原因 == 总丢弃` 与 `drop_records.size() == Σ`。**排除它意味着重设计期间这两条
+不再被守**。接口定稿、各介质回归后必须第一时间恢复,且恢复前不得宣称"无静默丢失"。
+
+`link_state_test`(链路可用性跨介质同形)与 `trace_wiring_test`(观测面接线)同理。
+
+### 现状
+
+收窄后:**8 个库源、24 个测试文件、178 个用例全绿**(收窄前 305)。

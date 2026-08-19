@@ -40,7 +40,6 @@ using transport::Endpoint;
 using transport::FakeDdsProvider;
 using transport::OperationOptions;
 using transport::SendUnit;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -83,16 +82,16 @@ OperationOptions Deadline(std::chrono::milliseconds d) {
 using transport::IDdsProvider;
 class FailingPublishProvider : public IDdsProvider {
  public:
-  Status Init(const DdsConfig&) override { return Status{}; }
+  Coro::Result<void> Init(const DdsConfig&) override { return Coro::Result<void>{}; }
   void Shutdown() override {}
-  Status Publish(const std::string&, const std::vector<uint8_t>&) override {
+  Coro::Result<void> Publish(const std::string&, const std::vector<uint8_t>&) override {
     return make_error_code(TransportErrc::kIo);
   }
-  Status Subscribe(const std::string&,
+  Coro::Result<void> Subscribe(const std::string&,
                    std::function<void(const std::vector<uint8_t>&)>) override {
-    return Status{};
+    return Coro::Result<void>{};
   }
-  Status Unsubscribe(const std::string&) override { return Status{}; }
+  Coro::Result<void> Unsubscribe(const std::string&) override { return Coro::Result<void>{}; }
   std::string Name() const override { return "failing-publish"; }
 };
 
@@ -108,8 +107,8 @@ TEST(DdsTransport, PublishToTopicDeliversDatagramWithTopicSource) {
   auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
   ASSERT_TRUE(static_cast<bool>(dg));
   EXPECT_EQ(dg.value().bytes, (std::vector<std::uint8_t>{1, 2, 3}));
-  EXPECT_EQ(dg.value().source.kind, Endpoint::Kind::kTopic);
-  EXPECT_EQ(dg.value().source.topic, "t");
+  EXPECT_EQ(dg.value().peer.kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ(dg.value().peer.topic, "t");
 }
 
 TEST(DdsTransport, MultiTopicEachArrivesAndSameTopicKeepsOrder) {
@@ -127,7 +126,7 @@ TEST(DdsTransport, MultiTopicEachArrivesAndSameTopicKeepsOrder) {
   for (int k = 0; k < 10; ++k) {
     auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
     ASSERT_TRUE(static_cast<bool>(dg));
-    if (dg.value().source.topic == "a")
+    if (dg.value().peer.topic == "a")
       a_seq.push_back(Dec(dg.value().bytes));
     else
       b_seq.push_back(Dec(dg.value().bytes));

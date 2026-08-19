@@ -69,7 +69,6 @@ using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
@@ -169,14 +168,14 @@ TEST(TraceWiring, ProtocolNodeCapturesSendRecvDecodeMatchHandlerAndClose) {
   FakeCoroTransport* fake = fake_owner.get();
   ProtocolNodeConfig config;
   config.trace_sink = &sink;
-  config.handler = [](const Message&, HandlerContext&) -> Status { return Status{}; };
+  config.handler = [](const Message&, HandlerContext&) -> Coro::Result<void> { return Coro::Result<void>{}; };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
   ASSERT_TRUE(node.Start());
 
   // 请求-响应回合:Write 完成(send)→ 对端注入响应 → Decode 成功(decode)→ 解出消息
   // (recv)→ PendingTable 匹配(match)。
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002, {0xAB}));
@@ -219,7 +218,7 @@ TEST(TraceWiring, ProtocolNodeCapturesTimeout) {
   ASSERT_TRUE(node.Start());
 
   // 无响应注入,短 deadline → 超时终结。
-  Result<Message> outcome{Message{}};
+  Coro::Result<Message> outcome{Message{}};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002, {}), Deadline(30ms));
@@ -246,7 +245,7 @@ TEST(TraceWiring, ProtocolNodeCapturesCancel) {
 
   OperationOptions options;
   options.cancellation = source.token();
-  Result<Message> outcome{Message{}};
+  Coro::Result<Message> outcome{Message{}};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002, {}), options);
@@ -279,7 +278,7 @@ TEST(TraceWiring, DdsNodeCapturesSendRecvDecodeAndMatch) {
   server_cfg.inbox_topic = "srv_inbox";
   server_cfg.node_id = "srv";
   server_cfg.trace_sink = &server_sink;
-  server_cfg.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Status {
+  server_cfg.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Coro::Result<void> {
     Message reply;
     reply.payload = msg.payload;
     return ctx.Reply(msg, std::move(reply));
@@ -300,7 +299,7 @@ TEST(TraceWiring, DdsNodeCapturesSendRecvDecodeAndMatch) {
                 std::move(client_cfg));
   ASSERT_TRUE(static_cast<bool>(client.Start()));
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto req = Coro::makeTask([&] {
     Message m;
@@ -329,12 +328,12 @@ TEST(TraceWiring, NullSinkLeavesControlFlowAndMetricsUnaffected) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();
   ProtocolNodeConfig config;  // trace_sink 默认 nullptr。
-  config.handler = [](const Message&, HandlerContext&) -> Status { return Status{}; };
+  config.handler = [](const Message&, HandlerContext&) -> Coro::Result<void> { return Coro::Result<void>{}; };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
   ASSERT_TRUE(node.Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002, {0xAB}));

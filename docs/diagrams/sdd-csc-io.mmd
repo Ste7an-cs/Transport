@@ -2,11 +2,10 @@ classDiagram
     direction TB
     class ITransport {
         <<interface>>
-        +Start() / Write(SendUnit)
-        +Read() shared_ptr~Awaitable~Datagram~~
-        +RequestClose() / WaitClosed(options)
-        +LastSendTime / LastReceiveTime / LastError
-        +CurrentLinkState()
+        +Start() / Close() / WaitClosed()
+        +AsyncRead() shared_ptr~Awaitable~Datagram~~
+        +AsyncWrite(Datagram) Coro::Result~void~
+        +LastError() / CurrentLinkState()
     }
     class TcpTransport { +已连接字节管道 }
     class TcpClientTransport {
@@ -14,7 +13,11 @@ classDiagram
         +具体诊断（非多态缝）：State/WaitForState
         +Generation/AttemptCount/LastFailure
     }
-    class UdpTransport { +报文+地址 }
+    class UdpTransport {
+        +报文+地址（peer）
+        +socket 管理泵 + 读写双队列
+        +silence_timeout：读超时兼重试间隔
+    }
     class SerialTransport { +串口字节流 }
     class DdsTransport { +provider 跨线程有界交接 }
     class TcpServer { +accept 每连接一 node }
@@ -31,4 +34,5 @@ classDiagram
     TcpClientTransport *-- TcpTransport : 一代际一内层
     DdsTransport *-- IDdsProvider : 组合
     TcpServer ..> TcpTransport : 每连接接管
-    note for DdsTransport "listener 线程非阻塞 Push → BoundedQueue~Sample~\nRead 侧 fiber 出队（跨线程唤醒）"
+    note for ITransport "读写刻意不对称：读交出等待器句柄，\n超时/取消/扇出由调用方自理；\n写入队即返，结果只落 LastError()"
+    note for UdpTransport "ADR-0008 已落地；TCP / 串口 / DDS\n按同一形态后续跟进（当前排除于编译面）"

@@ -57,7 +57,7 @@ struct TcpTransport::State {
       std::make_shared<Coro::Awaitable<Datagram>>()};
   LifecycleState lifecycle{LifecycleState::kCreated};
   // 对端地址,Start 时从已连接 socket 缓存(对已连接 TCP 恒定):投入 read_queue 的
-  // Datagram.source 恒填为对端 Endpoint::Net(TCP from 恒为对端,见 CONTEXT.md)。
+  // Datagram.peer 恒填为对端 Endpoint::Net(TCP from 恒为对端,见 CONTEXT.md)。
   std::string peer_host;
   std::uint16_t peer_port{0};
   bool active_write{false};  // 写槽是否被占。
@@ -109,7 +109,7 @@ void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
     gate->close(make_error_code(TransportErrc::kClosed));
   }
   if (complete) {
-    state->closed.Complete(Status{});
+    state->closed.Complete(Coro::Result<void>{});
   }
 }
 
@@ -134,7 +134,7 @@ void RunReadPump(const std::shared_ptr<TcpTransport::State>& state,
         std::lock_guard<std::mutex> lock(state->mutex);
         state->last_recv = OperationOptions::Clock::now();
         // TCP from 恒为对端:source 填 Start 时缓存的对端地址(CONTEXT.md 读-分发循环)。
-        datagram.source = Endpoint::Net(state->peer_host, state->peer_port);
+        datagram.peer = Endpoint::Net(state->peer_host, state->peer_port);
       }
       if (channel->push(std::move(datagram)) !=
           boost::fibers::channel_op_status::success) {
@@ -187,7 +187,7 @@ void ExitWrite(const std::shared_ptr<TcpTransport::State>& state) {
     next_gate->close();
   }
   if (complete) {
-    state->closed.Complete(Status{});
+    state->closed.Complete(Coro::Result<void>{});
   }
 }
 
@@ -215,14 +215,14 @@ TcpTransport::~TcpTransport() {
   }
 }
 
-Status TcpTransport::Start() {
+Coro::Result<void> TcpTransport::Start() {
   const auto state = state_;
   std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
   std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kRunning) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (state->lifecycle != LifecycleState::kCreated) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -231,7 +231,7 @@ Status TcpTransport::Start() {
       return make_error_code(TransportErrc::kInvalidState);
     }
     state->lifecycle = LifecycleState::kRunning;
-    // 缓存对端地址(已连接 TCP 恒定):投入 read_queue 的 Datagram.source 恒填为对端。
+    // 缓存对端地址(已连接 TCP 恒定):投入 read_queue 的 Datagram.peer 恒填为对端。
     state->peer_host = state->socket->peerAddress().toString().toStdString();
     state->peer_port = state->socket->peerPort();
     // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 会收下订阅前已到达的
@@ -245,7 +245,7 @@ Status TcpTransport::Start() {
   Coro::makeTask([state, stream, read_queue] {
     RunReadPump(state, stream, read_queue);
   });
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 // 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
@@ -259,7 +259,7 @@ std::shared_ptr<Coro::Awaitable<Datagram>> TcpTransport::Read() {
   return state_->read_queue;
 }
 
-Status TcpTransport::Write(SendUnit unit) {
+Coro::Result<void> TcpTransport::Write(SendUnit unit) {
   const auto state = state_;
   std::shared_ptr<Coro::Awaitable<void>> slot_gate;
   {
@@ -304,14 +304,14 @@ Status TcpTransport::Write(SendUnit unit) {
 
   // 失败即关本物理连接,不自动重发:先进入关闭(排队写等待者以 kClosed 收敛、不
   // 移交写槽),再释放写槽。
-  auto fail = [&state](std::error_code mapped) -> Status {
+  auto fail = [&state](std::error_code mapped) -> Coro::Result<void> {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
     }
     BeginClose(state);
     ExitWrite(state);
-    return Status{mapped};
+    return Coro::Result<void>{mapped};
   };
 
   // 把整帧全部交给 Qt 用户态发送缓冲、并等待其刷入操作系统发送缓冲:只有整帧字节
@@ -350,15 +350,15 @@ Status TcpTransport::Write(SendUnit unit) {
     state->last_send = Clock::now();
   }
   ExitWrite(state);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status TcpTransport::RequestClose() {
+Coro::Result<void> TcpTransport::RequestClose() {
   BeginClose(state_);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status TcpTransport::WaitClosed(OperationOptions options) {
+Coro::Result<void> TcpTransport::WaitClosed(OperationOptions options) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kCreated) {

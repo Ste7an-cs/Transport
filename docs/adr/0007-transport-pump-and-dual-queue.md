@@ -1,5 +1,7 @@
 # ADR-0007：传输层统一为「socket 管理泵 + 读写双队列」，读接口返回等待器
 
+> **注（2026-08-19）**：本 ADR 的泵形态（**D1**）与 fire-and-forget 写（**D3**）被 ADR-0008 保留并扩展，但**接口表达已改写**：`Read()`→`AsyncRead()`、`Write(SendUnit)`→`AsyncWrite(Datagram)`（**D4 的「写侧也交队列句柄」未采纳**）、`RequestClose()`→`Close()`、`WaitClosed()` 去掉时限参数。**D5（静默超时）已落地**，且与 bind 失败的重试间隔合并为同一个 `UdpConfig::silence_timeout`（默认 5s），故 D2 中「固定 3 秒」改为该配置项。
+
 **状态：** Accepted
 **日期：** 2026-08-12
 **关联：** ADR-0004（传输语义统一——本 ADR 改其 **D1** 的终止表达、扩大其 **D6** 连接泵形态至全介质）；ADR-0005 **D5**（致命错误自终——本 ADR 缩小其适用介质）；#152（AsyncTask 升级后 channel 默认有界 1024 且静默丢最旧）；SRS 落点：RT_TRANSPORT_004/008、RT_TCP_RECONNECT_003、RT_LIFECYCLE_008、新增心跳配置。

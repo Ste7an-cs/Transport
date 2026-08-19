@@ -22,7 +22,6 @@
 using namespace std::chrono_literals;
 using transport::ConnectionState;
 using transport::OperationOptions;
-using transport::Status;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
 using transport::TransportErrc;

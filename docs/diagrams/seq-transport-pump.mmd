@@ -1,49 +1,53 @@
 sequenceDiagram
     autonumber
-    participant X as 调用方（node）
+    participant X as 宿主 / node
     participant T as Transport（公开面）
     participant P as socket 管理泵 fiber
+    participant W as 写泵 fiber
     participant S as socket（Qt）
     participant RQ as read_queue
-    participant WQ as write_queue
+    participant WQ as write_queue（内部）
 
-    Note over T,P: Start()：起一条泵 fiber，随即返回<br/>（不等待 socket 就绪 —— 首次 bind/connect 未成不算启动失败）
+    Note over T,P: Start()：起两条泵后随即返回<br/>（首次 bind/connect 未成不算启动失败）
     X->>T: Start()
-    T->>P: spawn 泵
-    T-->>X: Status{}
+    T->>P: spawn 管理泵
+    T->>W: spawn 写泵
+    T-->>X: Coro::Result~void~{}
 
     rect rgba(200,220,255,0.25)
-    Note over P,S: 外层循环 —— socket 管理
+    Note over P,S: 管理泵 —— 读数据与超时判断同在这一条 fiber 内
     loop 未被 Close
-        P->>S: 按配置创建并就绪（UDP: bind / TCP: connect）
+        P->>S: 按配置绑定/连接
         alt 失败
             S-->>P: 错误
-            Note over P: 等固定间隔（UDP 3s）后重试<br/>不自终，唯一退出条件是我方 Close
+            Note over P: await_for(close_signal, timeout) 退避后重试<br/>不自终，唯一退出条件是我方 Close
         else 成功
-            P->>S: readAll() / receiveDatagram() 建流（一次，反复 await）
+            P->>S: receiveDatagram() / readAll() 建流（一次，反复 await）
             rect rgba(220,255,220,0.25)
-            Note over P,RQ: 内层循环 —— 数据泵
-            loop 流未终止
-                S-->>P: await 到数据（带静默超时，可配、0 禁用）
+            loop 内层数据泵
+                S-->>P: await_for(stream, timeout) 取到数据
                 P->>RQ: push
             end
-            Note over P: 流终止 / 静默超时 → 退出内层，回外层重建 socket
+            Note over P: 静默超时 / 流终止 / 我方 Close —— 三者不作区分，<br/>一律 break 回外层重建；区别只落在 LastError() 的归因上
             end
         end
+        Note over P,S: 每轮末尾无条件解绑，下轮从确定状态重建
     end
     end
 
-    Note over X,RQ: Read() 只交出 read_queue 句柄，不返回数据
-    X->>T: Read()
+    Note over X,RQ: AsyncRead() 只交出 read_queue 句柄，不返回数据
+    X->>T: AsyncRead()
     T-->>X: shared_ptr~Awaitable~Datagram~~
-    Note over X: 由调用方自行 await_for(deadline) / 接取消令牌；<br/>需多消费者扇出时自行 shared()，否则天然抢占
+    Note over X: 超时 / 取消由调用方自行 await_for；<br/>需多消费者扇出时自行 shared()，否则天然抢占
 
-    Note over X,WQ: Write() 只入队即返（fire-and-forget）
-    X->>T: Write(SendUnit)
+    Note over X,WQ: AsyncWrite(Datagram) 只判生命周期与入队
+    X->>T: AsyncWrite({bytes, peer})
     T->>WQ: push
-    T-->>X: Status{}（仅表示已入队，不表示已发出）
-    WQ-->>P: 消费者取出
-    P->>S: 写出
-    Note over P: 失败不回传调用方，只进 LastError() 与 Trace<br/>链路不可用时留在队列等待恢复，恢复后按序全部发出
+    T-->>X: Coro::Result~void~{}（仅表示已入队）
+    WQ-->>W: 阻塞点①：等数据
+    W->>W: 解析目的地（kDefault → config 默认对端）<br/>解析不了即丢该条并记 LastError，不占队头
+    W->>S: 阻塞点②：等 socket 就绪 → writeDatagram
+    Note over W: 写出结果不回传调用方，只落 LastError()<br/>链路不可用时留在队列等恢复，恢复后按序全发
 
-    Note over T,RQ: Close()：停外层循环 + close(read_queue) 并携带终止原因<br/>调用方在等待器上得到该终止错误 → 停止读取
+    Note over T,RQ: Close()：四处打断（退避 / 读流 / 写泵两个阻塞点）+ 关 read_queue 并携终止原因
+    Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放

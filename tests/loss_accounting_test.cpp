@@ -72,7 +72,6 @@ using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -151,10 +150,10 @@ Datagram MakeBusinessDatagram(FrameType frm_type, std::uint8_t session_id,
 // DecodeAndDispatch 的坏帧分支(kBadFrame),不依赖 SystemCodec 的坏 CRC 重扫细节。
 class AlwaysFailDecodeCodec : public ICodec {
  public:
-  Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
+  Coro::Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
     return real_.Encode(msg);
   }
-  Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
+  Coro::Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
     return make_error_code(TransportErrc::kCodec);
   }
 
@@ -179,7 +178,7 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
   FakeCoroTransport* fake = fake_owner.get();
   ProtocolNodeConfig config;
   config.trace_sink = &sink;
-  config.handler = [](const Message&, HandlerContext&) -> Status { return Status{}; };
+  config.handler = [](const Message&, HandlerContext&) -> Coro::Result<void> { return Coro::Result<void>{}; };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
   ASSERT_TRUE(node.Start());
@@ -197,7 +196,7 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
   for (int i = 0; i < 5; ++i) {
     const std::uint16_t msg_id = static_cast<std::uint16_t>(0x0010 + i);
     const std::size_t prior_sent_size = fake->sent().size();
-    Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+    Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
     bool done = false;
     auto request = Coro::makeTask([&] {
       outcome = node.Request(MakeRequest(msg_id, {static_cast<std::uint8_t>(i)}));
@@ -223,7 +222,7 @@ TEST(LossAccounting, CleanRunProtocolNodeAllDropCountersStayZero) {
   }
 
   for (int i = 0; i < 3; ++i) {
-    Status st = node.Send(MakeRequest(static_cast<std::uint16_t>(0x0080 + i), {}));
+    Coro::Result<void> st = node.Send(MakeRequest(static_cast<std::uint16_t>(0x0080 + i), {}));
     EXPECT_TRUE(static_cast<bool>(st));
     AssertAllZero();
   }
@@ -262,7 +261,7 @@ TEST(LossAccounting, CleanRunDdsNodeAllDropCountersStayZero) {
   server_cfg.inbox_topic = "srv_inbox";
   server_cfg.node_id = "srv";
   server_cfg.trace_sink = &sink;
-  server_cfg.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Status {
+  server_cfg.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Coro::Result<void> {
     Message reply;
     reply.payload = msg.payload;
     return ctx.Reply(msg, std::move(reply));
@@ -290,9 +289,9 @@ TEST(LossAccounting, CleanRunDdsNodeAllDropCountersStayZero) {
   sub_cfg.inbox_topic = "sub_inbox";
   sub_cfg.node_id = "sub";
   sub_cfg.trace_sink = &sink;
-  sub_cfg.handler = [&notify_count](const Message&, DdsHandlerContext&) -> Status {
+  sub_cfg.handler = [&notify_count](const Message&, DdsHandlerContext&) -> Coro::Result<void> {
     ++notify_count;
-    return Status{};
+    return Coro::Result<void>{};
   };
   DdsNode subscriber(std::move(sub_transport_owner), std::make_unique<DdsCodec>(),
                      std::move(sub_cfg));
@@ -343,7 +342,7 @@ TEST(LossAccounting, CleanRunDdsNodeAllDropCountersStayZero) {
 
   // 3 轮请求-应答。
   for (int i = 0; i < 3; ++i) {
-    Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+    Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
     bool done = false;
     auto req = Coro::makeTask([&] {
       Message m;
@@ -413,10 +412,10 @@ NodeACounts RunNodeAScenario(ITraceSink* sink) {
   ProtocolNodeConfig config;
   config.trace_sink = sink;
   config.business_queue_max_events = 2;
-  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     entered.fetch_add(1);
     ctx.cancellation().Wait();  // 卡住首条,不放行 —— 后续帧只入队 / 溢出,不处理。
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));

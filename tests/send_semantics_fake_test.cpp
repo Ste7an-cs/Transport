@@ -15,7 +15,6 @@
 using transport::Endpoint;
 using transport::LifecycleState;
 using transport::SendUnit;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 using testutil::FakeCoroTransport;
@@ -31,7 +30,7 @@ TEST(CoroSendSemantics, WriteDoesNotCompleteBeforeFlushGateReleases) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
-  Status written{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> written{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto writer = Coro::makeTask([&] {
     entered.resolve();
@@ -77,8 +76,8 @@ TEST(CoroSendSemantics, ConcurrentWritesSerializeIntoConsistentOrderWithoutInter
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
 
-  Status a{make_error_code(TransportErrc::kInternal)};
-  Status b{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> a{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> b{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> a_entered;
   auto first = Coro::makeTask([&] {
     a_entered.resolve();

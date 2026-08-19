@@ -28,8 +28,8 @@ class LengthFieldCodec : public ICodec {
   // 其余(header_size==0 / 长度字段越出 header / max_frame_size < header_size)→ kInvalidArgument。
   explicit LengthFieldCodec(LengthFieldCodecConfig config);
 
-  Result<std::vector<uint8_t>> Encode(const Message& msg) override;
-  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override;
+  Coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override;
+  Coro::Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override;
 
  private:
   LengthFieldCodecConfig config_;

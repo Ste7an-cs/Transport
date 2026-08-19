@@ -33,10 +33,10 @@
 #include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
+#include "detail/result.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
-#include "transport/core/Result.hpp"
 #include "transport/io/tcp/TcpClientTransport.hpp"
 #include "transport/io/tcp/TcpServer.hpp"
 #include "transport/core/TransportTypes.hpp"
@@ -56,7 +56,6 @@ using transport::ProtocolKey;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
@@ -112,7 +111,7 @@ TcpServer::NodeFactory EchoFactory() {
   return [](std::unique_ptr<ITransport> transport)
              -> std::unique_ptr<ProtocolNode> {
     ProtocolNodeConfig cfg;
-    cfg.handler = [](const Message& msg, HandlerContext& ctx) -> Status {
+    cfg.handler = [](const Message& msg, HandlerContext& ctx) -> Coro::Result<void> {
       Message reply;
       reply.frm_type = FrameType::kResponse;  // 终结帧(客户端 IsTerminal 认)。
       reply.message_id = static_cast<std::uint16_t>(msg.message_id | kResponseMarker);
@@ -157,7 +156,7 @@ void StartAndAwaitConnected(ClientNode& c) {
 // 客户端发一次请求并断言拿到 echo 响应(命令码 message_id、payload 回显)。
 void ExpectRequestEcho(ProtocolNode& client, std::uint16_t message_id,
                        std::vector<std::uint8_t> payload) {
-  Result<Message> resp = client.Request(MakeRequest(message_id, payload),
+  Coro::Result<Message> resp = client.Request(MakeRequest(message_id, payload),
                                         Deadline(4000ms));
   ASSERT_TRUE(resp) << resp.error().message();
   EXPECT_EQ(resp.value().message_id,
@@ -303,7 +302,7 @@ TEST(TcpServerAccept, ListenFailureIsObservable) {
   conflict.port = port;
   TcpServer clash(conflict, EchoFactory());
 
-  Status started = clash.Start();
+  Coro::Result<void> started = clash.Start();
   EXPECT_FALSE(started);
   EXPECT_FALSE(clash.IsListening());
   EXPECT_TRUE(clash.LastError()) << "监听失败应可观测(LastError 非空)";

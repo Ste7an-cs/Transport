@@ -17,7 +17,7 @@ namespace transport {
 
 class DdsCodec : public ICodec {
  public:
-  Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+  Coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override {
     // 字段超 uint16 长度前缀上限:codec 格式无法承载 → kCodec。
     if (msg.correlation_id.size() > 0xFFFF || msg.reply_to.size() > 0xFFFF)
       return make_error_code(TransportErrc::kCodec);
@@ -31,7 +31,7 @@ class DdsCodec : public ICodec {
     return out;
   }
 
-  Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
+  Coro::Result<std::vector<Message>> Decode(const uint8_t* data, std::size_t len) override {
     std::vector<Message> out;
     if (len == 0) return out;
     std::size_t pos = 0;

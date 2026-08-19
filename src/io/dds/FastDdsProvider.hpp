@@ -28,12 +28,12 @@ class FastDdsProvider : public IDdsProvider {
   FastDdsProvider();
   ~FastDdsProvider() override;
 
-  Status Init(const DdsConfig& config) override;
+  Coro::Result<void> Init(const DdsConfig& config) override;
   void         Shutdown() override;
-  Status Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
-  Status Subscribe(const std::string& topic,
+  Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
+  Coro::Result<void> Subscribe(const std::string& topic,
                          std::function<void(const std::vector<uint8_t>&)> cb) override;
-  Status Unsubscribe(const std::string& topic) override;
+  Coro::Result<void> Unsubscribe(const std::string& topic) override;
   std::string Name() const override { return "fastdds"; }
 
  private:

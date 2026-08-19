@@ -2,29 +2,36 @@ stateDiagram-v2
     direction LR
     [*] --> Created
 
-    Created --> Created: ValidateConfig 失败<br/>(kConfiguration，可改配重试)
-    Created --> Running: 首个 Start 成功<br/>(transport.Start + MarkRunning<br/>+ spawn 读循环/handler)
-    Created --> Created: 并发 Start<br/>(await start_done_，不重复 spawn)
+    Created --> Created: DoStart 失败<br/>(配置非法等，可改配重试)
+    Created --> Created: 并发 Start<br/>(另一次正在初始化 → kInvalidState)
+    Created --> Running: Start 成功<br/>(DoStart 返回后由基类置位)
+    Created --> Closed: 从未 Start 即 Close<br/>(无 fiber 可汇合)
 
     Running --> Running: 再次 Start（幂等成功）
-    Running --> Closing: 首个 Close<br/>(汇合信号 + FailAll<br/>+ 放行读循环收敛)
-    Running --> Closing: 致命错误自终<br/>(读循环退出时仍 Running →<br/>自发同一组汇合信号，ADR-0005 D5)
+    Running --> Closing: Close（只发信号）<br/>DoClose：关读订阅 + handler 取消<br/>+ Dispatcher.CloseAll
+    Running --> Closing: 读循环退出后调 Close()<br/>(传输终结即自终，与我方 Close 同一条路径)
 
-    Closing --> Closing: 后续 Close<br/>(共享 closed_，多等待者)
-    Closing --> Closed: 读循环收敛完成<br/>(读循环退出→等 handler 退出<br/>→close_drop→Closed)
+    Closing --> Closing: 再次 Close（幂等空操作）
+    Closing --> Closed: WaitClosed()<br/>DoJoin：join 读循环 + handler 消费者
 
-    Closed --> Closed: 再次 Close（直接成功）
+    Closed --> Closed: 再次 Close / WaitClosed（立即返回）
     Closed --> [*]
 
     note right of Closing
-        无重入守卫（ADR-0006 D8）：Close 结尾
-        无条件等 closed_。内部工作单元不走这里
-        —— 处理器经 RequestClose 只发信号不等待，
-        读循环收敛走内部路径。捕获 node* 硬调
-        Close 会挂死，属使用契约（RT_LIFECYCLE_005）
+        Close 不含等待点 —— 读-分发循环与业务处理器
+        均可直接调用公开的 Close()（ADR-0008 D2）。
+        旧形态的 SignalClose / ConvergeAfterReadLoop
+        与“内部工作单元不得调 Close”的使用契约已作废。
+    end note
+
+    note right of Closed
+        WaitClosed 返回即“全部内部 fiber 已不再运行、
+        不再触碰节点成员”—— 可安全析构的充分条件。
+        它无时限：Awaitable::close 只保证唤醒，
+        只有 FiberTask::get 保证跑完（ADR-0008 D3）。
     end note
 
     note right of Running
-        Request/Send 仅在 Running 放行；
-        Created/Closing/Closed 一律 kClosed
+        Request / Send 仅在 Running 放行；
+        Created / Closing / Closed 一律 kClosed
     end note

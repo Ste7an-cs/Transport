@@ -9,13 +9,14 @@
 // 不依赖 Transport。
 // -----------------------------------------------------------------------------
 
+#include "detail/result.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 #include "transport/core/Message.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/Result.hpp"
 
 namespace transport {
 
@@ -24,12 +25,12 @@ class ICodec {
   virtual ~ICodec() = default;
 
   // 发:一条消息 → 一段线缆字节。
-  virtual Result<std::vector<uint8_t>> Encode(const Message& msg) = 0;
+  virtual Coro::Result<std::vector<uint8_t>> Encode(const Message& msg) = 0;
 
   // 收:喂入字节切片 → 切出 0..N 条完整消息(半包返回空、粘包返回多条)。
   // 解析错误按类别报 TransportErrc:分帧/长度/最大帧长 → kFrame;
   // codec 语义(坏判别符/字段越界)→ kCodec。
-  virtual Result<std::vector<Message>> Decode(const uint8_t* data,
+  virtual Coro::Result<std::vector<Message>> Decode(const uint8_t* data,
                                                     std::size_t len) = 0;
 };
 

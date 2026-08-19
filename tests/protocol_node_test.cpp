@@ -1,491 +1,521 @@
-// -----------------------------------------------------------------------------
-// protocol_node_test.cpp — 最小 ProtocolNode 端到端契约单测(RT_NODE_003 / RT_REQUEST)
+// ProtocolNode 单元测试(重设计后的形态)。
 //
-// 用 FakeCoroTransport 作传输、真实 SystemCodec 作 codec,全程走 encode/decode。
-// 构造响应帧:另起一个 SystemCodec 实例 Encode 一个响应 Message 得字节,fake.Inject
-// (Datagram) 喂给读循环。请求 fiber 用 makeTask 起独立 fiber 在 Request 挂起,主(测试)
-// fiber 用 pumpFiberUntil 驱动时钟 / 让出(coro_test_main 范式)。
-// -----------------------------------------------------------------------------
-
-#include <gtest/gtest.h>
-
+// 在 fiber 调度器(coro_test_main)内,以假传输 + SystemDatagramCodec 驱动,覆盖五组事实:
+//
+//   1. 出站盖章:frm_type / protocol_id / session_id 的填写与 session_id 的循环递增;
+//   2. 请求-响应关联:由 Dispatcher 按"会话 + 命令码 + 帧类型"三字段匹配,任一不符即不
+//      终结该请求;
+//   3. 分发去向:命中订阅者的消息不再进入业务队列;未命中的终结帧归因丢弃,其余业务帧
+//      交入站处理器;
+//   4. 生命周期:节点关闭令在途请求恰好终结一次;传输终结使节点自行关闭;节点不启停传输;
+//   5. 分段交互:`Subscribe` 允许一次交互登记多段等待,各段各自设定时限。
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
 #include <vector>
 
-#include "await/awaitable.hpp"
-#include "task/fibertask.h"
-#include "transport/node/ProtocolNode.hpp"
-#include "transport/core/DropReason.hpp"
-#include "transport/core/ITraceSink.hpp"
-#include "transport/core/TransportTypes.hpp"
-#include "transport/codec/ICodec.hpp"
-#include "transport/codec/SystemCodec.hpp"
+#include <boost/fiber/operations.hpp>
+#include <gtest/gtest.h>
+
 #include "coro_test_util.hpp"
-#include "fake_coro_transport.hpp"
+#include "fake_transport.hpp"
+#include "task/fibertask.h"
+#include "transport/codec/SystemDatagramCodec.hpp"
+#include "transport/core/Error.hpp"
+#include "transport/core/ITraceSink.hpp"
+#include "transport/core/Message.hpp"
+#include "transport/node/ProtocolNode.hpp"
 
 using namespace std::chrono_literals;
-using testutil::FakeCoroTransport;
-using testutil::pumpFiberUntil;
-using transport::CapturingTraceSink;
-using transport::CorrelationKeyStrategy;
-using transport::Datagram;
-using transport::DefaultProtocolKeyStrategy;
-using transport::DropReason;
-using transport::DropReasonName;
+using testutil::FakeTransport;
 using transport::FrameType;
-using transport::ICodec;
+using transport::HandlerContext;
+using transport::kAny;
 using transport::Message;
-using transport::OperationOptions;
-using transport::ProtocolKey;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
-using transport::Result;
-using transport::SystemCodec;
+using transport::SystemDatagramCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 namespace {
 
-// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
-// decode/close 等事件(共用同一 trace_sink),按 category 过滤才是"这次丢弃恰好一条
-// Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
-std::vector<CapturingTraceSink::Record> DropRecords(
-    const std::vector<CapturingTraceSink::Record>& records) {
-  std::vector<CapturingTraceSink::Record> out;
-  for (const auto& rec : records) {
-    if (rec.category == "drop") {
-      out.push_back(rec);
-    }
-  }
-  return out;
+constexpr std::uint8_t kProtocolId = 0x2A;
+
+ProtocolNodeConfig BaseConfig() {
+  ProtocolNodeConfig config;
+  config.protocol_id = kProtocolId;
+  config.default_request_timeout = 200ms;
+  return config;
 }
 
-// 构造一个响应帧 Datagram:用独立 SystemCodec 把响应 Message 编成字节。
-Datagram MakeResponseDatagram(std::uint8_t session_id, std::uint16_t message_id,
-                              std::vector<std::uint8_t> payload,
-                              FrameType frm_type = FrameType::kResponse) {
-  Message resp;
-  resp.frm_type = frm_type;
-  resp.session_id = session_id;
-  resp.message_id = message_id;
-  resp.payload = std::move(payload);
-  SystemCodec wire;
-  auto bytes = wire.Encode(resp);
-  EXPECT_TRUE(bytes);
-  Datagram dg;
-  dg.bytes = bytes ? std::move(bytes).value() : std::vector<std::uint8_t>{};
-  return dg;
+std::unique_ptr<transport::ICodec> MakeCodec() {
+  return std::make_unique<SystemDatagramCodec>();
 }
 
-// 构造一个业务帧 Datagram(非 kResponse/kResult)。
-Datagram MakeBusinessDatagram(FrameType frm_type, std::uint8_t session_id,
-                              std::uint16_t message_id) {
+Message Command(std::uint16_t message_id, std::vector<std::uint8_t> payload = {1}) {
   Message msg;
-  msg.frm_type = frm_type;
+  msg.message_id = message_id;
+  msg.payload = std::move(payload);
+  return msg;
+}
+
+/// 造一条回帧(以独立 codec 编码),供假传输投递。
+std::vector<std::uint8_t> EncodeFrame(std::uint8_t session_id,
+                                      std::uint16_t message_id, FrameType type,
+                                      std::vector<std::uint8_t> payload = {9}) {
+  Message msg;
+  msg.protocol_id = kProtocolId;
   msg.session_id = session_id;
   msg.message_id = message_id;
-  SystemCodec wire;
-  auto bytes = wire.Encode(msg);
+  msg.frm_type = type;
+  msg.payload = std::move(payload);
+  SystemDatagramCodec codec;
+  auto bytes = codec.Encode(msg);
   EXPECT_TRUE(bytes);
-  Datagram dg;
-  dg.bytes = bytes ? std::move(bytes).value() : std::vector<std::uint8_t>{};
-  return dg;
+  return std::move(bytes).value();
 }
 
-Message MakeRequest(std::uint16_t message_id, std::vector<std::uint8_t> payload) {
-  Message req;
-  req.message_id = message_id;
-  req.payload = std::move(payload);
-  return req;
+/// 解出假传输收到的第 index 条出站报文。
+Message DecodeSent(const FakeTransport& fake, std::size_t index) {
+  EXPECT_GT(fake.sent().size(), index);
+  const auto& bytes = fake.sent()[index].bytes;
+  SystemDatagramCodec codec;
+  auto decoded = codec.Decode(bytes.data(), bytes.size());
+  EXPECT_TRUE(decoded);
+  EXPECT_EQ(decoded.value().size(), 1u);
+  return decoded.value().front();
 }
 
-// codec 双:Encode 委托真实 SystemCodec(Request 仍可正常编码上线),Decode 恒返回
-// kCodec——供确定性触发 DecodeAndDispatch 的坏帧分支(P5-3 kBadFrame),不依赖
-// SystemCodec 内部 resync 细节(其 Decode 遇坏 CRC 会前移重扫、不对外报错)。
-class AlwaysFailDecodeCodec : public ICodec {
- public:
-  Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
-    return real_.Encode(msg);
+bool SawDrop(const transport::CapturingTraceSink& sink, const std::string& reason) {
+  for (const auto& record : sink.Records()) {
+    if (record.category == "drop" && record.message == reason) {
+      return true;
+    }
   }
-  Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
-    return make_error_code(TransportErrc::kCodec);
-  }
+  return false;
+}
 
- private:
-  SystemCodec real_;
+/// 已 Start 的节点;传输由**测试**(即宿主)启停,节点只借用。
+struct Fixture {
+  FakeTransport transport;
+  std::unique_ptr<ProtocolNode> node;
+
+  explicit Fixture(ProtocolNodeConfig config = BaseConfig()) {
+    EXPECT_TRUE(transport.Start());
+    node = std::make_unique<ProtocolNode>(transport, MakeCodec(), std::move(config));
+    EXPECT_TRUE(node->Start());
+  }
+  ~Fixture() {
+    node.reset();  // 析构内含 Close + WaitClosed
+    (void)transport.Close();
+  }
 };
 
 }  // namespace
 
-// 端到端 happy path:发 Request → 注入匹配响应 → Request 恰好一次完成、返响应、关联清理。
-TEST(ProtocolNode, RequestResolvedByMatchingResponse) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
-  ASSERT_TRUE(node.Start());
+// —— 1. 出站盖章 ————————————————————————————————————————————————————
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    outcome = node.Request(MakeRequest(0x0002, {0x11, 0x22}));
-    done = true;
-  });
+TEST(ProtocolNode, SendStampsCommandFrameAndProtocolId) {
+  Fixture fx;
+  ASSERT_TRUE(fx.node->Send(Command(0x0102)));
 
-  // 请求 fiber 已进入 Write/Wait:node 盖了 session_id=0(首个滚动值)。等它把帧写出。
-  ASSERT_TRUE(pumpFiberUntil([&] { return !fake->sent().empty(); }));
-  // 注入匹配响应:session 不变、message_id=请求码|0x1000、frm_type=kResponse。
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {0xAB, 0xCD}));
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(outcome);
-  EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(outcome.value().session_id, 0);
-  EXPECT_EQ(outcome.value().message_id, 0x1002);
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0xAB, 0xCD}));
-  EXPECT_EQ(node.UnmatchedResponseCount(), 0u);
-
-  node.Close();
-  EXPECT_TRUE(request.get());
+  ASSERT_EQ(fx.transport.sent().size(), 1u);
+  const Message sent = DecodeSent(fx.transport, 0);
+  EXPECT_EQ(sent.frm_type, FrameType::kCommand);
+  EXPECT_EQ(sent.protocol_id, kProtocolId);
+  EXPECT_EQ(sent.message_id, 0x0102);
 }
 
-// 迟到 / 乱序:请求完成后再注入同 key 响应 → 丢弃 + UnmatchedResponseCount +1,不二次完成。
-TEST(ProtocolNode, LateResponseAfterCompletionIsDroppedAndCounted) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
-  ASSERT_TRUE(node.Start());
+// 调用方给出的业务类型优先于默认的 kCommand。
+TEST(ProtocolNode, SendKeepsCallerSuppliedFrameType) {
+  Fixture fx;
+  Message msg = Command(0x0007);
+  msg.frm_type = FrameType::kState;
+  ASSERT_TRUE(fx.node->Send(std::move(msg)));
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    outcome = node.Request(MakeRequest(0x0002, {}));
-    done = true;
-  });
-  ASSERT_TRUE(pumpFiberUntil([&] { return !fake->sent().empty(); }));
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(outcome);
-
-  // 关联已清理:同 key 的迟到响应无在途匹配 → 丢弃计数 +1,不影响已完成的 Request。
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
-  EXPECT_EQ(node.UnmatchedResponseCount(), 1u);
-
-  node.Close();
-  EXPECT_TRUE(request.get());
+  EXPECT_EQ(DecodeSent(fx.transport, 0).frm_type, FrameType::kState);
 }
 
-// 业务帧:注入 kState / kCommand → DroppedNoHandlerCount +1,不投递、不 crash。
-TEST(ProtocolNode, BusinessFrameCountedAsDroppedNoHandler) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
-  ASSERT_TRUE(node.Start());
-
-  fake->Inject(MakeBusinessDatagram(FrameType::kState, 3, 0x0005));
-  fake->Inject(MakeBusinessDatagram(FrameType::kCommand, 4, 0x0006));
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.DroppedNoHandlerCount() == 2u; }));
-  EXPECT_EQ(node.DroppedNoHandlerCount(), 2u);
-  EXPECT_EQ(node.UnmatchedResponseCount(), 0u);
-
-  node.Close();
+// session_id 是自增计数器:逐次递增,越过 255 回绕到 0。
+TEST(ProtocolNode, SessionIdIncrementsAndWrapsAround) {
+  Fixture fx;
+  for (int i = 0; i < 258; ++i) {
+    ASSERT_TRUE(fx.node->Send(Command(0x0001))) << "第 " << i << " 次";
+  }
+  ASSERT_EQ(fx.transport.sent().size(), 258u);
+  EXPECT_EQ(DecodeSent(fx.transport, 0).session_id, 0);
+  EXPECT_EQ(DecodeSent(fx.transport, 1).session_id, 1);
+  EXPECT_EQ(DecodeSent(fx.transport, 255).session_id, 255);
+  EXPECT_EQ(DecodeSent(fx.transport, 256).session_id, 0) << "越过 255 应回绕";
+  EXPECT_EQ(DecodeSent(fx.transport, 257).session_id, 1);
 }
 
-// 自定义 key:改 response_marker=0x2000 → 匹配按新规则成立。
-TEST(ProtocolNode, CustomKeyStrategyMatchesByNewMarker) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNodeConfig config;
-  config.key_strategy = DefaultProtocolKeyStrategy(0x2000);
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
+// —— 2. 请求-响应关联 ————————————————————————————————————————————————
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    outcome = node.Request(MakeRequest(0x0007, {}));
-    done = true;
-  });
-  ASSERT_TRUE(pumpFiberUntil([&] { return !fake->sent().empty(); }));
-  // 响应码按新 marker:请求 0x0007 → 响应 0x2007。旧 0x1000 规则下不会匹配。
-  fake->Inject(MakeResponseDatagram(0, 0x2007, {0x01}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(outcome);
-  EXPECT_EQ(outcome.value().message_id, 0x2007);
-  EXPECT_EQ(node.UnmatchedResponseCount(), 0u);
+TEST(ProtocolNode, RequestIsTerminatedByMatchingResponse) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010)); });
 
-  node.Close();
-  EXPECT_TRUE(request.get());
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {7, 7})));
+  (void)caller.get();
+
+  ASSERT_TRUE(reply) << reply.error().message();
+  EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
+  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{7, 7}));
 }
 
-// 生命周期:在途 Request → Close 恰好一次返 kClosed;WaitClosed 在读循环退出后完成;
-// 关闭后再 Request → kClosed。
-TEST(ProtocolNode, CloseFailsInflightRequestAndBlocksLaterRequests) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
+TEST(ProtocolNode, RequestTimesOutWithoutResponse) {
+  Fixture fx;
+  auto reply = fx.node->Request(Command(0x0010), 80ms);
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+}
+
+// 三个匹配字段任缺其一都不终结该请求。
+TEST(ProtocolNode, ResponseWithMismatchedSessionDoesNotTerminateRequest) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller =
+      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(static_cast<std::uint8_t>(sent.session_id + 1), sent.message_id,
+                  FrameType::kResponse)));
+  (void)caller.get();
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+}
+
+TEST(ProtocolNode, ResponseWithMismatchedFrameTypeDoesNotTerminateRequest) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller =
+      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+
+  // 同会话、同命令码,但类型是结果而非回应。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResult)));
+  (void)caller.get();
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+}
+
+TEST(ProtocolNode, ResponseWithMismatchedMessageIdDoesNotTerminateRequest) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller =
+      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, static_cast<std::uint16_t>(sent.message_id + 1),
+                  FrameType::kResponse)));
+  (void)caller.get();
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+}
+
+// 并发的两个请求各自拿到自己的响应:session_id 是二者的唯一区分。
+// 以回声(响应原样带回请求的 payload)判定归属,不依赖两个 fiber 的启动先后。
+TEST(ProtocolNode, ConcurrentRequestsAreCorrelatedIndependently) {
+  Fixture fx;
+  Coro::Result<Message> first = make_error_code(TransportErrc::kInternal);
+  Coro::Result<Message> second = make_error_code(TransportErrc::kInternal);
+  auto a = Coro::makeTask(
+      [&] { first = fx.node->Request(Command(0x0010, {0xAA}), 500ms); });
+  auto b = Coro::makeTask(
+      [&] { second = fx.node->Request(Command(0x0010, {0xBB}), 500ms); });
+
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return fx.transport.sent().size() >= 2; }, 500));
+  const Message sent_first = DecodeSent(fx.transport, 0);
+  const Message sent_second = DecodeSent(fx.transport, 1);
+  ASSERT_NE(sent_first.session_id, sent_second.session_id);
+
+  // 故意逆序回应:关联只看键,与到达次序无关。
+  for (const Message* sent : {&sent_second, &sent_first}) {
+    ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(
+        sent->session_id, sent->message_id, FrameType::kResponse, sent->payload)));
+  }
+  (void)a.get();
+  (void)b.get();
+
+  ASSERT_TRUE(first) << first.error().message();
+  ASSERT_TRUE(second) << second.error().message();
+  EXPECT_EQ(first.value().payload, (std::vector<std::uint8_t>{0xAA}));
+  EXPECT_EQ(second.value().payload, (std::vector<std::uint8_t>{0xBB}));
+}
+
+// —— 3. 分发去向 ————————————————————————————————————————————————————
+
+TEST(ProtocolNode, BusinessFrameIsDeliveredToHandler) {
+  std::vector<std::uint16_t> seen;
+  ProtocolNodeConfig config = BaseConfig();
+  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
+    seen.push_back(msg.message_id);
+    return Coro::Result<void>{};
+  };
+  Fixture fx(std::move(config));
+
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(3, 0x0055, FrameType::kCommand)));
+  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
+  EXPECT_EQ(seen.front(), 0x0055);
+}
+
+// 命中订阅者的消息不再进入业务队列:处理器只见到无人认领的业务帧。
+TEST(ProtocolNode, MatchedResponseDoesNotReachHandler) {
+  std::vector<FrameType> seen;
+  ProtocolNodeConfig config = BaseConfig();
+  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
+    seen.push_back(msg.frm_type);
+    return Coro::Result<void>{};
+  };
+  Fixture fx(std::move(config));
+
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010)); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse)));
+  (void)caller.get();
+  ASSERT_TRUE(reply);
+
+  boost::this_fiber::sleep_for(50ms);
+  EXPECT_TRUE(seen.empty()) << "已被订阅者认领的响应不应再进入业务队列";
+}
+
+// 无人认领的终结帧归因丢弃,且不转交处理器。
+TEST(ProtocolNode, UnmatchedTerminalFrameIsDroppedNotHandled) {
+  transport::CapturingTraceSink sink;
+  std::vector<FrameType> seen;
+  ProtocolNodeConfig config = BaseConfig();
+  config.trace_sink = &sink;
+  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
+    seen.push_back(msg.frm_type);
+    return Coro::Result<void>{};
+  };
+  Fixture fx(std::move(config));
+
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kResponse)));
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
+      << "未归因 unmatched-or-late-response";
+  EXPECT_TRUE(seen.empty()) << "终结帧不应转交业务处理器";
+}
+
+// 未配置处理器时业务帧归因丢弃。
+TEST(ProtocolNode, BusinessFrameIsDroppedWhenNoHandlerConfigured) {
+  transport::CapturingTraceSink sink;
+  ProtocolNodeConfig config = BaseConfig();
+  config.trace_sink = &sink;
+  Fixture fx(std::move(config));
+
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0033, FrameType::kCommand)));
+  EXPECT_TRUE(testutil::pumpFiberUntil(
+      [&] { return SawDrop(sink, "no-handler-configured"); }, 500));
+}
+
+// 坏帧由 codec 判定,归因丢弃且不影响后续报文。
+TEST(ProtocolNode, BadFrameIsDroppedAndDoesNotBlockLaterFrames) {
+  transport::CapturingTraceSink sink;
+  std::vector<std::uint16_t> seen;
+  ProtocolNodeConfig config = BaseConfig();
+  config.trace_sink = &sink;
+  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
+    seen.push_back(msg.message_id);
+    return Coro::Result<void>{};
+  };
+  Fixture fx(std::move(config));
+
+  ASSERT_TRUE(fx.transport.Deliver({0xDE, 0xAD, 0xBE, 0xEF}));  // 非法帧
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0044, FrameType::kCommand)));
+  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
+  EXPECT_EQ(seen.front(), 0x0044) << "坏帧之后的报文仍应正常分发";
+}
+
+// —— 4. 生命周期 ————————————————————————————————————————————————————
+
+// 节点关闭令在途请求恰好终结一次。
+TEST(ProtocolNode, CloseTerminatesInFlightRequest) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller =
+      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 5000ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+
+  ASSERT_TRUE(fx.node->Close());
+  (void)caller.get();
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kClosed));
+}
+
+TEST(ProtocolNode, RequestAndSendRejectedBeforeStartAndAfterClose) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
+
+  EXPECT_EQ(node.Request(Command(0x0001)).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.Send(Command(0x0001)).error(),
+            make_error_code(TransportErrc::kClosed));
+
   ASSERT_TRUE(node.Start());
-
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    outcome = node.Request(MakeRequest(0x0002, {}));
-    done = true;
-  });
-  ASSERT_TRUE(pumpFiberUntil([&] { return !fake->sent().empty(); }));
-
-  // Close:在途 Request 恰好一次以 kClosed 收敛。
   ASSERT_TRUE(node.Close());
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_FALSE(outcome);
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kClosed));
-
-  // WaitClosed 在读循环退出后完成。
-  EXPECT_TRUE(node.WaitClosed());
-
-  // 关闭后再 Request → kClosed。
-  auto after = node.Request(MakeRequest(0x0003, {}));
-  ASSERT_FALSE(after);
-  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
-
-  EXPECT_TRUE(request.get());
+  node.WaitClosed();
+  EXPECT_EQ(node.Request(Command(0x0001)).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.Send(Command(0x0001)).error(),
+            make_error_code(TransportErrc::kClosed));
+  (void)fake.Close();
 }
 
-// (可选)Request 超时:小 deadline 无响应 → kTimeout 且关联清理。
-TEST(ProtocolNode, RequestTimesOutAndReleasesCorrelation) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
+// 节点不启停传输:传输的 Start / Close 只由宿主发起。
+TEST(ProtocolNode, NodeNeverStartsOrClosesTheTransport) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ASSERT_EQ(fake.start_count(), 1u);
+  {
+    ProtocolNode node(fake, MakeCodec(), BaseConfig());
+    ASSERT_TRUE(node.Start());
+    ASSERT_TRUE(node.Send(Command(0x0001)));
+    ASSERT_TRUE(node.Close());
+    node.WaitClosed();
+  }
+  EXPECT_EQ(fake.start_count(), 1u) << "节点不得启动传输";
+  EXPECT_EQ(fake.close_count(), 0u) << "节点不得关闭传输";
+  EXPECT_TRUE(fake.running()) << "节点关闭后传输仍应可用";
+  (void)fake.Close();
+}
+
+// 传输终结(源读队列被关)使节点自行关闭——读循环退出时无条件调公开的 Close()。
+TEST(ProtocolNode, TransportTerminationClosesNode) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
+  ASSERT_TRUE(node.Start());
+  ASSERT_TRUE(node.IsRunning());
+
+  (void)fake.Close();  // 关闭源读队列 → 节点读循环退出
+  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return !node.IsRunning(); }, 500));
+  node.WaitClosed();
+}
+
+// 入站处理器可请求关闭本节点:Close 只发信号、不含等待点,故在处理器 fiber 内调用安全。
+TEST(ProtocolNode, HandlerCanRequestClose) {
+  ProtocolNodeConfig config = BaseConfig();
+  config.handler = [](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
+    return ctx.RequestClose();
+  };
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), std::move(config));
   ASSERT_TRUE(node.Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 20ms;
-    outcome = node.Request(MakeRequest(0x0002, {}), options);
-    done = true;
-  });
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_FALSE(outcome);
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
-
-  // 关联已清理:此刻注入迟到响应 → 无匹配丢弃计数 +1(证明超时时已 Evict entry)。
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
-
-  node.Close();
-  EXPECT_TRUE(request.get());
+  ASSERT_TRUE(fake.Deliver(EncodeFrame(1, 0x0066, FrameType::kCommand)));
+  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return !node.IsRunning(); }, 500));
+  node.WaitClosed();
+  (void)fake.Close();
 }
 
-// -----------------------------------------------------------------------------
-// 总超时缺省值(SRS §3.1.4.4 / ADR-0004 D3,issue #108)——调用方不给 deadline 时节点
-// 套用 config.default_request_timeout;节点不接受"永不超时"的请求。测试把默认值配小
-// (50ms / 20ms,而非缺省 30s)以落在单测时间尺度内。
-// -----------------------------------------------------------------------------
+// 处理器抛出的异常被边界兜住:隔离该事件,节点继续处理后续报文。
+TEST(ProtocolNode, HandlerExceptionIsIsolated) {
+  std::vector<std::uint16_t> seen;
+  ProtocolNodeConfig config = BaseConfig();
+  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
+    if (msg.message_id == 0x0001) {
+      throw std::runtime_error("boom");
+    }
+    seen.push_back(msg.message_id);
+    return Coro::Result<void>{};
+  };
+  Fixture fx(std::move(config));
 
-// ①不给 deadline:无响应时于配置的默认超时后返 kTimeout,且关联被清理(与显式 deadline
-// 走同一条终结路径)。若无此缺省,断链后该请求将无任何终结源(交互层已不再终结在途请求)。
-TEST(ProtocolNode, RequestWithoutDeadlineTimesOutAtConfiguredDefault) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNodeConfig config;
-  config.default_request_timeout = 50ms;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
-
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  OperationOptions::Clock::duration elapsed{};
-  auto request = Coro::makeTask([&] {
-    const auto started = OperationOptions::Clock::now();
-    outcome = node.Request(MakeRequest(0x0002, {}));  // 不给 options → 走默认超时。
-    elapsed = OperationOptions::Clock::now() - started;
-    done = true;
-  });
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_FALSE(outcome);
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
-  EXPECT_GE(elapsed, 50ms);  // 不早于默认超时终结(缺省值确实被套用而非即时失败)。
-
-  // 关联已清理:迟到响应无匹配丢弃 +1(证明超时时已 Evict entry、session_id 已归还)。
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
-
-  node.Close();
-  EXPECT_TRUE(request.get());
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0001, FrameType::kCommand)));
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0002, FrameType::kCommand)));
+  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
+  EXPECT_EQ(seen.front(), 0x0002) << "异常应只隔离该事件,不中断消费者";
 }
 
-// ②-a 显式 deadline 比默认值短:以调用方的为准(默认值不得把它拉长)。默认配 2s,显式
-// 给 20ms —— 若默认值覆盖了显式值,请求将在 pump 预算内一直挂着而非 kTimeout。
-TEST(ProtocolNode, ExplicitShortDeadlineNotOverriddenByDefault) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  ProtocolNodeConfig config;
-  config.default_request_timeout = 2s;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
+TEST(ProtocolNode, StartRejectsNonPositiveRequestTimeout) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNodeConfig config = BaseConfig();
+  config.default_request_timeout = 0ms;
+  ProtocolNode node(fake, MakeCodec(), std::move(config));
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  OperationOptions::Clock::duration elapsed{};
-  auto request = Coro::makeTask([&] {
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 20ms;
-    const auto started = OperationOptions::Clock::now();
-    outcome = node.Request(MakeRequest(0x0002, {}), options);
-    elapsed = OperationOptions::Clock::now() - started;
-    done = true;
-  });
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }, 1000));
-  ASSERT_FALSE(outcome);
-  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
-  EXPECT_LT(elapsed, 1s);  // 按 20ms 终结,而非等到 2s 的默认值。
-
-  node.Close();
-  EXPECT_TRUE(request.get());
+  auto started = node.Start();
+  ASSERT_FALSE(started);
+  EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
+  EXPECT_FALSE(node.IsRunning()) << "配置非法应停在 Created,允许改配后重试";
+  (void)fake.Close();
 }
 
-// ②-b 显式 deadline 比默认值长:同样以调用方的为准(默认值不得把它截短)。默认配 20ms,
-// 显式给 3s —— 越过默认值良久后请求仍在途,随后注入的匹配响应正常完成它。
-TEST(ProtocolNode, ExplicitLongDeadlineNotShortenedByDefault) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNodeConfig config;
-  config.default_request_timeout = 20ms;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
+// —— 5. 分段交互与旁路监听 ————————————————————————————————————————————
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 3s;
-    outcome = node.Request(MakeRequest(0x0002, {}), options);
-    done = true;
-  });
+// 一次交互登记两段等待:各段各自设定时限,互不干扰。
+TEST(ProtocolNode, SubscribeSupportsMultiPhaseInteraction) {
+  Fixture fx;
+  // 结果帧的命令码与请求不同,故按"任意会话 + 该命令码 + 结果"登记。
+  auto result = fx.node->Subscribe({kAny, 0x03F2, FrameType::kResult});
 
-  // 默认超时(20ms)早已越过,请求仍未终结。
-  EXPECT_FALSE(pumpFiberUntil([&] { return done; }, 200));
+  Coro::Result<Message> ack = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] { ack = fx.node->Request(Command(0x0010), 500ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
 
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {0x5A}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(outcome);
-  EXPECT_EQ(outcome.value().payload, std::vector<std::uint8_t>{0x5A});
+  // 第一段:回应。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  (void)caller.get();
+  ASSERT_TRUE(ack) << ack.error().message();
+  EXPECT_EQ(ack.value().payload, (std::vector<std::uint8_t>{1}));
 
-  node.Close();
-  EXPECT_TRUE(request.get());
+  // 第二段:另一命令码的结果,由此前登记的订阅接住。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, 0x03F2, FrameType::kResult, {2})));
+  auto got = result.Wait(500ms);
+  ASSERT_TRUE(got) << got.error().message();
+  EXPECT_EQ(got.value().payload, (std::vector<std::uint8_t>{2}));
 }
 
-// -----------------------------------------------------------------------------
-// P5-3:全线接入丢弃归因(issue #88)——配 CapturingTraceSink 时,各丢弃点计数与
-// 可辨识的 TraceEvent(category="drop", message=DropReasonName)同步产生。
-// -----------------------------------------------------------------------------
+// 旁路监听与精确等待同时命中同一条消息,各得一份。
+TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
+  Fixture fx;
+  auto audit = fx.node->Subscribe(transport::AnyOfType(FrameType::kResponse));
 
-// kUnmatchedOrLateResponse:迟到响应归因丢弃时,配置 trace_sink → 收到对应事件。
-TEST(ProtocolNode, UnmatchedResponseWithSinkEmitsDropTrace) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  CapturingTraceSink sink;
-  ProtocolNodeConfig config;
-  config.trace_sink = &sink;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller =
+      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 500ms); });
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {5})));
+  (void)caller.get();
 
-  // 无在途请求:注入一条响应帧 → 无匹配、归因丢弃。
-  fake->Inject(MakeResponseDatagram(0, 0x1002, {}));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.UnmatchedResponseCount() == 1u; }));
-  EXPECT_EQ(node.UnmatchedResponseCount(), 1u);
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message,
-           DropReasonName(DropReason::kUnmatchedOrLateResponse));
-
-  node.Close();
-}
-
-// kNoHandlerConfigured:未设 handler 的业务帧归因丢弃时,配置 trace_sink → 收到对应事件。
-TEST(ProtocolNode, DroppedNoHandlerWithSinkEmitsDropTrace) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  CapturingTraceSink sink;
-  ProtocolNodeConfig config;
-  config.trace_sink = &sink;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
-
-  fake->Inject(MakeBusinessDatagram(FrameType::kState, 1, 0x0001));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.DroppedNoHandlerCount() == 1u; }));
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kNoHandlerConfigured));
-
-  node.Close();
-}
-
-// kBadFrame:codec.Decode 失败(坏帧/codec 语义错误)时,新增 BadFrameCount() 归因 +1,
-// 配置 trace_sink → 收到对应事件。
-TEST(ProtocolNode, BadFrameDecodeFailureCountedAndTraced) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  CapturingTraceSink sink;
-  ProtocolNodeConfig config;
-  config.trace_sink = &sink;
-  ProtocolNode node(std::move(fake_owner), std::make_unique<AlwaysFailDecodeCodec>(),
-                    std::move(config));
-  ASSERT_TRUE(node.Start());
-
-  EXPECT_EQ(node.BadFrameCount(), 0u);
-  Datagram garbage;
-  garbage.bytes = {0xDE, 0xAD, 0xBE, 0xEF};
-  fake->Inject(std::move(garbage));
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 1u; }));
-  EXPECT_EQ(node.BadFrameCount(), 1u);
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kBadFrame));
-
-  // 再来一帧:计数与 Trace 同步递增。
-  Datagram garbage2;
-  garbage2.bytes = {0x01};
-  fake->Inject(std::move(garbage2));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 2u; }));
-  EXPECT_EQ(DropRecords(sink.Records()).size(), 2u);
-
-  node.Close();
-}
-
-// RT_TRACE_002:未配置 trace_sink(默认 nullptr)时,坏帧 / 迟到响应的计数行为与配置了
-// sink 时完全一致——sink 只是可选旁路,不影响控制流/计数。
-TEST(ProtocolNode, NoSinkConfiguredCountsUnaffected) {
-  auto fake_owner = std::make_unique<FakeCoroTransport>();
-  FakeCoroTransport* fake = fake_owner.get();
-  ProtocolNode node(std::move(fake_owner), std::make_unique<AlwaysFailDecodeCodec>());
-  ASSERT_TRUE(node.Start());  // config.trace_sink 缺省 nullptr。
-
-  Datagram garbage;
-  garbage.bytes = {0xFF};
-  fake->Inject(std::move(garbage));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node.BadFrameCount() == 1u; }));
-  EXPECT_EQ(node.BadFrameCount(), 1u);
-
-  node.Close();
+  ASSERT_TRUE(reply);
+  auto observed = audit.Wait(200ms);
+  ASSERT_TRUE(observed) << "旁路订阅者应另得一份副本";
+  EXPECT_EQ(observed.value().payload, (std::vector<std::uint8_t>{5}));
 }

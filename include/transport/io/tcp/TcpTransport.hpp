@@ -52,7 +52,7 @@ class TcpTransport final : public ITransport {
 
   /// @brief 进入 Running;须已持有已连接 socket。
   /// @return 成功;非法生命周期或无 socket 返回 InvalidState。
-  Status Start() override;
+  Coro::Result<void> Start() override;
 
   /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);每个元素是一片已到达字节
   ///        (流式,一次一任意切片)。
@@ -67,14 +67,14 @@ class TcpTransport final : public ITransport {
   ///        才报告成功(RT_TRANSPORT_008)。并发写按到达顺序排队串行化。
   /// @param unit 待发送帧(目的地址在已连接 TCP 上被忽略)。
   /// @return 成功;部分写失败 Io/Connection 并关闭本连接;关闭中 Closed。
-  Status Write(SendUnit unit) override;
+  Coro::Result<void> Write(SendUnit unit) override;
 
   /// @brief 请求关闭(幂等):撕连接、唤醒在途读写等待者。
-  Status RequestClose() override;
+  Coro::Result<void> RequestClose() override;
 
   /// @brief 等待完全关闭(支持多等待者)。
   /// @param options 仅 `deadline` 生效;取消令牌已随共享完成量轻量化移除(ADR-0006 D3)。
-  Status WaitClosed(OperationOptions options = {}) override;
+  Coro::Result<void> WaitClosed(OperationOptions options = {}) override;
 
   // 发送侧可观测——I/O 事实,非"连接健康"裁决(判活留给协议层)。
 

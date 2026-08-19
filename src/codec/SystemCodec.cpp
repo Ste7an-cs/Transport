@@ -40,7 +40,7 @@ uint16_t DefaultCrc16(const uint8_t* body, std::size_t len) {
 
 SystemCodec::SystemCodec(CrcFn crc) : crc_(std::move(crc)) {}
 
-Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
+Coro::Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
   // 整帧 body 超 16 位长度字段可表达上限 → 分帧上限,kFrame。
   if (msg.payload.size() + 2 > kMaxBody)
     return make_error_code(TransportErrc::kFrame);
@@ -64,7 +64,7 @@ Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& 
   return out;
 }
 
-Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
+Coro::Result<std::vector<uint8_t>> SystemCodec::Encode(const Message& msg) {
   return EncodeSystemFrame(msg, crc_);
 }
 
@@ -109,7 +109,7 @@ std::size_t ScanSystemFrames(const uint8_t* data, std::size_t len, const CrcFn& 
   return off;
 }
 
-Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
+Coro::Result<std::vector<Message>> SystemCodec::Decode(const uint8_t* data, std::size_t len) {
   buffer_.insert(buffer_.end(), data, data + len);
   std::vector<Message> out;
   const std::size_t consumed = ScanSystemFrames(buffer_.data(), buffer_.size(), crc_, out);

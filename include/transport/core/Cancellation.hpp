@@ -1,9 +1,10 @@
 #pragma once
 
+#include "detail/result.hpp"
+
 #include <functional>
 #include <memory>
 
-#include "transport/core/Result.hpp"
 
 namespace transport {
 namespace detail {
@@ -36,7 +37,7 @@ class CancellationToken {
   CancellationToken() = default;
   bool IsCancellationRequested() const noexcept;
   CancellationRegistration Register(std::function<void()> callback) const;
-  Status Wait() const;
+  Coro::Result<void> Wait() const;
   explicit operator bool() const noexcept { return state_ != nullptr; }
 
  private:

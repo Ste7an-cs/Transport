@@ -90,7 +90,7 @@ auto SpawnUdpEcho(UdpTransport& transport, Responder responder, bool& ended) {
         }
         continue;
       }
-      const Endpoint from = datagram.value().source;  // 请求方地址(kNet,发往它回帧)。
+      const Endpoint from = datagram.value().peer;  // 请求方地址(kNet,发往它回帧)。
       const auto& bytes = datagram.value().bytes;
       auto decoded = codec.Decode(bytes.data(), bytes.size());
       if (!decoded) {
@@ -146,7 +146,7 @@ TEST(ProtocolNodeUdp, RequestResolvedOverUdpSeamlessSwap) {
       std::make_unique<SystemDatagramCodec>());
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     OperationOptions options;
@@ -203,7 +203,7 @@ TEST(ProtocolNodeUdp, LateAndWrongKeyResponsesDroppedOverUdp) {
       std::make_unique<SystemDatagramCodec>());
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     OperationOptions options;

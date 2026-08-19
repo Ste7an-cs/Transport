@@ -1,11 +1,11 @@
 classDiagram
     direction TB
     class ProtocolNode {
-        +Request(Message, options) Result~Message~
-        +Send(Message) Status
+        +Request(Message, milliseconds) Coro::Result~Message~
+        +Send(Message) Coro::Result~void~
+        +Subscribe(Key) Ticket
         -DecodeAndDispatch() / Dispatch()
-        -AllocateSession() / SessionLease
-        -RunReactorLoop()
+        -NextSession() uint8
     }
     class DdsNode {
         +Request(Message, target, options)
@@ -13,38 +13,34 @@ classDiagram
         -Dispatch(kReply) / NextCorrelationId()
     }
     class NodeBase {
-        +Start() Status
-        +Close() Status
-        +WaitClosed(options) Status
-        #DoStart()* Status
-        #DoClose()* Status
-        -ConvergeAfterReadLoop() / ConvergeToClosed()
+        +Start() Coro::Result~void~
+        +Close() Coro::Result~void~  只发信号
+        +WaitClosed() void  join
+        +IsRunning() bool
+        #DoStart()* / DoClose()* / DoJoin()*
     }
     class HandlerLoop~Event~ {
         +Spawn(consume) / Enqueue(e)
-        +Join() / CancelAndClose()
+        +Join() / CancelAndClose() / Token()
+        -Coro::Awaitable~Event~ 队列
     }
-    class PendingTable~K_T~ {
-        +Register(key) Result~Handle~
-        +Resolve(key, value) bool
-        +FailAll(error, latch)
-        +Handle::Wait(options)
-    }
-    class BoundedQueue~T~ {
-        +Push / Pop / Close / Drain
-        +双上界 tail-drop
+    class Dispatcher~T_Fields~ {
+        +Subscribe(Key) Ticket
+        +Dispatch(const T&) size_t
+        +CloseAll(error)
+        -unordered_map~Mask, map~Values, vector~Entry~~~
     }
     class HandlerContext {
-        +Send / RequestClose(只发信号) / cancellation
+        +Send / RequestClose / cancellation
     }
 
     NodeBase <|-- ProtocolNode : 继承
-    ProtocolNode *-- PendingTable : 组合
     NodeBase <|-- DdsNode : 继承
-    DdsNode *-- PendingTable : 组合
+    ProtocolNode *-- Dispatcher : 组合
     ProtocolNode *-- HandlerLoop : 组合
     DdsNode *-- HandlerLoop : 组合
-    HandlerLoop *-- BoundedQueue : 拥有
     ProtocolNode ..> HandlerContext : 构造传入
     DdsNode ..> HandlerContext : 构造传入
-    note for PendingTable "entry = 裸 Coro::Awaitable~T~ 信箱\n表锁 find+erase 作唯一仲裁点"
+    ProtocolNode ..> ITransport : 按引用借用（不拥有、不启停）
+    note for Dispatcher "订阅时不参与匹配的字段填 kAny\n一条消息投给全部键匹配者，各得一份\n成本 O(在用 mask 种数 + 收件人数)"
+    note for NodeBase "Close 只发信号、任何 fiber 可调；\nWaitClosed 无时限，语义即 join"

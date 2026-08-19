@@ -12,7 +12,6 @@
 #include "transport/core/Error.hpp"
 
 using transport::CancellationSource;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -127,8 +126,8 @@ TEST(CoroCancellation, RegistrationDestructionPreventsNotification) {
 TEST(CoroCancellation, WaitWakesAllFibers) {
   CancellationSource source;
   Coro::Awaitable<void> ready;
-  Status first{make_error_code(TransportErrc::kInternal)};
-  Status second{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> first{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> second{make_error_code(TransportErrc::kInternal)};
 
   auto one = Coro::makeTask([&] {
     ready.resolve();
@@ -153,14 +152,14 @@ TEST(CoroCancellation, WaitAfterCancellationReturnsImmediately) {
   CancellationSource source;
   EXPECT_TRUE(source.Cancel());
 
-  const Status result = source.token().Wait();
+  const Coro::Result<void> result = source.token().Wait();
 
   EXPECT_TRUE(result);
 }
 
 TEST(CoroCancellation, EmptyTokenWaitReturnsInvalidState) {
   transport::CancellationToken token;
-  const Status result = token.Wait();
+  const Coro::Result<void> result = token.Wait();
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error(), make_error_code(TransportErrc::kInvalidState));
 }

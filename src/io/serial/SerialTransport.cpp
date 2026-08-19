@@ -139,7 +139,7 @@ void BeginClose(const std::shared_ptr<SerialTransport::State>& state,
     gate->close(make_error_code(TransportErrc::kClosed));
   }
   if (complete) {
-    state->closed.Complete(Status{});
+    state->closed.Complete(Coro::Result<void>{});
   }
 }
 
@@ -190,7 +190,7 @@ void RunReadPump(const std::shared_ptr<SerialTransport::State>& state,
         reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
             bytes.size());
     // 单设备无寻址:source 用中立默认目的地(destination 亦被忽略,收发同一设备)。
-    datagram.source = Endpoint::Default();
+    datagram.peer = Endpoint::Default();
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_recv = OperationOptions::Clock::now();
@@ -233,7 +233,7 @@ void ExitWrite(const std::shared_ptr<SerialTransport::State>& state) {
     next_gate->close();
   }
   if (complete) {
-    state->closed.Complete(Status{});
+    state->closed.Complete(Coro::Result<void>{});
   }
 }
 
@@ -261,14 +261,14 @@ SerialTransport::~SerialTransport() {
   }
 }
 
-Status SerialTransport::Start() {
+Coro::Result<void> SerialTransport::Start() {
   const auto state = state_;
   std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
   std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kRunning) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (state->lifecycle != LifecycleState::kCreated) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -312,7 +312,7 @@ Status SerialTransport::Start() {
   Coro::makeTask([state, stream, read_queue] {
     RunReadPump(state, stream, read_queue);
   });
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 // 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
@@ -326,7 +326,7 @@ std::shared_ptr<Coro::Awaitable<Datagram>> SerialTransport::Read() {
   return state_->read_queue;
 }
 
-Status SerialTransport::Write(SendUnit unit) {
+Coro::Result<void> SerialTransport::Write(SendUnit unit) {
   const auto state = state_;
   std::shared_ptr<Coro::Awaitable<void>> slot_gate;
   {
@@ -367,14 +367,14 @@ Status SerialTransport::Write(SendUnit unit) {
   }
 
   // 失败即关设备,不自动重发:先进入关闭(排队写等待者以 kClosed 收敛),再释放写槽。
-  auto fail = [&state](std::error_code mapped) -> Status {
+  auto fail = [&state](std::error_code mapped) -> Coro::Result<void> {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_error = mapped;
     }
     BeginClose(state);
     ExitWrite(state);
-    return Status{mapped};
+    return Coro::Result<void>{mapped};
   };
 
   // 整帧全部交给 Qt 用户态发送缓冲并等其刷入设备(bytesToWrite()==0)才报告成功。
@@ -427,15 +427,15 @@ Status SerialTransport::Write(SendUnit unit) {
     state->last_send = Clock::now();
   }
   ExitWrite(state);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status SerialTransport::RequestClose() {
+Coro::Result<void> SerialTransport::RequestClose() {
   BeginClose(state_);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status SerialTransport::WaitClosed(OperationOptions options) {
+Coro::Result<void> SerialTransport::WaitClosed(OperationOptions options) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kCreated) {

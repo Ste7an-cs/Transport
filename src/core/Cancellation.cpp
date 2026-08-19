@@ -137,7 +137,7 @@ CancellationRegistration CancellationToken::Register(
                     : CancellationRegistration{state_, std::move(callback)};
 }
 
-Status CancellationToken::Wait() const {
+Coro::Result<void> CancellationToken::Wait() const {
   if (!state_) return make_error_code(TransportErrc::kInvalidState);
   auto event = std::make_shared<Coro::Awaitable<void>>();
   auto registration = Register([event] {
@@ -145,7 +145,7 @@ Status CancellationToken::Wait() const {
     event->close();
   });
   auto result = event->await();
-  if (result) return Status{};
+  if (result) return Coro::Result<void>{};
   return result.error();
 }
 

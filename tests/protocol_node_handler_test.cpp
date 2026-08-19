@@ -46,7 +46,6 @@ using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -160,11 +159,11 @@ TEST(ProtocolNodeHandler, HandlersRunStrictlySerial) {
   FakeCoroTransport* fake = fake_owner.get();
   GateBank bank;
   ProtocolNodeConfig config;
-  config.handler = [&bank](const Message&, HandlerContext&) -> Status {
+  config.handler = [&bank](const Message&, HandlerContext&) -> Coro::Result<void> {
     auto gate = bank.Enter();
     Coro::await(gate);
     bank.Leave();
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -200,7 +199,7 @@ TEST(ProtocolNodeHandler, HandlerRepliesViaContextSend) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   FakeCoroTransport* fake = fake_owner.get();
   ProtocolNodeConfig config;
-  config.handler = [](const Message& msg, HandlerContext& ctx) -> Status {
+  config.handler = [](const Message& msg, HandlerContext& ctx) -> Coro::Result<void> {
     Message reply;
     reply.message_id = 0x00AA;
     reply.payload = msg.payload;  // 回显收到的 payload。
@@ -237,18 +236,18 @@ TEST(ProtocolNodeHandler, QueueOverflowTailDropsWhileResponsesStillMatch) {
   GateBank bank;
   ProtocolNodeConfig config;
   config.business_queue_max_events = 2;  // 小容量,便于溢出。
-  config.handler = [&bank](const Message&, HandlerContext&) -> Status {
+  config.handler = [&bank](const Message&, HandlerContext&) -> Coro::Result<void> {
     auto gate = bank.Enter();
     Coro::await(gate);
     bank.Leave();
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
   ASSERT_TRUE(node.Start());
 
   // 起一个在途请求(session_id=0),用于验证响应匹配不被 handler 阻塞。
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002, {}));
@@ -295,11 +294,11 @@ TEST(ProtocolNodeHandler, QueueOverflowWithSinkEmitsDropTraceForEachDrop) {
   ProtocolNodeConfig config;
   config.business_queue_max_events = 2;  // 小容量,便于溢出。
   config.trace_sink = &sink;
-  config.handler = [&bank](const Message&, HandlerContext&) -> Status {
+  config.handler = [&bank](const Message&, HandlerContext&) -> Coro::Result<void> {
     auto gate = bank.Enter();
     Coro::await(gate);
     bank.Leave();
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -354,13 +353,13 @@ TEST(ProtocolNodeHandler, HandlerExceptionIsolatedAndLoopContinues) {
   int calls = 0;
   bool second_seen = false;
   ProtocolNodeConfig config;
-  config.handler = [&](const Message&, HandlerContext&) -> Status {
+  config.handler = [&](const Message&, HandlerContext&) -> Coro::Result<void> {
     ++calls;
     if (calls == 1) {
       throw std::runtime_error("handler boom");  // 逃逸异常。
     }
     second_seen = true;
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -385,7 +384,7 @@ TEST(ProtocolNodeHandler, NoresponseSendDoesNotRegisterPending) {
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>());
   ASSERT_TRUE(node.Start());
 
-  Status result = make_error_code(TransportErrc::kInternal);
+  Coro::Result<void> result = make_error_code(TransportErrc::kInternal);
   bool done = false;
   auto sender = Coro::makeTask([&] {
     Message msg;
@@ -418,8 +417,8 @@ TEST(ProtocolNodeHandler, NoresponseSendDoesNotRegisterPending) {
 TEST(ProtocolNodeHandler, CloseConvergesConsumerFiber) {
   auto fake_owner = std::make_unique<FakeCoroTransport>();
   ProtocolNodeConfig config;
-  config.handler = [](const Message&, HandlerContext&) -> Status {
-    return Status{};
+  config.handler = [](const Message&, HandlerContext&) -> Coro::Result<void> {
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));

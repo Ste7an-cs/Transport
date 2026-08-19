@@ -50,7 +50,6 @@ using transport::Message;
 using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -94,9 +93,9 @@ TEST(ProtocolNodeLifecycle, RedundantStartIsIdempotentAndDoesNotRespawn) {
   FakeCoroTransport* fake = fake_owner.get();
   std::atomic_int calls{0};
   ProtocolNodeConfig config;
-  config.handler = [&calls](const Message&, HandlerContext&) -> Status {
+  config.handler = [&calls](const Message&, HandlerContext&) -> Coro::Result<void> {
     calls.fetch_add(1);
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -211,11 +210,11 @@ TEST(ProtocolNodeLifecycle, CloseCooperativelyCancelsHandlerAndWakesAllWaiters) 
   std::atomic_bool handler_returned{false};
   std::atomic_bool handler_entered{false};
   ProtocolNodeConfig config;
-  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     handler_entered.store(true);
     ctx.cancellation().Wait();  // 协作取消:阻塞至 Close 触发令牌再返回。
     handler_returned.store(true);
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -254,7 +253,7 @@ TEST(ProtocolNodeLifecycle, HandlerRequestCloseDoesNotSelfDeadlock) {
   std::atomic_bool closed_on_return{true};
   std::atomic_bool send_rejected_on_return{false};
   ProtocolNodeConfig config;
-  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     // 消费者 fiber 内发起关闭:不等待,返回即"已受理"(RequestClose 若等待收敛,本行
     // 就是等自己退出 → 整个用例挂死)。
     accepted.store(static_cast<bool>(ctx.RequestClose()));
@@ -268,7 +267,7 @@ TEST(ProtocolNodeLifecycle, HandlerRequestCloseDoesNotSelfDeadlock) {
     // 但**尚未关完**:收敛(置 Closed + 记关闭时延)要等本 handler 退出后由读循环做。
     closed_on_return.store(node_ptr->LastCloseLatency() !=
                            OperationOptions::Clock::duration::zero());
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -293,7 +292,7 @@ TEST(ProtocolNodeLifecycle, HandlerRequestCloseIsAcceptedButNotYetClosed) {
   std::atomic_int woken{0};
   std::atomic_int woken_on_request_close_return{-1};
   ProtocolNodeConfig config;
-  config.handler = [&](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     auto accepted = ctx.RequestClose();
     woken_on_request_close_return.store(woken.load());  // 快照:此刻外部等待者是否已醒。
     return accepted;
@@ -322,10 +321,10 @@ TEST(ProtocolNodeLifecycle, UnstartedQueuedBusinessCountedAsCloseDrop) {
   FakeCoroTransport* fake = fake_owner.get();
   std::atomic_int entered{0};
   ProtocolNodeConfig config;
-  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     entered.fetch_add(1);
     ctx.cancellation().Wait();  // 卡住首条,让后续帧只入队不启动。
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -353,10 +352,10 @@ TEST(ProtocolNodeLifecycle, UnstartedQueuedBusinessCloseDropWithSinkEmitsTraceEv
   CapturingTraceSink sink;
   ProtocolNodeConfig config;
   config.trace_sink = &sink;
-  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     entered.fetch_add(1);
     ctx.cancellation().Wait();  // 卡住首条,让后续帧只入队不启动。
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -392,11 +391,11 @@ TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminatesAndWakesWaiters) {
   CapturingTraceSink sink;
   ProtocolNodeConfig config;
   config.trace_sink = &sink;
-  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Status {
+  config.handler = [&entered](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
     entered.fetch_add(1);
     // 卡住首条:自终若不触发 handler 协作取消,收敛将卡在 join handler 上(必挂)。
     ctx.cancellation().Wait();
-    return Status{};
+    return Coro::Result<void>{};
   };
   ProtocolNode node(std::move(fake_owner), std::make_unique<SystemCodec>(),
                     std::move(config));
@@ -450,7 +449,7 @@ TEST(ProtocolNodeLifecycle, FatalReadErrorSelfTerminationFailsInFlightRequest) {
   ASSERT_TRUE(node.Start());
 
   // 在途请求:对端(fake)不回响应 → 只能由收敛或总超时(默认 30s)终结。
-  transport::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   std::atomic_bool done{false};
   auto request = Coro::makeTask([&] {
     Message req;

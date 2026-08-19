@@ -337,7 +337,7 @@ void RunConnectLoop(StatePtr s) {
 
     // 成功物理连接:用 sock 造内层并 Start,切代际,进 Connected。
     auto inner = std::make_shared<TcpTransport>(sock);
-    Status started = inner->Start();
+    Coro::Result<void> started = inner->Start();
     if (!started) {
       inner->RequestClose();  // 内层析构会 deleteLater sock。
       {
@@ -428,7 +428,7 @@ void RunConnectLoop(StatePtr s) {
                       close_latency)
                       .count()));
   SetConnectionState(s, ConnectionState::kDisconnected);
-  s->closed.Complete(Status{});
+  s->closed.Complete(Coro::Result<void>{});
 }
 
 // 在一个状态 gate 上等待,承载 deadline 与 cancellation。
@@ -475,12 +475,12 @@ TcpClientTransport::~TcpClientTransport() {
   }
 }
 
-Status TcpClientTransport::Start() {
+Coro::Result<void> TcpClientTransport::Start() {
   ITraceSink* sink = nullptr;
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kRunning) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (state_->lifecycle != LifecycleState::kCreated) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -494,7 +494,7 @@ Status TcpClientTransport::Start() {
   auto s = state_;
   state_->loop_task = std::make_shared<Coro::FiberTask<void>>(
       Coro::makeTask([s] { RunConnectLoop(s); }));
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 // 交出对外 read_queue 的句柄(ADR-0007 D4)——**无需转发泵**:connect-loop 的读泵本就
@@ -511,7 +511,7 @@ std::shared_ptr<Coro::Awaitable<Datagram>> TcpClientTransport::Read() {
   return state_->rx;
 }
 
-Status TcpClientTransport::Write(SendUnit unit) {
+Coro::Result<void> TcpClientTransport::Write(SendUnit unit) {
   std::shared_ptr<TcpTransport> inner;
   bool created = false;
   bool closed = false;
@@ -534,7 +534,7 @@ Status TcpClientTransport::Write(SendUnit unit) {
     // 链路不可用(未连上 / 重连中)→ 立即返 kConnection,不缓存(RT_TCP_RECONNECT_003)。
     return make_error_code(TransportErrc::kConnection);
   }
-  Status sent = inner->Write(std::move(unit));
+  Coro::Result<void> sent = inner->Write(std::move(unit));
   if (!sent && sent.error() == make_error_code(TransportErrc::kClosed)) {
     // 内层在本次发送期间随断链终结,而本传输仍在运行(还会重连):对调用方而言这是
     // "链路不可用",不是传输终结 → 归 kConnection(ADR-0004 D1:kClosed 仅表传输终结)。
@@ -546,7 +546,7 @@ Status TcpClientTransport::Write(SendUnit unit) {
   return sent;
 }
 
-Status TcpClientTransport::RequestClose() {
+Coro::Result<void> TcpClientTransport::RequestClose() {
   QPointer<QAbstractSocket> connecting;
   std::shared_ptr<Coro::Awaitable<void>> reconnect_gate;
   std::shared_ptr<TcpTransport> inner;
@@ -557,7 +557,7 @@ Status TcpClientTransport::RequestClose() {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->closing) {
-      return Status{};  // 幂等。
+      return Coro::Result<void>{};  // 幂等。
     }
     state_->closing = true;
     requested_at = Clock::now();
@@ -599,12 +599,12 @@ Status TcpClientTransport::RequestClose() {
       state_->last_close_latency = Clock::now() - requested_at;  // P5-4:关闭时延终点。
     }
     NotifyWaiters(state_);
-    state_->closed.Complete(Status{});
+    state_->closed.Complete(Coro::Result<void>{});
   }
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status TcpClientTransport::WaitClosed(OperationOptions options) {
+Coro::Result<void> TcpClientTransport::WaitClosed(OperationOptions options) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kCreated) {
@@ -614,7 +614,7 @@ Status TcpClientTransport::WaitClosed(OperationOptions options) {
   return state_->closed.Wait(std::move(options));
 }
 
-Status TcpClientTransport::ApplyConfig(TcpClientConfig config,
+Coro::Result<void> TcpClientTransport::ApplyConfig(TcpClientConfig config,
                                        std::uint64_t version) {
   // 端点变化时需在锁外掐断当前尝试/连接的相位句柄(避免持锁重入)。
   QPointer<QAbstractSocket> connecting;
@@ -642,7 +642,7 @@ Status TcpClientTransport::ApplyConfig(TcpClientConfig config,
     }
     if (version == state_->config_version) {
       if (config == state_->config) {
-        return Status{};  // 同版同容 → 成功 no-op,不产生变更通知。
+        return Coro::Result<void>{};  // 同版同容 → 成功 no-op,不产生变更通知。
       }
       return make_error_code(TransportErrc::kInvalidArgument);  // 同版异容 → 乱序拒绝。
     }
@@ -684,7 +684,7 @@ Status TcpClientTransport::ApplyConfig(TcpClientConfig config,
       inner->RequestClose();  // 停止接受新发送 + 关旧连接(读泵随之退出)。
     }
   }
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 ConnectionState TcpClientTransport::State() const {
@@ -692,7 +692,7 @@ ConnectionState TcpClientTransport::State() const {
   return state_->conn;
 }
 
-Status TcpClientTransport::WaitForState(ConnectionState target,
+Coro::Result<void> TcpClientTransport::WaitForState(ConnectionState target,
                                         OperationOptions options) {
   const auto s = state_;
   for (;;) {
@@ -701,7 +701,7 @@ Status TcpClientTransport::WaitForState(ConnectionState target,
     {
       std::lock_guard<std::mutex> lock(s->mutex);
       if (s->conn == target) {
-        return Status{};  // 已满足即刻返回。
+        return Coro::Result<void>{};  // 已满足即刻返回。
       }
       if (s->closing) {
         return make_error_code(TransportErrc::kClosed);  // 关闭前无法达成。
@@ -725,7 +725,7 @@ Status TcpClientTransport::WaitForState(ConnectionState target,
   }
 }
 
-Result<ConnectionState> TcpClientTransport::WaitStateChange(
+Coro::Result<ConnectionState> TcpClientTransport::WaitStateChange(
     OperationOptions options) {
   const auto s = state_;
   std::shared_ptr<Coro::Awaitable<void>> gate = std::make_shared<Coro::Awaitable<void>>();
@@ -748,7 +748,7 @@ Result<ConnectionState> TcpClientTransport::WaitStateChange(
   if (outcome == WaitOutcome::kCancelled) {
     return make_error_code(TransportErrc::kCancelled);
   }
-  return Result<ConnectionState>{now};
+  return Coro::Result<ConnectionState>{now};
 }
 
 std::uint64_t TcpClientTransport::Generation() const {

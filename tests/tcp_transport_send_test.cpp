@@ -26,7 +26,6 @@ using transport::Endpoint;
 using transport::Datagram;
 using transport::OperationOptions;
 using transport::SendUnit;
-using transport::Status;
 using transport::TcpTransport;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -135,7 +134,7 @@ TEST(CoroTcpTransport, SlowReaderAppliesBackpressureAndBoundsInFlightFrames) {
   ASSERT_TRUE(sender.Start());
 
   const std::vector<std::uint8_t> big(256u * 1024u, 0x33);  // 256 KiB,远超收紧后的缓冲。
-  Status write_status{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> write_status{make_error_code(TransportErrc::kInternal)};
   auto writer = Coro::makeTask([&] { write_status = sender.Write(Frame(big)); });
 
   // 内核发送缓冲填满 → Write 在刷完循环中挂起,发送等待者深度为 1。
@@ -147,7 +146,7 @@ TEST(CoroTcpTransport, SlowReaderAppliesBackpressureAndBoundsInFlightFrames) {
   EXPECT_FALSE(sender.LastSendTime().has_value());
   // 并发第二写不再被拒,而是排队等待写槽 → 深度升至 2;但至多一个在写帧真正进入
   // 内核(队首持有者),框架用户态发送缓冲仍有界。
-  Status second_status{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> second_status{make_error_code(TransportErrc::kInternal)};
   auto writer_b =
       Coro::makeTask([&] { second_status = sender.Write(Frame({0x99})); });
   ASSERT_TRUE(
@@ -222,7 +221,7 @@ TEST(CoroTcpTransport, PeerResetDuringFlushFailsWriteAndClosesConnection) {
   ASSERT_TRUE(sender.Start());
 
   const std::vector<std::uint8_t> big(256u * 1024u, 0x44);
-  Status write_status{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> write_status{make_error_code(TransportErrc::kInternal)};
   auto writer = Coro::makeTask([&] { write_status = sender.Write(Frame(big)); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return sender.SendWaiterDepth() == 1; }));
@@ -294,7 +293,7 @@ TEST(CoroTcpTransport, TimeoutAfterWriteStartedDoesNotTruncateHealthyFrame) {
   ASSERT_TRUE(sender.Start());
 
   const std::vector<std::uint8_t> big(256u * 1024u, 0x77);
-  Status write_status{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> write_status{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> completion;
   auto writer = Coro::makeTask([&] {
     write_status = sender.Write(Frame(big));

@@ -5,21 +5,20 @@
 using transport::DdsConfig;
 using transport::DdsProviderRegistry;
 using transport::IDdsProvider;
-using transport::Status;
 
 namespace {
 class StubProvider : public IDdsProvider {
  public:
-  Status Init(const DdsConfig&) override { return Status{}; }
+  Coro::Result<void> Init(const DdsConfig&) override { return Coro::Result<void>{}; }
   void   Shutdown() override {}
-  Status Publish(const std::string&, const std::vector<uint8_t>&) override {
-    return Status{};
+  Coro::Result<void> Publish(const std::string&, const std::vector<uint8_t>&) override {
+    return Coro::Result<void>{};
   }
-  Status Subscribe(const std::string&,
+  Coro::Result<void> Subscribe(const std::string&,
                    std::function<void(const std::vector<uint8_t>&)>) override {
-    return Status{};
+    return Coro::Result<void>{};
   }
-  Status Unsubscribe(const std::string&) override { return Status{}; }
+  Coro::Result<void> Unsubscribe(const std::string&) override { return Coro::Result<void>{}; }
   std::string Name() const override { return "stub"; }
 };
 }  // namespace

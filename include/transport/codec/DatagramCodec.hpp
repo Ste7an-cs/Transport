@@ -13,10 +13,10 @@ namespace transport {
 
 class DatagramCodec : public ICodec {
  public:
-  Result<std::vector<uint8_t>> Encode(const Message& msg) override {
+  Coro::Result<std::vector<uint8_t>> Encode(const Message& msg) override {
     return msg.payload;
   }
-  Result<std::vector<Message>> Decode(const uint8_t* data,
+  Coro::Result<std::vector<Message>> Decode(const uint8_t* data,
                                             std::size_t len) override {
     std::vector<Message> out;
     if (len > 0) {

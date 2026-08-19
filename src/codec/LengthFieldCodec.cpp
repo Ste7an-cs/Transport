@@ -10,7 +10,7 @@
 namespace transport {
 
 namespace {
-Status ValidateConfig(const LengthFieldCodecConfig& c) {
+Coro::Result<void> ValidateConfig(const LengthFieldCodecConfig& c) {
   // 非法配置参数 → kConfiguration;不支持的长度字段宽度 → kUnsupported。
   if (c.header_size == 0)
     return make_error_code(TransportErrc::kConfiguration);
@@ -27,11 +27,11 @@ Status ValidateConfig(const LengthFieldCodecConfig& c) {
 LengthFieldCodec::LengthFieldCodec(LengthFieldCodecConfig config)
     : config_(config) {}
 
-Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
+Coro::Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
   return msg.payload;  // 透传
 }
 
-Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
+Coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
                                                             std::size_t len) {
   if (auto v = ValidateConfig(config_); !v) return v.error();
 

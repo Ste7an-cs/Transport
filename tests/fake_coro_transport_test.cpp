@@ -19,7 +19,6 @@ using transport::LifecycleState;
 using transport::OperationOptions;
 using transport::Result;
 using transport::SendUnit;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 using testutil::FakeCoroTransport;
@@ -38,7 +37,7 @@ TEST(CoroFakeTransport, StartIsIdempotentAndClosedCannotRestart) {
 TEST(CoroFakeTransport, InjectCompletesReadWithSourceMetadata) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
-  Result<Datagram> received{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> received{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
@@ -49,8 +48,8 @@ TEST(CoroFakeTransport, InjectCompletesReadWithSourceMetadata) {
   ASSERT_TRUE(reader.get());
   ASSERT_TRUE(received);
   EXPECT_EQ(received.value().bytes, (std::vector<std::uint8_t>{1, 2}));
-  EXPECT_EQ(received.value().source.host, "127.0.0.1");
-  EXPECT_EQ(received.value().source.port, 7001);
+  EXPECT_EQ(received.value().peer.host, "127.0.0.1");
+  EXPECT_EQ(received.value().peer.port, 7001);
 }
 
 TEST(CoroFakeTransport, QueuedInjectionAndErrorAreConsumedInOrder) {
@@ -63,7 +62,7 @@ TEST(CoroFakeTransport, QueuedInjectionAndErrorAreConsumedInOrder) {
   const auto first = testutil::ReadOnce(fake);
   ASSERT_TRUE(first);
   EXPECT_EQ(first.value().bytes, (std::vector<std::uint8_t>{3}));
-  EXPECT_EQ(first.value().source.topic, "queued");
+  EXPECT_EQ(first.value().peer.topic, "queued");
 
   OperationOptions no_block;
   no_block.deadline = OperationOptions::Clock::now() - 1ms;
@@ -76,7 +75,7 @@ TEST(CoroFakeTransport, QueuedInjectionAndErrorAreConsumedInOrder) {
 TEST(CoroFakeTransport, PendingReaderTakesFirstAndRestStaysQueued) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
-  Result<Datagram> first{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> first{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
@@ -134,7 +133,7 @@ TEST(CoroFakeTransport, ReadDeadlineTimeoutLeavesQueueUsable) {
   const auto delivered = testutil::ReadOnce(fake, no_block);
   ASSERT_TRUE(delivered);
   EXPECT_EQ(delivered.value().bytes, (std::vector<std::uint8_t>{8}));
-  EXPECT_EQ(delivered.value().source.topic, "after-timeout");
+  EXPECT_EQ(delivered.value().peer.topic, "after-timeout");
 
   fake.InjectError(make_error_code(TransportErrc::kConnection));
   const auto terminated = testutil::ReadOnce(fake, no_block);
@@ -166,8 +165,8 @@ TEST(CoroFakeTransport, CloseAfterReadTimeoutStillConvergesWithClosed) {
 TEST(CoroFakeTransport, ConcurrentReadersPreemptInsteadOfBeingRejected) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
-  Result<Datagram> first{make_error_code(TransportErrc::kInternal)};
-  Result<Datagram> second{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> first{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> second{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto reader_a = Coro::makeTask([&] {
     entered.resolve();
@@ -196,8 +195,8 @@ TEST(CoroFakeTransport, ConcurrentPhysicalWriteSerializes) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
-  Status first{make_error_code(TransportErrc::kInternal)};
-  Status second{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> first{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> second{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto writer_a = Coro::makeTask([&] {
     entered.resolve();
@@ -254,9 +253,9 @@ TEST(CoroFakeTransport, PartialWriteFailureClosesTransport) {
 TEST(CoroFakeTransport, CloseWakesReadAndAllClosedWaiters) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
-  Result<Datagram> read{make_error_code(TransportErrc::kInternal)};
-  Status first{make_error_code(TransportErrc::kInternal)};
-  Status second{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> read{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> first{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> second{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   Coro::Awaitable<void> read_entered;
   auto reader = Coro::makeTask([&] {
@@ -288,7 +287,7 @@ TEST(CoroFakeTransport, RequestCloseWakesHeldWriteAndCompletesAfterItExits) {
   FakeCoroTransport fake;
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
-  Status written{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> written{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto writer = Coro::makeTask([&] {
     entered.resolve();
@@ -314,7 +313,7 @@ TEST(CoroFakeTransport, WaiterTimeoutIsLocal) {
   ASSERT_TRUE(fake.Start());
   OperationOptions timeout_options;
   timeout_options.deadline = OperationOptions::Clock::now() - 1ms;
-  Status survivor{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> survivor{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto survivor_waiter = Coro::makeTask([&] {
     entered.resolve();
@@ -345,7 +344,7 @@ TEST(CoroFakeTransport, IllegalOperationsReflectEveryLifecycleState) {
 
   ASSERT_TRUE(fake.Start());
   fake.HoldWrites();
-  Status held_write{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<void> held_write{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto writer = Coro::makeTask([&] {
     entered.resolve();
@@ -446,7 +445,7 @@ TEST(CoroFakeTransport, DestructionWakesAnActiveReadWithoutUsingObjectStorage) {
   auto* raw = fake.get();
   // 句柄先取出:它是 shared_ptr,寿命独立于传输对象(析构后仍可安全 await 到终止原因)。
   const auto rx = raw->Read();
-  Result<Datagram> read{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> read{make_error_code(TransportErrc::kInternal)};
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
