@@ -1,0 +1,33 @@
+stateDiagram-v2
+    direction LR
+    [*] --> Subscribed: Subscribe(Key)<br/>推导 mask + 投影键值 → 入索引 → 建信箱
+
+    Subscribed --> Subscribed: Dispatch 命中<br/>信箱 push 一份副本（队列语义，可多次）
+    Subscribed --> TimedOut: Wait(timeout) 超时<br/>订阅仍在册，可继续等下一条
+    TimedOut --> Subscribed: 再次 Wait
+
+    Subscribed --> Closed: CloseAll(error)<br/>信箱被关并置终止标记
+    TimedOut --> Closed: CloseAll(error)
+
+    Subscribed --> Unsubscribed: ~Ticket / Reset()<br/>从索引摘除（空桶与空 mask 一并清理）
+    TimedOut --> Unsubscribed: ~Ticket / Reset()
+    Closed --> Unsubscribed: ~Ticket / Reset()
+    Unsubscribed --> [*]
+
+    note right of Subscribed
+        一票一键。信箱是队列，故同一凭据可多次 Wait
+        —— 一次交互分段等待多条报文时，各段各自登记、
+        各自设定时限（ADR-0008 D6）。
+    end note
+
+    note right of Closed
+        CloseAll 后再 Subscribe 返回的凭据其信箱
+        已关闭，Wait 立即得到该终止原因，
+        语义等同于“关闭后不再受理订阅”。
+    end note
+
+    note right of Unsubscribed
+        注销靠凭据的生存期，不靠状态枚举。
+        Ticket 内部以弱引用持有索引，
+        故允许在 Dispatcher 析构之后再析构。
+    end note
