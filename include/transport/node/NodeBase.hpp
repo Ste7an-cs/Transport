@@ -2,67 +2,65 @@
 
 /**
  * @file NodeBase.hpp
- * @brief 交互节点生命周期基类 NodeBase(ADR-0006 D1/D2/D6 / RT_LIFECYCLE / RT_DESIGN_008)。
+ * @brief 交互节点生命周期基类 NodeBase——只装"每个节点都有的那一件事":生命周期。
  *
- * NodeBase 以**模板方法**承载每个交互节点都有的那一件事——生命周期:
+ * **关闭拆成发信号与等收敛两半**,与 `ITransport` 同形:
  *
- *   1. 状态机 Created→Running→Closing→Closed + 并发幂等 `Start`(共享一次结果、不重复
- *      spawn)+ 关闭仲裁(恒只有一个首个关闭者)+ 多等待者 `WaitClosed`;
- *   2. **收敛**(ADR-0006 D6,不可下放):读循环退出后 join 内部工作单元 → Drain 未启动
- *      业务归因 close_drop → 置 Closed → 广播唤醒全部等待者。`Awaitable::close()` 只保证
- *      等待者被**唤醒**,不保证被唤醒的 fiber 已跑完并不再触碰 `this`;安全释放要的是后者,
- *      只能靠 join,故这段留在基类只此一份;
- *   3. **致命错误自终**(ADR-0005 D5 / RT_LIFECYCLE_008):读循环退出时若节点仍 Running,
- *      由读循环自行发出与 `Close` **完全相同**的一组汇合信号再走**同一段**收敛;
- *   4. **无重入守卫**(ADR-0006 D8 撤销 ADR-0005 D6):`Close()` 结尾无条件等收敛,不比对
- *      fiber id、不设"半执行"分支;"内部工作单元不等待本节点关闭"由**使用契约**保证——
- *      处理器走只发信号的 `SignalClose()`,读循环收敛走内部的 `ConvergeAfterReadLoop()`。
+ * | | 语义 |
+ * |---|---|
+ * | `Start()` | 幂等启动;`DoStart()` 返回成功即 Running |
+ * | `Close()` | **只发信号,不等待收敛**。幂等,**任何 fiber 都可调**(含节点自己的内部 fiber) |
+ * | `WaitClosed()` | join 全部内部 fiber——返回即可安全析构。**单调用方** |
+ * | `IsRunning()` | 交互前置判据(`Request`/`Send`/`Publish`) |
  *
- * **协议特有的实事由子类经钩子提供**(ADR-0006 D1):`ValidateConfig()`(配置校验)、
- * `DoStart()`(transport.Start + spawn 读循环 / handler)、`DoClose()`(发出全部汇合信号:
- * transport.RequestClose + 业务队列 Close + handler 协作取消 + PendingTable.FailAll)、
- * `JoinHandler()` / `DrainUnstartedBusiness()`(收敛时对可选 handler 小件的两个叶子
- * 动作)。
- * 基类一律不触及协议类型:本头文件不 include 任何协议/消息类型,也不持有 handler 队列
- * ——`HandlerLoop` 是**可选件**,由 node 持有(ADR-0006 D4),基类只装每个节点都有的东西。
+ * 这个拆分消掉了旧形态里三样东西:
  *
- * **公开接口返 `Status` 而非 `bool`**(ADR-0006 D2):`bool` 会把「已 `Running`(成功)」与
- * 「已 `Closing`/`Closed`(RT_LIFECYCLE_003 要求 `kInvalidState`)」压成同一个 `false`,二者
- * 对调用方含义相反;且 RT_LIFECYCLE_007 要求宿主据错误改配置重试。"本次调用是否真正执行
- * 了转换"只在基类内部作为仲裁结果使用,不外露。
+ * 1. **第二个关闭入口**(旧 `SignalClose()`)。旧 `Close()` 结尾无条件等收敛,内部工作单元
+ *    调它就是等自己退出、静默挂死,于是分裂出一个"只发信号"的受保护入口,并以**使用契约**
+ *    约束谁能调哪个(ADR-0005 D6 想用重入守卫解决,ADR-0006 D8 又撤销)。现在 `Close()`
+ *    本身就不等待,契约、守卫、那一整轮反复一并作废。
+ * 2. **子类回调基类的三个动作**(旧 `MarkRunning()` / `ConvergeAfterReadLoop()` /
+ *    `JoinHandler()`)。基类只向下调钩子,子类不再反向驱动基类状态机:置 Running 由基类在
+ *    `DoStart()` 返回后自己做,收敛由 `WaitClosed()` 的调用方经 `DoJoin()` 自上而下完成。
+ * 3. **手搓的同步件**(旧三个 `SharedCompletion<void>`)。`close_signalled_` 那个"信号已发完"
+ *    的握手,只在"收敛者是个可能被提前唤醒的 fiber"时才需要;现在关闭方自己顺序执行
+ *    「发完信号 → join」,顺序由调用栈保证,不需要握手对象。剩下的汇合一律用 AsyncTask
+ *    自带的 `Coro::FiberTask<T>::get()`(见其 `doc/使用说明.md` §6.1:捕获对方句柄 `get()`
+ *    即多协程 join)。
  *
- * 同步纪律(ADR-0003 D8):生命周期状态(lifecycle/starting/关闭计数与时延)由一把
- * std::mutex 守;运行时 await 只出现在 fiber 体内的挂起点,唤醒/回调在锁外调用。
+ * **协议特有的实事经三个钩子交给子类**:`DoStart()`(含配置校验;transport.Start + spawn
+ * 读循环 / handler)、`DoClose()`(发出全部汇合信号)、`DoJoin()`(join 自己 spawn 的全部
+ * fiber)。基类一律不触及协议类型:本头文件不 include 任何协议 / 消息类型,也不持有任何
+ * 队列——`HandlerLoop` 是**可选件**,由 node 持有。
+ *
+ * 同步纪律(ADR-0003 D8):生命周期状态由一把 `std::mutex` 守,**持锁期间不调任何钩子、
+ * 不出现挂起点**;`DoStart()` / `DoClose()` / `DoJoin()` 全在锁外调用。
  */
 
-#include <cstddef>
+#include "detail/result.hpp"
+
 #include <mutex>
 
-#include "transport/core/ITraceSink.hpp"
-#include "transport/core/Result.hpp"
-#include "transport/core/SharedCompletion.hpp"
 #include "transport/core/TransportTypes.hpp"
 
 namespace transport {
 
 /**
- * @brief 交互节点生命周期基类:幂等 Start / 关闭仲裁 / 收敛,协议特有实事下沉纯虚钩子。
+ * @brief 交互节点生命周期基类:幂等 Start / 只发信号的 Close / join 式 WaitClosed。
  *
  * **库内实现基类**,不是应用扩展点:RT_IF_API「不要求应用继承节点类型」约束的是**应用**,
  * 宿主仍按组合方式使用 `ProtocolNode` / `DdsNode`。
  *
- * 不可拷贝、不可移动(读循环 / handler fiber 捕获 this,且持 std::mutex)。
+ * 不可拷贝、不可移动(内部 fiber 捕获 this,且持 `std::mutex`)。
  */
 class NodeBase {
  public:
-  using Clock = OperationOptions::Clock;
-
   /**
    * @brief 析构:**不**在此收敛。
    *
-   * 收敛须调 `DoClose()` / `JoinHandler()` / `DrainUnstartedBusiness()` 等虚钩子,而基类
-   * 析构时子类已析构完毕、虚派发已退回基类(纯虚 ⇒ UB)。故每个具体 node 在**自身**析构
-   * 函数体内调 `Close()`(彼时动态类型仍是该 node,且其成员尚未析构)。
+   * 收敛须调 `DoClose()` / `DoJoin()` 虚钩子,而基类析构时子类已析构完毕、虚派发已退回
+   * 基类(纯虚 ⇒ UB)。故每个具体 node 在**自身**析构函数体内调 `Close()` 后再
+   * `WaitClosed()`(彼时动态类型仍是该 node,且其成员尚未析构)。
    */
   virtual ~NodeBase();
 
@@ -70,175 +68,87 @@ class NodeBase {
   NodeBase& operator=(const NodeBase&) = delete;
 
   /**
-   * @brief 并发安全幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
+   * @brief 幂等启动(RT_LIFECYCLE_003 / RT_LIFECYCLE_007)。
    *
-   * 首个 Start 先跑 `ValidateConfig()`(协议特有配置校验):失败原样返回、停在 Created、
-   * 不置 starting、不 latch `start_done_`(允许改配 / 重建重试)。通过则置 starting、**出
-   * 临界区**调 `DoStart()`(子实事:transport.Start + `MarkRunning()` + spawn 读循环 /
-   * handler);`DoStart` 失败退回 Created。首个 Start 的结果经 `start_done_` 共享给并发进来
-   * 的 Start(不重复 spawn)。已 Running 再启幂等成功;Closing/Closed 返 kInvalidState。
+   * 出临界区调 `DoStart()`(子实事:配置校验 + transport.Start + spawn 读循环 / handler),
+   * 返回成功则由**基类**置 Running;失败退回 Created,允许宿主改配后重试(实现须保证失败
+   * 时未 spawn 任何 fiber)。已 Running 再启幂等成功;Closing/Closed 返 `kInvalidState`。
+   *
+   * **不承诺并发调用可共享同一次初始化结果**:另一次 `Start()` 正在初始化时返
+   * `kInvalidState`。旧形态用一个一次性 `SharedCompletion` 共享首次结果,而它 latch 后不再
+   * 更新,第二轮重试的调用方会拿到上一轮的陈旧失败(#150);启动是宿主调一次的动作,
+   * 不值得为此保留一个坏 latch。
    */
-  Status Start();
+  Coro::Result<void> Start();
 
   /**
-   * @brief 并发安全幂等关闭(RT_LIFECYCLE_004/005/006):发汇合信号 + **等**收敛结果。
+   * @brief 只发关闭汇合信号,**不等待收敛**。幂等。
    *
-   * **Close 只发汇合信号 + 等收敛结果**(ADR-0005 D1),不亲自收敛;即
-   * `SignalClose()` + `closed_.Wait()`。首个关闭者:Running→Closing(立即拒新交互)→
-   * 汇合信号(`DoClose()`:transport.RequestClose + 业务队列 Close + handler 协作取消 +
-   * PendingTable.FailAll)→ Complete `close_signalled_`(读循环据此放行收敛)。收敛由
-   * **读循环兼任**:读循环退出后 join handler → Drain 未启动业务归因 close_drop → 置
-   * Closed → `closed_.Complete`(见 `ConvergeAfterReadLoop`)。从未 spawn 读循环
-   * (Created/starting)时无收敛者,由 `SignalClose` 就地收敛。后续关闭者共享 `closed_`
-   * (多等待者);已 Closed 再关直接成功。**读循环因致命错误自终**(D5)时本函数即"后续
-   * 关闭者",一样等 `closed_`。
+   * 首个关闭者:Running→Closing(立即拒新交互)→ 锁外调 `DoClose()` 发出全部汇合信号
+   * (transport.Close + 业务队列 Close + handler 协作取消 + PendingTable.FailAll)。从未
+   * `Start()` 过则直接落 Closed(无 fiber 可汇合,不调 `DoClose()`)。
    *
-   * **无重入守卫**(ADR-0006 D8):结尾无条件 `closed_.Wait()`。内部工作单元(读-分发循环、
-   * 入站业务处理器)**不得**调用本方法——那是等自己退出,会静默挂死;这是**使用契约**
-   * (RT_LIFECYCLE_005),处理器请求关闭须走只发信号的 `SignalClose()`。
+   * **不含任何等待点,故任何 fiber 都可调**——包括节点自己的读循环与业务处理器。读循环退出
+   * 时无条件调本方法即可:我方 `Close` 所致时它是幂等空操作,底层致命错误所致时它就是自终
+   * (ADR-0005 D5 的两条路径至此合并,不再需要"退出时是否仍 Running"的判据)。业务处理器
+   * 经 `HandlerContext::RequestClose()` 转调之。
+   *
+   * @return 仅表示**已受理**,不表示已关完。要确认收敛完成须由**节点外部**调 `WaitClosed()`。
    */
-  Status Close();
+  Coro::Result<void> Close();
 
-  /// @brief 等待节点收敛到 Closed(多等待者;支持 deadline)。**只应由节点外部调用**
-  ///        (RT_LIFECYCLE_005 使用契约:内部工作单元等待收敛 = 等自己退出,静默挂死;
-  ///        无运行时守卫,ADR-0006 D8)。
-  ///        取消能力已随 SharedCompletion 轻量化移除(ADR-0006 D3,#137)。
-  [[nodiscard]] Status WaitClosed(OperationOptions options = {});
+  /**
+   * @brief 等待节点**完全收敛**:join 全部内部 fiber,返回即可安全析构。
+   *
+   * 经 `DoJoin()` 让出式 join(`Coro::FiberTask::get()`),**必须在 fiber 内调用**。
+   * 未 `Start()` 或已收敛时立即返回。
+   *
+   * **单调用方**(节点的所有者),这是本方法与旧 `WaitClosed()` 唯一的能力回退:
+   * `FiberTask::get()` 底层是 `boost::fibers::future::get()`,**取过一次即失效**,并发的第二
+   * 个等待者会立刻拿到"已收敛"的假答案。旧形态的多等待者是被"`Close()` 要等收敛"逼出来
+   * 的——每个 `Close()` 调用方都成了等待者;`Close()` 不再等待之后,真正需要等的只剩所有者
+   * 一个。
+   *
+   * **无 deadline**:`Awaitable::close()` 只保证等待者被**唤醒**,不保证被唤醒的 fiber 已跑完
+   * 并不再触碰 `this`,而安全释放要的恰是后者——只有 `get()` 给得了(ADR-0006 D6)。deadline
+   * 与"安全析构"二选一,且超时返回后调用方什么也做不了(仍不能析构节点),故取后者。
+   */
+  void WaitClosed();
 
   /// @brief 当前是否处于 Running(node 的 Request/Send/Publish 前置状态判据)。
+  ///        启动中、关闭中与已关闭一律 false。
   [[nodiscard]] bool IsRunning() const;
 
-  /// @brief 观测:Close 时业务队列内未启动、被 Drain 丢弃归因的业务事件累计数(close_drop)。
-  [[nodiscard]] std::size_t CloseDropCount() const;
-
-  /// @brief 观测:最近一次 Close 发起到 Closed 完成的时延(P5-4,RT_DATA_BUFFER)。尚未
-  ///        关闭完成时为 0。
-  [[nodiscard]] Clock::duration LastCloseLatency() const;
-
  protected:
-  /**
-   * @brief 构造基类。
-   *
-   * @param trace_sink 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。
-   *                   用于生命周期跃迁 `RecordEvent` 与 Close 时的 close_drop 批量归因。
-   *                   RT_TRACE_002:为空时不改变任何控制流/计数,仅一次判空。
-   */
-  explicit NodeBase(ITraceSink* trace_sink = nullptr);
+  NodeBase() = default;
 
-  // —— 子类钩子(协议特有实事)——————————————————————————————————————————
+  // —— 子类钩子(协议特有实事;一律锁外调用)————————————————————————————
 
-  /// @brief 协议特有配置校验(RT_LIFECYCLE_007):非成功即拒绝启动、停 Created 可重试,
-  ///        且**不** latch `start_done_`。基类在首个 Start 的临界区内调用(实现不得取节点
-  ///        自身的锁,也不得挂起)。默认无配置可校验。
-  virtual Status ValidateConfig() const { return Status{}; }
+  /// @brief 启动的协议特有实事:**配置校验** → transport.Start → spawn 读-分发循环 /
+  ///        (设了 handler 时)handler 消费者。返回非成功即启动失败,基类退回 Created 允许
+  ///        改配重试——实现须保证此时未 spawn 任何 fiber。配置校验放在本钩子**开头**即可,
+  ///        不再单设 `ValidateConfig()`:它旧时唯一的存在理由是绕开 `start_done_` 那个坏
+  ///        latch,latch 删掉后二者行为一致。
+  virtual Coro::Result<void> DoStart() = 0;
 
-  /// @brief 首个 Start 的协议特有实事(锁外调用):transport.Start → `MarkRunning()` →
-  ///        spawn 读-分发循环 /(设了 handler 时)handler 消费者。返回非成功即启动失败,
-  ///        基类退回 Created 允许重试(实现须保证此时未 `MarkRunning`、未 spawn)。
-  virtual Status DoStart() = 0;
+  /// @brief 关闭汇合信号的协议特有实事(恒由首个关闭者独占执行一次):按序发出
+  ///        transport.Close → 业务队列 Close + handler 协作取消 → PendingTable.FailAll。
+  ///        **只发信号、不得等待任何 fiber**(等待属于 `DoJoin()`)——本钩子可能在节点自己的
+  ///        读循环 fiber 内被调用。返回 Coro::Result<void> 与 `DoStart` 对称;关闭一经置 Closing 即不可
+  ///        回滚,基类不据此分支。
+  virtual Coro::Result<void> DoClose() = 0;
 
-  /// @brief 关闭汇合信号的协议特有实事(锁外调用,恒由首个关闭者独占执行一次):按序发出
-  ///        transport.RequestClose → 业务队列 Close + handler 协作取消 →
-  ///        PendingTable.FailAll。
-  ///        **顺序即契约**:transport.RequestClose 一执行读循环就可能被唤醒退出,故其余信号
-  ///        必须在同一段内发完,基类随后才 Complete `close_signalled_` 放行收敛。
-  ///        返回 Status 与 `DoStart` 对称;关闭一经置 Closing 即不可回滚,基类不据此分支。
-  virtual Status DoClose() = 0;
-
-  /// @brief 收敛叶子动作:让出式 join 入站业务处理器(等其实际退出,不强杀,
-  ///        RT_LIFECYCLE_006 / ADR-0005 D2 的 `FiberTask::get()`)。未设 handler 的节点无可
-  ///        汇合者,默认空实现。基类在**读循环自身 fiber 内**、锁外调用。
-  virtual void JoinHandler() {}
-
-  /// @brief 收敛叶子动作:Drain 业务队列内未启动的排队业务(不排空处理),返回其条数;
-  ///        归因 close_drop 由基类做(与置 Closed 同一临界区)。默认无队列可 Drain。
-  ///        基类**持生命周期锁**调用:实现不得取节点自身的锁、不得挂起。
-  virtual std::size_t DrainUnstartedBusiness() { return 0; }
-
-  // —— 供子类驱动的生命周期动作 ——————————————————————————————————————
-
-  /**
-   * @brief 置 Running(`DoStart` 内、spawn 各 fiber 之前调):lifecycle=Running、清 starting。
-   *        与 lifecycle_ 同锁置位,令并发 Close 一致地观察到 Running(据此判定收敛者就位)。
-   */
-  void MarkRunning();
-
-  /**
-   * @brief 只发关闭汇合信号、**不等待**收敛(RT_LIFECYCLE_005 / ADR-0006 D8)。
-   *
-   * `Close` 的前半段:并发安全幂等地做首个关闭者仲裁并发出全部汇合信号,随即返回;收敛由
-   * **读循环**完成(`ConvergeAfterReadLoop`)。命名与 `ITransport::RequestClose()`(发信号)
-   * / `WaitClosed()`(等待)的仓内既有约定一致——本方法即 node 侧"发信号"那一半。
-   *
-   * **这是内部工作单元唯一被授权的关闭入口**:它不含任何等待点,故处理器 fiber 内调用
-   * 也不自锁,框架因此不需要运行时重入守卫(ADR-0006 D8 撤销 ADR-0005 D6)。node 经
-   * `HandlerContext::RequestClose()` / `DdsHandlerContext::RequestClose()` 暴露之。
-   *
-   * @return 仅表示**已受理**(关闭已发起或此前已发起/已完成),**不表示已关完**。要确认
-   *         收敛完成须由**节点外部**调 `WaitClosed()`(内部工作单元不得等,见
-   *         RT_LIFECYCLE_005)。
-   */
-  Status SignalClose();
-
-  /**
-   * @brief 读循环退出后的收敛尾段(ADR-0005 D1 / ADR-0006 D6):读循环兼任收敛者,在其自身
-   *        fiber 内跑完整个收敛,故**不得调公开的 `Close()`**(那会等 closed_ = 等自己退出)。
-   *
-   * 依次:自终判定 → 等关闭汇合信号 →(设 handler 时)join handler → 收敛到 Closed。
-   *
-   * **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:读循环退出有两种成因——我方
-   * `Close`(信号已在退出前发出),或不具重连能力的传输发生底层致命错误而节点仍 `Running`
-   * (ADR-0004 D1 后二者同为 kClosed、读循环无从区分)。后者由本 fiber **自行**置 Closing
-   * 并发出与 `Close` 完全相同的一组汇合信号,再走下面同一段收敛代码;不这样做则业务队列未
-   * Close、handler 未取消,节点将停在 `Running` 而收发已终止,`WaitClosed` 的等待者永不被
-   * 唤醒(僵尸节点)。我方 `Close` 所致时 lifecycle 已是 Closing/Closed,自终判定原样退让,
-   * `Wait` 至多挂起到 `Close` 把余下的汇合信号发完(读循环可能在 transport.RequestClose 后、
-   * 其余信号发出前就已退出);自终时则是本 fiber 自己刚刚 Complete 的,`Wait` 立即返回。
-   * **TCP 客户端天然落不到自终分支**:它无限重连,`Read` 只在我方 `Close` 后返 kClosed,
-   * 彼时 lifecycle 已非 Running——无需按介质分支,判据只是"读循环退出时是否仍 Running"。
-   * **与 RT_LIFECYCLE_005 的边界**:自终的收敛驱动者是读循环,而 D1 之后**无人等待读循环
-   * 退出**,故它不是"被收敛所等待的内部工作单元",不构成自等待。
-   */
-  void ConvergeAfterReadLoop();
+  /// @brief join 本节点 spawn 的**全部** fiber(读-分发循环 + 可选 handler 消费者),等其
+  ///        实际退出、不强杀(RT_LIFECYCLE_006)。以 `Coro::FiberTask::get()` 让出式实现;
+  ///        返回即意味着这些 fiber 已不再运行、不再触碰节点成员。由 `WaitClosed()` 在调用方
+  ///        fiber 内调用,**节点自己的 fiber 不得调**(等自己退出)。
+  virtual void DoJoin() = 0;
 
  private:
-  /**
-   * @brief 置 Closing 并发出**全部**关闭汇合信号——`Close` 与致命错误自终共用的同一段发起
-   *        代码(ADR-0005 D5:正常关闭与自终合并为一条路径,区别仅在"谁先置的 Closing")。
-   *
-   * 首个关闭者(lifecycle 尚非 Closing/Closed)独占地:置 Closing(立即拒新交互)→ 记关闭
-   * 时延起点 → 锁外调 `DoClose()` 发出全部汇合信号 → 最后 Complete `close_signalled_` 放行
-   * 收敛者。并发的 `Close` 与自终以 lifecycle_ 为唯一仲裁点,故**恒只有一个发起者**,
-   * `close_signalled_` 也只被 Complete 一次。
-   *
-   * @param[out] read_loop_converges 非空时写出"收敛者是否已就位":自 Running 进入 Closing
-   *             ⇒ `DoStart` 已 spawn 读循环 ⇒ 由它收敛;否则(Created/starting)无人收敛,
-   *             调用者须就地 `ConvergeToClosed`。非首个关闭者时写 false(其无收敛职责)。
-   * @return 本调用是否为首个关闭者。
-   */
-  bool SignalCloseIfFirstCloser(bool* read_loop_converges);
-
-  /// @brief 收敛到 Closed 的共用尾段(读循环收敛路径与"从未 spawn 读循环"直接收敛分支
-  ///        共用):Drain 未启动的排队业务逐条归因 close_drop(不排空处理)→ 置 Closed +
-  ///        记关闭时延(P5-4)→ lifecycle Trace → `closed_.Complete` 广播唤醒全部等待者。
-  void ConvergeToClosed();
-
-  /// 可选 Trace 出口(非拥有,P5-3/P5-4):生命周期 `RecordEvent` 与 close_drop 归因。
-  /// 写一次(构造)不再变,读不需持锁。
-  ITraceSink* trace_sink_{nullptr};
-
-  SharedCompletion<void> start_done_;  ///< 首个 Start 初始化结果(并发 Start 共享)。
-  /// 首个关闭者(外部 `Close` 或致命错误自终的读循环自身,D5)已发出全部汇合信号
-  /// (读循环退出后据此放行收敛;D1)。
-  SharedCompletion<void> close_signalled_;
-  SharedCompletion<void> closed_;  ///< 节点 Closed 通知(Close/WaitClosed 等待点)。
-
-  mutable std::mutex mutex_;  ///< 守生命周期状态与关闭归因(ADR-0003 D8)。
+  mutable std::mutex mutex_;  ///< 守生命周期状态(ADR-0003 D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
-  bool starting_{false};  ///< 首个 Start 正在初始化(并发 Start 据此 await start_done_)。
-  std::size_t close_drop_count_{0};
-  Clock::time_point close_requested_at_{};  ///< P5-4:Close 首个调用者置 Closing 的时刻。
-  Clock::duration last_close_latency_{};    ///< P5-4:最近一次关闭时延(简单存最近值)。
+  bool starting_{false};  ///< `DoStart()` 正在锁外执行;并发 Start 据此返 kInvalidState。
+  bool joined_{false};    ///< `DoJoin()` 已执行过;`WaitClosed()` 据此幂等(get() 一次性)。
 };
 
 }  // namespace transport

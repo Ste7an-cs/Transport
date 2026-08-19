@@ -23,7 +23,7 @@ namespace transport {
  * @brief DDS 交接元素:一条到达样本的不透明字节 + 来源 topic。
  *
  * provider `Subscribe` 回调在 listener 线程(非 fiber)构造 Sample 并非阻塞入队交接
- * 边界;`Read` 侧 fiber 出队后据 topic 填 `Datagram.source = Endpoint::Topic(topic)`。
+ * 边界;`Read` 侧 fiber 出队后据 topic 填 `Datagram.peer = Endpoint::Topic(topic)`。
  */
 struct Sample {
   std::vector<std::uint8_t> bytes;
@@ -83,7 +83,7 @@ class DdsTransport final : public ITransport {
 
   /// @brief 进入 Running:`provider.Init` + 对每个订阅 topic `Subscribe`(回调入队交接边界)。
   /// @return 成功;非法生命周期返回 kInvalidState;provider Init/Subscribe 失败返其错误。
-  Status Start() override;
+  Coro::Result<void> Start() override;
 
   /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);转发泵把交接样本转成
   ///        `Datagram{bytes, source=Endpoint::Topic(topic)}` 投入其中。
@@ -96,13 +96,13 @@ class DdsTransport final : public ITransport {
   /// @param unit 待发送样本;`destination` 须为 `Endpoint::Topic`,否则 kInvalidArgument。
   /// @return 成功;非 topic 目的地 kInvalidArgument;未 Start kInvalidState;关闭 kClosed;
   ///         provider 发布失败返其错误。
-  Status Write(SendUnit unit) override;
+  Coro::Result<void> Write(SendUnit unit) override;
 
   /// @brief 请求关闭(幂等):Unsubscribe 停投递 → 交接边界 Close 唤醒在途 Read → provider Shutdown。
-  Status RequestClose() override;
+  Coro::Result<void> RequestClose() override;
 
   /// @brief 等待完全关闭(支持多等待者)。
-  Status WaitClosed(OperationOptions options = {}) override;
+  Coro::Result<void> WaitClosed(OperationOptions options = {}) override;
 
   /// @brief 交接边界累计 tail-drop 丢弃样本数(命名归因 `dds_handoff_overflow`,RT_NODE_007)。
   [[nodiscard]] std::size_t DdsHandoffOverflowCount() const;

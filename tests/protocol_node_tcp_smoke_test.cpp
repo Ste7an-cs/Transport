@@ -42,7 +42,6 @@ using transport::Message;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::SendUnit;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpTransport;
 using transport::TransportErrc;
@@ -87,7 +86,7 @@ TEST(ProtocolNodeTcpSmoke, HandlerReceivesBusinessRepliesAndClosesEndToEnd) {
   // 请求方 node:配 handler,对收到的业务帧经 ctx.Send 回一帧 noresponse 应答(回显 payload,
   // 打上判别性 message_id)。
   ProtocolNodeConfig config;
-  config.handler = [](const Message& msg, HandlerContext& ctx) -> Status {
+  config.handler = [](const Message& msg, HandlerContext& ctx) -> Coro::Result<void> {
     Message reply;
     reply.frm_type = FrameType::kState;
     reply.message_id = 0x00BB;

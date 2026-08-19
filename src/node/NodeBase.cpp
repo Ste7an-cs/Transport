@@ -1,170 +1,92 @@
 #include "transport/node/NodeBase.hpp"
 
-#include <chrono>
-#include <utility>
-
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/Observability.hpp"
-#include "transport/core/TraceCategories.hpp"
 
-// NodeBase.cpp — 见 .hpp。生命周期唯一的一份实现(ADR-0006 D1/D6):幂等 Start、关闭仲裁、
-// 收敛(join → Drain 归因 → 置 Closed → 广播)。协议特有实事一律经虚钩子交给子类,本文件
-// 不 include 任何协议 / 消息类型。
+// NodeBase.cpp — 见 .hpp。生命周期唯一的一份实现:幂等 Start、只发信号的 Close、join 式
+// WaitClosed。协议特有实事一律经三个钩子交给子类,本文件不 include 任何协议 / 消息类型。
+//
+// 全文只有一条同步纪律:**持 mutex_ 期间不调钩子、不挂起**。三个钩子都在锁外调用,故基类
+// 不需要向子类下达"实现不得取锁、不得挂起"这类反向约束。
 
 namespace transport {
 
-NodeBase::NodeBase(ITraceSink* trace_sink) : trace_sink_(trace_sink) {}
-
 NodeBase::~NodeBase() = default;
 
-Status NodeBase::Start() {
-  bool do_init = false;
+Coro::Result<void> NodeBase::Start() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     switch (lifecycle_) {
       case LifecycleState::kRunning:
-        return Status{};  // 已 Running 再启 → 幂等成功。
+        return Coro::Result<void>{};  // 已 Running 再启 → 幂等成功。
       case LifecycleState::kClosing:
       case LifecycleState::kClosed:
         return make_error_code(TransportErrc::kInvalidState);
       case LifecycleState::kCreated:
         if (starting_) {
-          break;  // 已有 Start 在初始化 → 出临界区 await 同一 start_done_,不重复 spawn。
-        }
-        // 首个 Start:先校验(失败停 Created、start_done_ 不 latch、可重试)。
-        if (auto valid = ValidateConfig(); !valid) {
-          return valid;
+          // 另一次 Start 正在锁外跑 DoStart:不共享其结果(见 .hpp,#150)。
+          return make_error_code(TransportErrc::kInvalidState);
         }
         starting_ = true;
-        do_init = true;
         break;
     }
   }
-  if (!do_init) {
-    return start_done_.Wait();  // 并发 Start:共享首个 Start 的结果,不重复创建资源。
-  }
 
-  Status started = DoStart();  // 子实事:失败时未 MarkRunning、仍在 Created。
+  const Coro::Result<void> started = DoStart();  // 锁外:配置校验 + transport.Start + spawn。
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  starting_ = false;
   if (!started) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    starting_ = false;  // 退回 Created 允许重试;并发 await 者共享此失败结果。
+    return started;  // 停在 Created:未 spawn 任何 fiber,允许改配重试。
   }
-  start_done_.Complete(started);
-  return started;
+  // 置 Running 由**基类**做(旧形态是子类在 DoStart 中途回调 MarkRunning())。DoStart
+  // spawn 的 fiber 与本调用同线程亲和(Affinity::fixed),且 spawn 后至此无挂起点,故它们
+  // 不可能先于本行运行、观察到"已 spawn 但尚未 Running"。
+  lifecycle_ = LifecycleState::kRunning;
+  return Coro::Result<void>{};
 }
 
-void NodeBase::MarkRunning() {
+Coro::Result<void> NodeBase::Close() {
+  bool has_fibers = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    lifecycle_ = LifecycleState::kRunning;
-    starting_ = false;
-  }
-  // 生命周期跃迁 Trace(P5-4:Created→Running;类别原名 "close",#98 改 lifecycle)。
-  RecordEvent(kTraceCategoryLifecycle, trace_sink_, "running");
-}
-
-Status NodeBase::SignalClose() {
-  bool read_loop_converges = false;
-  if (SignalCloseIfFirstCloser(&read_loop_converges) && !read_loop_converges) {
-    // 从未 spawn 读循环:无收敛者,就地收敛。残留业务(理论上无)一并 close_drop 归因。
-    // 本段不等待任何 fiber(只 Drain + 置 Closed + Complete),故仍是"不等待"入口。
-    ConvergeToClosed();
-  }
-  return Status{};
-}
-
-Status NodeBase::Close() {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (lifecycle_ == LifecycleState::kClosed) {
-      return Status{};  // 已 Closed 再关直接成功(RT_LIFECYCLE_004)。
+    if (lifecycle_ == LifecycleState::kClosing ||
+        lifecycle_ == LifecycleState::kClosed) {
+      return Coro::Result<void>{};  // 幂等:信号已由首个关闭者发过(lifecycle_ 即唯一仲裁点)。
     }
+    // 只有 Running 才有 spawn 出去的 fiber 需要发信号唤醒;Created(含 starting_ 期间)
+    // 无 fiber、也无 transport 可关,直接落 Closed。
+    has_fibers = (lifecycle_ == LifecycleState::kRunning);
+    lifecycle_ =
+        has_fibers ? LifecycleState::kClosing : LifecycleState::kClosed;
   }
-  (void)SignalClose();  // 幂等仲裁在内:本调用未必是首个关闭者。
-  return closed_.Wait();  // 后续关闭者与外部调用者共享同一收敛结果(多等待者)。
+  if (!has_fibers) {
+    return Coro::Result<void>{};
+  }
+  // 锁外发出全部汇合信号。**本函数至此没有任何等待点**——这正是"读循环 / handler 可以
+  // 直接调公开的 Close()"的全部依据(旧形态为此另设了受保护的 SignalClose())。
+  // 关闭一经置 Closing 即不可回滚,故不据返回值分支(签名与 DoStart 对称)。
+  (void)DoClose();
+  return Coro::Result<void>{};
 }
 
-Status NodeBase::WaitClosed(OperationOptions options) {
-  return closed_.Wait(std::move(options));
+void NodeBase::WaitClosed() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (joined_ || lifecycle_ == LifecycleState::kCreated) {
+      return;  // 已 join 过(get() 一次性),或从未 Start 过:无 fiber 可汇合。
+    }
+    joined_ = true;
+  }
+  // 锁外让出式 join 全部内部 fiber(FiberTask::get())。返回即意味着它们已不再运行、
+  // 不再触碰本对象成员——这是"可安全析构"的唯一充分条件(ADR-0006 D6)。
+  DoJoin();
+  std::lock_guard<std::mutex> lock(mutex_);
+  lifecycle_ = LifecycleState::kClosed;
 }
 
 bool NodeBase::IsRunning() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return lifecycle_ == LifecycleState::kRunning;
-}
-
-std::size_t NodeBase::CloseDropCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return close_drop_count_;
-}
-
-NodeBase::Clock::duration NodeBase::LastCloseLatency() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return last_close_latency_;
-}
-
-bool NodeBase::SignalCloseIfFirstCloser(bool* read_loop_converges) {
-  bool first_closer = false;
-  bool converger_ready = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (lifecycle_ != LifecycleState::kClosing &&
-        lifecycle_ != LifecycleState::kClosed) {
-      first_closer = true;
-      // Running ⇒ DoStart 已 spawn 读循环 ⇒ 收敛者就位;否则(Created/starting)无人收敛。
-      converger_ready = (lifecycle_ == LifecycleState::kRunning);
-      lifecycle_ = LifecycleState::kClosing;
-      close_requested_at_ = Clock::now();  // P5-4:关闭时延起点。
-    }
-  }
-  if (read_loop_converges) {
-    *read_loop_converges = converger_ready;
-  }
-  if (!first_closer) {
-    return false;
-  }
-  // 生命周期跃迁 Trace(Running→Closing)。
-  RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closing");
-  // 汇合信号(锁外,子实事):唤醒读循环 + 消费者 + 触发 handler 取消 + FailAll 在途请求。
-  // 关闭一经置 Closing 即不可回滚,故基类不据其返回值分支(签名与 DoStart 对称)。
-  (void)DoClose();
-  // 最后一步:此时上述信号均已发出,读循环一旦被放行即可无条件走完收敛。**无条件**
-  // Complete(即便此刻无收敛者):它是"首个关闭者已发完全部汇合信号"这一事实本身,
-  // 无人等待时 Complete 亦无副作用;而漏发一次即等于读循环永久挂在 Wait 上。
-  close_signalled_.Complete(Status{});
-  return true;
-}
-
-void NodeBase::ConvergeAfterReadLoop() {
-  (void)SignalCloseIfFirstCloser(nullptr);  // 仍 Running ⇒ 致命错误自终(D5)。
-  close_signalled_.Wait();  // 信号已 Complete(我方 Close 或上一行自终),立即返回。
-  // 结构化并发 join(ADR-0005 D2):`JoinHandler` 在本 fiber 内让出,直至 handler 消费者
-  // 实际退出(RT_LIFECYCLE_006:不强制销毁 fiber,等其协作返回);未设 handler 时立即
-  // 返回。返回即意味着 handler fiber 已不再运行,可安全置 Closed。
-  JoinHandler();
-  ConvergeToClosed();
-}
-
-void NodeBase::ConvergeToClosed() {
-  Clock::duration latency{};
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // 归因留在基类(子类只报条数):close_drop 是关闭语义,与 close 时延、置 Closed 同一
-    // 临界区(与拆件前的加锁范围逐字相同)。
-    const std::size_t drained = DrainUnstartedBusiness();
-    for (std::size_t i = 0; i < drained; ++i) {
-      RecordDrop(DropReason::kCloseDrop, close_drop_count_, trace_sink_);
-    }
-    lifecycle_ = LifecycleState::kClosed;
-    latency = Clock::now() - close_requested_at_;
-    last_close_latency_ = latency;
-  }
-  RecordEvent(kTraceCategoryLifecycle, trace_sink_, "closed", {}, {}, {},
-              static_cast<long>(std::chrono::duration_cast<
-                                 std::chrono::microseconds>(latency)
-                                     .count()));
-  closed_.Complete(Status{});
 }
 
 }  // namespace transport

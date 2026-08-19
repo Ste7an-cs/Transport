@@ -38,7 +38,7 @@ DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
 // 析构即关闭:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚(见 NodeBase 文档)。
 DdsNode::~DdsNode() { Close(); }
 
-Status DdsNode::ValidateConfig() const {
+Coro::Result<void> DdsNode::ValidateConfig() const {
   // inbox_topic 是 reply_to 的来源、node_id 是 correlation_id 的前缀——二者为空则请求-应答
   // 无从成立(收不到应答 / 键无归属),停 Created 允许改配重试。
   if (config_.inbox_topic.empty() || config_.node_id.empty()) {
@@ -53,13 +53,13 @@ Status DdsNode::ValidateConfig() const {
       config_.business_queue_max_bytes > Q::kMaxBytes) {
     return make_error_code(TransportErrc::kConfiguration);
   }
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status DdsNode::DoStart() {
+Coro::Result<void> DdsNode::DoStart() {
   // 基类已做完幂等仲裁与配置校验,这里只做 DDS 特有实事。三介质(含 DDS)共用同一段无
   // 分支读循环(ADR-0004 D1/D2)——DdsTransport 断开即致命(Read 返 kClosed),由读循环收敛。
-  Status started = transport_->Start();  // DdsTransport:Init + 订阅 topic 集。
+  Coro::Result<void> started = transport_->Start();  // DdsTransport:Init + 订阅 topic 集。
   if (!started) {
     return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
   }
@@ -71,15 +71,15 @@ Status DdsNode::DoStart() {
   if (config_.handler) {
     handler_loop_.Spawn([this](Message&& msg) {
       DdsHandlerContext ctx(this, handler_loop_.Token());
-      // 返回 Status 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
+      // 返回 Coro::Result<void> 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
       // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
       (void)config_.handler(msg, ctx);
     });
   }
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status DdsNode::DoClose() {
+Coro::Result<void> DdsNode::DoClose() {
   // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
   // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
   transport_->RequestClose();
@@ -88,7 +88,7 @@ Status DdsNode::DoClose() {
   // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
   // 无 reactor(无连接),故无额外取消源。
   pending_.FailAll(make_error_code(TransportErrc::kClosed));
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 void DdsNode::JoinHandler() { handler_loop_.Join(); }
@@ -124,7 +124,7 @@ std::string DdsNode::NextCorrelationId() {
   return config_.node_id + ":" + std::to_string(++correlation_counter_);
 }
 
-Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
+Coro::Result<void> DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
   msg.kind = kind;
   auto encoded = codec_->Encode(msg);
   if (!encoded) {
@@ -143,7 +143,7 @@ Status DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
   return written;
 }
 
-Result<Message> DdsNode::Request(Message req, Endpoint target,
+Coro::Result<Message> DdsNode::Request(Message req, Endpoint target,
                                  OperationOptions options) {
   if (!IsRunning()) {
     // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
@@ -173,7 +173,7 @@ Result<Message> DdsNode::Request(Message req, Endpoint target,
   return handle.Wait(std::move(options));
 }
 
-Status DdsNode::Publish(Message msg, Endpoint topic) {
+Coro::Result<void> DdsNode::Publish(Message msg, Endpoint topic) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
@@ -195,8 +195,8 @@ void DdsNode::DecodeAndDispatch(Datagram datagram) {
               static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
-    msg.source = datagram.source.topic;
-    msg.topic = datagram.source.topic;
+    msg.source = datagram.peer.topic;
+    msg.topic = datagram.peer.topic;
     // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
     RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, msg.source, {},
                 static_cast<long>(msg.payload.size()));
@@ -264,7 +264,7 @@ DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
 
 // —— DdsHandlerContext ————————————————————————————————————————————————————————
 
-Status DdsHandlerContext::Reply(const Message& request, Message reply) {
+Coro::Result<void> DdsHandlerContext::Reply(const Message& request, Message reply) {
   // DDS 应答寻址内联:非请求 / 无回送 topic → 无从回送。
   if (request.kind != MessageKind::kRequest || request.reply_to.empty()) {
     return make_error_code(TransportErrc::kInvalidArgument);
@@ -274,11 +274,11 @@ Status DdsHandlerContext::Reply(const Message& request, Message reply) {
                             Endpoint::Topic(request.reply_to));
 }
 
-Status DdsHandlerContext::Publish(Message msg, Endpoint topic) {
+Coro::Result<void> DdsHandlerContext::Publish(Message msg, Endpoint topic) {
   return node_->Publish(std::move(msg), std::move(topic));
 }
 
-Status DdsHandlerContext::RequestClose() {
+Coro::Result<void> DdsHandlerContext::RequestClose() {
   // 只发汇合信号、不等待(ADR-0006 D8):当前即 handler 消费者 fiber,任何等待收敛的入口
   // 都等于等自己退出。返回仅表示已受理;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
   return node_->SignalClose();  // NodeBase 的受保护入口(本类是 DdsNode 的友元)。

@@ -29,7 +29,6 @@ using transport::FrameType;
 using transport::Message;
 using transport::ProtocolNode;
 using transport::Result;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -80,8 +79,8 @@ TEST(ProtocolNodeCapacity, MaxInflightConcurrentRequestsAllResolveExactlyOnce) {
   ASSERT_TRUE(node.Start());
 
   constexpr int kN = 256;
-  std::vector<Result<Message>> outcomes(
-      kN, Result<Message>{make_error_code(TransportErrc::kInternal)});
+  std::vector<Coro::Result<Message>> outcomes(
+      kN, Coro::Result<Message>{make_error_code(TransportErrc::kInternal)});
   std::vector<Coro::FiberTask<void>> requests;
   requests.reserve(kN);
   int done = 0;
@@ -143,7 +142,7 @@ TEST(ProtocolNodeCapacity, RequestBeyondSessionSpaceExhaustsWithoutSending) {
       [&] { return fake->sent().size() == static_cast<std::size_t>(kN); }));
 
   // 第 257 个:空闲集空 → kResourceExhausted,且未新增发送帧。
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto overflow = Coro::makeTask([&] {
     outcome = node.Request(MakeRequest(0x0002));
@@ -236,7 +235,7 @@ TEST(ProtocolNodeCapacity, NoresponseSendDoesNotDisturbSessionFifoOrBudget) {
   std::size_t frames = 0;  // fake->sent() 游标(Send 帧与 Request 帧交错)。
   for (std::uint8_t expected = 0; expected < 3; ++expected) {
     // 穿插 noresponse Send:盖空闲集尾部 id,不出队。
-    Status send_result = make_error_code(TransportErrc::kInternal);
+    Coro::Result<void> send_result = make_error_code(TransportErrc::kInternal);
     bool sent_done = false;
     auto sender = Coro::makeTask([&] {
       send_result = node.Send(MakeRequest(0x0033));
@@ -293,7 +292,7 @@ TEST(ProtocolNodeCapacity, LateResponseOfRetiredSessionIsNotMisattributed) {
   EXPECT_TRUE(a.get());
 
   // B:FIFO → 拿 session 1(退休窗口令 0 不被立即复用)。B 保持在途(不注入其响应)。
-  Result<Message> outcomeB{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcomeB{make_error_code(TransportErrc::kInternal)};
   bool doneB = false;
   auto b = Coro::makeTask([&] {
     outcomeB = node.Request(MakeRequest(0x0002));

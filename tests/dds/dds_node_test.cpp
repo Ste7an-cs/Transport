@@ -54,7 +54,6 @@ using transport::Message;
 using transport::MessageKind;
 using transport::OperationOptions;
 using transport::Result;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -131,7 +130,7 @@ DdsNodeConfig EchoServerConfig(std::string inbox, std::string node_id) {
   DdsNodeConfig c;
   c.inbox_topic = std::move(inbox);
   c.node_id = std::move(node_id);
-  c.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Status {
+  c.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Coro::Result<void> {
     Message reply;
     reply.payload = msg.payload;  // 回显。
     return ctx.Reply(msg, std::move(reply));
@@ -143,10 +142,10 @@ DdsNodeConfig EchoServerConfig(std::string inbox, std::string node_id) {
 // kCodec——供确定性触发 DecodeAndDispatch 的坏帧分支(P5-3 kBadFrame)。
 class AlwaysFailDecodeCodec : public ICodec {
  public:
-  Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
+  Coro::Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
     return real_.Encode(msg);
   }
-  Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
+  Coro::Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
     return make_error_code(TransportErrc::kCodec);
   }
 
@@ -167,7 +166,7 @@ TEST(DdsNode, RequestGetsMatchingReplyAndCleansUp) {
   ASSERT_TRUE(static_cast<bool>(server->Start()));
   ASSERT_TRUE(static_cast<bool>(client->Start()));
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto req = Coro::makeTask([&] {
     Message m;
@@ -196,10 +195,10 @@ TEST(DdsNode, PublishNotifyReachesSubscriberHandler) {
   DdsNodeConfig sub_cfg;
   sub_cfg.inbox_topic = "sub_inbox";
   sub_cfg.node_id = "sub";
-  sub_cfg.handler = [&](const Message& msg, DdsHandlerContext&) -> Status {
+  sub_cfg.handler = [&](const Message& msg, DdsHandlerContext&) -> Coro::Result<void> {
     received = msg;
     got = true;
-    return Status{};
+    return Coro::Result<void>{};
   };
   auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
 
@@ -242,8 +241,8 @@ TEST(DdsNode, MultiTopicConcurrentRequestsDoNotCrossTalk) {
   ASSERT_TRUE(static_cast<bool>(s2->Start()));
   ASSERT_TRUE(static_cast<bool>(client->Start()));
 
-  Result<Message> o1{make_error_code(TransportErrc::kInternal)};
-  Result<Message> o2{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> o1{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> o2{make_error_code(TransportErrc::kInternal)};
   bool d1 = false, d2 = false;
   auto r1 = Coro::makeTask([&] {
     Message m;
@@ -302,7 +301,7 @@ TEST(DdsNode, CloseConvergesInflightRequestWithClosed) {
   auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
   ASSERT_TRUE(static_cast<bool>(client->Start()));
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto req = Coro::makeTask([&] {
     Message m;
@@ -451,10 +450,10 @@ TEST(DdsNode, BusinessQueueOverflowWithSinkEmitsDropTrace) {
   sub_cfg.node_id = "sub";
   sub_cfg.trace_sink = &sink;
   sub_cfg.business_queue_max_events = 1;
-  sub_cfg.handler = [&](const Message&, DdsHandlerContext&) -> Status {
+  sub_cfg.handler = [&](const Message&, DdsHandlerContext&) -> Coro::Result<void> {
     ++entered;
     Coro::await(gate);  // 卡住首条,让后续帧只入队不启动 → 可控溢出。
-    return Status{};
+    return Coro::Result<void>{};
   };
   auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
   ASSERT_TRUE(static_cast<bool>(subscriber->Start()));
@@ -492,10 +491,10 @@ TEST(DdsNode, CloseDropWithSinkEmitsTraceEvents) {
   sub_cfg.inbox_topic = "sub_inbox";
   sub_cfg.node_id = "sub";
   sub_cfg.trace_sink = &sink;
-  sub_cfg.handler = [&](const Message&, DdsHandlerContext& ctx) -> Status {
+  sub_cfg.handler = [&](const Message&, DdsHandlerContext& ctx) -> Coro::Result<void> {
     ++entered;
     ctx.cancellation().Wait();  // 卡住首条,让后续帧只入队不启动。
-    return Status{};
+    return Coro::Result<void>{};
   };
   auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
   ASSERT_TRUE(static_cast<bool>(subscriber->Start()));

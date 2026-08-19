@@ -24,9 +24,9 @@ class FakeCoroTransport final : public transport::ITransport {
   using OperationOptions = transport::OperationOptions;
   using Clock = OperationOptions::Clock;
   template <typename T>
-  using Result = transport::Result<T>;
+  using Result = Coro::Result<T>;
   using SendUnit = transport::SendUnit;
-  using Status = transport::Status;
+  using Coro::Result<void> = Coro::Result<void>;
   using TransportErrc = transport::TransportErrc;
 
   struct State {
@@ -61,15 +61,15 @@ class FakeCoroTransport final : public transport::ITransport {
   FakeCoroTransport() : state_(std::make_shared<State>()) {}
   ~FakeCoroTransport() override { BeginClose(state_); }
 
-  Status Start() override {
+  Coro::Result<void> Start() override {
     const auto state = state_;
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kCreated) {
       state->lifecycle = LifecycleState::kRunning;
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (state->lifecycle == LifecycleState::kRunning) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     return transport::make_error_code(TransportErrc::kInvalidState);
   }
@@ -87,7 +87,7 @@ class FakeCoroTransport final : public transport::ITransport {
     return state->read_queue;
   }
 
-  Status Write(SendUnit unit) override {
+  Coro::Result<void> Write(SendUnit unit) override {
     const auto state = state_;
     std::shared_ptr<Coro::Awaitable<void>> slot_gate;
     {
@@ -114,10 +114,10 @@ class FakeCoroTransport final : public transport::ITransport {
       if (!acquired) {
         // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数,不释放写槽。
         LeaveWriteQueue(state);
-        Status failure = acquired.error().category() ==
+        Coro::Result<void> failure = acquired.error().category() ==
                                  transport::transport_error_category()
-                             ? Status{acquired.error()}
-                             : Status{transport::make_error_code(
+                             ? Coro::Result<void>{acquired.error()}
+                             : Coro::Result<void>{transport::make_error_code(
                                    TransportErrc::kClosed)};
         RecordWriteOutcome(state, failure);
         return failure;
@@ -138,8 +138,8 @@ class FakeCoroTransport final : public transport::ITransport {
       if (!released) {
         auto status = released.error().category() ==
                               transport::transport_error_category()
-                          ? Status{released.error()}
-                          : Status{transport::make_error_code(
+                          ? Coro::Result<void>{released.error()}
+                          : Coro::Result<void>{transport::make_error_code(
                                 TransportErrc::kInternal)};
         ExitWrite(state);
         RecordWriteOutcome(state, status);
@@ -147,16 +147,16 @@ class FakeCoroTransport final : public transport::ITransport {
       }
     }
 
-    Status result{};
+    Coro::Result<void> result{};
     bool partial_failure = false;
     std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       if (state->lifecycle != LifecycleState::kRunning) {
-        result = Status{
+        result = Coro::Result<void>{
             transport::make_error_code(TransportErrc::kClosed)};
       } else if (state->next_write_error) {
-        result = Status{state->next_write_error->first};
+        result = Coro::Result<void>{state->next_write_error->first};
         partial_failure = state->next_write_error->second;
         state->next_write_error.reset();
         if (partial_failure) {
@@ -176,12 +176,12 @@ class FakeCoroTransport final : public transport::ITransport {
     return result;
   }
 
-  Status RequestClose() override {
+  Coro::Result<void> RequestClose() override {
     BeginClose(state_);
-    return Status{};
+    return Coro::Result<void>{};
   }
 
-  Status WaitClosed(OperationOptions options = {}) override {
+  Coro::Result<void> WaitClosed(OperationOptions options = {}) override {
     const auto state = state_;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
@@ -360,7 +360,7 @@ class FakeCoroTransport final : public transport::ITransport {
       next_gate->close();
     }
     if (complete_close) {
-      state->closed.Complete(Status{});
+      state->closed.Complete(Coro::Result<void>{});
     }
   }
 
@@ -375,7 +375,7 @@ class FakeCoroTransport final : public transport::ITransport {
   // I/O 事实记账(与生产传输口径对齐):Write 成功记 last_send,失败记
   // last_error。
   static void RecordWriteOutcome(const std::shared_ptr<State>& state,
-                                 const Status& outcome) {
+                                 const Coro::Result<void>& outcome) {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (outcome) {
       state->last_send = Clock::now();
@@ -416,7 +416,7 @@ class FakeCoroTransport final : public transport::ITransport {
       gate->close(transport::make_error_code(TransportErrc::kClosed));
     }
     if (complete_close) {
-      state->closed.Complete(Status{});
+      state->closed.Complete(Coro::Result<void>{});
     }
   }
 

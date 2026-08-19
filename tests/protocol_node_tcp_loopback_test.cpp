@@ -47,7 +47,6 @@ using transport::OperationOptions;
 using transport::ProtocolNode;
 using transport::Result;
 using transport::SendUnit;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpTransport;
 using transport::TransportErrc;
@@ -171,7 +170,7 @@ TEST(ProtocolNodeTcpLoopback, RequestResolvedByRealEchoPeer) {
   auto node = MakeRequesterNode(client);
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     OperationOptions options;
@@ -224,7 +223,7 @@ TEST(ProtocolNodeTcpLoopback, LateAndWrongKeyResponsesDroppedAndCounted) {
   auto node = MakeRequesterNode(client);
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     OperationOptions options;
@@ -292,9 +291,9 @@ TEST(ProtocolNodeTcpLoopback, ResponseSourceIsPeerEndpoint) {
     options.deadline = deadline;
     auto datagram = testutil::ReadOnce(requester, options);
     ASSERT_TRUE(datagram) << datagram.error().message();
-    EXPECT_EQ(datagram.value().source.kind, Endpoint::Kind::kNet);
-    EXPECT_EQ(datagram.value().source.host, expected_host);
-    EXPECT_EQ(datagram.value().source.port, expected_port);
+    EXPECT_EQ(datagram.value().peer.kind, Endpoint::Kind::kNet);
+    EXPECT_EQ(datagram.value().peer.host, expected_host);
+    EXPECT_EQ(datagram.value().peer.port, expected_port);
     const auto& bytes = datagram.value().bytes;
     auto decoded = codec.Decode(bytes.data(), bytes.size());
     ASSERT_TRUE(decoded);
@@ -333,7 +332,7 @@ TEST(ProtocolNodeTcpLoopback, CloseConvergesEndToEnd) {
   auto node = MakeRequesterNode(client);
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     outcome = node->Request(MakeRequest(0x0002, {0x01}));  // 无 deadline,靠 Close 收敛。

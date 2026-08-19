@@ -1,24 +1,23 @@
+#include "detail/result.hpp"
+
 #include <array>
 #include <system_error>
 #include <gtest/gtest.h>
 
 #include "transport/core/Error.hpp"
-#include "transport/core/Result.hpp"
 
-using transport::Result;
-using transport::Status;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 TEST(CoroResult, UsesAsyncTaskValueAndVoidResults) {
-  Result<int> value{42};
+  Coro::Result<int> value{42};
   ASSERT_TRUE(value);
   EXPECT_EQ(value.value(), 42);
 
-  Status ok;
+  Coro::Result<void> ok;
   EXPECT_TRUE(ok);
 
-  Result<int> failed{make_error_code(TransportErrc::kIo)};
+  Coro::Result<int> failed{make_error_code(TransportErrc::kIo)};
   ASSERT_FALSE(failed);
   EXPECT_EQ(failed.error(), make_error_code(TransportErrc::kIo));
 }

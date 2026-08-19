@@ -1,6 +1,6 @@
 // 协程原生 TcpTransport 读侧契约真实回环集成测试。
 // 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证读侧可观察契约:
-// Datagram.source 为对端地址、对端断开 → Closed(不重连,终止语义单一)、
+// Datagram.peer 为对端地址、对端断开 → Closed(不重连,终止语义单一)、
 // 我方 RequestClose → Closed、
 // 带 deadline 的读超时 → Timeout 且不停流(可再读)、单读守卫已删除(并发第二个读者
 // 不再被拒,ADR-0007 D4)。连接建立由测试夹具完成(非本类职责)。
@@ -31,7 +31,6 @@ using transport::Datagram;
 using transport::Endpoint;
 using transport::OperationOptions;
 using transport::SendUnit;
-using transport::Status;
 using transport::TcpTransport;
 using transport::TransportErrc;
 using transport::make_error_code;
@@ -69,7 +68,7 @@ SendUnit Frame(std::vector<std::uint8_t> bytes) {
 
 }  // namespace
 
-// 读侧契约:Datagram.source 填为对端 Endpoint::Net(ip, port)(取自已连接 socket 的
+// 读侧契约:Datagram.peer 填为对端 Endpoint::Net(ip, port)(取自已连接 socket 的
 // peerAddress/peerPort;TCP from 恒为对端)。
 TEST(CoroTcpTransportRead, SourceIsPeerEndpoint) {
   QTcpServer server;
@@ -92,9 +91,9 @@ TEST(CoroTcpTransportRead, SourceIsPeerEndpoint) {
   options.deadline = OperationOptions::Clock::now() + 3s;
   auto r = testutil::ReadOnce(receiver, options);
   ASSERT_TRUE(r) << r.error().message();
-  EXPECT_EQ(r.value().source.kind, Endpoint::Kind::kNet);
-  EXPECT_EQ(r.value().source.host, expected_host);
-  EXPECT_EQ(r.value().source.port, expected_port);
+  EXPECT_EQ(r.value().peer.kind, Endpoint::Kind::kNet);
+  EXPECT_EQ(r.value().peer.host, expected_host);
+  EXPECT_EQ(r.value().peer.port, expected_port);
 }
 
 // 读侧契约(RT_TRANSPORT_008 / ADR-0004 D1):本类不重连,连接终结即传输终结,故

@@ -63,7 +63,6 @@ using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::Result;
 using transport::SendUnit;
-using transport::Status;
 using transport::SystemCodec;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
@@ -227,7 +226,7 @@ TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
   auto echo1 = SpawnEcho(*server_txp1, responder1, echo1_ended);
 
   // 首个 Request 恰好一次完成(echo 回帧)。
-  Result<Message> a{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> a{make_error_code(TransportErrc::kInternal)};
   bool a_done = false;
   auto req_a = Coro::makeTask([&] {
     a = node.Request(MakeRequest(0x0001, {0x11}), Deadline(4000ms));
@@ -242,7 +241,7 @@ TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
 
   // 令对端静默 → 起一个在途 Request(总超时 900ms:断链后唯一的收敛手段)。
   *silent = true;
-  Result<Message> b{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> b{make_error_code(TransportErrc::kInternal)};
   bool b_done = false;
   auto req_b = Coro::makeTask([&] {
     b = node.Request(MakeRequest(0x0002, {0x22}), Deadline(900ms));
@@ -279,7 +278,7 @@ TEST(TcpClientE2E, DisconnectReconnectLoopRequestsSucceedAcrossGenerations) {
   EXPECT_GT(nc.client->Generation(), gen1);
 
   // 新代际 Request 成功(证读循环跨重连续命 + 新代际物理隔离连上)。
-  Result<Message> c{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> c{make_error_code(TransportErrc::kInternal)};
   bool c_done = false;
   auto req_c = Coro::makeTask([&] {
     c = node.Request(MakeRequest(0x0004, {0xAB}), Deadline(4000ms));
@@ -318,13 +317,13 @@ TEST(TcpClientE2E, DisconnectKeepsQueuedBusinessAndInFlightRequests) {
   int completed = 0;
   ProtocolNodeConfig cfg;
   cfg.handler = [&started, &completed, gate](const Message&,
-                                             HandlerContext&) -> Status {
+                                             HandlerContext&) -> Coro::Result<void> {
     ++started;
     if (started == 1) {
       Coro::await(gate);  // 仅首帧挂住,后续帧释放后依次跑完。
     }
     ++completed;
-    return Status{};
+    return Coro::Result<void>{};
   };
 
   auto nc = MakeNodeWithClient(FastClientConfig(port), std::move(cfg));
@@ -340,7 +339,7 @@ TEST(TcpClientE2E, DisconnectKeepsQueuedBusinessAndInFlightRequests) {
   bool echo1_ended = false;
   auto sink = [](const Message&) { return std::vector<Message>{}; };
   auto echo1 = SpawnEcho(*server_txp1, sink, echo1_ended);
-  Result<Message> req{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> req{make_error_code(TransportErrc::kInternal)};
   bool req_done = false;
   auto request = Coro::makeTask([&] {
     req = node.Request(MakeRequest(0x0007, {0x01}), Deadline(1200ms));
@@ -491,7 +490,7 @@ TEST(TcpClientE2E, ReconfigEndpointSwitchConnectsNewServer) {
   ASSERT_TRUE(pumpFiberUntil([&] { return nc.client->Generation() == 1u; }, 4000));
   EXPECT_EQ(nc.client->ConfigVersion(), 1u);
 
-  Result<Message> a{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> a{make_error_code(TransportErrc::kInternal)};
   bool a_done = false;
   auto req_a = Coro::makeTask([&] {
     a = node.Request(MakeRequest(0x0005, {0x55}), Deadline(900ms));
@@ -527,7 +526,7 @@ TEST(TcpClientE2E, ReconfigEndpointSwitchConnectsNewServer) {
   EXPECT_EQ(nc.client->ConfigVersion(), 2u);
 
   // 新 Request 在 server_b 上成功。
-  Result<Message> b{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> b{make_error_code(TransportErrc::kInternal)};
   bool b_done = false;
   auto req_b = Coro::makeTask([&] {
     b = node.Request(MakeRequest(0x0006, {0x66}), Deadline(4000ms));

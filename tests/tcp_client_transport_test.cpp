@@ -31,7 +31,6 @@ using transport::LinkState;
 using transport::OperationOptions;
 using transport::Result;
 using transport::SendUnit;
-using transport::Status;
 using transport::TcpClientConfig;
 using transport::TcpClientTransport;
 using transport::TransportErrc;
@@ -280,7 +279,7 @@ TEST(CoroTcpClientTransport, RequestCloseWakesInFlightReadWithClosed) {
   QTcpSocket* accepted = AcceptNext(server);
   ASSERT_NE(accepted, nullptr);
 
-  Result<Datagram> out{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Datagram> out{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   Coro::Awaitable<void> entered;
   auto reader = Coro::makeTask([&] {

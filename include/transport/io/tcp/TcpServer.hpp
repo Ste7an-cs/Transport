@@ -61,16 +61,16 @@ class TcpServer {
    * @return 成功;监听失败(端口占用/地址非法)返 kConnection(见 LastError),停在 Created
    *         可改配重试;非法生命周期返 kInvalidState。
    */
-  Status Start();
+  Coro::Result<void> Start();
 
   /**
    * @brief 请求关闭(幂等):停 accept(停监听)+ 逐个关闭全部子 node 并等其收敛 + 回收。
    * @return 全部子 node 收敛后成功。
    */
-  Status Close();
+  Coro::Result<void> Close();
 
   /// @brief 等待 server 完全关闭(accept 循环退出 + 全部子 node 收敛;支持多等待者)。
-  [[nodiscard]] Status WaitClosed(OperationOptions options = {});
+  [[nodiscard]] Coro::Result<void> WaitClosed(OperationOptions options = {});
 
   /// @brief 当前是否在监听。
   [[nodiscard]] bool IsListening() const;

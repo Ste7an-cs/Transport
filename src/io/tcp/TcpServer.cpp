@@ -89,7 +89,7 @@ void SuperviseChild(StatePtr s, std::uint64_t id, QPointer<QAbstractSocket> sock
     node->WaitClosed();
     node.reset();
   }
-  done->Complete(Status{});
+  done->Complete(Coro::Result<void>{});
 }
 
 // 处理一条新接受的连接:setParent(nullptr) 交出所有权 → 内层 TcpTransport 接管 → 工厂
@@ -104,7 +104,7 @@ void HandleAccepted(const StatePtr& s, QTcpSocket* sock) {
     ++s->accept_error_count;
     return;
   }
-  Status started = node->Start();
+  Coro::Result<void> started = node->Start();
   if (!started) {
     node->Close();  // 显式撕连接(node 析构亦兜底)。
     std::lock_guard<std::mutex> lock(s->mutex);
@@ -174,7 +174,7 @@ void RunAcceptLoop(StatePtr s) {
       }
     }
   }
-  s->accept_done.Complete(Status{});
+  s->accept_done.Complete(Coro::Result<void>{});
 }
 
 }  // namespace
@@ -187,12 +187,12 @@ TcpServer::TcpServer(TcpServerConfig config, NodeFactory factory)
 
 TcpServer::~TcpServer() { Close(); }
 
-Status TcpServer::Start() {
+Coro::Result<void> TcpServer::Start() {
   const auto s = state_;
   {
     std::lock_guard<std::mutex> lock(s->mutex);
     if (s->lifecycle == LifecycleState::kRunning) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (s->lifecycle != LifecycleState::kCreated) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -227,10 +227,10 @@ Status TcpServer::Start() {
     s->accept_spawned = true;
   }
   Coro::makeTask([s] { RunAcceptLoop(s); });
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status TcpServer::Close() {
+Coro::Result<void> TcpServer::Close() {
   const auto s = state_;
   QPointer<QTcpServer> srv;
   bool first_closer = false;
@@ -239,12 +239,12 @@ Status TcpServer::Close() {
   {
     std::lock_guard<std::mutex> lock(s->mutex);
     if (s->lifecycle == LifecycleState::kClosed) {
-      return Status{};
+      return Coro::Result<void>{};
     }
     if (s->lifecycle == LifecycleState::kCreated) {
       s->lifecycle = LifecycleState::kClosed;  // 从未 Start:无 accept/子 node 可停。
-      s->closed.Complete(Status{});
-      return Status{};
+      s->closed.Complete(Coro::Result<void>{});
+      return Coro::Result<void>{};
     }
     if (s->lifecycle == LifecycleState::kRunning) {
       first_closer = true;
@@ -292,11 +292,11 @@ Status TcpServer::Close() {
     s->server = nullptr;
     s->lifecycle = LifecycleState::kClosed;
   }
-  s->closed.Complete(Status{});
-  return Status{};
+  s->closed.Complete(Coro::Result<void>{});
+  return Coro::Result<void>{};
 }
 
-Status TcpServer::WaitClosed(OperationOptions options) {
+Coro::Result<void> TcpServer::WaitClosed(OperationOptions options) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kCreated) {

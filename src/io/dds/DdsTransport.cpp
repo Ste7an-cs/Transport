@@ -87,7 +87,7 @@ void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->lifecycle = LifecycleState::kClosed;
   }
-  state->closed.Complete(Status{});
+  state->closed.Complete(Coro::Result<void>{});
 }
 
 // 转发泵(ADR-0007 D1 的 DDS 形态):反复从交接边界 Pop 一条 Sample,转成 Datagram 投入
@@ -101,7 +101,7 @@ void RunReadPump(const std::shared_ptr<DdsTransport::State>& state,
                  const std::shared_ptr<Coro::Awaitable<Datagram>>& read_queue) {
   const auto channel = read_queue->channel();
   for (;;) {
-    Result<Sample> sample = state->handoff.Pop();
+    Coro::Result<Sample> sample = state->handoff.Pop();
     if (!sample) {
       const auto error = sample.error();
       if (error == make_error_code(TransportErrc::kClosed)) {
@@ -119,7 +119,7 @@ void RunReadPump(const std::shared_ptr<DdsTransport::State>& state,
     }
     Datagram datagram;
     datagram.bytes = std::move(sample.value().bytes);
-    datagram.source = Endpoint::Topic(std::move(sample.value().topic));
+    datagram.peer = Endpoint::Topic(std::move(sample.value().topic));
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->last_recv = OperationOptions::Clock::now();
@@ -143,7 +143,7 @@ DdsTransport::DdsTransport(std::unique_ptr<IDdsProvider> provider,
 
 DdsTransport::~DdsTransport() { BeginClose(state_); }
 
-Status DdsTransport::Start() {
+Coro::Result<void> DdsTransport::Start() {
   const auto state = state_;
   IDdsProvider* provider = nullptr;
   DdsConfig config;
@@ -152,7 +152,7 @@ Status DdsTransport::Start() {
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->lifecycle == LifecycleState::kRunning) {
-      return Status{};  // 幂等。
+      return Coro::Result<void>{};  // 幂等。
     }
     if (state->lifecycle != LifecycleState::kCreated) {
       return make_error_code(TransportErrc::kInvalidState);
@@ -165,13 +165,13 @@ Status DdsTransport::Start() {
     topics = state->subscribe_topics;
   }
 
-  if (Status init = provider->Init(config); !init) {
+  if (Coro::Result<void> init = provider->Init(config); !init) {
     return init;
   }
   // 逐 topic 订阅:回调在 listener 线程构造 Sample 并**非阻塞** Push 交接边界。回调只
   // 捕获 handoff(BoundedQueue 共享句柄)与 topic,不引用 State——无引用环、迟到安全。
   for (const auto& topic : topics) {
-    Status sub = provider->Subscribe(
+    Coro::Result<void> sub = provider->Subscribe(
         topic, [handoff, topic](const std::vector<std::uint8_t>& bytes) mutable {
           // 满即 tail-drop(BoundedQueue 内部计数 dds_handoff_overflow),不阻塞 listener。
           (void)handoff.Push(Sample{bytes, topic});
@@ -190,7 +190,7 @@ Status DdsTransport::Start() {
   // 起转发泵(ADR-0007 D1):把交接边界的样本转成 Datagram 投 read_queue。句柄不留存:
   // 泵只触碰以 shared_ptr 持有的 State 与队列,故本类析构后仍安全收敛。
   Coro::makeTask([state, read_queue] { RunReadPump(state, read_queue); });
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 // 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
@@ -204,7 +204,7 @@ std::shared_ptr<Coro::Awaitable<Datagram>> DdsTransport::Read() {
   return state_->read_queue;
 }
 
-Status DdsTransport::Write(SendUnit unit) {
+Coro::Result<void> DdsTransport::Write(SendUnit unit) {
   const auto state = state_;
   IDdsProvider* provider = nullptr;
   {
@@ -226,7 +226,7 @@ Status DdsTransport::Write(SendUnit unit) {
   if (!provider) {
     return make_error_code(TransportErrc::kInvalidState);
   }
-  Status result = provider->Publish(unit.destination.topic, unit.bytes);
+  Coro::Result<void> result = provider->Publish(unit.destination.topic, unit.bytes);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (result) {
@@ -238,12 +238,12 @@ Status DdsTransport::Write(SendUnit unit) {
   return result;
 }
 
-Status DdsTransport::RequestClose() {
+Coro::Result<void> DdsTransport::RequestClose() {
   BeginClose(state_);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status DdsTransport::WaitClosed(OperationOptions options) {
+Coro::Result<void> DdsTransport::WaitClosed(OperationOptions options) {
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     if (state_->lifecycle == LifecycleState::kCreated) {

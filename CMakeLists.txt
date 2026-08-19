@@ -93,24 +93,20 @@ if(TRANSPORT_BUILD_TESTS)
 
   add_executable(transport_tests
     tests/coro_test_main.cpp
+    # —— 重设计(redesign 分支)后仍成立的用例 ——
     tests/version_test.cpp
     tests/error_test.cpp
     tests/cancellation_test.cpp
-    tests/shared_completion_test.cpp
-    tests/pending_table_test.cpp
-    tests/bounded_queue_test.cpp
-    tests/handler_loop_test.cpp
     tests/observability_test.cpp
-    tests/protocol_node_test.cpp
-    tests/protocol_node_handler_test.cpp
-    tests/protocol_node_lifecycle_test.cpp
-    tests/protocol_node_capacity_test.cpp
-    tests/transport_contract_test.cpp
+    tests/dispatcher_test.cpp
     tests/coro_harness_test.cpp
-    tests/fake_coro_transport_test.cpp
-    tests/send_semantics_fake_test.cpp
     tests/udp_transport_test.cpp
-    tests/protocol_node_udp_test.cpp
+    tests/protocol_node_test.cpp
+    # —— 以下用例仍在旧 ITransport / NodeBase 面上，随重设计逐个迁移后再放回 ——
+    #   protocol_node_handler_test / protocol_node_lifecycle_test
+    #   protocol_node_capacity_test / protocol_node_udp_test / transport_contract_test
+    #   fake_coro_transport_test / send_semantics_fake_test / handler_loop_test
+    #   shared_completion_test（SharedCompletion 已随手搓同步件一并删除）
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp

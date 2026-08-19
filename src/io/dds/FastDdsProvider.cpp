@@ -59,7 +59,7 @@ class FastDdsProvider::ReaderListener : public dds::DataReaderListener {
 FastDdsProvider::FastDdsProvider() = default;
 FastDdsProvider::~FastDdsProvider() { Shutdown(); }
 
-Status FastDdsProvider::Init(const DdsConfig& config) {
+Coro::Result<void> FastDdsProvider::Init(const DdsConfig& config) {
   config_ = config;
   auto* factory = dds::DomainParticipantFactory::get_instance();
   participant_ = factory->create_participant(config.domain_id, dds::PARTICIPANT_QOS_DEFAULT);
@@ -73,7 +73,7 @@ Status FastDdsProvider::Init(const DdsConfig& config) {
   subscriber_ = participant_->create_subscriber(dds::SUBSCRIBER_QOS_DEFAULT);
   if (!publisher_ || !subscriber_)
     return make_error_code(TransportErrc::kIo);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
@@ -84,7 +84,7 @@ dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
   return t;
 }
 
-Status FastDdsProvider::Publish(const std::string& topic,
+Coro::Result<void> FastDdsProvider::Publish(const std::string& topic,
                                       const std::vector<uint8_t>& bytes) {
   dds::DataWriter* writer = nullptr;
   {
@@ -105,12 +105,12 @@ Status FastDdsProvider::Publish(const std::string& topic,
   RawBytes copy; copy.payload = bytes;
   // Fast DDS 2.13.1 的 DataWriter::write(void*) 单参重载返回 bool(成功 true)。
   if (!writer->write(&copy)) return make_error_code(TransportErrc::kIo);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status FastDdsProvider::Subscribe(const std::string& topic, Sink cb) {
+Coro::Result<void> FastDdsProvider::Subscribe(const std::string& topic, Sink cb) {
   std::lock_guard<std::mutex> lk(mutex_);
-  if (readers_.count(topic)) return Status{};  // 幂等
+  if (readers_.count(topic)) return Coro::Result<void>{};  // 幂等
   dds::Topic* t = GetOrCreateTopic(topic);
   if (!t) return make_error_code(TransportErrc::kIo);
   auto listener = std::make_unique<ReaderListener>(std::move(cb));
@@ -119,16 +119,16 @@ Status FastDdsProvider::Subscribe(const std::string& topic, Sink cb) {
   dds::DataReader* reader = subscriber_->create_datareader(t, rqos, listener.get());
   if (!reader) return make_error_code(TransportErrc::kIo);
   readers_[topic] = ReaderEntry{reader, std::move(listener)};
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status FastDdsProvider::Unsubscribe(const std::string& topic) {
+Coro::Result<void> FastDdsProvider::Unsubscribe(const std::string& topic) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto it = readers_.find(topic);
-  if (it == readers_.end()) return Status{};
+  if (it == readers_.end()) return Coro::Result<void>{};
   subscriber_->delete_datareader(it->second.reader);
   readers_.erase(it);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 void FastDdsProvider::Shutdown() {

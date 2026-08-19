@@ -14,9 +14,9 @@ std::shared_ptr<FakeDdsProvider::Bus> FakeDdsProvider::StaticBusForDomain(int do
   return b;
 }
 
-Status FakeDdsProvider::Init(const DdsConfig& config) {
+Coro::Result<void> FakeDdsProvider::Init(const DdsConfig& config) {
   if (!bus_) bus_ = StaticBusForDomain(config.domain_id);  // 未注入 → 接入静态 domain 总线
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 void FakeDdsProvider::Shutdown() {
@@ -30,24 +30,24 @@ void FakeDdsProvider::Shutdown() {
       for (auto id : kv.second) bus_->Remove(kv.first, id);
 }
 
-Status FakeDdsProvider::Publish(const std::string& topic,
+Coro::Result<void> FakeDdsProvider::Publish(const std::string& topic,
                                       const std::vector<uint8_t>& bytes) {
   // 未 Init(无总线)即发布:调用序错误 → kInvalidState。
   if (!bus_) return make_error_code(TransportErrc::kInvalidState);
   bus_->Dispatch(topic, bytes);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status FakeDdsProvider::Subscribe(const std::string& topic, Sink cb) {
+Coro::Result<void> FakeDdsProvider::Subscribe(const std::string& topic, Sink cb) {
   // 未 Init(无总线)即订阅:调用序错误 → kInvalidState。
   if (!bus_) return make_error_code(TransportErrc::kInvalidState);
   uint64_t id = bus_->Add(topic, std::move(cb));
   std::lock_guard<std::mutex> lk(mine_m_);
   mine_[topic].push_back(id);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
-Status FakeDdsProvider::Unsubscribe(const std::string& topic) {
+Coro::Result<void> FakeDdsProvider::Unsubscribe(const std::string& topic) {
   std::vector<uint64_t> ids;
   {
     std::lock_guard<std::mutex> lk(mine_m_);
@@ -56,7 +56,7 @@ Status FakeDdsProvider::Unsubscribe(const std::string& topic) {
   }
   if (bus_)
     for (auto id : ids) bus_->Remove(topic, id);
-  return Status{};
+  return Coro::Result<void>{};
 }
 
 }  // namespace transport

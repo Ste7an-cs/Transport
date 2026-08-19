@@ -69,7 +69,7 @@ class TcpClientTransport final : public ITransport {
 
   /// @brief 进入 Running 并 spawn connect-loop fiber;立即返回不等首次 Connected
   ///        (RT_LIFECYCLE 3.1.6.3),状态进 Connecting。重复调用幂等。
-  Status Start() override;
+  Coro::Result<void> Start() override;
 
   /// @brief 交出对外 `read_queue` 的等待器句柄(ADR-0007 D4):**断链完全透明**
   ///        (ADR-0004 D1/D6,RT_TRANSPORT_008)。
@@ -83,14 +83,14 @@ class TcpClientTransport final : public ITransport {
 
   /// @brief 发送一帧:直操当前代际内层;链路不可用(未连上/重连中)立即返 `kConnection`
   ///        (不缓存等待重连,RT_TCP_RECONNECT_003)。我方已关闭则返 `kClosed`。
-  Status Write(SendUnit unit) override;
+  Coro::Result<void> Write(SendUnit unit) override;
 
   /// @brief 请求关闭(幂等):停 connect-loop、掐断当前尝试、关闭当前内层与对外
   ///        `read_queue`(以 `kClosed` 关闭,在途读者 await 得到该终止原因)。
-  Status RequestClose() override;
+  Coro::Result<void> RequestClose() override;
 
   /// @brief 等待完全关闭(connect-loop 退出;支持多等待者)。
-  Status WaitClosed(OperationOptions options = {}) override;
+  Coro::Result<void> WaitClosed(OperationOptions options = {}) override;
 
   // -- 运行时重配置(客户端具体方法,宿主直接调,不经 node;ADR-0004 D7)--
 
@@ -111,7 +111,7 @@ class TcpClientTransport final : public ITransport {
   ///
   /// @param config 完整配置快照。
   /// @param version 单调版本(须严格大于当前才应用;等于且同容为 no-op)。
-  Status ApplyConfig(TcpClientConfig config, std::uint64_t version);
+  Coro::Result<void> ApplyConfig(TcpClientConfig config, std::uint64_t version);
 
   // -- 连接诊断面(具体方法,ADR-0004 D7:不进基类、不构成多态缝)--
 
@@ -122,11 +122,11 @@ class TcpClientTransport final : public ITransport {
   /// @param options deadline 只结束本次等待(返 kTimeout),后台重连继续;取消返
   ///        kCancelled;目标在关闭前无法达成返 kClosed。
   /// @note 非通用要求(RT_TCP_RECONNECT_005),仅本类以自身方法提供,供宿主与测试同步。
-  [[nodiscard]] Status WaitForState(ConnectionState target,
+  [[nodiscard]] Coro::Result<void> WaitForState(ConnectionState target,
                                     OperationOptions options = {});
 
   /// @brief 等待下一次状态跃迁,返回跃迁后的新状态(多等待者)。
-  [[nodiscard]] Result<ConnectionState> WaitStateChange(
+  [[nodiscard]] Coro::Result<ConnectionState> WaitStateChange(
       OperationOptions options = {});
 
   /// @brief 连接代际:单调 uint64,每次成功物理连接 +1。

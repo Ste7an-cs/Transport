@@ -40,7 +40,6 @@ using transport::OperationOptions;
 using transport::SendUnit;
 using transport::SerialConfig;
 using transport::SerialTransport;
-using transport::Status;
 using transport::FrameType;
 using transport::Message;
 using transport::ProtocolNode;
@@ -133,7 +132,7 @@ TEST(CoroSerialTransport, TransportWriteReachesPeer) {
   ::close(pty.master);
 }
 
-// 回环:master 写 → 被测传输 Read 读到相同字节;Datagram.source 为默认目的地。
+// 回环:master 写 → 被测传输 Read 读到相同字节;Datagram.peer 为默认目的地。
 TEST(CoroSerialTransport, PeerWriteReachesTransport) {
   PtyPair pty = MakePty();
   ASSERT_TRUE(pty.ok);
@@ -150,7 +149,7 @@ TEST(CoroSerialTransport, PeerWriteReachesTransport) {
   opts.deadline = OperationOptions::Clock::now() + 3s;
   auto first = testutil::ReadOnce(t, opts);
   ASSERT_TRUE(first) << first.error().message();
-  EXPECT_EQ(first.value().source.kind, Endpoint::Kind::kDefault);
+  EXPECT_EQ(first.value().peer.kind, Endpoint::Kind::kDefault);
   std::vector<std::uint8_t> got(first.value().bytes.begin(),
                                 first.value().bytes.end());
   while (got.size() < frame.size()) {
@@ -422,7 +421,7 @@ TEST(CoroSerialTransport, NodeRequestResponseEndToEnd) {
       std::make_unique<SerialTransport>(cfg), std::make_unique<SystemCodec>());
   ASSERT_TRUE(node->Start());
 
-  Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto request = Coro::makeTask([&] {
     OperationOptions options;
