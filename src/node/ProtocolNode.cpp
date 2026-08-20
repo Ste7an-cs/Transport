@@ -16,7 +16,10 @@
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
-// join)由基类 NodeBase 承载,本类只填三个钩子;handler 消费者在可选小件 HandlerLoop。
+// join)由基类 NodeBase 承载,本类只填三个钩子。
+//
+// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不再持有业务队列与
+// handler 消费者 fiber:入站业务由宿主 `Subscribe` 后在自己的 fiber 上消费。
 //
 // 本类**不触碰 transport 的生命周期**:不 Start、不 Close、不 WaitClosed,只借它的两条
 // 队列句柄。链路的绑定/超时/重连/退避全在传输内部,对本类不可见。
@@ -48,8 +51,6 @@ ProtocolNode::ProtocolNode(ITransport& transport, std::unique_ptr<ICodec> codec,
     : transport_(transport),
       codec_(std::move(codec)),
       config_(std::move(config)),
-      // handler 消费者小件持有业务队列;未设 handler 时不 Spawn,它只是个空队列。
-      handler_loop_(config_.business_queue_capacity),
       // 键提取函数:给出一条消息各匹配字段的具体值。部分匹配由 Dispatcher 实现,本类
       // 不再需要把字段压成单一关联键,也不再需要为"响应命令码"做归一化。
       dispatcher_([](const Message& msg) {
@@ -80,17 +81,8 @@ Coro::Result<void> ProtocolNode::DoStart() {
   // 源队列与其它订阅者不受影响;写侧无句柄可取,直接调 transport_.Write()。
   rx_ = transport_.AsyncRead()->shared();
 
+  // 本节点只 spawn 这一条 fiber。入站业务的消费 fiber 属宿主,由其自行 spawn 与 join。
   SpawnReadLoop();
-  // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列);node 在 consume
-  // 回调内构造 HandlerContext 并跑业务 handler(协议特有的能力面 + 语义)。
-  if (config_.handler) {
-    handler_loop_.Spawn([this](Message&& msg) {
-      HandlerContext ctx(this, handler_loop_.Token());
-      // 返回值仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
-      // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
-      (void)config_.handler(msg, ctx);
-    });
-  }
   return Coro::Result<void>{};
 }
 
@@ -102,20 +94,22 @@ Coro::Result<void> ProtocolNode::DoClose() {
     rx_->close(make_error_code(TransportErrc::kClosed));
     rx_->channel()->discard_pending();
   }
-  handler_loop_.CancelAndClose();  // 业务队列 Close + handler 协作取消。
-  // 协议特有的收敛信号:关闭全部订阅信箱并置终止标记,令在途请求恰好终结一次。
-  // 断链不是收敛信号——在途请求仅由时限或节点关闭终结。
+  // 协议特有的收敛信号:关闭全部订阅信箱并置终止标记。一举两得——令在途请求恰好终结
+  // 一次,同时**即入站业务订阅者的协作取消信号**(ADR-0009 D4):其在途 `await` 恰好终结
+  // 一次,消费 fiber 据此自然退出。断链不是收敛信号——在途请求仅由时限或节点关闭终结。
   dispatcher_.CloseAll(make_error_code(TransportErrc::kClosed));
   return Coro::Result<void>{};
 }
 
 void ProtocolNode::DoJoin() {
-  // 让出式 join(FiberTask::get()):返回即意味着这两条 fiber 已不再运行、不再触碰本对象。
+  // 让出式 join(FiberTask::get()):返回即意味着读循环已不再运行、不再触碰本对象。
   // 由 WaitClosed() 在**调用方** fiber 内调用,故不构成自等待。
+  //
+  // 这里 join 的是本节点**全部**的内部工作单元——只此一条。订阅者的消费 fiber 属宿主,
+  // 本节点无从 join;`WaitClosed()` 返回后它们可能仍在退出途中(ADR-0009 D4)。
   if (read_task_) {
     (void)read_task_->get();
   }
-  handler_loop_.Join();
 }
 
 void ProtocolNode::SpawnReadLoop() {
@@ -211,43 +205,32 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   // Decode 成功边界:一次 Decode 调用一条事件,不逐条消息重复。
   RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
               static_cast<long>(bytes.size()));
-  for (auto& msg : decoded.value()) {
+  for (const auto& msg : decoded.value()) {
     // Read 解出消息边界:按解出的消息计,不逐字节。
     RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, {}, {},
                 static_cast<long>(msg.payload.size()));
-    Dispatch(std::move(msg));
+    Dispatch(msg);
   }
 }
 
-void ProtocolNode::Dispatch(Message msg) {
-  // 交由 Dispatcher 按键投递:命中的订阅者各得一份副本。
+void ProtocolNode::Dispatch(const Message& msg) {
+  // **唯一投递路径**:交由 Dispatcher 按键投递,命中的订阅者各得一份副本(ADR-0009 D1)。
   if (dispatcher_.Dispatch(msg) > 0) {
     return;
   }
-  // 无匹配订阅。终结帧(kResponse / kResult)此时属于迟到、乱序或无对应请求,归因丢弃,
-  // 不转交业务处理器;其余为业务帧,设有处理器则入有界队列串行处理,队列满时静默丢弃
-  // 队首最旧的事件(见 HandlerLoop 的容量语义),读循环不因此阻塞。
+  // 无人认领。终结帧(kResponse / kResult)此时属于迟到、乱序或无对应请求——这是请求-响应
+  // 侧的异常,仍须归因。
   if (msg.frm_type == FrameType::kResponse || msg.frm_type == FrameType::kResult) {
     TraceDrop(config_.trace_sink, DropReason::kUnmatchedOrLateResponse);
     return;
   }
-  if (config_.handler) {
-    (void)handler_loop_.Enqueue(std::move(msg));
-    return;
-  }
-  TraceDrop(config_.trace_sink, DropReason::kNoHandlerConfigured);
+  // 其余为业务帧:**静默丢弃,不归因**(ADR-0009 D5)。订阅模型下"没人订阅"是宿主的正常
+  // 选择(只订阅自己关心的帧)而非异常,记为丢弃会把常态噪声混进丢弃归因。代价是这类帧
+  // 成为不可见丢弃,完整性归因的覆盖面随之变窄——已明确接受。
 }
 
 MessageDispatcher::Ticket ProtocolNode::Subscribe(MessageDispatcher::Key key) {
   return dispatcher_.Subscribe(std::move(key));
-}
-
-Coro::Result<void> HandlerContext::Send(Message msg) { return node_->Send(std::move(msg)); }
-
-Coro::Result<void> HandlerContext::RequestClose() {
-  // 直接转公开的 Close():它只发信号、不含等待点,故在 handler 自己的 fiber 内调用安全。
-  // 节点由**外部** WaitClosed() 汇合到 Closed。
-  return node_->Close();
 }
 
 }  // namespace transport

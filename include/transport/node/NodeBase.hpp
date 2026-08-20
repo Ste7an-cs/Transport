@@ -90,8 +90,9 @@ class NodeBase {
    *
    * **不含任何等待点,故任何 fiber 都可调**——包括节点自己的读循环与业务处理器。读循环退出
    * 时无条件调本方法即可:我方 `Close` 所致时它是幂等空操作,底层致命错误所致时它就是自终
-   * (ADR-0005 D5 的两条路径至此合并,不再需要"退出时是否仍 Running"的判据)。业务处理器
-   * 经 `HandlerContext::RequestClose()` 转调之。
+   * (ADR-0005 D5 的两条路径至此合并,不再需要"退出时是否仍 Running"的判据)。`DdsNode` 的
+   * 业务处理器经 `DdsHandlerContext::RequestClose()` 转调之;`ProtocolNode` 的订阅者直接调
+   * 本方法即可(ADR-0009 D4:订阅者 fiber 属宿主,不是节点的内部工作单元)。
    *
    * @return 仅表示**已受理**,不表示已关完。要确认收敛完成须由**节点外部**调 `WaitClosed()`。
    */

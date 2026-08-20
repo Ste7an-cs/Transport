@@ -5,13 +5,24 @@
  * @brief 最小外部协议交互节点 ProtocolNode(RT_NODE_003 / RT_REQUEST / ADR-0003 D8/D9)。
  *
  * ProtocolNode 继承 `NodeBase`(生命周期由基类承载幂等与汇合,本类实现 `DoStart` /
- * `DoClose` / `DoJoin` 三个钩子),组合 `ICodec`(线缆格式)、`Dispatcher`(请求与响应的
- * 关联)与可选的 `HandlerLoop`(入站业务处理器),并自持一条读-分发循环
- * (`await → decode → dispatch`),交付一次 needresponse 的请求-响应。
+ * `DoClose` / `DoJoin` 三个钩子),组合 `ICodec`(线缆格式)与 `Dispatcher`(按键分发),
+ * 并自持一条读-分发循环(`await → decode → dispatch`),交付一次 needresponse 的
+ * 请求-响应。
  *
- * **请求与响应的关联由 `Dispatcher` 承担**:发出请求前先按"同会话、同命令码、帧类型为
- * 回应"登记一个订阅,读循环收到消息后交由 `Dispatcher` 按键投递。字段级的部分匹配、
- * 多订阅者同时命中均由其实现,本类不再维护在途请求表,也不再需要把字段压成单一关联键。
+ * **入站只有一条通路:订阅**(ADR-0009 D1 / RT_INBOUND_001)。读循环解出的每条消息一律交
+ * `Dispatcher` 按键投递给全部匹配的订阅者,各得一份副本;节点**不再内置**"入站业务处理器"
+ * 通道,也不再持有第二条业务队列与第二条消费者 fiber。请求-响应的关联与入站业务的取用
+ * 因此是同一套机制的两种用法:前者由 `Request` 内部按"同会话、同命令码、帧类型为回应"
+ * 临时登记,后者由宿主经公开的 `Subscribe(Key)` 长期登记,在**自己的 fiber** 上消费自己的
+ * 信箱。
+ *
+ * **串行、异常隔离与背压是调用方契约**(ADR-0009 D3 / RT_INBOUND_005):一条 fiber 顺序消费
+ * 即得串行,需要并发就自己起多条;消费代码的逃逸异常须自行 `try/catch`;队列容量即订阅
+ * 信箱的容量。框架三者一概不保证。
+ *
+ * **无订阅者的业务帧静默丢弃、不归因**(ADR-0009 D5):订阅模型下"没人订阅"是宿主的正常
+ * 选择而非异常。终结帧(kResponse / kResult)无人认领仍归因 `kUnmatchedOrLateResponse`——
+ * 那属请求-响应侧的迟到/乱序,是真正的异常。
  *
  * **不管 transport 的生命周期**:传输由**宿主**创建、`Start()`、`Close()`、`WaitClosed()`,
  * 本节点只按引用借用它:读侧取它的读队列句柄,写侧调它的 `Write()`。链路的绑定、静默超时、重连、退避**全部是传输内部的事**,
@@ -45,9 +56,7 @@
  */
 
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 #include "await/awaitable.hpp"
@@ -55,57 +64,14 @@
 #include "detail/result.hpp"
 
 #include "transport/codec/ICodec.hpp"
-#include "transport/core/Cancellation.hpp"
 #include "transport/core/Dispatcher.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/ITransport.hpp"
-#include "transport/node/HandlerLoop.hpp"
 #include "transport/node/NodeBase.hpp"
 
 namespace transport {
-
-class ProtocolNode;
-
-/**
- * @brief 入站业务处理器的能力面(RT_HANDLER_001):handler 经它与节点交互,而非裸捕获
- *        node&。只露三项能力,协议内部状态不外泄。
- *
- * 由 ProtocolNode 在消费者 fiber 内构造并按引用传入 handler;handler 不得持有其地址越出
- * 单次调用(生命周期系于该次分发)。
- */
-class HandlerContext {
- public:
-  /// @brief 从本节点 fire-and-forget 发一帧(noresponse);委托到 ProtocolNode::Send。
-  [[nodiscard]] Coro::Result<void> Send(Message msg);
-
-  /// @brief 请求关闭本节点:直接转调节点公开的 `Close()`。
-  ///
-  /// `NodeBase::Close()` **只发汇合信号、不等待收敛**,不含任何等待点,故在 handler
-  /// 自己的 fiber 内调用是安全的——不再需要"内部工作单元只能走某个专用入口"的使用契约
-  /// (旧形态的 `SignalClose()` 已随之删除)。
-  ///
-  /// @return 仅表示**已受理**,不表示已关完。确认收敛完成须由节点**外部** `WaitClosed()`。
-  [[nodiscard]] Coro::Result<void> RequestClose();
-
-  /// @brief 节点所属执行域的协作取消令牌(Close 时被触发);handler 可据它提前收手。
-  [[nodiscard]] const CancellationToken& cancellation() const {
-    return cancellation_;
-  }
-
- private:
-  friend class ProtocolNode;
-  HandlerContext(ProtocolNode* node, CancellationToken cancellation)
-      : node_(node), cancellation_(std::move(cancellation)) {}
-
-  ProtocolNode* node_;
-  CancellationToken cancellation_;
-};
-
-/// 入站业务处理器(组合注入,RT_HANDLER_001):对一条业务帧返回结构化结果(仅记录,
-/// 框架不据此自动应答,避 TBD-001);预期失败用 Coro::Result<void> 表达,不抛异常(RT_HANDLER_005)。
-using InboundHandler = std::function<Coro::Result<void>(const Message&, HandlerContext&)>;
 
 /// 参与请求-响应关联的字段:会话标识、命令码、帧类型。三者的部分匹配由 `Dispatcher`
 /// 实现,本类只需在 `KeyOf` 中给出各字段的具体值。
@@ -126,8 +92,10 @@ using MessageDispatcher =
 /// @brief 任意会话、任意命令码的某类帧,用于旁路监听。
 [[nodiscard]] MessageDispatcher::Key AnyOfType(FrameType type);
 
-/// ProtocolNode 配置:默认外部协议 id + 默认请求超时 + 可选入站业务处理器 + 业务队列
-/// 容量 + 可选 Trace 出口。
+/// ProtocolNode 配置:默认外部协议 id + 默认请求超时 + 可选 Trace 出口。
+///
+/// 入站业务不在配置面上——它由宿主经 `Subscribe(Key)` 自行登记(ADR-0009 D1),故本结构
+/// 既无处理器字段,也无业务队列容量字段(容量即订阅信箱的容量,ADR-0009 D3)。
 struct ProtocolNodeConfig {
   std::uint8_t protocol_id = 0;
   /**
@@ -139,15 +107,10 @@ struct ProtocolNodeConfig {
    * 须为正值,否则 `Start` 返 kConfiguration 并停在 Created(RT_LIFECYCLE_007)。
    */
   std::chrono::milliseconds default_request_timeout{30000};
-  /// 入站业务处理器(RT_HANDLER_001);为空 = 业务帧归因 dropped_no_handler 后丢弃。
-  InboundHandler handler;
-  /// 业务队列容量(事件数;仅 handler 设时用)。0 = 无上限。
-  /// **满时静默丢弃队首最旧的事件**——AsyncTask 队列的语义,无计数、无归因(见 #152)。
-  std::uint32_t business_queue_capacity = HandlerLoop<Message>::kDefaultCapacity;
   /// 可选 Trace 出口(ADR-0003 D13);非拥有,可为 nullptr。**观测的唯一出口**——本类不再
-  /// 有任何计数器与 getter。本类在各丢弃点
-  /// (kBadFrame / kUnmatchedOrLateResponse / kNoHandlerConfigured)与 send/recv/decode
-  /// 边界上报事件。RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果,仅一次判空。
+  /// 有任何计数器与 getter。本类在两个丢弃点(kBadFrame / kUnmatchedOrLateResponse)与
+  /// send/recv/decode 边界上报事件。无订阅者的业务帧**不**在此列(ADR-0009 D5)。
+  /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果,仅一次判空。
   ITraceSink* trace_sink = nullptr;
 };
 
@@ -156,11 +119,16 @@ struct ProtocolNodeConfig {
  *        借用宿主的 transport,交付请求-响应。
  *
  * **生命周期**:`Start()` / `Close()` / `WaitClosed()` / `IsRunning()` 一律继承自 `NodeBase`,
- * 本类只实现三个钩子。`Close()` 只发信号、任何 fiber 都可调;`WaitClosed()` join 读循环与
- * handler 消费者,返回即可安全析构。
+ * 本类只实现三个钩子。`Close()` 只发信号、任何 fiber 都可调(含宿主的订阅消费 fiber);
+ * `WaitClosed()` join 本节点**唯一**的内部工作单元——读-分发循环,返回即可安全析构。
  *
- * **它关的是自己,不是传输**:`DoClose()` 只 close 本节点的读订阅、业务队列与在途请求表,
- * 不触碰 transport。传输的关闭由宿主自己做。
+ * @warning `WaitClosed()` 返回**不**代表宿主的订阅消费 fiber 已退出(ADR-0009 D4 /
+ *          RT_LIFECYCLE_006):那些 fiber 属宿主而非本节点,本节点无从 join。关闭只保证它们
+ *          的在途 `await` 恰好终结一次(信箱被 `CloseAll` 关闭),此后它们至多再跑完手上
+ *          那一条即退出。需要严格汇合的宿主须自己 join 自己的 fiber。
+ *
+ * **它关的是自己,不是传输**:`DoClose()` 只 close 本节点的读订阅与全部订阅信箱,不触碰
+ * transport。传输的关闭由宿主自己做。
  *
  * **读循环退出即自关**:读循环无论因我方 `Close`(订阅被关)还是因传输终结(源队列被关)
  * 退出,出口处一律调公开的 `Close()`——前者是幂等空操作,后者即"传输没了,节点也该关"。
@@ -215,10 +183,31 @@ class ProtocolNode : public NodeBase {
   [[nodiscard]] Coro::Result<void> Send(Message msg);
 
   /**
-   * @brief 登记一个订阅,用于分段交互与旁路监听。
+   * @brief 登记一个订阅——**取用入站消息的唯一入口**(RT_INBOUND_001 / ADR-0009 D1)。
    *
-   * 一次交互需要等待多条报文时(例如先等回应、再等另一命令码的结果),各段各自登记、
-   * 各自设定时限。**登记须先于请求发出**,否则先到的报文因无订阅而被丢弃。
+   * 三类用法共用本入口:① 取用入站业务帧(按 `FrameType` 等字段订阅自己关心的帧);
+   * ② 分段交互(一次交互需等待多条报文时,各段各自登记、各自设定时限);③ 旁路监听。
+   * **登记须先于对应报文到达**,否则先到的报文因无订阅而被丢弃(业务帧静默丢弃,
+   * ADR-0009 D5)。
+   *
+   * 消费在**调用方自己的 fiber** 内进行,节点不代管:
+   * ```cpp
+   * auto ticket = node.Subscribe(AnyOfType(FrameType::kCommand));
+   * auto task = Coro::makeTask([&] {
+   *   for (;;) {
+   *     auto m = Coro::await(ticket.mailbox());
+   *     if (!m) break;                 // 信箱被节点关闭 → 退出
+   *     try {
+   *       Handle(m.value());           // 业务处理,可自由挂起
+   *     } catch (...) {
+   *       // 自行隔离:框架不再兜住逃逸异常
+   *     }
+   *   }
+   * });
+   * ...
+   * (void)task.get();                  // 宿主自己 join,勿依赖 WaitClosed
+   * ```
+   * 串行、异常隔离与信箱容量之外的背压一律是**调用方契约**(RT_INBOUND_005)。
    *
    * @param key 订阅键;不参与匹配的字段填 `kAny`。见 `ResponseTo` / `FrameOf` /
    *            `AnyOfType` 三个具名工厂。
@@ -229,22 +218,21 @@ class ProtocolNode : public NodeBase {
  protected:
   // —— NodeBase 生命周期钩子 ————————————————————————————————————————————
 
-  /// @brief 启动的协议特有实事:校验 config → 取读订阅 → spawn 读-分发循环 +
-  ///        (设了 handler 时)handler 消费者。**不启动 transport**(那是宿主的事)。
+  /// @brief 启动的协议特有实事:校验 config → 取读订阅 → spawn 读-分发循环。
+  ///        **不启动 transport**(那是宿主的事)。
   ///        配置非法返 kConfiguration,基类退回 Created 允许改配重试(此时未 spawn)。
   Coro::Result<void> DoStart() override;
 
   /// @brief 关闭汇合信号(首个关闭者独占执行一次,只发信号、不等待):close 本节点的读
-  ///        订阅(读循环据此退出)→ 业务队列 Close + handler 协作取消 →
-  ///        `Dispatcher::CloseAll`(令在途请求恰好终结一次)。不关闭 transport。
+  ///        订阅(读循环据此退出)→ `Dispatcher::CloseAll`(关闭全部订阅信箱:令在途请求
+  ///        恰好终结一次,同时即订阅者的协作取消信号,ADR-0009 D4)。不关闭 transport。
   Coro::Result<void> DoClose() override;
 
-  /// @brief join 本节点 spawn 的全部 fiber:读-分发循环 + handler 消费者。
+  /// @brief join 本节点 spawn 的全部 fiber——只有读-分发循环一条。订阅者的消费 fiber 属
+  ///        宿主,不在此列(ADR-0009 D4)。
   void DoJoin() override;
 
  private:
-  friend class HandlerContext;
-
   /// @brief 校验 config(RT_LIFECYCLE_007):`default_request_timeout` 须为正值。非法返
   ///        kConfiguration,节点停在 Created,允许宿主改配后重试。由 `DoStart()` 开头调用。
   [[nodiscard]] Coro::Result<void> ValidateConfig() const;
@@ -265,8 +253,12 @@ class ProtocolNode : public NodeBase {
 
   /// @brief 读循环体内的协议特有处理:Decode 一帧 → 逐条 Dispatch。
   void DecodeAndDispatch(Datagram datagram);
-  /// 单条 Message 的分发(协议特有分类):响应帧 → Resolve;业务帧 → 入队 / 丢弃归因。
-  void Dispatch(Message msg);
+  /// 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时终结帧
+  /// 归因丢弃、业务帧静默丢弃(ADR-0009 D1/D5)。
+  ///
+  /// 取 const 引用:投递只读源消息(命中的订阅者各拷一份副本),本函数不再有"把消息移交
+  /// 第二条队列"的分支,故不需要按值取走所有权。
+  void Dispatch(const Message& msg);
   /// @brief 编码 + 交给传输(Request / Send 共用的出站尾段)。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
 
@@ -277,9 +269,6 @@ class ProtocolNode : public NodeBase {
   ITransport& transport_;  ///< **借用**:宿主拥有并启停,寿命须长于本节点。
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
-  /// 入站业务处理器消费者小件(**可选**件):业务队列 + 消费者 fiber 句柄 + 协作取消 +
-  /// 异常隔离。未设 `config_.handler`(即未 `Spawn`)时它只是个没人消费的空队列。
-  HandlerLoop<Message> handler_loop_;
 
   /// 本节点在传输 `read_queue` 上的独立订阅(`shared()`):关闭它只终止本节点这一路,
   /// 源队列与其它订阅者不受影响。`DoStart` 建立,`DoClose` 关闭。
@@ -287,7 +276,8 @@ class ProtocolNode : public NodeBase {
   /// 读-分发循环的结构化并发句柄;`DoJoin()` 让出式 join 之。
   std::shared_ptr<Coro::FiberTask<void>> read_task_;
 
-  /// 请求与响应的关联:发出请求前登记订阅,读循环收到消息后按键投递。
+  /// 入站的**唯一**投递路径:`Request` 与宿主的 `Subscribe` 都在此登记,读循环收到消息后
+  /// 按键投给全部匹配的订阅者。
   MessageDispatcher dispatcher_;
 
   /// 下一个待取用的 session_id;每次取用后自增,越过 255 自然回绕。

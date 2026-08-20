@@ -1,18 +1,26 @@
-// ProtocolNode 单元测试(重设计后的形态)。
+// ProtocolNode 单元测试(重设计 + ADR-0009 之后的形态)。
 //
 // 在 fiber 调度器(coro_test_main)内,以假传输 + SystemDatagramCodec 驱动,覆盖五组事实:
 //
 //   1. 出站盖章:frm_type / protocol_id / session_id 的填写与 session_id 的循环递增;
 //   2. 请求-响应关联:由 Dispatcher 按"会话 + 命令码 + 帧类型"三字段匹配,任一不符即不
 //      终结该请求;
-//   3. 分发去向:命中订阅者的消息不再进入业务队列;未命中的终结帧归因丢弃,其余业务帧
-//      交入站处理器;
-//   4. 生命周期:节点关闭令在途请求恰好终结一次;传输终结使节点自行关闭;节点不启停传输;
+//   3. 分发去向(ADR-0009 D1/D5):入站只有订阅一条通路——业务帧投给键匹配的订阅者,
+//      无人认领的终结帧归因 unmatched-or-late-response,无人认领的业务帧静默丢弃且**不**
+//      产生任何 drop 归因;
+//   4. 生命周期:节点关闭令在途请求恰好终结一次、并关闭全部订阅信箱(即订阅者的协作取消
+//      信号,ADR-0009 D4);传输终结使节点自行关闭;节点不启停传输;
 //   5. 分段交互:`Subscribe` 允许一次交互登记多段等待,各段各自设定时限。
+//
+// 入站业务一律经 `Subscribe` + **调用方自有消费 fiber** 取用(ADR-0009 D2 的样板,本文件
+// 收在 `Subscriber` 小件里):串行、异常隔离与 join 全由调用方自己负责(RT_INBOUND_005)。
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -20,6 +28,7 @@
 #include <boost/fiber/operations.hpp>
 #include <gtest/gtest.h>
 
+#include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
 #include "fake_transport.hpp"
 #include "task/fibertask.h"
@@ -32,9 +41,9 @@
 using namespace std::chrono_literals;
 using testutil::FakeTransport;
 using transport::FrameType;
-using transport::HandlerContext;
 using transport::kAny;
 using transport::Message;
+using transport::MessageDispatcher;
 using transport::ProtocolNode;
 using transport::ProtocolNodeConfig;
 using transport::SystemDatagramCodec;
@@ -98,6 +107,79 @@ bool SawDrop(const transport::CapturingTraceSink& sink, const std::string& reaso
   }
   return false;
 }
+
+/// drop 类事件总数(不问归因),用于证明"一条都没有"。
+std::size_t DropCount(const transport::CapturingTraceSink& sink) {
+  std::size_t count = 0;
+  for (const auto& record : sink.Records()) {
+    if (record.category == "drop") {
+      ++count;
+    }
+  }
+  return count;
+}
+
+/**
+ * 订阅 + 自有消费 fiber——ADR-0009 D2 的调用方样板,本文件内收一份复用。
+ *
+ * 它**不是**框架件:节点不再代管入站业务消费,串行(一条 fiber 顺序消费)、逃逸异常隔离
+ * (自己 try/catch)与汇合(自己 join 自己的 fiber)全部由调用方自负(RT_INBOUND_005)。
+ *
+ * 消费 fiber 的退出有两条路径,都是"信箱被关":① 节点 `Close()` → `Dispatcher::CloseAll`
+ * 关闭全部信箱(ADR-0009 D4 的协作取消信号);② 本件 `Join()` 自己关自己的信箱——用于节点
+ * 尚未关闭就要收尾的用例。二者都令在途 `await` 恰好终结一次。
+ */
+class Subscriber {
+ public:
+  Subscriber(ProtocolNode& node, MessageDispatcher::Key key,
+             std::function<void(const Message&)> on_message)
+      : ticket_(node.Subscribe(std::move(key))), mailbox_(ticket_.mailbox()) {
+    task_ = std::make_shared<Coro::FiberTask<void>>(
+        Coro::makeTask([this, on_message = std::move(on_message)] {
+          for (;;) {
+            Coro::Result<Message, std::error_code> msg = Coro::await(mailbox_);
+            if (!msg) {
+              stop_error_ = msg.error();  // 信箱被关 → 退出
+              break;
+            }
+            try {
+              on_message(msg.value());
+            } catch (...) {
+              ++exceptions_;  // 自行隔离:框架不再兜住逃逸异常
+            }
+          }
+          exited_ = true;
+        }));
+  }
+
+  ~Subscriber() { Join(); }
+
+  Subscriber(const Subscriber&) = delete;
+  Subscriber& operator=(const Subscriber&) = delete;
+
+  /// 关自己的信箱(幂等:节点已关过则不覆盖首个终止原因)+ join 自己的 fiber。
+  /// **不依赖 `WaitClosed()`**——它不 join 宿主的 fiber(ADR-0009 D4)。
+  void Join() {
+    if (!task_) {
+      return;
+    }
+    mailbox_->close(make_error_code(TransportErrc::kClosed));
+    (void)task_->get();  // 让出式 join:返回即消费 fiber 已退出。
+    task_.reset();
+  }
+
+  [[nodiscard]] bool exited() const { return exited_; }
+  [[nodiscard]] std::error_code stop_error() const { return stop_error_; }
+  [[nodiscard]] std::size_t exceptions() const { return exceptions_; }
+
+ private:
+  MessageDispatcher::Ticket ticket_;
+  std::shared_ptr<Coro::Awaitable<Message>> mailbox_;
+  std::shared_ptr<Coro::FiberTask<void>> task_;
+  bool exited_ = false;
+  std::error_code stop_error_;
+  std::size_t exceptions_ = 0;
+};
 
 /// 已 Start 的节点;传输由**测试**(即宿主)启停,节点只借用。
 struct Fixture {
@@ -263,31 +345,35 @@ TEST(ProtocolNode, ConcurrentRequestsAreCorrelatedIndependently) {
   EXPECT_EQ(second.value().payload, (std::vector<std::uint8_t>{0xBB}));
 }
 
-// —— 3. 分发去向 ————————————————————————————————————————————————————
+// —— 3. 分发去向(ADR-0009:入站只有订阅一条通路)——————————————————————————
 
-TEST(ProtocolNode, BusinessFrameIsDeliveredToHandler) {
+// 【新增语义 ①】业务帧有订阅者 → 投递到其信箱,消费 fiber 收到(RT_INBOUND_001)。
+TEST(ProtocolNode, BusinessFrameIsDeliveredToSubscriber) {
+  Fixture fx;
   std::vector<std::uint16_t> seen;
-  ProtocolNodeConfig config = BaseConfig();
-  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
-    seen.push_back(msg.message_id);
-    return Coro::Result<void>{};
-  };
-  Fixture fx(std::move(config));
+  Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                      [&seen](const Message& msg) { seen.push_back(msg.message_id); });
 
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(3, 0x0055, FrameType::kCommand)));
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
   EXPECT_EQ(seen.front(), 0x0055);
+
+  business.Join();  // 宿主自己 join 自己的 fiber(ADR-0009 D4)。
+  EXPECT_TRUE(business.exited());
 }
 
-// 命中订阅者的消息不再进入业务队列:处理器只见到无人认领的业务帧。
-TEST(ProtocolNode, MatchedResponseDoesNotReachHandler) {
-  std::vector<FrameType> seen;
+// 投递按键走:请求的响应只进该请求的信箱,业务订阅者(订的是命令帧)见不到它。
+// 这条替代旧的"命中订阅者的消息不再进入业务队列"——第二条通路已不存在,同一事实现在由
+// 键匹配本身保证。
+TEST(ProtocolNode, MatchedResponseDoesNotReachBusinessSubscriber) {
+  transport::CapturingTraceSink sink;
   ProtocolNodeConfig config = BaseConfig();
-  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
-    seen.push_back(msg.frm_type);
-    return Coro::Result<void>{};
-  };
+  config.trace_sink = &sink;
   Fixture fx(std::move(config));
+
+  std::vector<FrameType> seen;
+  Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                      [&seen](const Message& msg) { seen.push_back(msg.frm_type); });
 
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010)); });
@@ -300,56 +386,99 @@ TEST(ProtocolNode, MatchedResponseDoesNotReachHandler) {
   ASSERT_TRUE(reply);
 
   boost::this_fiber::sleep_for(50ms);
-  EXPECT_TRUE(seen.empty()) << "已被订阅者认领的响应不应再进入业务队列";
+  EXPECT_TRUE(seen.empty()) << "响应帧不应投给订阅命令帧的业务订阅者";
+  EXPECT_EQ(DropCount(sink), 0u) << "被请求认领的响应不是丢弃";
+  business.Join();
 }
 
-// 无人认领的终结帧归因丢弃,且不转交处理器。
-TEST(ProtocolNode, UnmatchedTerminalFrameIsDroppedNotHandled) {
+// 【新增语义 ③】终结帧无人认领 → 仍归因 kUnmatchedOrLateResponse。
+// 该分支属请求-响应侧,与 handler 无关,ADR-0009 明确**保留**。
+TEST(ProtocolNode, UnmatchedTerminalFrameIsStillAttributed) {
   transport::CapturingTraceSink sink;
-  std::vector<FrameType> seen;
   ProtocolNodeConfig config = BaseConfig();
   config.trace_sink = &sink;
-  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
-    seen.push_back(msg.frm_type);
-    return Coro::Result<void>{};
-  };
   Fixture fx(std::move(config));
+
+  // 订的是命令帧,故终结帧无人认领。
+  std::vector<FrameType> seen;
+  Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                      [&seen](const Message& msg) { seen.push_back(msg.frm_type); });
 
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kResponse)));
   ASSERT_TRUE(testutil::pumpFiberUntil(
       [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
       << "未归因 unmatched-or-late-response";
-  EXPECT_TRUE(seen.empty()) << "终结帧不应转交业务处理器";
+  EXPECT_TRUE(seen.empty()) << "终结帧不应投给业务订阅者";
+
+  // 结果帧同为终结帧,走同一条归因分支。
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kResult)));
+  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return DropCount(sink) >= 2u; }, 500));
+  EXPECT_EQ(DropCount(sink), 2u) << "两条终结帧各归因一次,不多不少";
+  business.Join();
 }
 
-// 未配置处理器时业务帧归因丢弃。
-TEST(ProtocolNode, BusinessFrameIsDroppedWhenNoHandlerConfigured) {
+// 【新增语义 ②】业务帧无订阅者 → 静默丢弃,drop 类 Trace **一条都没有**(ADR-0009 D5)。
+// 这是"完整性归因覆盖面明确变窄"的行为证据:旧形态此处归因 no-handler-configured。
+TEST(ProtocolNode, UnclaimedBusinessFrameIsSilentlyDropped) {
   transport::CapturingTraceSink sink;
   ProtocolNodeConfig config = BaseConfig();
   config.trace_sink = &sink;
   Fixture fx(std::move(config));
 
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0033, FrameType::kCommand)));
-  EXPECT_TRUE(testutil::pumpFiberUntil(
-      [&] { return SawDrop(sink, "no-handler-configured"); }, 500));
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(2, 0x0034, FrameType::kState)));
+  // 先确认两帧确已被解出并走完分发(recv 事件到齐),再断言"无归因"——否则可能只是还没到。
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] {
+        std::size_t recv = 0;
+        for (const auto& record : sink.Records()) {
+          if (record.category == "recv") {
+            ++recv;
+          }
+        }
+        return recv >= 2;
+      },
+      500));
+  boost::this_fiber::sleep_for(20ms);
+  EXPECT_EQ(DropCount(sink), 0u) << "无订阅者的业务帧不得产生任何 drop 归因";
 }
 
-// 坏帧由 codec 判定,归因丢弃且不影响后续报文。
+// 坏帧不影响后续报文(丢弃由 codec 内部 resync 消化,故此处不断言 bad-frame 归因:
+// SystemDatagramCodec 的 Decode 对扫不出帧的报文返回空成功,不报错)。
 TEST(ProtocolNode, BadFrameIsDroppedAndDoesNotBlockLaterFrames) {
   transport::CapturingTraceSink sink;
-  std::vector<std::uint16_t> seen;
   ProtocolNodeConfig config = BaseConfig();
   config.trace_sink = &sink;
-  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
-    seen.push_back(msg.message_id);
-    return Coro::Result<void>{};
-  };
   Fixture fx(std::move(config));
+
+  std::vector<std::uint16_t> seen;
+  Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                      [&seen](const Message& msg) { seen.push_back(msg.message_id); });
 
   ASSERT_TRUE(fx.transport.Deliver({0xDE, 0xAD, 0xBE, 0xEF}));  // 非法帧
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0044, FrameType::kCommand)));
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
   EXPECT_EQ(seen.front(), 0x0044) << "坏帧之后的报文仍应正常分发";
+  business.Join();
+}
+
+// 同一条业务帧投给全部键匹配的订阅者,各得一份副本(RT_INBOUND_001)。
+TEST(ProtocolNode, BusinessFrameIsCopiedToEveryMatchingSubscriber) {
+  Fixture fx;
+  std::vector<std::uint16_t> wide;
+  std::vector<std::uint16_t> narrow;
+  Subscriber all(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                 [&wide](const Message& msg) { wide.push_back(msg.message_id); });
+  Subscriber one(*fx.node, transport::FrameOf(4, 0x0077, FrameType::kCommand),
+                 [&narrow](const Message& msg) { narrow.push_back(msg.message_id); });
+
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(4, 0x0077, FrameType::kCommand)));
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return !wide.empty() && !narrow.empty(); }, 500));
+  EXPECT_EQ(wide.front(), 0x0077);
+  EXPECT_EQ(narrow.front(), 0x0077);
+  one.Join();
+  all.Join();
 }
 
 // —— 4. 生命周期 ————————————————————————————————————————————————————
@@ -420,40 +549,84 @@ TEST(ProtocolNode, TransportTerminationClosesNode) {
   node.WaitClosed();
 }
 
-// 入站处理器可请求关闭本节点:Close 只发信号、不含等待点,故在处理器 fiber 内调用安全。
-TEST(ProtocolNode, HandlerCanRequestClose) {
-  ProtocolNodeConfig config = BaseConfig();
-  config.handler = [](const Message&, HandlerContext& ctx) -> Coro::Result<void> {
-    return ctx.RequestClose();
-  };
+// 【新增语义 ④】Close() 后订阅者的在途 await 得到终止错误,消费 fiber 自行退出
+// (ADR-0009 D4 / RT_INBOUND_004):信箱关闭就是协作取消信号,框架不强杀 fiber。
+TEST(ProtocolNode, CloseTerminatesSubscriberAwaitAndConsumerExits) {
   FakeTransport fake;
   ASSERT_TRUE(fake.Start());
-  ProtocolNode node(fake, MakeCodec(), std::move(config));
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
   ASSERT_TRUE(node.Start());
 
-  ASSERT_TRUE(fake.Deliver(EncodeFrame(1, 0x0066, FrameType::kCommand)));
-  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return !node.IsRunning(); }, 500));
+  Subscriber business(node, transport::AnyOfType(FrameType::kCommand),
+                      [](const Message&) {});
+  // 让消费 fiber 先真正挂到 await 上,再关节点——考的正是"在途 await 被终结"。
+  boost::this_fiber::sleep_for(20ms);
+  EXPECT_FALSE(business.exited()) << "无消息且节点未关时消费 fiber 应挂在 await 上";
+
+  ASSERT_TRUE(node.Close());
+  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return business.exited(); }, 500))
+      << "信箱被 CloseAll 关闭后消费 fiber 应自行退出";
+  EXPECT_EQ(business.stop_error(), make_error_code(TransportErrc::kClosed))
+      << "在途 await 应得到节点的终止原因";
+  business.Join();  // 幂等:已退出,立即返回。
   node.WaitClosed();
   (void)fake.Close();
 }
 
-// 处理器抛出的异常被边界兜住:隔离该事件,节点继续处理后续报文。
-TEST(ProtocolNode, HandlerExceptionIsIsolated) {
+// 关闭后新登记的订阅其信箱已处于关闭态:消费 fiber 起来即退出,不会挂死。
+TEST(ProtocolNode, SubscribeAfterCloseYieldsClosedMailbox) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
+  ASSERT_TRUE(node.Start());
+  ASSERT_TRUE(node.Close());
+  node.WaitClosed();
+
+  Subscriber late(node, transport::AnyOfType(FrameType::kCommand),
+                  [](const Message&) { ADD_FAILURE() << "关闭后不应再有投递"; });
+  late.Join();
+  EXPECT_TRUE(late.exited());
+  EXPECT_EQ(late.stop_error(), make_error_code(TransportErrc::kClosed));
+  (void)fake.Close();
+}
+
+// 订阅者可在自己的 fiber 内关闭本节点(ADR-0009 D4):消费 fiber 属宿主、不是节点的内部
+// 工作单元,且 Close() 只发信号、不含等待点。
+TEST(ProtocolNode, SubscriberCanCloseNodeFromItsOwnFiber) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
+  ASSERT_TRUE(node.Start());
+
+  Subscriber business(node, transport::AnyOfType(FrameType::kCommand),
+                      [&node](const Message&) { (void)node.Close(); });
+
+  ASSERT_TRUE(fake.Deliver(EncodeFrame(1, 0x0066, FrameType::kCommand)));
+  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return !node.IsRunning(); }, 500));
+  business.Join();
+  node.WaitClosed();
+  (void)fake.Close();
+}
+
+// 消费代码的逃逸异常由**调用方自己**隔离(ADR-0009 D3 / RT_INBOUND_005):框架不再兜住,
+// 宿主的 try/catch 使消费 fiber 只丢掉该条、继续消费后续报文。
+TEST(ProtocolNode, SubscriberExceptionIsIsolatedByCaller) {
+  Fixture fx;
   std::vector<std::uint16_t> seen;
-  ProtocolNodeConfig config = BaseConfig();
-  config.handler = [&seen](const Message& msg, HandlerContext&) -> Coro::Result<void> {
-    if (msg.message_id == 0x0001) {
-      throw std::runtime_error("boom");
-    }
-    seen.push_back(msg.message_id);
-    return Coro::Result<void>{};
-  };
-  Fixture fx(std::move(config));
+  Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
+                      [&seen](const Message& msg) {
+                        if (msg.message_id == 0x0001) {
+                          throw std::runtime_error("boom");
+                        }
+                        seen.push_back(msg.message_id);
+                      });
 
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0001, FrameType::kCommand)));
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0002, FrameType::kCommand)));
   ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
   EXPECT_EQ(seen.front(), 0x0002) << "异常应只隔离该事件,不中断消费者";
+  EXPECT_EQ(business.exceptions(), 1u);
+  business.Join();
 }
 
 TEST(ProtocolNode, StartRejectsNonPositiveRequestTimeout) {
