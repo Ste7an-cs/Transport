@@ -21,7 +21,7 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
 ## 决策（Decision）
 
 - **D1（废止节点内置 handler 通道）：** 删除 `ProtocolNode::Config::handler`、`HandlerContext` 与 `ProtocolNode::handler_loop_`（`HandlerLoop<Event>` 类本身因 `DdsNode` 仍在用而暂留，见 D2 删除时机）。入站业务帧一律经 `Subscribe(Key)` 交付：宿主按 `FrameType` 等字段显式订阅自己关心的帧，在**自己的 fiber** 上消费。
-  `Dispatch()` 因此收为一句"投递给全部键匹配的订阅者"，不再有"无匹配 → 转交业务处理器"的第二分支。
+  `Dispatch()` 因此只剩**一条投递路径**（按键投给全部匹配的订阅者），删去尾部"无匹配业务帧 → `handler_loop_.Enqueue`"及其兜底的 `kNoHandlerConfigured` 归因。**保留**终结帧（`kResponse`/`kResult`）无人认领时的 `kUnmatchedOrLateResponse` 归因——该分支属请求-响应侧，与 handler 无关。
 
 - **D2（消费样板彻底交给调用方，不保留任何辅助件）：** `HandlerLoop` **终将整体删除**，不降级为公开小件、也不另造 `SubscriptionLoop`。宿主自行编写：
   ```cpp
