@@ -1,8 +1,8 @@
 # ADR-0009：废止节点内置 handler 通道，入站业务改由订阅承载
 
-**状态：** Proposed
+**状态：** Accepted
 **日期：** 2026-08-20
-**关联：** ADR-0008（接口重设计与键匹配分发——本 ADR 建立在其 `Dispatcher` / `Subscribe(Key)` 之上，并废止与之并存的第二条入站通路）；ADR-0006（节点基类与轻量完成量——`HandlerLoop` 由该 ADR 拆出，本 ADR 将其整体删除）；SRS `docs/需求规格说明书-协程原生.md`（落点：RT_HANDLER 全组、RT_LIFECYCLE_006、§3.6 丢弃归因、§3.2.2 RT_IF_API 接口变更登记）。
+**关联：** ADR-0008（接口重设计与键匹配分发——本 ADR 建立在其 `Dispatcher` / `Subscribe(Key)` 之上，并废止与之并存的第二条入站通路）；ADR-0006（节点基类与轻量完成量——`HandlerLoop` 由该 ADR 拆出，本 ADR 令 `ProtocolNode` 停止使用它，待 `DdsNode` 改造后删除）；SRS `docs/需求规格说明书-协程原生.md`（落点：RT_HANDLER 全组、RT_LIFECYCLE_006、§3.6 丢弃归因、§3.2.2 RT_IF_API 接口变更登记）。
 
 ## 背景（Context）
 
@@ -20,10 +20,10 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
 
 ## 决策（Decision）
 
-- **D1（废止节点内置 handler 通道）：** 删除 `ProtocolNode::Config::handler`、`HandlerContext`、`handler_loop_` 及 `HandlerLoop<Event>` 本身。入站业务帧一律经 `Subscribe(Key)` 交付：宿主按 `FrameType` 等字段显式订阅自己关心的帧，在**自己的 fiber** 上消费。
+- **D1（废止节点内置 handler 通道）：** 删除 `ProtocolNode::Config::handler`、`HandlerContext` 与 `ProtocolNode::handler_loop_`（`HandlerLoop<Event>` 类本身因 `DdsNode` 仍在用而暂留，见 D2 删除时机）。入站业务帧一律经 `Subscribe(Key)` 交付：宿主按 `FrameType` 等字段显式订阅自己关心的帧，在**自己的 fiber** 上消费。
   `Dispatch()` 因此收为一句"投递给全部键匹配的订阅者"，不再有"无匹配 → 转交业务处理器"的第二分支。
 
-- **D2（消费样板彻底交给调用方，不保留任何辅助件）：** `HandlerLoop` **整体删除**，不降级为公开小件、也不另造 `SubscriptionLoop`。宿主自行编写：
+- **D2（消费样板彻底交给调用方，不保留任何辅助件）：** `HandlerLoop` **终将整体删除**，不降级为公开小件、也不另造 `SubscriptionLoop`。宿主自行编写：
   ```cpp
   auto ticket = node.Subscribe({kAny, kAny, FrameType::kRequest});
   auto task = Coro::makeTask([&] {
@@ -38,6 +38,7 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
   (void)task.get();                  // 宿主自己 join
   ```
   **明确接受**：该样板会在每个调用方处重复。取舍是"少一个框架件、少一套需要维护的语义"胜过"少几行重复代码"。
+  **删除时机（与 D6 的衔接）**：本轮 `ProtocolNode` 停止使用它，但 `DdsNode` 仍在用（D6），故 `HandlerLoop<Event>` 及其单测**本轮暂留**，待 `DdsNode` 改造票落地后一并删除。过渡期内它是**仅服务 `DdsNode` 的遗留件**，不得被新代码引用，头文件须标注该状态。
 
 - **D3（串行、异常隔离、背压降为调用方契约）：** 框架不再保证同节点业务处理的严格串行，不再兜住业务代码的逃逸异常，不再提供业务队列容量。三者由宿主的消费 fiber 自行决定：一条 fiber 顺序消费即得串行，需要并发就自己起多条；异常自己 `try/catch`；队列容量即 `Ticket` 信箱的容量。
   RT_HANDLER_001 / 003 / 006 相应废止。
@@ -48,20 +49,20 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
   **语义变化（明确记录）**：RT_LIFECYCLE_006 的"`WaitClosed` 返回即全部内部工作单元已退出"，其"内部工作单元"由**两条**（读循环 + handler 消费者）收窄为**一条**（读循环）。订阅者的消费 fiber 属于宿主，节点无从 join——`WaitClosed` 返回后它们可能仍在退出途中（信箱已关，它们至多再跑完手上那一条就退出）。宿主若需要严格汇合，须自己 join 自己的 fiber。
   附带简化：从订阅者 fiber 调 `node.Close()` 是**合法**的——它不是节点的内部工作单元，且新形态下 `Close()` 本就不含等待点。
 
-- **D5（观测项全部删除，接受完整性归因弱化）：** 删除 `DroppedNoHandlerCount()` / `BusinessQueueOverflowCount()` / `HandlerExceptionCount()` / `LastHandlerDuration()` 及其计数，并删除 `DropReason::kNoHandlerConfigured` 的产生点。
+- **D5（观测项全部删除，接受完整性归因弱化）：** 删除 `ProtocolNode` 上的 `BusinessQueueOverflowCount()` / `HandlerExceptionCount()` / `LastHandlerDuration()` 及其计数，并删除 `ProtocolNode` 内 `DropReason::kNoHandlerConfigured` 的产生点。（`DdsNode` 的同名访问器与该归因项随 D6 暂留；枚举值本身待 `DdsNode` 改造后删除。）
   **明确接受的代价**：**无订阅者认领的业务帧将不再有任何归因记录**——既不计数也不产生 Trace。P5 的"完整性归因"从"每一条被丢弃的入站消息都有命名原因"退化为"框架已知的丢弃有命名原因"。`loss=0` harness 的两条等式（Σ命名原因 = 总丢弃、`drop_records.size() == Σ`）在数值上仍成立，但其**覆盖面**变窄。
   依据：订阅模型下"没有订阅者"不再是异常，而是宿主的正常选择（只订阅关心的帧）；把它记为丢弃会把常态噪声混进丢弃归因。
 
 - **D6（本轮范围仅 `ProtocolNode`，`DdsNode` 另票）：** `DdsNode` 的 `handler_loop_` 与 `DdsHandlerContext` 本轮**不动**，另开票处理。
-  代价（明确记录）：一段时间内仓内**并存两种入站模型**——`ProtocolNode` 走订阅、`DdsNode` 走 handler。文档须写清这是过渡态而非设计意图。
+  代价（明确记录）：一段时间内仓内**并存两种入站模型**——`ProtocolNode` 走订阅、`DdsNode` 走 handler；且 `HandlerLoop<Event>`、`DdsHandlerContext` 与 `DropReason::kNoHandlerConfigured` 因此**不能在本轮删净**（见 D2 的删除时机）。文档须写清这是过渡态而非设计意图。
 
 - **D7（#152 不因本次消失，仅换层）：** `HandlerLoop` 的队列与 `Ticket` 信箱同为 `Coro::Awaitable`，"满时丢最旧、静默、无丢弃计数"的语义（#152）随之整体上移到 `Dispatcher` 的信箱层，**问题不因删除 HandlerLoop 而解决**。#152 仍需独立处置。
 
 ## 影响（Consequences）
 
-- **正面：** 入站通路由两条并存收为一条；删除 `HandlerLoop<Event>` 整个小件及其单测；`Dispatch()` 去掉第二分支；`DoClose`/`DoJoin` 各少一步；节点不再承担串行/异常隔离/队列容量三项职责；节点内部工作单元由两条降为一条。
+- **正面：** `ProtocolNode` 的入站通路由两条并存收为一条；`Dispatch()` 去掉第二分支；`DoClose`/`DoJoin` 各少一步；节点不再承担串行/异常隔离/队列容量三项职责；节点内部工作单元由两条降为一条。
 - **负面（明确接受）：** ① 消费样板在每个调用方处重复（D2）；② 严格串行与异常隔离由框架保证降为调用方契约，宿主写错即失去该性质（D3）；③ `WaitClosed` 的汇合覆盖面收窄，宿主须自行 join 其消费 fiber（D4）；④ 无订阅者的业务帧成为**不可见丢弃**，完整性归因覆盖面变窄（D5）；⑤ 过渡期内两种入站模型并存（D6）。
-- **破坏性 API 变更：** 移除 `ProtocolNode::Config::handler`、`HandlerContext`（含其 `Send()` / `RequestClose()` / `cancellation()`）、`HandlerLoop<Event>`、上述四个观测访问器、`DropReason::kNoHandlerConfigured` 的产生点。须在 `CHANGELOG.md` 标注，SRS §3.2.2 接口变更登记同步。
+- **破坏性 API 变更：** 移除 `ProtocolNode::Config::handler`、`HandlerContext`（含其 `Send()` / `RequestClose()` / `cancellation()`）及 `ProtocolNode` 上的三个观测访问器。`HandlerLoop<Event>`、`DdsHandlerContext`、`DropReason::kNoHandlerConfigured` 与 `DdsNode` 的同名访问器**本轮保留**（D6）。须在 `CHANGELOG.md` 标注，SRS §3.2.2 接口变更登记同步。
 - **测试面：** `config.handler` 在测试中有 **35 处设置、分布 10 个文件**，须逐一改写为订阅 + 自有消费 fiber。其中 `protocol_node_handler_test.cpp` 整个文件的立意（RT_HANDLER 契约）随需求废止而失效，须重定位或删除。
 
 ## 备选方案（Alternatives considered）
