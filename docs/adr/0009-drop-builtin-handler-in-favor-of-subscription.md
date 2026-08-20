@@ -25,7 +25,7 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
 
 - **D2（消费样板彻底交给调用方，不保留任何辅助件）：** `HandlerLoop` **终将整体删除**，不降级为公开小件、也不另造 `SubscriptionLoop`。宿主自行编写：
   ```cpp
-  auto ticket = node.Subscribe({kAny, kAny, FrameType::kRequest});
+  auto ticket = node.Subscribe({kAny, kAny, FrameType::kCommand});
   auto task = Coro::makeTask([&] {
     for (;;) {
       auto m = Coro::await(ticket.mailbox());
