@@ -53,9 +53,9 @@
 - **DD-1 三层解耦 + 内部缝（满足 RT_IN_INTERFACE_001/002、RT_DESIGN_006）：** 传输（纯字节管道）/ 编解码（线缆格式）/ 交互节点三层，以可测替换的**缝**衔接。`ITransport` 是内部缝（非用户 API），`ICodec` 是公共扩展点，编程主入口是交互层 node。原则：各层职责单一、可独立替换与单测。
 - **DD-2 AsyncTask 强制运行时（满足 RT_CORO_RUNTIME_001..005、RT_DESIGN_002）：** 不设独立 `IExecutor`/`ThreadExecutor` 业务调度体系；M:N 协作式；同一节点交互状态串行访问，以一把 `std::mutex` 守临界区实现，运行时 await 只出现在 fiber 挂起点，唤醒/回调在锁外调用。**依赖性**：节点所属执行域首次启动后稳定、不迁移（RT_CORO_RUNTIME_003）。
 - **DD-3 无共享交互引擎（满足 RT_DESIGN_003、RT_NODE_003）：** 不设独立 `InteractionEngine`/`InteractionPolicy` 层；协议特有语义（键派生、终结判别、寻址、帧盖章）内联各 node。公共只抽出**协议无关机制**：`PendingTable`、`BoundedQueue`、`HandlerLoop`、`SharedCompletion`，以及承载生命周期的基类 `NodeBase`。原则：语义归属清晰、不造上帝对象。
-  **变更（ADR-0008 D6/D8）**：清单已改为 **`Dispatcher`（按键分配）、`HandlerLoop`、`NodeBase`** 三件。`PendingTable` 由 `Dispatcher` 取代；`BoundedQueue` 与 `SharedCompletion` 删除——前者是 `FiberChannel` 的手工重造，后者是 `Awaitable::close()` 广播的手工重造。
+  **变更（ADR-0008 D6/D8）**：清单已改为 **`Dispatcher`（按键分配）、`HandlerLoop`、`NodeBase`** 三件。**再变更（ADR-0009 D1，2026-08-20）**：`ProtocolNode` 停止使用 `HandlerLoop`，其清单收为 **`Dispatcher` + `NodeBase`** 两件；`HandlerLoop` 降为仅服务 `DdsNode` 的过渡遗留件。`PendingTable` 由 `Dispatcher` 取代；`BoundedQueue` 与 `SharedCompletion` 删除——前者是 `FiberChannel` 的手工重造，后者是 `Awaitable::close()` 广播的手工重造。
   **变更（ADR-0006 D1）**：原 `NodeRuntime<Event>` **已删除**（#139 迁空生命周期职责，#140 下放读循环与 handler 驱动后删除文件）——它把生命周期、handler 队列、读循环骨架与观测计数四件事装进一个 528 行模板，恰是本决策所反对的上帝对象。生命周期上移基类 `NodeBase`（模板方法：基类管幂等与收敛，子类实现 `DoStart`/`DoClose`），handler 队列下沉为可选小件 `HandlerLoop`，读循环骨架与观测计数回归各 node。
-- **DD-4 协议无关基座可复用（满足 RT_DESIGN_008、D10）：** `PendingTable<Key,T>`/`BoundedQueue<T>`/`HandlerLoop<Message>` 对协议类型不透明，经模板参数/注入回调解耦。**变更（ADR-0006 D1）**：`NodeRuntime<Event>` 的模板参数从未被变化过（两处实例化均为 `NodeRuntime<Message>`），泛型代价（头文件实现、`byte_size_of` 回调注入）全部白付，故随其删除一并取消；`NodeBase` 为非模板。DdsNode 复用它们：仅把 Key 从 `uint32` 换为 `std::string`，基座一行不改（实证）。
+- **DD-4 协议无关基座可复用（满足 RT_DESIGN_008、D10）：** `PendingTable<Key,T>`/`BoundedQueue<T>`/`HandlerLoop<Message>`（前二者已删、后者 ADR-0009 后仅服务 `DdsNode`）对协议类型不透明，经模板参数/注入回调解耦。**变更（ADR-0006 D1）**：`NodeRuntime<Event>` 的模板参数从未被变化过（两处实例化均为 `NodeRuntime<Message>`），泛型代价（头文件实现、`byte_size_of` 回调注入）全部白付，故随其删除一并取消；`NodeBase` 为非模板。DdsNode 复用它们：仅把 Key 从 `uint32` 换为 `std::string`，基座一行不改（实证）。
 - **DD-5 结果承载错误、不抛异常（满足 RT_ERROR_001/002/003、RT_DESIGN_005）：** 预期失败用 `Result<T>`/`Status`（`[[nodiscard]]`）+ 机器可判别 `TransportErrc` 类别，不靠解析字符串前缀。唯一授权的 `catch` 在 handler 消费者边界（隔离第三方逃逸异常）。
 - **DD-6 发送排序（满足 RT_TRANSPORT_007/004；ADR-0004 D5）：** 同 fiber 程序序、跨 fiber 串行为一致全序，单帧字节不与另一帧交错。**发送完成语义与协程背压已撤销**（原"帧进内核才报成功"，ADR-0002 D2 → 被 ADR-0004 D5 撤销）：发送成功此后仅表示该帧已交付下层发送通路。并发写串行化**保留**——它是 RT_TRANSPORT_004 的实现手段，与完成语义是两件事。**代价**：发送侧不再有框架级内存上界（见 §7.2 已知缺口）。
 - **DD-7 两个独立生命周期轴 + 链路可用性上移（满足 RT_LIFECYCLE_001/002、RT_TRANSPORT_009；ADR-0004 D2）：** 节点生命周期 `Created→Running→Closing→Closed`（全介质通用）与 TCP 物理连接状态（仅 TCP 客户端，Running 内子状态）正交。**连接管理**（状态机/重连间隔/重连策略/代际推进）不下沉纯字节管道；但**当前链路可用性**作为与 `LastSendTime`/`LastError` 同类的 I/O 事实**上移至 `ITransport` 基类**，所有介质同形作答——交互层因此不再按介质探测可选能力接口（`IConnectionObservable` 取消）。此为 ADR-0002 D3′ 的边界重划。
@@ -63,10 +63,10 @@
 - **DD-12 撤销连接代际隔离（满足 RT_TCP_RECONNECT_002 改写；ADR-0004 D3/D4）：** 断链时交互层不再批量终结在途请求、不再清空旧链路排队业务，"代际"概念自交互层消失。在途请求由各自总超时（**缺省值 30 秒，强制项**）、取消或关闭终结。RT_REQUEST_004"旧代际响应不得完成新请求"由物理事实保证（旧 socket 已关，字节不跨链路投递；在途关联标识未释放，新请求取不到同键）。**不引入编解码器重置**（ADR-0004 D4 撤销）：断链残尾与新链路首字节可能拼成错帧，由编解码器既有校验与重同步处置（报坏帧后恢复）。
 - **DD-13 收敛并入读循环（满足 RT_LIFECYCLE_004/006；ADR-0005 D1）：**
   > **已推翻（ADR-0008 D2/D3）**：`Close()` 改为**只发信号**，收敛移出内部 fiber——由 `WaitClosed()` 的调用方经 `DoJoin()` 自上而下 join 全部内部 fiber。"读循环兼任收敛者"、`close_signalled_` 握手、`SharedCompletion` 多等待者通知一并取消。下段描述的是重设计之前的形态。
- 关闭收敛**不另起 fiber**——读-分发循环退出后兼任收敛者（等 handler 退出 → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 唤醒全部关闭等待者），`Close()` 退化为"发汇合信号 + 等待收敛结果"。依据：两条内部工作单元（读循环 / handler）中**读循环恒是第一个退出的**——无论我方 `Close` 使 `Read` 返 `kClosed`，还是不可重连介质的底层致命错误使其返 `kClosed`（DD-11 之后二者同码），故它天然是收敛的正确位置。独立 finalizer fiber 与其汇合点 `loop_done_` 随之取消；**结构约束**：读循环收敛走内部路径，不得调用公开的 `Close()`（那会等待自身退出）。多等待者通知仍用 `SharedCompletion`（**ADR-0006 D3 后为"存结果 + `close()` 广播"的轻量实现**：支持每等待者独立 deadline，不再支持每等待者取消——ADR-0005 D3 关于"必须为每等待者分配独立 `Awaitable`"的理由已被修正，那只在需要 per-waiter 取消时成立）。
+ 关闭收敛**不另起 fiber**。**现状（ADR-0008 D2 起）**：`Close()` **只发信号**（关本节点读订阅 + `Dispatcher.CloseAll`）即返回、不含等待点；汇合由 `WaitClosed()` 在**调用方 fiber** 上 join 内部工作单元完成，故不构成自等待。**内部工作单元自 ADR-0009 D1 起只剩读-分发循环一条**——订阅者的消费 fiber 属宿主，节点无从 join（见 SRS RT_LIFECYCLE_006 的覆盖面收窄）。下述"读循环恒是第一个退出的"——无论我方 `Close` 使 `Read` 返 `kClosed`，还是不可重连介质的底层致命错误使其返 `kClosed`（DD-11 之后二者同码），故它天然是收敛的正确位置。独立 finalizer fiber 与其汇合点 `loop_done_` 随之取消；**结构约束**：读循环收敛走内部路径，不得调用公开的 `Close()`（那会等待自身退出）。多等待者通知仍用 `SharedCompletion`（**ADR-0006 D3 后为"存结果 + `close()` 广播"的轻量实现**：支持每等待者独立 deadline，不再支持每等待者取消——ADR-0005 D3 关于"必须为每等待者分配独立 `Awaitable`"的理由已被修正，那只在需要 per-waiter 取消时成立）。
 - **DD-8 恰好一次终结的挂起-应答仲裁（满足 RT_REQUEST_001..005）：** 请求↔响应关联复用 `PendingTable`，每个在途 entry 一个等待者、以裸 `Coro::Awaitable<T>` 为信箱，**表锁 `find+erase` 作唯一仲裁点**（Resolve/超时/取消/FailAll 谁先摘除谁胜）。原则：恰好一次不靠状态枚举而靠单点抢占，竞态面小。
   **变更（ADR-0008 D6）**：改由 `Dispatcher` 承担。仲裁点从"表锁 find+erase"变为"**订阅凭据的生存期**"：凭据析构即注销，故一个订阅在其生存期内可接收多条消息（分段交互所需），而请求的"恰好一次终结"由 `Request` 内 `Wait` 一次后凭据即析构来保证。**投递语义同时从"独占"改为"全部键匹配者各得一份"**——多消费者与旁路监听由此成立，唯一性改由协议在键的设计上保证。
-- **DD-9 底层回调不碰节点状态（满足 RT_HANDLER_002、RT_NODE_004、RT_IN_INTERFACE_003）：** Qt I/O 回调在 socket QThread、DDS 样本在 provider listener 线程，均须安全转交节点执行域；DDS 经跨线程有界交接边界（`BoundedQueue<Sample>`）转交，跨线程唤醒靠 boost.fiber channel 跨线程安全。
+- **DD-9 底层回调不碰节点状态（满足 RT_INBOUND_002、RT_NODE_004、RT_IN_INTERFACE_003）：** Qt I/O 回调在 socket QThread、DDS 样本在 provider listener 线程，均须安全转交节点执行域；DDS 经跨线程有界交接边界（`BoundedQueue<Sample>`）转交，跨线程唤醒靠 boost.fiber channel 跨线程安全。
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**六项** `DropReason` 之一（原七项，`kGenerationIsolationDrop` 随 ADR-0004 D3 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
 
 ## 4. CSCI 体系结构设计
@@ -86,7 +86,7 @@
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`TcpClientTransport`、`TcpServer`、`IDdsProvider` | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
-| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`DdsNode`、`HandlerLoop`、`HandlerContext`（**ADR-0008**：`PendingTable`/`BoundedQueue` 已删除） | RT_NODE、RT_REQUEST、RT_HANDLER、RT_LIFECYCLE、RT_DESIGN_003/008 |
+| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`DdsNode`；`HandlerLoop`、`DdsHandlerContext`（**ADR-0009**：仅 `DdsNode` 使用，过渡遗留）（**ADR-0008**：`PendingTable`/`BoundedQueue` 已删除） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
@@ -116,7 +116,7 @@
 
 #### 4.1.4 交互层部件（CSC_NODE）
 
-- **用途**：在传输 + 编解码之上组合请求关联、入站分发、超时、连接状态与协议交互；薄壳组合、不共享引擎。响应 RT_NODE_*、RT_REQUEST_*、RT_HANDLER_*、RT_LIFECYCLE_*、RT_DESIGN_003/008。
+- **用途**：在传输 + 编解码之上组合请求关联、入站分发、超时、连接状态与协议交互；薄壳组合、不共享引擎。响应 RT_NODE_*、RT_REQUEST_*、RT_INBOUND_*、RT_LIFECYCLE_*、RT_DESIGN_003/008。
 - **主要内容**：交互节点 `ProtocolNode`（外部协议请求-响应）、`DdsNode`（DDS pub-sub + 多路请求-应答）；生命周期基类 `NodeBase`（幂等 Start + 只发信号的 Close + join 式 WaitClosed）；协议无关机制 `HandlerLoop<Message>`（handler 消费者 fiber + `Coro::Awaitable` 业务队列）；`HandlerContext`（handler 能力面）。**变更（ADR-0008）**：`PendingTable` / `BoundedQueue` 已删除，请求关联移交 `Dispatcher`（位于 CSC_CORE，见 §5.2）。
 - **类图**：见图 4-3。
 - **关系与结构**：依赖 CSC_CORE，组合 CSC_IO + CSC_CODEC。
@@ -139,7 +139,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![数据流上下文图](diagrams/dfd-context.svg)
 
-**图例说明**：① **宿主应用**——装配 codec / 注册 handler、发起 Request/Send/Publish，取回 Result/Message/连接状态/观测；② **通信介质对端**——收发字节/样本、断连事件；③ **AsyncTask 运行时**——框架请求它创建/恢复协程、超时、跨线程唤醒；④ **DDS Provider**（可选）——按 topic 收发、listener 回调样本。要点：框架不产生业务数据，只在四方之间搬运字节与关联/分发。
+**图例说明**：① **宿主应用**——装配 codec、**订阅入站业务帧并在自有 fiber 上消费**（ADR-0009）、发起 Request/Send/Publish，取回 Result/Message/连接状态/观测；② **通信介质对端**——收发字节/样本、断连事件；③ **AsyncTask 运行时**——框架请求它创建/恢复协程、超时、跨线程唤醒；④ **DDS Provider**（可选）——按 topic 收发、listener 回调样本。要点：框架不产生业务数据，只在四方之间搬运字节与关联/分发。
 
 #### 4.2.2 顶层数据流（MS_DFD_TOPLEVEL）
 
@@ -181,7 +181,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![关闭收敛时序图](diagrams/seq-close.svg)
 
-**图例说明（ADR-0008 D2/D3/D5）**：`Close()` **只发信号**（关本节点的读订阅 + 业务队列 Close + handler 取消 + `Dispatcher.CloseAll`）即返回，**不含任何等待点**，故读-分发循环与业务处理器均可直接调用它。收敛移出内部 fiber：由 `WaitClosed()` 的调用方经 `DoJoin()` **自上而下** join 读循环与 handler 消费者，返回即全部内部 fiber 已不再触碰节点。读循环退出时无条件调 `Close()`——我方 Close 所致时是幂等空操作、传输终结所致时即自终，两条路径合并为一条。**传输的生命周期由宿主自理**，节点从不启停它。
+**图例说明（ADR-0008 D2/D3/D5）**：`Close()` **只发信号**（关本节点的读订阅 + `Dispatcher.CloseAll`——后者关闭全部订阅信箱，**即订阅者的协作取消信号**，ADR-0009 D4）即返回，**不含任何等待点**，故读-分发循环与业务处理器均可直接调用它。收敛移出内部 fiber：由 `WaitClosed()` 的调用方经 `DoJoin()` **自上而下** join 读循环与 handler 消费者，返回即全部内部 fiber 已不再触碰节点。读循环退出时无条件调 `Close()`——我方 Close 所致时是幂等空操作、传输终结所致时即自终，两条路径合并为一条。**传输的生命周期由宿主自理**，节点从不启停它。
 
 #### 4.2.6 链路断开处置时序（MS_LINK_DOWN，原 MS_GEN_ISOLATION）
 
@@ -229,7 +229,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.10 对象/线程/协程的动态创建与删除（MS_DYNAMIC_LIFECYCLE）
 
-- **fiber（一个 node 内）**：`Start` 时 spawn 读-分发循环 fiber、handler 消费者 fiber（设 handler 时），**共两条**；`Close` **不再 spawn 任何 fiber**——收敛由读-分发循环 fiber 在其退出后兼任（handler 消费者 fiber 的 `FiberTask` 句柄由 runtime 持有至收敛 join 完成，ADR-0005 D2），跑完收敛即终止（ADR-0005 D1）。**reactor fiber 已随 ADR-0004 D2/D3 取消，finalizer fiber 已随 ADR-0005 D1 取消。** 均由 AsyncTask `makeTask` 创建、返回即终止。
+- **fiber（一个 node 内）**：`Start` 时 spawn 读-分发循环 fiber，**共一条**（ADR-0009 D1：内置 handler 消费者 fiber 已废止；订阅者的消费 fiber 属**宿主**，不计入节点内部工作单元）；`Close` **不再 spawn 任何 fiber**，且不含等待点——汇合由 `WaitClosed()` 在调用方 fiber 上 `FiberTask::get()` join 读循环完成（ADR-0008 D2）。**reactor fiber 已随 ADR-0004 D2/D3 取消，finalizer fiber 已随 ADR-0005 D1 取消。** 均由 AsyncTask `makeTask` 创建、返回即终止。
 - **传输连接代际（内于传输层）**：`TcpClientTransport` 的 connect-loop fiber 每次成功物理连接创建一个内层 `TcpTransport`（`Generation()`+1），断链销毁旧内层、隔固定间隔（1s）后建新代际；断链**不向交互层发任何信号**（完全透明，DD-11）。交互层不参与。
 - **DDS 交接**：`DdsTransport` `Start` 对每 topic `Subscribe`，listener 回调在外线程构造 `Sample` 非阻塞 `Push`；`RequestClose` 先 `Unsubscribe` 停投递 → 交接边界 `Close` 唤醒在途 `Read` → provider `Shutdown`；迟到回调只捕获交接边界共享句柄、不触碰已销毁对象。
 - **TcpServer 子 node**：每接受一条连接经 NodeFactory 派生 `ProtocolNode` + supervisor fiber；对端断开 → supervisor 驱动该 node `Closing→Closed` 并注销（连接生命=节点生命）。
@@ -240,7 +240,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ```
 [宿主应用]
-   │ 节点/配置/handler/请求/可观测      (JK_NODE_API 编程接口, CSC_NODE)
+   │ 节点/配置/订阅/请求/可观测        (JK_NODE_API 编程接口, CSC_NODE)
    │ 装配 codec                        (JK_CODEC 编解码扩展点, CSC_CODEC)
    ▼
 [transport]
@@ -273,6 +273,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - 数据元素：`TraceEvent`（零分配视图：level/category/message/key/endpoint/error/size 等）。
 - 通信方式：push，`OnTrace` 在库内部**可能持锁调用**——实现须快速返回、不阻塞、不回调本库任何 API（重入契约）。
 - 协议特征：九类 category（connect/generation/send/recv/decode/match/timeout·cancel/handler/reconnect/lifecycle）+ `drop`（`RecordDrop` 专用，message=DropReasonName）。
+  **实况标注（2026-08-20）**：`match`、`timeout·cancel`、`handler` 三类当前**定义了但无任何发射点**（ADR-0006/0008 重设计遗留漂移，非 ADR-0009 造成）；`handler` 一类随本轮 handler 通道废止而更无来源。是否重新接线或删除待评审。
 
 #### 4.3.5 传输内部接口（JK_TRANSPORT）
 - 优先级：高（框架正确性核心，内部缝）。
@@ -400,7 +401,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 > - **八个观测接口全部删除**，丢弃只经 `ITraceSink` 上报。
 > - 公开面收为 5 个：构造 / 析构 / `Request(Message, milliseconds)` / `Send(Message)` / `Subscribe(Key)`，另继承基类的四个生命周期方法。
 
-**单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ICodec`+`Dispatcher`+`HandlerLoop`、**按引用借用** `ITransport`，协议特有语义全内联本类；DdsNode 复用同套基座仅换键字段（D10 实证）。
+**单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ICodec`+`Dispatcher`（**ADR-0009**：不再组合 `HandlerLoop`）、**按引用借用** `ITransport`，协议特有语义全内联本类；DdsNode 复用同套基座仅换键字段（D10 实证）。
 
 **设计约束**：`Request/Send/Publish` 仅 Running 放行（否则 kClosed）；session_id 空间协议特有（uint8=256）内联 ProtocolNode；correlation_id 确定性（node_id:序号）内联 DdsNode。
 
@@ -408,9 +409,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **读-分发循环**（ADR-0006 D5 起为 node 的实现细节）：私有 `SpawnReadLoop()` 起一条长寿 fiber，`transport_->Read() → 错误分类（仅 `kClosed` 退出、其余瞬时错误继续）→ 本类 `DecodeAndDispatch()``；退出后调基类 `ConvergeAfterReadLoop()` 兼任收敛者。两个 node 各持一份逐字相同的 13 行——D5 明确接受该重复（"不构成需要共享的机制"）；第三个 node 出现前不宜再抽共享件。
 - **键派生**：`CorrelationKeyStrategy`（可注入）；默认请求键 `(session_id<<16)|message_id`，响应键清 `0x1000` 标记位归一化。
 - **session_id**：空闲集 `deque<uint8>`（0..255），Request `pop_front` 取最久释放者（FIFO 退休窗口 RT_REQUEST_005），`SessionLease` RAII 归还；256 全在途 `kResourceExhausted`。Send 只读空闲集尾部盖帧、不出队（不扰 FIFO、不占预算）。
-- **Dispatch**：`kResponse`/`kResult`=响应帧→`Resolve`（未命中归因 kUnmatchedOrLateResponse）；否则业务帧入队/丢弃（无 handler 归因 kNoHandlerConfigured）。
+- **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。`kResponse`/`kResult`=响应帧未命中时仍归因 `kUnmatchedOrLateResponse`；**业务帧无人认领则静默丢弃、不归因**（订阅模型下无订阅者是常态而非异常，见 SRS §3.1.5.4）。
 - **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
-- **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8）**：`HandlerContext` 与 `DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
+- **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8；ADR-0009 D1 后仅存 DDS 侧）**：`HandlerContext` 已随 `ProtocolNode` 的 handler 通道一并移除；`DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
 
 **软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。
 
@@ -457,7 +458,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | §4.1.1、§5.1 |
 | CSC_IO | 部件 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 | §4.1.2、§5.6 |
 | CSC_CODEC | 部件 | RT_CODEC、RT_IF_SYSFRAME | §4.1.3、§5.7 |
-| CSC_NODE | 部件 | RT_NODE、RT_REQUEST、RT_HANDLER、RT_LIFECYCLE、RT_DESIGN_003/008 | §4.1.4、§5.2–5.5 |
+| CSC_NODE | 部件 | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 | §4.1.4、§5.2–5.5 |
 | MS_DFD_CONTEXT / MS_DFD_TOPLEVEL | 执行方案 | RT_IN_INTERFACE_001、RT_TRANSPORT、RT_REQUEST | §4.2.1、§4.2.2 |
 | MS_NODE_DATAFLOW / MS_REQ_RESP | 执行方案 | RT_REQUEST、RT_NODE_003 | §4.2.3、§4.2.4 |
 | MS_CLOSE / MS_NODE_LIFECYCLE | 执行方案 | RT_LIFECYCLE_001/003–007 | §4.2.5、§4.2.7 |
@@ -472,9 +473,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | JK_PROVIDER | 接口 | RT_IN_INTERFACE_003、RT_IF_DDS | §4.3.6 |
 | CSU_CORE | 详细设计 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_CORO_RUNTIME_005 | §5.1 |
 | CSU_DISPATCHER | 详细设计 | RT_REQUEST_001..004、RT_IN_INTERFACE_004、RT_DESIGN_008 | §5.2 |
-| ~~CSU_BOUNDEDQUEUE~~ | 已删除（ADR-0008 D8） | RT_HANDLER_004、RT_DATA_BUFFER 的上界与归因**不再满足** | §5.3 |
-| CSU_NODEBASE | 详细设计 | RT_LIFECYCLE、RT_HANDLER、RT_NODE_003、RT_DESIGN_008 | §5.4 |
-| CSU_PROTOCOLNODE | 详细设计 | RT_REQUEST、RT_NODE_003、RT_HANDLER、RT_TCP_RECONNECT | §5.5 |
+| ~~CSU_BOUNDEDQUEUE~~ | 已删除（ADR-0008 D8） | RT_DATA_BUFFER 的上界与归因**不再满足**；原 RT_HANDLER_004 已由 RT_INBOUND_003 承接（改由结构保证，不依赖队列上界） | §5.3 |
+| CSU_NODEBASE | 详细设计 | RT_LIFECYCLE、RT_NODE_003、RT_DESIGN_008 | §5.4 |
+| CSU_PROTOCOLNODE | 详细设计 | RT_REQUEST、RT_NODE_003、RT_INBOUND、RT_TCP_RECONNECT | §5.5 |
 | CSU_DDSNODE | 详细设计 | RT_NODE_004/005/007、RT_IF_DDS、RT_REQUEST | §5.5 |
 | CSU_IO | 详细设计 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_NODE_006、RT_IF_* | §5.6 |
 | CSU_CODEC | 详细设计 | RT_CODEC、RT_IF_SYSFRAME | §5.7 |
@@ -487,7 +488,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | RT_TRANSPORT_001..009 | DD-6、DD-11 / CSC_IO / CSU_IO / JK_TRANSPORT / MS_DFD_TOPLEVEL |
 | RT_CODEC_001..006 | CSC_CODEC / CSU_CODEC / JK_CODEC |
 | RT_REQUEST_001..006 | DD-8 / CSC_NODE / CSU_DISPATCHER、CSU_PROTOCOLNODE / MS_REQ_RESP、MS_TICKET（**RT_REQUEST_005/006 已由 ADR-0008 D7 推翻**） |
-| RT_HANDLER_001..006 | CSC_NODE / CSU_NODEBASE、`HandlerLoop` / MS_NODE_DATAFLOW（**RT_HANDLER_004 的队列上界与 tail-drop 归因已随 ADR-0008 D8 回退**） |
+| ~~RT_HANDLER_001..006~~ | **整组废止（ADR-0009）**，由 RT_INBOUND 取代；废止/承接对照见 SRS §3.1.5 引言 |
+| RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 TBD-009** |
 | RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、MS_CONNECTION |
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
 | RT_TCP_RECONNECT_001..005 | DD-11、DD-12 / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、MS_CONNECTION |

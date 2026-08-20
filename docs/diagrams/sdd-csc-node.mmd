@@ -20,6 +20,7 @@ classDiagram
         #DoStart()* / DoClose()* / DoJoin()*
     }
     class HandlerLoop~Event~ {
+        <<仅 DdsNode 用 · ADR-0009 过渡遗留>>
         +Spawn(consume) / Enqueue(e)
         +Join() / CancelAndClose() / Token()
         -Coro::Awaitable~Event~ 队列
@@ -30,17 +31,16 @@ classDiagram
         +CloseAll(error)
         -unordered_map~Mask, map~Values, vector~Entry~~~
     }
-    class HandlerContext {
+    class DdsHandlerContext {
+        <<仅 DdsNode 用 · ADR-0009 过渡遗留>>
         +Send / RequestClose / cancellation
     }
 
     NodeBase <|-- ProtocolNode : 继承
     NodeBase <|-- DdsNode : 继承
     ProtocolNode *-- Dispatcher : 组合
-    ProtocolNode *-- HandlerLoop : 组合
-    DdsNode *-- HandlerLoop : 组合
-    ProtocolNode ..> HandlerContext : 构造传入
-    DdsNode ..> HandlerContext : 构造传入
+    DdsNode *-- HandlerLoop : 组合（过渡遗留）
+    DdsNode ..> DdsHandlerContext : 构造传入（过渡遗留）
     ProtocolNode ..> ITransport : 按引用借用（不拥有、不启停）
     note for Dispatcher "订阅时不参与匹配的字段填 kAny\n一条消息投给全部键匹配者，各得一份\n成本 O(在用 mask 种数 + 收件人数)"
     note for NodeBase "Close 只发信号、任何 fiber 可调；\nWaitClosed 无时限，语义即 join"

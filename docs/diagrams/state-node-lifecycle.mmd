@@ -8,11 +8,11 @@ stateDiagram-v2
     Created --> Closed: 从未 Start 即 Close<br/>(无 fiber 可汇合)
 
     Running --> Running: 再次 Start（幂等成功）
-    Running --> Closing: Close（只发信号）<br/>DoClose：关读订阅 + handler 取消<br/>+ Dispatcher.CloseAll
+    Running --> Closing: Close（只发信号）<br/>DoClose：关读订阅<br/>+ Dispatcher.CloseAll（即订阅者的协作取消信号）
     Running --> Closing: 读循环退出后调 Close()<br/>(传输终结即自终，与我方 Close 同一条路径)
 
     Closing --> Closing: 再次 Close（幂等空操作）
-    Closing --> Closed: WaitClosed()<br/>DoJoin：join 读循环 + handler 消费者
+    Closing --> Closed: WaitClosed()<br/>DoJoin：join 读循环（唯一内部工作单元）<br/>订阅者 fiber 属宿主，节点不 join
 
     Closed --> Closed: 再次 Close / WaitClosed（立即返回）
     Closed --> [*]

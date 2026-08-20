@@ -7,7 +7,7 @@ flowchart TB
     SER([串口设备])
     DDS([DDS Domain / Topic])
 
-    APP -->|RT_IF_API：节点/配置/handler/请求/可观测| NODE
+    APP -->|RT_IF_API：节点/配置/订阅/请求/可观测| NODE
     NODE -->|RT_IF_SYSFRAME / DDS 消息格式| CODEC
     NODE -->|RT_IF_TCP| TCP
     NODE -->|RT_IF_UDP| UDP

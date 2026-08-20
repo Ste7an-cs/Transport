@@ -5,7 +5,7 @@ flowchart TB
     P1["P1 出站<br/>盖章 + Encode + Write"]
     P2["P2 入站读循环<br/>Read + Decode + Dispatch 分类"]
     P3["P3 请求关联<br/>Register / Resolve / 终结仲裁"]
-    P4["P4 业务处理<br/>入队 + 单消费者 handler"]
+    P4["P4 业务交付<br/>按键投递给订阅者信箱"]
     P5["P5 生命周期<br/>汇合信号 + 读循环收敛"]
 
     D1[("D1 在途请求表<br/>PendingTable")]
@@ -24,7 +24,7 @@ flowchart TB
     P1 -->|Result 响应/错误| APP
 
     D2 -->|Pop| P4
-    P4 -->|handler 处理结果 记录| APP
+    P4 -->|投递到订阅信箱<br/>宿主自有 fiber 消费| APP
     P4 -.->|ctx.Send / Reply| P1
 
     APP -->|Start/Close| P5

@@ -28,4 +28,4 @@ sequenceDiagram
     N->>D: Ticket 析构 → 自动注销订阅
     N-->>C: return Coro::Result~Message~
 
-    Note over D,N: 投递份数为 0 时：终结帧归因 unmatched-or-late-response 丢弃，<br/>其余业务帧交 HandlerLoop
+    Note over D,N: 投递份数为 0 时：终结帧归因 unmatched-or-late-response 丢弃，<br/>其余业务帧静默丢弃、不归因<br/>（无订阅者是常态，ADR-0009 D5）

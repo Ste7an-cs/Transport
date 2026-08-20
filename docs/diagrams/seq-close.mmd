@@ -4,9 +4,8 @@ sequenceDiagram
     participant N as ProtocolNode
     participant B as NodeBase
     participant D as Dispatcher
-    participant H as HandlerLoop
     participant RL as 读-分发循环 fiber
-    participant HC as handler 消费者 fiber
+    participant SUB as 宿主订阅者 fiber
     participant T as ITransport
 
     Note over X,B: Close() 只发信号，不含任何等待点<br/>故任何 fiber 都可调用（ADR-0008 D2）
@@ -14,25 +13,23 @@ sequenceDiagram
     B->>B: Running → Closing（立即拒新 Request/Send）
     B->>N: DoClose()（锁外）
     N->>N: 关闭本节点的读订阅 rx_（AsyncRead()->shared()）<br/>源队列与其它订阅者不受影响
-    N->>H: CancelAndClose()：关业务队列 + 触发协作取消
-    N->>D: CloseAll(kClosed)：在途请求恰好终结一次
+    N->>D: CloseAll(kClosed)：关闭全部订阅信箱<br/>在途请求恰好终结一次；订阅者的 await 亦终结（即协作取消信号）
     B-->>X: 返回（仅表示已受理）
 
-    Note over RL,HC: 读订阅被关 → 读循环的 await 得到终止错误
+    Note over RL,SUB: 读订阅被关 → 读循环的 await 得到终止错误
     RL->>RL: 退出读循环
     RL->>B: Close()（无条件调公开接口）
     Note over RL,B: 我方 Close 所致时是幂等空操作；<br/>传输终结所致时即自终 —— 两条路径合并
-    H-->>HC: 业务队列被关 → handler 消费者退出
+    D-->>SUB: 信箱被关 → 宿主订阅者 await 终结、自行退出
 
     Note over X,B: 收敛由 WaitClosed 的调用方自上而下 join（ADR-0008 D3）
     X->>B: WaitClosed()
     B->>N: DoJoin()（锁外）
     N->>RL: read_task_->get()（让出式 join）
     RL-->>N: 读循环 fiber 已退出
-    N->>HC: handler_loop_.Join()
-    HC-->>N: handler 消费者已退出
     B->>B: lifecycle = Closed
-    B-->>X: 返回 —— 全部内部 fiber 已不再触碰节点，可安全析构
+    B-->>X: 返回 —— 节点内部 fiber 已不再触碰节点，可安全析构
+    Note over X,SUB: 但订阅者 fiber 属宿主，可能仍在退出途中<br/>需严格汇合者须自行 join（ADR-0009 D4）
 
     Note over X,T: 传输的生命周期由宿主自行管理（ADR-0008 D5）<br/>节点从不 Start / Close / WaitClosed 传输
     X->>T: Close() / WaitClosed()

@@ -35,7 +35,7 @@ classDiagram
         #DoStart()* / DoClose()* / DoJoin()*
     }
     class HandlerLoop~Event~ {
-        <<协议无关机制>>
+        <<协议无关机制 · 仅 DdsNode 用（ADR-0009 过渡遗留）>>
         +Spawn(consume) / Enqueue(e)
         +Join() / CancelAndClose()
     }
@@ -46,7 +46,8 @@ classDiagram
         +CloseAll(error)
         +Ticket::Wait(timeout) Coro::Result~T~
     }
-    class HandlerContext {
+    class DdsHandlerContext {
+        <<仅 DdsNode 用（ADR-0009 过渡遗留）>>
         +Send()
         +RequestClose() 转调公开的 Close()
         +cancellation()
@@ -84,11 +85,11 @@ classDiagram
     ProtocolNode ..> ITransport : 借用（宿主启停）
     ProtocolNode *-- ICodec : 组合
     ProtocolNode *-- Dispatcher : 组合
-    ProtocolNode *-- HandlerLoop : 组合
+    DdsNode *-- HandlerLoop : 组合（过渡遗留）
     NodeBase <|-- ProtocolNode : 继承
     DdsNode *-- ITransport : 组合
     DdsNode *-- ICodec : 组合
     NodeBase <|-- DdsNode : 继承
-    ProtocolNode ..> HandlerContext : 构造传入
+    DdsNode ..> DdsHandlerContext : 构造传入（过渡遗留）
     TcpServer ..> ProtocolNode : 每连接派生
     ProtocolNode ..> ITraceSink : 可选出口

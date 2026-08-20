@@ -22,9 +22,8 @@ flowchart TB
 
     DSP -->|命中 ≥1| RES["各订阅者信箱各得一份副本"]
     DSP -->|0 份 · 终结帧| UM["kUnmatchedOrLateResponse 丢弃"]
-    DSP -->|0 份 · 业务帧·有 handler| BQ["HandlerLoop.Enqueue<br/>满则静默丢最旧（无归因，#152）"]
-    DSP -->|0 份 · 无 handler| NH["kNoHandlerConfigured 丢弃"]
-    BQ --> HD["handler 消费者 fiber<br/>await → 串行处理 · 异常隔离"]
+    DSP -->|0 份 · 业务帧| NH["静默丢弃 · 不归因<br/>（无订阅者是常态，ADR-0009 D5）"]
+    RES --> HD["宿主自有消费 fiber<br/>await 信箱 → 自行串行 · 自行隔离异常<br/>满则静默丢最旧（无归因，#152）"]
     RES -. 唤醒 .-> WT
 
     DEC -.->|坏帧| BF["kBadFrame 丢弃"]
