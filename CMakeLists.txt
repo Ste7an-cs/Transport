@@ -105,8 +105,9 @@ if(TRANSPORT_BUILD_TESTS)
     # —— 以下用例仍在旧 ITransport / NodeBase 面上，随重设计逐个迁移后再放回 ——
     #   protocol_node_handler_test / protocol_node_lifecycle_test
     #   protocol_node_capacity_test / protocol_node_udp_test / transport_contract_test
-    #   fake_coro_transport_test / send_semantics_fake_test / handler_loop_test
+    #   fake_coro_transport_test / send_semantics_fake_test
     #   shared_completion_test（SharedCompletion 已随手搓同步件一并删除）
+    #   handler_loop_test（HandlerLoop 已随 ADR-0009 废止内建 handler 通道而删除）
     tests/codec/message_test.cpp
     tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
