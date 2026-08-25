@@ -5,6 +5,16 @@
  * @brief 协议无关的 handler 消费者小件 HandlerLoop<Event>(RT_HANDLER_003 /
  *        RT_HANDLER_006 / RT_DESIGN_008)。
  *
+ * @deprecated **过渡遗留件,不得被新代码引用**(ADR-0009 D2)。ADR-0009 废止了"节点内置
+ *             入站业务处理器通道":入站业务一律改由 `Subscribe(Key)` 承载,调用方在自己的
+ *             fiber 上消费自己的信箱,消费样板由调用方自行编写——本件**不**降级为公开辅
+ *             助件,也不另造 `SubscriptionLoop` 替代品。`ProtocolNode` 已停止使用它;当下
+ *             它**仅服务 `DdsNode`**(ADR-0009 D6,另票改造),待该票落地后本文件与
+ *             `tests/handler_loop_test.cpp` 一并整体删除。
+ *
+ *             其承载的三项框架职责(严格串行 / 逃逸异常隔离 / 业务队列容量)在订阅模型下
+ *             已降为**调用方契约**(ADR-0009 D3 / RT_INBOUND_005)。
+ *
  * HandlerLoop 把"入站业务事件的单消费者串行处理"收成一个独立小件,拥有该职责所需的
  * **全部**状态:
  *
