@@ -53,9 +53,9 @@
 - **DD-1 三层解耦 + 内部缝（满足 RT_IN_INTERFACE_001/002、RT_DESIGN_006）：** 传输（纯字节管道）/ 编解码（线缆格式）/ 交互节点三层，以可测替换的**缝**衔接。`ITransport` 是内部缝（非用户 API），`ICodec` 是公共扩展点，编程主入口是交互层 node。原则：各层职责单一、可独立替换与单测。
 - **DD-2 AsyncTask 强制运行时（满足 RT_CORO_RUNTIME_001..005、RT_DESIGN_002）：** 不设独立 `IExecutor`/`ThreadExecutor` 业务调度体系；M:N 协作式；同一节点交互状态串行访问，以一把 `std::mutex` 守临界区实现，运行时 await 只出现在 fiber 挂起点，唤醒/回调在锁外调用。**依赖性**：节点所属执行域首次启动后稳定、不迁移（RT_CORO_RUNTIME_003）。
 - **DD-3 无共享交互引擎（满足 RT_DESIGN_003、RT_NODE_003）：** 不设独立 `InteractionEngine`/`InteractionPolicy` 层；协议特有语义（键派生、终结判别、寻址、帧盖章）内联各 node。公共只抽出**协议无关机制**：`PendingTable`、`BoundedQueue`、`HandlerLoop`、`SharedCompletion`，以及承载生命周期的基类 `NodeBase`。原则：语义归属清晰、不造上帝对象。
-  **变更（ADR-0008 D6/D8）**：清单已改为 **`Dispatcher`（按键分配）、`HandlerLoop`、`NodeBase`** 三件。**再变更（ADR-0009 D1，2026-08-20）**：`ProtocolNode` 停止使用 `HandlerLoop`，其清单收为 **`Dispatcher` + `NodeBase`** 两件；`HandlerLoop` 降为仅服务 `DdsNode` 的过渡遗留件。`PendingTable` 由 `Dispatcher` 取代；`BoundedQueue` 与 `SharedCompletion` 删除——前者是 `FiberChannel` 的手工重造，后者是 `Awaitable::close()` 广播的手工重造。
+  **变更（ADR-0008 D6/D8）**：清单已改为 **`Dispatcher`（按键分配）、`HandlerLoop`、`NodeBase`** 三件。**再变更（ADR-0009 D1，2026-08-20；#163 收尾，2026-08-25）**：`ProtocolNode` 停止使用 `HandlerLoop`，清单收为 **`Dispatcher` + `NodeBase`** 两件；**`HandlerLoop` 已整体删除**——其唯一名义使用者 `DdsNode` 实为重设计之前的代码、不参与编译。`PendingTable` 由 `Dispatcher` 取代；`BoundedQueue` 与 `SharedCompletion` 删除——前者是 `FiberChannel` 的手工重造，后者是 `Awaitable::close()` 广播的手工重造。
   **变更（ADR-0006 D1）**：原 `NodeRuntime<Event>` **已删除**（#139 迁空生命周期职责，#140 下放读循环与 handler 驱动后删除文件）——它把生命周期、handler 队列、读循环骨架与观测计数四件事装进一个 528 行模板，恰是本决策所反对的上帝对象。生命周期上移基类 `NodeBase`（模板方法：基类管幂等与收敛，子类实现 `DoStart`/`DoClose`），handler 队列下沉为可选小件 `HandlerLoop`，读循环骨架与观测计数回归各 node。
-- **DD-4 协议无关基座可复用（满足 RT_DESIGN_008、D10）：** `PendingTable<Key,T>`/`BoundedQueue<T>`/`HandlerLoop<Message>`（前二者已删、后者 ADR-0009 后仅服务 `DdsNode`）对协议类型不透明，经模板参数/注入回调解耦。**变更（ADR-0006 D1）**：`NodeRuntime<Event>` 的模板参数从未被变化过（两处实例化均为 `NodeRuntime<Message>`），泛型代价（头文件实现、`byte_size_of` 回调注入）全部白付，故随其删除一并取消；`NodeBase` 为非模板。DdsNode 复用它们：仅把 Key 从 `uint32` 换为 `std::string`，基座一行不改（实证）。
+- **DD-4 协议无关基座可复用（满足 RT_DESIGN_008、D10）：** `PendingTable<Key,T>`/`BoundedQueue<T>`/`HandlerLoop<Message>`（**三者均已删除**：前二者随 ADR-0008 D8，后者随 ADR-0009 于 #163）曾对协议类型不透明，经模板参数/注入回调解耦。**变更（ADR-0006 D1）**：`NodeRuntime<Event>` 的模板参数从未被变化过（两处实例化均为 `NodeRuntime<Message>`），泛型代价（头文件实现、`byte_size_of` 回调注入）全部白付，故随其删除一并取消；`NodeBase` 为非模板。DdsNode 复用它们：仅把 Key 从 `uint32` 换为 `std::string`，基座一行不改（实证）。
 - **DD-5 结果承载错误、不抛异常（满足 RT_ERROR_001/002/003、RT_DESIGN_005）：** 预期失败用 `Result<T>`/`Status`（`[[nodiscard]]`）+ 机器可判别 `TransportErrc` 类别，不靠解析字符串前缀。唯一授权的 `catch` 在 handler 消费者边界（隔离第三方逃逸异常）。
 - **DD-6 发送排序（满足 RT_TRANSPORT_007/004；ADR-0004 D5）：** 同 fiber 程序序、跨 fiber 串行为一致全序，单帧字节不与另一帧交错。**发送完成语义与协程背压已撤销**（原"帧进内核才报成功"，ADR-0002 D2 → 被 ADR-0004 D5 撤销）：发送成功此后仅表示该帧已交付下层发送通路。并发写串行化**保留**——它是 RT_TRANSPORT_004 的实现手段，与完成语义是两件事。**代价**：发送侧不再有框架级内存上界（见 §7.2 已知缺口）。
 - **DD-7 两个独立生命周期轴 + 链路可用性上移（满足 RT_LIFECYCLE_001/002、RT_TRANSPORT_009；ADR-0004 D2）：** 节点生命周期 `Created→Running→Closing→Closed`（全介质通用）与 TCP 物理连接状态（仅 TCP 客户端，Running 内子状态）正交。**连接管理**（状态机/重连间隔/重连策略/代际推进）不下沉纯字节管道；但**当前链路可用性**作为与 `LastSendTime`/`LastError` 同类的 I/O 事实**上移至 `ITransport` 基类**，所有介质同形作答——交互层因此不再按介质探测可选能力接口（`IConnectionObservable` 取消）。此为 ADR-0002 D3′ 的边界重划。
@@ -86,7 +86,7 @@
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`TcpClientTransport`、`TcpServer`、`IDdsProvider` | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
-| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`DdsNode`；`HandlerLoop`、`DdsHandlerContext`（**ADR-0009**：仅 `DdsNode` 使用，过渡遗留）（**ADR-0008**：`PendingTable`/`BoundedQueue` 已删除） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
+| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`Dispatcher`；`DdsNode`、`DdsHandlerContext`（未编译的历史代码，待复活重写）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
@@ -117,7 +117,7 @@
 #### 4.1.4 交互层部件（CSC_NODE）
 
 - **用途**：在传输 + 编解码之上组合请求关联、入站分发、超时、连接状态与协议交互；薄壳组合、不共享引擎。响应 RT_NODE_*、RT_REQUEST_*、RT_INBOUND_*、RT_LIFECYCLE_*、RT_DESIGN_003/008。
-- **主要内容**：交互节点 `ProtocolNode`（外部协议请求-响应）、`DdsNode`（DDS pub-sub + 多路请求-应答）；生命周期基类 `NodeBase`（幂等 Start + 只发信号的 Close + join 式 WaitClosed）；协议无关机制 `HandlerLoop<Message>`（handler 消费者 fiber + `Coro::Awaitable` 业务队列）；`HandlerContext`（handler 能力面）。**变更（ADR-0008）**：`PendingTable` / `BoundedQueue` 已删除，请求关联移交 `Dispatcher`（位于 CSC_CORE，见 §5.2）。
+- **主要内容**：交互节点 `ProtocolNode`（外部协议请求-响应）、`DdsNode`（DDS pub-sub + 多路请求-应答）；生命周期基类 `NodeBase`（幂等 Start + 只发信号的 Close + join 式 WaitClosed）；协议无关机制 `Dispatcher<T,Fields...>`（按键分配、部分匹配、多订阅者各得一份副本）；`HandlerContext`（handler 能力面）。**变更（ADR-0008）**：`PendingTable` / `BoundedQueue` 已删除，请求关联移交 `Dispatcher`（位于 CSC_CORE，见 §5.2）。
 - **类图**：见图 4-3。
 - **关系与结构**：依赖 CSC_CORE，组合 CSC_IO + CSC_CODEC。
 
@@ -125,7 +125,7 @@
 
 ![CSC_NODE 类图](diagrams/sdd-csc-node.svg)
 
-**图例说明**：`ProtocolNode`/`DdsNode` **继承 `NodeBase`**（基类管幂等与汇合，子类实现 `DoStart`/`DoClose`/`DoJoin`），并组合 `Dispatcher` + `HandlerLoop`（不共享交互引擎）。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。`HandlerLoop` 的业务队列直接用 `Coro::Awaitable`（原 `BoundedQueue` 已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
+**图例说明**：`ProtocolNode`/`DdsNode` **继承 `NodeBase`**（基类管幂等与汇合，子类实现 `DoStart`/`DoClose`/`DoJoin`），并组合 `Dispatcher` + `HandlerLoop`（不共享交互引擎）。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。订阅信箱直接用 `Coro::Awaitable`（原 `BoundedQueue` 与 `HandlerLoop` 均已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
 
 ### 4.2 执行方案
 

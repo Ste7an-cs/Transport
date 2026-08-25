@@ -1,3 +1,5 @@
+%% ⚠ 本图 .mmd 已按 #163 更新(删除 HandlerLoop),但同名 .svg 尚未重渲染——
+%%   本机 node/npx 与 chrome 已随环境变更移除,mermaid-cli 不可用。恢复后须重渲染。
 classDiagram
     direction TB
     class ProtocolNode {
@@ -19,12 +21,6 @@ classDiagram
         +IsRunning() bool
         #DoStart()* / DoClose()* / DoJoin()*
     }
-    class HandlerLoop~Event~ {
-        <<仅 DdsNode 用 · ADR-0009 过渡遗留>>
-        +Spawn(consume) / Enqueue(e)
-        +Join() / CancelAndClose() / Token()
-        -Coro::Awaitable~Event~ 队列
-    }
     class Dispatcher~T_Fields~ {
         +Subscribe(Key) Ticket
         +Dispatch(const T&) size_t
@@ -39,7 +35,6 @@ classDiagram
     NodeBase <|-- ProtocolNode : 继承
     NodeBase <|-- DdsNode : 继承
     ProtocolNode *-- Dispatcher : 组合
-    DdsNode *-- HandlerLoop : 组合（过渡遗留）
     DdsNode ..> DdsHandlerContext : 构造传入（过渡遗留）
     ProtocolNode ..> ITransport : 按引用借用（不拥有、不启停）
     note for Dispatcher "订阅时不参与匹配的字段填 kAny\n一条消息投给全部键匹配者，各得一份\n成本 O(在用 mask 种数 + 收件人数)"

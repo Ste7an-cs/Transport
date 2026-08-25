@@ -1,8 +1,10 @@
+%% ⚠ 本图 .mmd 已按 #163 更新(删除 HandlerLoop),但同名 .svg 尚未重渲染——
+%%   本机 node/npx 与 chrome 已随环境变更移除,mermaid-cli 不可用。恢复后须重渲染。
 flowchart TB
     subgraph HOST[" "]
       APP([宿主应用])
     end
-    NODE["CSC_NODE（交互层）<br/>NodeBase · ProtocolNode · DdsNode · Dispatcher<br/>HandlerLoop · DdsHandlerContext（仅 DdsNode，过渡遗留）"]
+    NODE["CSC_NODE（交互层）<br/>NodeBase · ProtocolNode · DdsNode · Dispatcher<br/>DdsHandlerContext（仅 DdsNode，未编译的历史代码）"]
     CODEC["CSC_CODEC（编解码层）<br/>ICodec · SystemCodec · DatagramCodec · DdsCodec"]
     IO["CSC_IO（传输层）<br/>ITransport（唯一内部缝）<br/>Tcp/Udp/Serial/Dds Transport · TcpServer"]
     CORE["CSC_CORE（核心原语）<br/>Result/Status · Message · Endpoint · Cancellation<br/>SharedCompletion · Observability · ITraceSink"]

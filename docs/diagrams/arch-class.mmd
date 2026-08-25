@@ -1,3 +1,5 @@
+%% ⚠ 本图 .mmd 已按 #163 更新(删除 HandlerLoop),但同名 .svg 尚未重渲染——
+%%   本机 node/npx 与 chrome 已随环境变更移除,mermaid-cli 不可用。恢复后须重渲染。
 classDiagram
     direction TB
 
@@ -33,11 +35,6 @@ classDiagram
         <<生命周期基类>>
         +Start() / Close() / WaitClosed() / IsRunning()
         #DoStart()* / DoClose()* / DoJoin()*
-    }
-    class HandlerLoop~Event~ {
-        <<协议无关机制 · 仅 DdsNode 用（ADR-0009 过渡遗留）>>
-        +Spawn(consume) / Enqueue(e)
-        +Join() / CancelAndClose()
     }
     class Dispatcher~T,Fields~ {
         <<协议无关机制>>
@@ -85,7 +82,6 @@ classDiagram
     ProtocolNode ..> ITransport : 借用（宿主启停）
     ProtocolNode *-- ICodec : 组合
     ProtocolNode *-- Dispatcher : 组合
-    DdsNode *-- HandlerLoop : 组合（过渡遗留）
     NodeBase <|-- ProtocolNode : 继承
     DdsNode *-- ITransport : 组合
     DdsNode *-- ICodec : 组合

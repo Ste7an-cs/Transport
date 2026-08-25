@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### 💥 删除 `HandlerLoop` 与 `DropReason::kNoHandlerConfigured`(ADR-0009 D2 收尾,#163)
+
+> ADR-0009 初稿称二者"因 `DdsNode` 仍在用而暂留",**该前提经核对不成立**:`src/node/DdsNode.cpp` 调用着 `MarkRunning()` / `transport_->Read()` / `transport_->Write()` / `SignalClose()` 四个已被 ADR-0006/0008 删除的接口,且**不在库源文件清单内**——它是重设计之前的代码而非活着的使用者。`HandlerLoop` 在当时的编译面里生产端与测试端**均无使用者**。
+
+- **💥 破坏性** 移除 `include/transport/node/HandlerLoop.hpp`(整件)及 `tests/handler_loop_test.cpp`。入站业务的消费样板改由调用方自行编写(`Subscribe` + 自有 fiber,见 ADR-0009 D2)。
+- **💥 破坏性** 移除枚举值 `DropReason::kNoHandlerConfigured` 与 `DropReasonName` 的对应分支——**丢弃归因由六项减为五项**。ADR-0009 D1 之后"未设 handler"这一产生时刻已不存在。
+- **保留**(位于未编译文件中,随 `DdsNode` 复活/重写票处置):`DdsHandlerContext` 与 `DdsNode` 侧的同名观测访问器。
+- **验证** 全量 115 tests `--gtest_repeat=5` 五轮全绿,与基线一致;构建零警告。净删约 490 行。
+- **文档** ADR-0009 D2/D5/D6 更正错误前提;SRS §3.2.2 接口变更登记与 §3.6 归因清单(六项→五项);SDD DD-3/DD-4、`CSC_NODE` 组成与相关图例;`arch-class` / `sdd-csc-node` / `sdd-csc-layers` 三图的 `.mmd` 已更新,**`.svg` 待重渲染**(本机 node/chrome 已随环境变更移除)。
+
 ### 重设计:传输/节点接口收窄、请求关联改为按键分配、手搓同步件一律换用 AsyncTask 原语(ADR-0008)
 
 > **破坏性变更。** 依 ADR-0008,`ITransport` / `NodeBase` / `ProtocolNode` 的接口面一次性重画,六个与 AsyncTask 重复的手搓件删除。当前编译面收窄为 **UDP + ProtocolNode**;TCP / 串口 / DDS 及其节点按同一形态后续跟进。全量 **112 tests** 通过(`--gtest_repeat=6` 无抖动)。
