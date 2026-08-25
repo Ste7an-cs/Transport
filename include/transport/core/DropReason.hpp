@@ -16,7 +16,7 @@
 
 namespace transport {
 
-/// @brief 框架本地丢弃/重复抑制的命名归因原因(六项,穷尽 CONTEXT.md「丢弃归因」)。
+/// @brief 框架本地丢弃/重复抑制的命名归因原因(五项,穷尽 CONTEXT.md「丢弃归因」)。
 ///
 /// 每项恰好一个归属组件 + 一个定义时刻(ADR-0003 D13 Q3 可审计表):
 /// - `kBusinessQueueOverflow`   -> `BoundedQueue::Push` 满
@@ -24,11 +24,13 @@ namespace transport {
 /// - `kBadFrame`                -> 各 node 读循环 `codec.Decode` 失败
 /// - `kUnmatchedOrLateResponse` -> 各 node `Dispatch` 的 `PendingTable::Resolve` 返回 false
 /// - `kCloseDrop`               -> `NodeBase` 收敛 drain
-/// - `kNoHandlerConfigured`     -> 各 node `Dispatch` 未设 handler
 ///
-/// 原第七项「连接代际隔离丢弃」(`ProtocolNode` reactor 断连收敛)随 ADR-0004 D3
+/// 原「连接代际隔离丢弃」(`ProtocolNode` reactor 断连收敛)随 ADR-0004 D3
 /// **撤销连接代际隔离**而移除:交互层不再于断链时清空旧链路排队业务,该归因项的产生
 /// 机制已不存在。
+///
+/// 原 `kNoHandlerConfigured`(各 node `Dispatch` 未设 handler)随 ADR-0009 **废止内建
+/// handler 通道**而移除:入站业务改由订阅承载,"未设 handler"这一产生时刻不复存在。
 ///
 /// `HandlerExceptionCount`(处理器执行失败)**不进本口径**——RT_HANDLER_006 是隔离当前
 /// 事件语义,不是帧/响应未投递。
@@ -38,7 +40,6 @@ enum class DropReason {
   kBadFrame,
   kUnmatchedOrLateResponse,
   kCloseDrop,
-  kNoHandlerConfigured,
 };
 
 /// @brief 返回 `DropReason` 的稳定短名,供 Trace `message`/日志复用。
@@ -58,8 +59,6 @@ enum class DropReason {
       return "unmatched-or-late-response";
     case DropReason::kCloseDrop:
       return "close-drop";
-    case DropReason::kNoHandlerConfigured:
-      return "no-handler-configured";
   }
   return "unknown";
 }

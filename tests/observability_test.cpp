@@ -3,7 +3,7 @@
 // (ADR-0003 D13 Q2/Q3、RT_TRACE_001/002、RT_DATA_BUFFER)
 //
 // 覆盖:
-//  - DropReason 六项枚举值完整可用,DropReasonName 稳定可辨识、互不相同。
+//  - DropReason 五项枚举值完整可用,DropReasonName 稳定可辨识、互不相同。
 //  - RecordDrop:计数器恰好 +1;配 sink 收到一条可辨识出 reason 的 TraceEvent;
 //    sink == nullptr 时无副作用(仅计数)。
 //  - RecordEvent:配 sink 收到对应事件;sink == nullptr 时是空操作。
@@ -37,12 +37,13 @@ using transport::TraceLevel;
 
 namespace {
 
-// 六项 DropReason,与 ADR-0003 D13 Q2 taxonomy 一一对应(原第七项「连接代际隔离
-// 丢弃」随 ADR-0004 D3 撤销代际隔离而移除)。
+// 五项 DropReason,与 ADR-0003 D13 Q2 taxonomy 一一对应(「连接代际隔离丢弃」随
+// ADR-0004 D3 撤销代际隔离而移除;`kNoHandlerConfigured` 随 ADR-0009 废止内建
+// handler 通道而移除——入站业务改由订阅承载,"未设 handler"的产生时刻已不存在)。
 constexpr DropReason kAllReasons[] = {
     DropReason::kBusinessQueueOverflow, DropReason::kDdsHandoffOverflow,
     DropReason::kBadFrame,              DropReason::kUnmatchedOrLateResponse,
-    DropReason::kCloseDrop,             DropReason::kNoHandlerConfigured,
+    DropReason::kCloseDrop,
 };
 
 std::string ReadFile(const std::string& path) {
@@ -55,7 +56,7 @@ std::string ReadFile(const std::string& path) {
 
 }  // namespace
 
-TEST(DropReasonTest, SixValuesAreDistinctAndUsable) {
+TEST(DropReasonTest, FiveValuesAreDistinctAndUsable) {
   std::set<std::string_view> names;
   for (DropReason reason : kAllReasons) {
     // 每项都可构造、可比较、可转成稳定短名。
@@ -64,7 +65,7 @@ TEST(DropReasonTest, SixValuesAreDistinctAndUsable) {
     EXPECT_NE(name, "unknown");
     names.insert(name);
   }
-  EXPECT_EQ(names.size(), 6u) << "六项 DropReasonName 应互不相同";
+  EXPECT_EQ(names.size(), 5u) << "五项 DropReasonName 应互不相同";
 }
 
 TEST(RecordDropTest, IncrementsCounterExactlyOnceWithoutSink) {

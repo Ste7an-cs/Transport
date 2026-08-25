@@ -29,9 +29,9 @@
  *    即多协程 join)。
  *
  * **协议特有的实事经三个钩子交给子类**:`DoStart()`(含配置校验;transport.Start + spawn
- * 读循环 / handler)、`DoClose()`(发出全部汇合信号)、`DoJoin()`(join 自己 spawn 的全部
+ * 读循环)、`DoClose()`(发出全部汇合信号)、`DoJoin()`(join 自己 spawn 的全部
  * fiber)。基类一律不触及协议类型:本头文件不 include 任何协议 / 消息类型,也不持有任何
- * 队列——`HandlerLoop` 是**可选件**,由 node 持有。
+ * 队列——入站业务的排队与消费由订阅侧承载(ADR-0009),由 node 自己持有。
  *
  * 同步纪律(ADR-0003 D8):生命周期状态由一把 `std::mutex` 守,**持锁期间不调任何钩子、
  * 不出现挂起点**;`DoStart()` / `DoClose()` / `DoJoin()` 全在锁外调用。
