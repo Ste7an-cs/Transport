@@ -242,7 +242,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![交互模式时序图](diagrams/seq-interaction-modes.svg)
 
-**图例说明（ADR-0010 / RT_NODE_002_a..e）**：四种模式各一个方法，**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；④ 的确认帧**完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
+**图例说明（ADR-0010 / RT_NODE_002_a..g）**：四种模式各一个方法，**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；④ 的确认帧**完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
 
 #### 4.3.1 接口标识和接口图
 
@@ -408,7 +408,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 > - **`session_id` 简化为自增计数器**：`std::uint8_t` 每次取用后自增、越过 255 自然回绕。0..255 空闲集、FIFO 退休窗口、RAII 租约与 `kResourceExhausted` 边界一并删除（推翻 RT_REQUEST_005/006）。
 > - **八个观测接口全部删除**，丢弃只经 `ITraceSink` 上报。
 > - 公开面收为 5 个：构造 / 析构 / `Request(Message, milliseconds)` / `Send(Message)` / `Subscribe(Key)`，另继承基类的四个生命周期方法。
-> - **新增（ADR-0010，2026-08-26）**：三个交互模式方法 `RequestForResponse` / `RequestForResult` / `RequestForResultAndConfirm`（见下"交互模式"）。`Request` 与 `Send` 本轮保留（ADR-0010 **D10**），其与新接口的语义重叠推迟处置。
+> - **新增（ADR-0010，2026-08-26）**：三个交互模式方法 `RequestForResponse` / `RequestForResult` / `RequestForResultDirect`（见下"交互模式"）。`Request` 与 `Send` 本轮保留（ADR-0010 **D10**），其与新接口的语义重叠推迟处置。
 
 **单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ICodec`+`Dispatcher`（**ADR-0009**：不再组合 `HandlerLoop`）、**按引用借用** `ITransport`，协议特有语义全内联本类；DdsNode 复用同套基座仅换键字段（D10 实证）。
 
@@ -419,13 +419,15 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **键派生**（ADR-0008 D6 后）：无独立策略件——`Dispatcher` 的键提取函数在 `ProtocolNode` 构造期以一行 lambda 给出：`make_tuple(session_id, message_id, frm_type)`。~~`CorrelationKeyStrategy`、`ProtocolKey`、`kResponseMarker` 与"响应键清标记位归一化"~~ 均已删除。
 - **session_id**（ADR-0008 D7 后）：`std::uint8_t next_session_` 自增计数器，`NextSession()` 取用后自增、越过 255 自然回绕。~~空闲集 `deque<uint8>`、`pop_front` 取最久释放者、FIFO 退休窗口、`SessionLease` RAII 归还、256 全在途返 `kResourceExhausted`~~ 均已删除；**在途超过 256 时标识重复**，两个订阅落入同一桶、一条响应同时投给二者（SRS RT_REQUEST_MOT_2 已记该边界）。
 - **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。`kResponse`/`kResult`=响应帧未命中时仍归因 `kUnmatchedOrLateResponse`；**业务帧无人认领则静默丢弃、不归因**（订阅模型下无订阅者是常态而非异常，见 SRS §3.1.5.4）。
-- **交互模式（ADR-0010，RT_NODE_002_a..e）**：四种模式各一个方法，**模式不作参数、不入节点状态**——状态机的阶段、已发送次数与原始命令帧全是该方法的局部变量，活在**调用方 fiber 的栈**上，故节点无"在途交互表"、`Dispatcher` 不认识模式。各方法的公共骨架：
+- **交互模式（ADR-0010，RT_NODE_002_a..g）**：四种模式各一个方法，**模式不作参数、不入节点状态**——状态机的阶段、已发送次数与原始命令帧全是该方法的局部变量，活在**调用方 fiber 的栈**上，故节点无"在途交互表"、`Dispatcher` 不认识模式。各方法的公共骨架：
   1. 取 `session_id` → 盖章；
   2. **发命令之前**同时登记两个订阅 `{sid, mid, kResponse}` 与（③④）`{sid, result_mid, kResult}`——`kResult` 可能先于 `kResponse` 到达，等收到受理再登记会丢帧（**D4**）；
   3. 第一阶段：发帧 → 等 `kResponse`，超时则**重发字节完全相同的原帧**（`session_id` 不变，**D3**），至多 `max_attempts` 次；耗尽返 **`kNotAccepted`**（**D12**）；
   4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，按 `kUnmatchedOrLateResponse` 归因；
   5. ③④ 第二阶段：等 `kResult`，超时返 `kTimeout`，**不重发**（**D2/D5**：`kResult` 未达意味着对端正在执行）；
-  6. ④ 收到 `kResult` 后回一帧确认，该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**不得走 `Send()`**（它会强制盖新 `session_id` 与 `kCommand`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
+  6. `RequestForResult` 收到 `kResult` 后回一帧回应（**该模型固有的最后一步**），该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**不得走 `Send()`**（它会强制盖新 `session_id` 与 `kCommand`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
+
+  7. **`RequestForResultDirect`（另一种协议）**：无受理阶段——登记 `{sid, result_mid, kResult}` 一个订阅，发命令后**直接等结果**，超时即**重发**（与 3 同法），耗尽返 `kTimeout`；收到即成功，**不回应**。其"等结果可重发"与 `RequestForResult` 的"等结果不重发"并存——后者是**外部系统协议**的约束，非框架普遍规则（**D13**）。
 
   **实现注记**：重发的帧字节完全相同，可编码一次重复写出，不必每次 `Encode`。
   **接收侧不建模**（**D9**）：节点收到 `kCommand` 后如何应答由宿主 `Subscribe` 自理，框架不提供对应辅助。
@@ -483,7 +485,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | MS_CLOSE / MS_NODE_LIFECYCLE | 执行方案 | RT_LIFECYCLE_001/003–007 | §4.2.5、§4.2.7 |
 | MS_TRANSPORT_PUMP | 执行方案 | RT_TRANSPORT_008/010、RT_IF_UDP、RT_LIFECYCLE_008 | §4.2.11 |
 | MS_LINK_DOWN / MS_CONNECTION | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008、RT_LIFECYCLE_002 | §4.2.6、§4.2.8 |
-| MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..e | §4.2.11 |
+| MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..g | §4.2.11 |
 | MS_TICKET | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.10 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
@@ -495,7 +497,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | CSU_DISPATCHER | 详细设计 | RT_REQUEST_001..004、RT_IN_INTERFACE_004、RT_DESIGN_008 | §5.2 |
 | ~~CSU_BOUNDEDQUEUE~~ | 已删除（ADR-0008 D8） | RT_DATA_BUFFER 的上界与归因**不再满足**；原 RT_HANDLER_004 已由 RT_INBOUND_003 承接（改由结构保证，不依赖队列上界） | §5.3 |
 | CSU_NODEBASE | 详细设计 | RT_LIFECYCLE、RT_NODE_003、RT_DESIGN_008 | §5.4 |
-| CSU_PROTOCOLNODE | 详细设计 | RT_REQUEST、RT_NODE_002_a..e、RT_NODE_003、RT_INBOUND、RT_TCP_RECONNECT | §5.5 |
+| CSU_PROTOCOLNODE | 详细设计 | RT_REQUEST、RT_NODE_002_a..g、RT_NODE_003、RT_INBOUND、RT_TCP_RECONNECT | §5.5 |
 | CSU_DDSNODE | 详细设计 | RT_NODE_004/005/007、RT_IF_DDS、RT_REQUEST | §5.5 |
 | CSU_IO | 详细设计 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_NODE_006、RT_IF_* | §5.6 |
 | CSU_CODEC | 详细设计 | RT_CODEC、RT_IF_SYSFRAME | §5.7 |
@@ -512,7 +514,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 TBD-009** |
 | RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、MS_CONNECTION |
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
-| RT_NODE_002_a..e（四种交互模式，ADR-0010） | CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
+| RT_NODE_002_a..g（四种交互模式，ADR-0010） | CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
 | RT_TCP_RECONNECT_001..005 | DD-11、DD-12 / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、MS_CONNECTION |
 | RT_TCP_RECONFIG_001..006 | CSU_IO（TcpClientTransport::ApplyConfig） |
 | RT_ERROR_001..003 | DD-5 / CSC_CORE / CSU_CORE |

@@ -33,7 +33,7 @@ sequenceDiagram
     end
 
     rect rgb(251, 246, 239)
-        Note over C,P: ③ RequestForResult（withfeedback）
+        Note over C,P: ③ RequestForResult（withfeedback ＝ needfeedback，同一模型）
         C->>N: RequestForResult(req, retry, result_mid, result_timeout)
         N->>D: Subscribe {sid, mid, kResponse}
         N->>D: Subscribe {sid, result_mid, kResult}
@@ -46,19 +46,27 @@ sequenceDiagram
         N->>N: 等 kResult（result_timeout，【不重发】D2）
         P-->>D: kResult
         D-->>N: 阶段二完成
+        N->>T: AsyncWrite(kResponse) 回应结果
+        Note over N,T: 该模型【固有的最后一步】，非可选：<br/>= 收到的 kResult 帧原样改帧类型<br/>payload 回显 · sid/mid 不变 · 仅 frm_type→kResponse · CRC 由 Encode 重算<br/>不走 Send()（它会强制盖新 session_id 与 kCommand）—— 走私有 EncodeAndWrite（D8）
+        T-->>P: kResponse
         N-->>C: 成功 · 返回 kResult 帧 Message
-        Note over N,C: 阶段二超时 ⇒ kTimeout（区别于 kNotAccepted）
+        Note over N,C: 等结果阶段超时 ⇒ kTimeout（【不重发】D2）<br/>受理阶段耗尽 ⇒ kNotAccepted（D12）
     end
 
     rect rgb(250, 240, 234)
-        Note over C,P: ④ RequestForResultAndConfirm（needfeedback）= ③ + 我方回确认<br/>签名与 ③ 相同 —— 确认帧无调用方参数
-        Note over C,N: ……前两阶段同 ③……
+        Note over C,P: ④ RequestForResultDirect（【另一种协议】）—— 无受理阶段
+        C->>N: RequestForResultDirect(req, retry, result_mid)
+        N->>D: Subscribe {sid, result_mid, kResult}
+        Note over N,D: 只有一个订阅 —— 本交互不存在受理帧
+        loop 至多 max_attempts 次
+            N->>T: AsyncWrite(kCommand)
+            T-->>P: kCommand
+            N->>N: 等 kResult（timeout）
+        end
         P-->>D: kResult
-        D-->>N: 阶段二完成
-        N->>T: AsyncWrite(kResponse) 确认帧
-        Note over N,T: 确认帧 = 收到的 kResult 帧【原样改帧类型】：<br/>payload 回显 · sid/mid 不变 · 仅 frm_type→kResponse · CRC 由 Encode 重算<br/>不走 Send()（它会强制盖新 session_id 与 kCommand）—— 走私有 EncodeAndWrite（D8）
-        T-->>P: kResponse
-        N-->>C: 成功 · 返回 kResult 帧 Message
+        D-->>N: 收到即成功
+        N-->>C: 成功 · 返回该帧 Message（【不回应】）
+        Note over N,C: 耗尽 ⇒ kTimeout（非 kNotAccepted —— 本交互无受理这一步，D12）<br/>本交互【在等结果阶段重发】：与 ③ 的"等结果不重发"并存不矛盾<br/>后者是【外部系统协议】的约束，非框架普遍规则（D13）
     end
 
     Note over C,P: 接收侧（收到 kCommand 后如何应答）不建模，由宿主 Subscribe 自理（D9）<br/>repeating 本轮不定义（D11）
