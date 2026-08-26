@@ -12,9 +12,9 @@
  * **入站只有一条通路:订阅**(ADR-0009 D1 / RT_INBOUND_001)。读循环解出的每条消息一律交
  * `Dispatcher` 按键投递给全部匹配的订阅者,各得一份副本;节点**不再内置**"入站业务处理器"
  * 通道,也不再持有第二条业务队列与第二条消费者 fiber。请求-响应的关联与入站业务的取用
- * 因此是同一套机制的两种用法:前者由 `Request` 内部按"同会话、同命令码、帧类型为回应"
- * 临时登记,后者由宿主经公开的 `Subscribe(Key)` 长期登记,在**自己的 fiber** 上消费自己的
- * 信箱。
+ * 因此是同一套机制的两种用法:前者由各 `RequestFor*` 内部按"同会话、同命令码、帧类型为
+ * 回应"临时登记,后者由宿主经公开的 `Subscribe(Key)` 长期登记,在**自己的 fiber** 上
+ * 消费自己的信箱。
  *
  * **串行、异常隔离与背压是调用方契约**(ADR-0009 D3 / RT_INBOUND_005):一条 fiber 顺序消费
  * 即得串行,需要并发就自己起多条;消费代码的逃逸异常须自行 `try/catch`;队列容量即订阅
@@ -50,7 +50,7 @@
  * **无观测接口**:各类丢弃与时延一律只经 `config.trace_sink` 上报(`RecordEvent`),不再
  * 有计数器成员与其 getter。要统计就在 sink 里统计——一个事实一条出口。
  *
- * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:`Request` 运行于调用方
+ * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
  * fiber,读-分发循环运行于自持 fiber,二者同线程且仅在挂起点交错,而 session 取用与投递
  * 路径内均无挂起点,故普通成员不加锁。
  */
@@ -112,7 +112,7 @@ struct RetryPolicy {
 struct ProtocolNodeConfig {
   std::uint8_t protocol_id = 0;
   /**
-   * 默认请求总超时(SRS §3.1.4.4):`Request` 未显式给出时限时以本值补齐。节点不接受
+   * 默认请求总超时(SRS §3.1.4.4):调用方未显式给出时限时以本值补齐。节点不接受
    * "永不超时"的请求——链路断开不终结在途请求(重连对交互层透明),写出又是
    * fire-and-forget 而不回传失败,故时限是在途请求唯一的兜底终结源;缺失该终结源的请求
    * 将挂至节点关闭,与 RT_REQUEST_003"每个请求恰好终结一次"冲突。
@@ -166,24 +166,6 @@ class ProtocolNode : public NodeBase {
   ProtocolNode& operator=(const ProtocolNode&) = delete;
 
   /**
-   * @brief 交付一次 needresponse 请求-响应。
-   *
-   * 调用方给出 payload 与 message_id;本节点盖 `frm_type=kCommand`、默认 protocol_id,
-   * 并取用下一个 session_id,随后**先登记回应订阅、再编码发出**,最后在订阅凭据上等待
-   * 唯一响应。请求终结后订阅随凭据析构自动注销。
-   *
-   * 写出为 fire-and-forget:交给传输即返回,不等待实际发出、也无从得知是否发出成功,
-   * 因此 `timeout` 是本调用唯一的兜底终结源,不接受"永不超时"。节点关闭后返 kClosed。
-   *
-   * @param req     请求 Message(payload + message_id 由调用方填)。
-   * @param timeout 本次请求的总超时,自进入本函数起算,涵盖取用 session、登记订阅、编码、
-   *                入队与等待响应的全部时间。零值表示套用 `config.default_request_timeout`。
-   * @return 匹配到的响应 Message,或机器可判别错误(kClosed / kTimeout / 编码错误等)。
-   */
-  [[nodiscard]] Coro::Result<Message> Request(Message req,
-                                        std::chrono::milliseconds timeout = {});
-
-  /**
    * @brief 交付一次 `needresponse` 交互:命令 → 等受理回应,超时重发(ADR-0010 D2 ②)。
    *
    * ```
@@ -192,9 +174,10 @@ class ProtocolNode : public NodeBase {
    * ← kResponse                                ⇒ 成功(返回该帧)
    * ```
    *
-   * 与 `Request` 的差别(ADR-0010 D10 已记:二者语义相近而不相同,合并推迟):`Request` 是
-   * **一次总超时、不重发**,本方法是**每次尝试各一份超时 + 至多 `max_attempts` 次发送**,
-   * 且耗尽时返回的是 `kNotAccepted`(对端**始终没有受理**)而非 `kTimeout`。
+   * 本方法是 needresponse 的**唯一**入口(ADR-0010 D10:旧的 `Request` 已删除,因
+   * `RequestForResponse(req, {timeout, 1})` 完全覆盖其行为——单次尝试时"总超时"与
+   * "单次超时"等价)。耗尽次数时返回的是 `kNotAccepted`(对端**始终没有受理**)而非
+   * `kTimeout`(D12)。
    *
    * 重发的是**字节完全相同**的原帧,`session_id` 不变(D3),故原订阅横跨全部重发继续有效,
    * **最先到达**的那一帧即终结本次交互,框架不区分它对应第几次尝试。由此要求对端能容忍
@@ -378,7 +361,7 @@ class ProtocolNode : public NodeBase {
   /// 取 const 引用:投递只读源消息(命中的订阅者各拷一份副本),本函数不再有"把消息移交
   /// 第二条队列"的分支,故不需要按值取走所有权。
   void Dispatch(const Message& msg);
-  /// @brief 编码 + 交给传输(Request / Send / 两个交互方法共用的出站尾段)。
+  /// @brief 编码 + 交给传输(`Send` 与各 `RequestFor*` 共用的出站尾段)。
   ///        **不盖任何章**——这正是 D8 的回应结果帧走本函数而非 `Send()` 的原因。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
 
@@ -415,8 +398,8 @@ class ProtocolNode : public NodeBase {
   /// 读-分发循环的结构化并发句柄;`DoJoin()` 让出式 join 之。
   std::shared_ptr<Coro::FiberTask<void>> read_task_;
 
-  /// 入站的**唯一**投递路径:`Request` 与宿主的 `Subscribe` 都在此登记,读循环收到消息后
-  /// 按键投给全部匹配的订阅者。
+  /// 入站的**唯一**投递路径:各 `RequestFor*` 与宿主的 `Subscribe` 都在此登记,读循环收到
+  /// 消息后按键投给全部匹配的订阅者。
   MessageDispatcher dispatcher_;
 
   /// 下一个待取用的 session_id;每次取用后自增,越过 255 自然回绕。
