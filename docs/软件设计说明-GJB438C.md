@@ -242,7 +242,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![交互模式时序图](diagrams/seq-interaction-modes.svg)
 
-**图例说明（ADR-0010 / RT_NODE_002_a..g）**：四个方法分属**两种协议**——`Send`/`RequestForResponse`/`RequestForResult` 属外部系统协议（其中 `withfeedback` 与 `needfeedback` 为**同一模型**，合用 `RequestForResult`），`RequestForResultDirect` 属另一种协议。**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；④ 的确认帧**完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
+**图例说明（ADR-0010 / RT_NODE_002_a..g）**：四个方法分属**两种协议**——`Send`/`RequestForResponse`/`RequestForResult` 属外部系统协议（其中 `withfeedback` 与 `needfeedback` 为**同一模型**，合用 `RequestForResult`），`RequestForResultDirect` 属另一种协议。**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；`RequestForResult` **末尾的回应帧完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）——注意 `RequestForResultDirect` **不回应任何帧**，二者相反。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
 
 #### 4.3.1 接口标识和接口图
 
