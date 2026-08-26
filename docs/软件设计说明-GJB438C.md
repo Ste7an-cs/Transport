@@ -86,12 +86,16 @@
 
 **图例说明**：实线箭头读作"A 使用/组合 B"，虚线为可选依赖。`CSC_NODE` 组合 `CSC_CODEC`+`CSC_IO`、依赖 `CSC_CORE`；`CSC_CODEC`/`CSC_IO` 各依赖 `CSC_CORE`；全体运行于 `AsyncTask`；`CSC_IO` 的 Qt socket/串口依赖在宿主未启用 Qt 时不编译。整体单向依赖、上层不被下层反向引用。总体类关系见附图 `arch-class.svg`（`ITransport`/`ICodec`/node/core 的组合 ▷ 与实现 △）。
 
+框内标注了**当前编译面**：`CSC_IO` 仅 `UdpTransport` 一个实现在编译面内，TCP/串口/DDS 与 `TcpServer` 待按 ADR-0007 的新形态跟进；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
+
+> **变更（ADR-0006/0008/0009）**：`CSC_CORE` 框原列 `Result/Status`、`Cancellation`、`SharedCompletion` 三项——`Result`/`Status` 本就只是别名、已随 `core/Result.hpp` 删除（改用 `Coro::Result`），`SharedCompletion` 已删除（改用 `Awaitable::close()` 广播 + `FiberTask::get()` 汇合）。`Cancellation` **文件仍在且随库编译、亦有自己的测试**，但 ADR-0006 D3 取消令牌退化为时限之后，**库的活代码里已无使用者**，故在框内标注其性质而非直接抹去。`Dispatcher` 原被同时画进 `CSC_NODE`——它实际位于 `core/`，已归入 `CSC_CORE` 一处。
+
 | 部件 | 目录 | 主要内容 | 响应需求 |
 |---|---|---|---|
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`TcpClientTransport`、`TcpServer`、`IDdsProvider` | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
-| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、`Dispatcher`；`DdsNode`、`DdsHandlerContext`（未编译的历史代码，待复活重写）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
+| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`；`DdsNode`、`DdsHandlerContext`（未编译的历史代码，待复活重写）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
@@ -117,7 +121,7 @@
 
 - **用途**：逻辑 `Message` ↔ 线缆字节的分帧、序列化、校验、重同步；应用可提供并装配的公共扩展点。响应 RT_CODEC_*、RT_IF_SYSFRAME。
 - **主要内容**：接口 `ICodec`（`Encode` 一对一 / `Decode` 0..N）；实现 `SystemCodec`（外部协议流式，占位帧常量）、`DatagramCodec`（报文式保边界）、`DdsCodec`（DDS 元数据，无状态并发）、`LengthFieldCodec`（长度字段分帧基元）。
-- **关系与结构**：依赖 CSC_CORE（`Message`/`Result`）；被 CSC_NODE 组合（node 持 `unique_ptr<ICodec>`）。结构简单，无独立类图，详见 §5.5。
+- **关系与结构**：依赖 CSC_CORE（`Message`/`Coro::Result`）；被 CSC_NODE 组合（node 持 `unique_ptr<ICodec>`）。结构简单，无独立类图，详见 §5.5。
 
 #### 4.1.4 交互层部件（CSC_NODE）
 
@@ -130,7 +134,9 @@
 
 ![CSC_NODE 类图](diagrams/sdd-csc-node.svg)
 
-**图例说明**：`ProtocolNode`/`DdsNode` **继承 `NodeBase`**（基类管幂等与汇合，子类实现 `DoStart`/`DoClose`/`DoJoin`），并组合 `Dispatcher`（~~`HandlerLoop` 已随 ADR-0009 于 #163 删除~~）（不共享交互引擎）。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。订阅信箱直接用 `Coro::Awaitable`（原 `BoundedQueue` 与 `HandlerLoop` 均已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
+**图例说明**：`ProtocolNode`/`DdsNode` **继承 `NodeBase`**（基类管幂等与汇合，子类实现 `DoStart`/`DoClose`/`DoJoin`），并组合 `Dispatcher`（~~`HandlerLoop` 已随 ADR-0009 于 #163 删除~~）（不共享交互引擎）。`ProtocolNode` 的公开面即三个交互模式方法加 `Send`/`Subscribe`（ADR-0010；`Request` 已随 **D10** 删除），私有的 `AwaitAccept()` 是受理阶段的共用骨架。
+
+> **`DdsNode` 与 `DdsHandlerContext` 已在图中标注为「未编译的历史代码」**。二者调用着 `MarkRunning()`、`transport_->Read()/Write()`、`SignalClose()` 等**已被 ADR-0006/0008 删除**的接口，且不在库源文件清单内——是重设计**之前**的代码，**不是活着的使用者**（该核实正是 ADR-0009 D2 得以删除 `HandlerLoop` 的依据）。旧图未加此标注，易被读成当前架构的一部分。`DdsNode::Request` 签名里的 `options` 是已删除的 `OperationOptions`，随其整体复活/重写时一并处置。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。订阅信箱直接用 `Coro::Awaitable`（原 `BoundedQueue` 与 `HandlerLoop` 均已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
 
 ### 4.2 执行方案
 
@@ -148,21 +154,26 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.2 顶层数据流（MS_DFD_TOPLEVEL）
 
-分解为 5 个加工（P1–P5）与 3 个数据存储（D1–D3）。
+分解为 5 个加工（P1–P5）与 4 个数据存储（D1–D4）。
 
 **图 4-5（`dfd-toplevel`）**
 
 ![顶层数据流图](diagrams/dfd-toplevel.svg)
 
-**图例说明**：一条请求-响应/业务帧的完整走向——**P1 出站**盖章+Encode+AsyncWrite，先在 D1 登记订阅、取用 D3 的 session_id；**P2 入站读循环** await 读订阅 + Decode + Dispatch，D1 按键投给全部匹配的订阅者、各得一份；命中即唤醒 P1 的 `Ticket.Wait` 交回结果；**P4 业务处理**从 D2 取出交单消费者 handler，handler 可经 P1 回送；**P5 生命周期**驱动 D1 的 `CloseAll` 与 D2 的 Close。
+**图例说明**：一条请求-响应/业务帧的完整走向——**P1 出站**（跑在**调用方 fiber** 上）盖章、在 D1 登记订阅、取用 D3 的 session_id，Encode 后 `AsyncWrite` 入 D4 的写队列即返（**fire-and-forget**）；**P2 入站读循环**（节点自有 fiber）从 D4 的读队列 `await(rx_)` 取 `Datagram` 并 Decode；**P3 按键分配**查 D1，投给全部键匹配的订阅者、**各得一份副本**进入 D2 的信箱。命中即唤醒 P1 的 `Ticket.Wait` 交回结果；业务帧则由 **P4**——**宿主自有 fiber**，非节点内置——`await` 信箱取出消费。**P5 生命周期**：`Close()` 只发信号，`WaitClosed()` 才 join；对 D1 施以 `CloseAll(error)` 唤醒全部在等的订阅者。
+
+**投递份数为 0** 时才分流：终结帧归因 `kUnmatchedOrLateResponse`，其余业务帧**静默丢弃、不归因**（无订阅者是常态，ADR-0009 D5）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
 
 **数据存储说明：**
 
 | 存储 | 实现 | 读者 ← 写者 | 一致性保护 |
 |---|---|---|---|
-| D1 订阅索引 | `Dispatcher`：`map<Mask, map<Values, vector<Entry{Awaitable<T> mailbox}>>>` | P1 等待者 ← P2 Dispatch / P5 CloseAll | 无锁（单线程 fiber 协作，ADR-0008 D9）；凭据生存期即仲裁 |
-| D2 业务队列 | `Coro::Awaitable<Message>` + `setCapacity` | P4 消费者 await ← P2 push | `FiberChannel` 自守；满则**静默丢最旧**（无归因，#152） |
-| D3 交互状态 | session 空闲集 `deque<uint8>`（**连接代际已移出交互层**，ADR-0004 D3） | node 各方法 | 一把 `std::mutex`（node 私有） |
+| D1 订阅索引 | `Dispatcher`：`map<Mask, map<Values, vector<Entry{Awaitable<T> mailbox}>>>` | P3 分配时查 ← P1 Subscribe / P5 CloseAll | 无锁（单线程 fiber 协作，ADR-0008 D9）；凭据生存期即仲裁 |
+| D2 订阅信箱 | `Coro::Awaitable<Message>` + `setCapacity`（每个 `Ticket` 一个） | P1 等待者 / P4 宿主消费 fiber ← P3 投递 | `FiberChannel` 自守；满则**静默丢最旧**（无归因，#152） |
+| D3 session_id 计数器 | `std::uint8_t` 自增回绕 | P1 各交互方法 | 无——单线程 fiber 协作，取用不会失败 |
+| D4 传输读/写双队列 | `UdpTransport` 的泵持有（ADR-0007 D1） | P2 `await(rx_)` / socket 写泵 ← socket 读泵 / P1 `AsyncWrite` | `FiberChannel` 自守；有界，满则丢最旧 |
+
+> **变更（ADR-0008 D8 / ADR-0009 / #163）**：原 **D1 在途请求表 `PendingTable`**、**D2 业务队列 `BoundedQueue`**、**D3 session 空闲集 `deque<uint8>` + 私有 `std::mutex`** 三者**均已删除**——分别由 `Dispatcher` 的按键索引、`Ticket` 各自的 `Awaitable` 信箱、自增回绕计数器取代（自增回绕的边界代价：**超 256 个在途标识会重复**，见 §5.6）。原图中**未与任何加工连线的孤立加工 P3「请求关联」**已重定义为 `Dispatcher` 的按键分配并接入数据流；原 P4「业务交付」经 `ctx.Send / Reply` 回送 P1 的虚线随 handler 通道废止而删除。新增 **D4** 显式画出传输层的读/写双队列——旧图把它隐含在 P1/P2 内部，看不出 `AsyncWrite` 是**入队即返**。
 
 #### 4.2.3 请求-响应节点数据流（MS_NODE_DATAFLOW）
 
