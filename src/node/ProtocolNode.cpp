@@ -151,33 +151,6 @@ Coro::Result<void> ProtocolNode::EncodeAndWrite(const Message& msg) {
   return Coro::Result<void>{};
 }
 
-Coro::Result<Message> ProtocolNode::Request(Message req,
-                                            std::chrono::milliseconds timeout) {
-  if (!IsRunning()) {
-    return make_error_code(TransportErrc::kClosed);  // 未启动 / 关闭中 / 已关闭。
-  }
-  // 总超时自本函数入口起算,涵盖分配 session、登记订阅、编码与入队的全部时间;零值套用
-  // 配置默认值。以下各步均无挂起点,故实际耗时可忽略,但仍按契约扣减。
-  const auto began = std::chrono::steady_clock::now();
-  const auto total = timeout > std::chrono::milliseconds::zero()
-                         ? timeout
-                         : config_.default_request_timeout;
-
-  req.frm_type = FrameType::kCommand;
-  req.protocol_id = config_.protocol_id;
-  req.session_id = NextSession();
-
-  // **先登记订阅、再发出请求**:反之则回应可能先于订阅到达而被丢弃。凭据析构自动注销。
-  auto ticket = dispatcher_.Subscribe(ResponseTo(req));
-  if (auto queued = EncodeAndWrite(req); !queued) {
-    return queued.error();
-  }
-
-  const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - began);
-  return ticket.Wait(spent < total ? total - spent : std::chrono::milliseconds{1});
-}
-
 Coro::Result<void> ProtocolNode::ValidateInteraction(
     const RetryPolicy& retry) const {
   if (!IsRunning()) {

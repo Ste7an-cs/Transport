@@ -54,10 +54,16 @@ namespace {
 
 constexpr std::uint8_t kProtocolId = 0x2A;
 
+/// 本夹具的默认请求时限。`Request` 删除后(ADR-0010 D10)需求-响应一律走
+/// `RequestForResponse`,时限必须显式给出;凡原先不带时限、由
+/// `config.default_request_timeout` 补齐的调用,一律改填本值——与 `BaseConfig()` 所设
+/// 的 200ms 同源,故用例的时限语义不变。
+constexpr auto kDefaultRequestTimeout = 200ms;
+
 ProtocolNodeConfig BaseConfig() {
   ProtocolNodeConfig config;
   config.protocol_id = kProtocolId;
-  config.default_request_timeout = 200ms;
+  config.default_request_timeout = kDefaultRequestTimeout;
   return config;
 }
 
@@ -241,7 +247,9 @@ TEST(ProtocolNode, SessionIdIncrementsAndWrapsAround) {
 TEST(ProtocolNode, RequestIsTerminatedByMatchingResponse) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller = Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010)); });
+  auto caller = Coro::makeTask([&] {
+    reply = fx.node->RequestForResponse(Command(0x0010), {kDefaultRequestTimeout, 1});
+  });
 
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
@@ -255,19 +263,22 @@ TEST(ProtocolNode, RequestIsTerminatedByMatchingResponse) {
   EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{7, 7}));
 }
 
+// 无回应 → 单次尝试耗尽。终结原因是 kNotAccepted 而非 kTimeout(ADR-0010 D12:
+// 受理阶段没等到即"对端始终没有受理"),这是 `Request` 删除后本用例唯一的可观察差异,
+// 时限(80ms)与"一次尝试、不重发"均与原用例一致。
 TEST(ProtocolNode, RequestTimesOutWithoutResponse) {
   Fixture fx;
-  auto reply = fx.node->Request(Command(0x0010), 80ms);
+  auto reply = fx.node->RequestForResponse(Command(0x0010), {80ms, 1});
   ASSERT_FALSE(reply);
-  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kNotAccepted));
 }
 
 // 三个匹配字段任缺其一都不终结该请求。
 TEST(ProtocolNode, ResponseWithMismatchedSessionDoesNotTerminateRequest) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller =
-      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), {120ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
@@ -277,14 +288,15 @@ TEST(ProtocolNode, ResponseWithMismatchedSessionDoesNotTerminateRequest) {
                   FrameType::kResponse)));
   (void)caller.get();
   ASSERT_FALSE(reply);
-  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kNotAccepted))
+      << "不匹配的帧不终结该请求,只能由单次尝试耗尽终结";
 }
 
 TEST(ProtocolNode, ResponseWithMismatchedFrameTypeDoesNotTerminateRequest) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller =
-      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), {120ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
@@ -294,14 +306,15 @@ TEST(ProtocolNode, ResponseWithMismatchedFrameTypeDoesNotTerminateRequest) {
       EncodeFrame(sent.session_id, sent.message_id, FrameType::kResult)));
   (void)caller.get();
   ASSERT_FALSE(reply);
-  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kNotAccepted))
+      << "不匹配的帧不终结该请求,只能由单次尝试耗尽终结";
 }
 
 TEST(ProtocolNode, ResponseWithMismatchedMessageIdDoesNotTerminateRequest) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller =
-      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 120ms); });
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), {120ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
@@ -311,7 +324,8 @@ TEST(ProtocolNode, ResponseWithMismatchedMessageIdDoesNotTerminateRequest) {
                   FrameType::kResponse)));
   (void)caller.get();
   ASSERT_FALSE(reply);
-  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kNotAccepted))
+      << "不匹配的帧不终结该请求,只能由单次尝试耗尽终结";
 }
 
 // 并发的两个请求各自拿到自己的响应:session_id 是二者的唯一区分。
@@ -320,10 +334,12 @@ TEST(ProtocolNode, ConcurrentRequestsAreCorrelatedIndependently) {
   Fixture fx;
   Coro::Result<Message> first = make_error_code(TransportErrc::kInternal);
   Coro::Result<Message> second = make_error_code(TransportErrc::kInternal);
-  auto a = Coro::makeTask(
-      [&] { first = fx.node->Request(Command(0x0010, {0xAA}), 500ms); });
-  auto b = Coro::makeTask(
-      [&] { second = fx.node->Request(Command(0x0010, {0xBB}), 500ms); });
+  auto a = Coro::makeTask([&] {
+    first = fx.node->RequestForResponse(Command(0x0010, {0xAA}), {500ms, 1});
+  });
+  auto b = Coro::makeTask([&] {
+    second = fx.node->RequestForResponse(Command(0x0010, {0xBB}), {500ms, 1});
+  });
 
   ASSERT_TRUE(testutil::pumpFiberUntil(
       [&] { return fx.transport.sent().size() >= 2; }, 500));
@@ -376,7 +392,9 @@ TEST(ProtocolNode, MatchedResponseDoesNotReachBusinessSubscriber) {
                       [&seen](const Message& msg) { seen.push_back(msg.frm_type); });
 
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller = Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010)); });
+  auto caller = Coro::makeTask([&] {
+    reply = fx.node->RequestForResponse(Command(0x0010), {kDefaultRequestTimeout, 1});
+  });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
@@ -487,8 +505,8 @@ TEST(ProtocolNode, BusinessFrameIsCopiedToEveryMatchingSubscriber) {
 TEST(ProtocolNode, CloseTerminatesInFlightRequest) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller =
-      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 5000ms); });
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), {5000ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
 
@@ -503,16 +521,18 @@ TEST(ProtocolNode, RequestAndSendRejectedBeforeStartAndAfterClose) {
   ASSERT_TRUE(fake.Start());
   ProtocolNode node(fake, MakeCodec(), BaseConfig());
 
-  EXPECT_EQ(node.Request(Command(0x0001)).error(),
-            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(
+      node.RequestForResponse(Command(0x0001), {kDefaultRequestTimeout, 1}).error(),
+      make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Send(Command(0x0001)).error(),
             make_error_code(TransportErrc::kClosed));
 
   ASSERT_TRUE(node.Start());
   ASSERT_TRUE(node.Close());
   node.WaitClosed();
-  EXPECT_EQ(node.Request(Command(0x0001)).error(),
-            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(
+      node.RequestForResponse(Command(0x0001), {kDefaultRequestTimeout, 1}).error(),
+      make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Send(Command(0x0001)).error(),
             make_error_code(TransportErrc::kClosed));
   (void)fake.Close();
@@ -652,7 +672,8 @@ TEST(ProtocolNode, SubscribeSupportsMultiPhaseInteraction) {
   auto result = fx.node->Subscribe({kAny, 0x03F2, FrameType::kResult});
 
   Coro::Result<Message> ack = make_error_code(TransportErrc::kInternal);
-  auto caller = Coro::makeTask([&] { ack = fx.node->Request(Command(0x0010), 500ms); });
+  auto caller = Coro::makeTask(
+      [&] { ack = fx.node->RequestForResponse(Command(0x0010), {500ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
@@ -678,8 +699,8 @@ TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
   auto audit = fx.node->Subscribe(transport::AnyOfType(FrameType::kResponse));
 
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
-  auto caller =
-      Coro::makeTask([&] { reply = fx.node->Request(Command(0x0010), 500ms); });
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), {500ms, 1}); });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
   const Message sent = DecodeSent(fx.transport, 0);
