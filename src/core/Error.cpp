@@ -24,6 +24,7 @@ class TransportErrorCategory final : public std::error_category {
       case TransportErrc::kResourceExhausted: return "resource exhausted";
       case TransportErrc::kUnsupported: return "unsupported operation";
       case TransportErrc::kInternal: return "internal error";
+      case TransportErrc::kNotAccepted: return "peer did not accept the request";
     }
     return "unknown transport error";
   }

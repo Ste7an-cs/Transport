@@ -92,6 +92,19 @@ using MessageDispatcher =
 /// @brief 任意会话、任意命令码的某类帧,用于旁路监听。
 [[nodiscard]] MessageDispatcher::Key AnyOfType(FrameType type);
 
+/**
+ * @brief 一次交互中**受理阶段**的重发策略(ADR-0010 D6 / RT_NODE_002_e)。
+ *
+ * 逐次调用传入而**不进节点配置**:两阶段的等待是数量级不同的量(第一阶段等"对端受理",
+ * 第二阶段等"对端执行完"),且同一节点上不同命令的耐受度不同,不宜由节点级配置一刀切。
+ */
+struct RetryPolicy {
+  /// 单次尝试的等待时长;须为正值,否则调用返 kInvalidArgument。
+  std::chrono::milliseconds timeout{};
+  /// 总发送次数(**含首发**);须 ≥ 1,否则调用返 kInvalidArgument。
+  int max_attempts = 1;
+};
+
 /// ProtocolNode 配置:默认外部协议 id + 默认请求超时 + 可选 Trace 出口。
 ///
 /// 入站业务不在配置面上——它由宿主经 `Subscribe(Key)` 自行登记(ADR-0009 D1),故本结构
@@ -169,6 +182,67 @@ class ProtocolNode : public NodeBase {
    */
   [[nodiscard]] Coro::Result<Message> Request(Message req,
                                         std::chrono::milliseconds timeout = {});
+
+  /**
+   * @brief 交付一次 `needresponse` 交互:命令 → 等受理回应,超时重发(ADR-0010 D2 ②)。
+   *
+   * ```
+   * → kCommand
+   * ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
+   * ← kResponse                                ⇒ 成功(返回该帧)
+   * ```
+   *
+   * 与 `Request` 的差别(ADR-0010 D10 已记:二者语义相近而不相同,合并推迟):`Request` 是
+   * **一次总超时、不重发**,本方法是**每次尝试各一份超时 + 至多 `max_attempts` 次发送**,
+   * 且耗尽时返回的是 `kNotAccepted`(对端**始终没有受理**)而非 `kTimeout`。
+   *
+   * 重发的是**字节完全相同**的原帧,`session_id` 不变(D3),故原订阅横跨全部重发继续有效,
+   * **最先到达**的那一帧即终结本次交互,框架不区分它对应第几次尝试。由此要求对端能容忍
+   * 重复命令(幂等,或自行按 session_id 去重)——协议层假设,框架不校验。
+   *
+   * @param req   请求 Message(payload + message_id 由调用方填);本节点盖 kCommand /
+   *              protocol_id / session_id。
+   * @param retry 受理阶段的重发策略,见 RetryPolicy。
+   * @return 受理回应帧;或 kNotAccepted(次数耗尽)、kInvalidArgument(策略非法)、
+   *         kClosed(未启动 / 已关闭)、编码错误。
+   */
+  [[nodiscard]] Coro::Result<Message> RequestForResponse(Message req,
+                                                         RetryPolicy retry);
+
+  /**
+   * @brief 交付一次 `withfeedback` / `needfeedback` 交互(**同一模型**,ADR-0010 D1 修正)。
+   *
+   * ```
+   * → kCommand
+   * ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
+   * ← kResponse(受理)
+   * ⏱ 等 kResult   ──超时──▶ kTimeout(**不重发**)
+   * ← kResult
+   * → kResponse(回应结果 = 该 kResult 帧原样改帧类型)  ⇒ 成功(返回 kResult 那一帧)
+   * ```
+   *
+   * **两个订阅在发出命令之前一起登记**(D4):`kResult` 可能先于 `kResponse` 到达(对端足够
+   * 快),若等收到受理再登记结果订阅,该帧将因无匹配而被丢弃。
+   *
+   * **第二阶段不重发**(D2 / RT_NODE_002_c):`kResult` 未达意味着对端**正在执行**,重发命令
+   * 有使其重复执行的风险;故该阶段超时直接以 `kTimeout` 终结。
+   *
+   * **末尾的回应结果是本模型固有的最后一步、不是可选项**(D8 / RT_NODE_002_f):该帧完全由
+   * 收到的 `kResult` 派生——payload 原样回显、session_id 与 message_id 沿用,**仅**把帧类型
+   * 改为 kResponse,CRC 由 `ICodec::Encode` 重算。它不走 `Send()`(那会强制盖新 session_id
+   * 与 kCommand)。该帧交给传输失败则整次交互返错(只在节点关闭时可能发生)。
+   *
+   * @param req               请求 Message;盖章同 `RequestForResponse`。
+   * @param retry             **受理阶段**的重发策略。
+   * @param result_message_id 结果帧的命令码。它与请求帧**不同**,其对应关系是协议知识,
+   *                          框架不猜、不做映射规则(D7),由调用方给出。
+   * @param result_timeout    等待结果帧的时限;须为正值。
+   * @return 收到的 `kResult` 帧;或 kNotAccepted(受理阶段次数耗尽)、kTimeout(已受理但
+   *         结果超时)、kInvalidArgument、kClosed、编码错误。
+   */
+  [[nodiscard]] Coro::Result<Message> RequestForResult(
+      Message req, RetryPolicy retry, std::uint16_t result_message_id,
+      std::chrono::milliseconds result_timeout);
 
   /**
    * @brief noresponse fire-and-forget 出站:盖章 + 编码 + 交给传输,不期待应答。
@@ -259,8 +333,24 @@ class ProtocolNode : public NodeBase {
   /// 取 const 引用:投递只读源消息(命中的订阅者各拷一份副本),本函数不再有"把消息移交
   /// 第二条队列"的分支,故不需要按值取走所有权。
   void Dispatch(const Message& msg);
-  /// @brief 编码 + 交给传输(Request / Send 共用的出站尾段)。
+  /// @brief 编码 + 交给传输(Request / Send / 两个交互方法共用的出站尾段)。
+  ///        **不盖任何章**——这正是 D8 的回应结果帧走本函数而非 `Send()` 的原因。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
+
+  /// @brief 受理阶段(等 kResponse,超时重发),两个交互方法共用的私有骨架。
+  ///
+  /// **前置**:`ack_ticket` 须**已由调用者登记**——登记必须先于第一次发出(D4),且
+  /// `RequestForResult` 还须与结果订阅一起登记,故不能挪进本函数。
+  ///
+  /// @return 首个到达的受理帧(D3);次数耗尽返 kNotAccepted(D12);编码失败与
+  ///         kClosed 等终止原因直接透出、**不重试**。
+  [[nodiscard]] Coro::Result<Message> AwaitAccept(
+      const Message& req, const RetryPolicy& retry,
+      MessageDispatcher::Ticket& ack_ticket);
+
+  /// @brief 两个交互方法共用的前置判据:节点在运行 + 重发策略合法。
+  [[nodiscard]] Coro::Result<void> ValidateInteraction(
+      const RetryPolicy& retry) const;
 
   /// @brief 取用下一个 session_id:自增计数器,`std::uint8_t` 自然回绕即 0..255 循环。
   ///        取用不会失败,故不返回错误。

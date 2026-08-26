@@ -23,14 +23,15 @@ TEST(CoroResult, UsesAsyncTaskValueAndVoidResults) {
 }
 
 TEST(CoroError, AllRequiredErrorsAreStableAndDiagnostic) {
-  constexpr std::array<TransportErrc, 13> errors{
+  // 顺序即枚举值(自 1 起连续):新增值一律**追加在末尾**,插入中间会改动既有值。
+  constexpr std::array<TransportErrc, 14> errors{
       TransportErrc::kInvalidArgument, TransportErrc::kInvalidState,
       TransportErrc::kConfiguration, TransportErrc::kConnection,
       TransportErrc::kClosed, TransportErrc::kTimeout,
       TransportErrc::kCancelled, TransportErrc::kIo,
       TransportErrc::kFrame, TransportErrc::kCodec,
       TransportErrc::kResourceExhausted, TransportErrc::kUnsupported,
-      TransportErrc::kInternal};
+      TransportErrc::kInternal, TransportErrc::kNotAccepted};
 
   int expected = 1;
   for (const auto error : errors) {

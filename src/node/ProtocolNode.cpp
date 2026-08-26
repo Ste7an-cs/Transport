@@ -178,6 +178,101 @@ Coro::Result<Message> ProtocolNode::Request(Message req,
   return ticket.Wait(spent < total ? total - spent : std::chrono::milliseconds{1});
 }
 
+Coro::Result<void> ProtocolNode::ValidateInteraction(
+    const RetryPolicy& retry) const {
+  if (!IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);  // 未启动 / 关闭中 / 已关闭。
+  }
+  // 时限是在途交互唯一的兜底终结源(写出是 fire-and-forget、断链不终结在途交互),故不
+  // 接受"零即永不超时";次数含首发,少于一次意味着一帧都不发,无意义。
+  if (retry.max_attempts < 1 ||
+      retry.timeout <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  return Coro::Result<void>{};
+}
+
+Coro::Result<Message> ProtocolNode::AwaitAccept(
+    const Message& req, const RetryPolicy& retry,
+    MessageDispatcher::Ticket& ack_ticket) {
+  // 前置:ack_ticket 已由调用者登记(D4)——登记必须先于第一次发出。
+  for (int attempt = 0; attempt < retry.max_attempts; ++attempt) {
+    // 重发的是**字节完全相同**的原帧(D3):req 全程不改,session_id 不变,故原订阅横跨
+    // 全部重发继续有效。
+    if (auto queued = EncodeAndWrite(req); !queued) {
+      return queued.error();  // 编码失败 / 生命周期非法——不属超时,不重试。
+    }
+    auto ack = ack_ticket.Wait(retry.timeout);
+    if (ack) {
+      return ack;  // D3:首个到达者即终结本阶段,不问它对应第几次尝试。
+    }
+    if (ack.error() != make_error_code(TransportErrc::kTimeout)) {
+      return ack.error();  // kClosed 等终止原因直接透出,重试无意义。
+    }
+    // 超时 → 重发。
+  }
+  // D12:本质不是"超时"而是"对端始终没有受理",与"已受理但执行慢"是两类事实。
+  return make_error_code(TransportErrc::kNotAccepted);
+}
+
+Coro::Result<Message> ProtocolNode::RequestForResponse(Message req,
+                                                       RetryPolicy retry) {
+  if (auto valid = ValidateInteraction(retry); !valid) {
+    return valid.error();
+  }
+  req.frm_type = FrameType::kCommand;
+  req.protocol_id = config_.protocol_id;
+  req.session_id = NextSession();
+
+  // **先登记订阅、再发出**(D4):反之则回应可能先于订阅到达而被丢弃。
+  auto ack = dispatcher_.Subscribe(ResponseTo(req));
+  return AwaitAccept(req, retry, ack);
+}
+
+Coro::Result<Message> ProtocolNode::RequestForResult(
+    Message req, RetryPolicy retry, std::uint16_t result_message_id,
+    std::chrono::milliseconds result_timeout) {
+  if (auto valid = ValidateInteraction(retry); !valid) {
+    return valid.error();
+  }
+  if (result_timeout <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  req.frm_type = FrameType::kCommand;
+  req.protocol_id = config_.protocol_id;
+  req.session_id = NextSession();
+
+  // D4:两个订阅**一起**在发命令之前登记——kResult 可能先于 kResponse 到达(对端足够快),
+  // 若等收到受理再登记结果订阅,该帧会因无匹配而被丢弃。结果帧的命令码与请求帧不同,是
+  // 协议知识,由调用方给出(D7)。
+  auto ack = dispatcher_.Subscribe(ResponseTo(req));
+  auto result = dispatcher_.Subscribe(
+      FrameOf(req.session_id, result_message_id, FrameType::kResult));
+
+  if (auto accepted = AwaitAccept(req, retry, ack); !accepted) {
+    return accepted.error();
+  }
+  // D5:受理阶段一完成立即注销 ack 订阅——重发会引出重复 kResponse,不注销则它们继续落入
+  // 信箱;注销后它们成为无匹配终结帧,按 kUnmatchedOrLateResponse 归因丢弃。
+  ack.Reset();
+
+  // D2:本阶段**不重发**——kResult 未达意味着对端正在执行,重发有使其重复执行的风险。
+  auto result_msg = result.Wait(result_timeout);
+  if (!result_msg) {
+    return result_msg;  // 超时即 kTimeout(区别于受理耗尽的 kNotAccepted)。
+  }
+
+  // D8:回应结果是本模型**固有的最后一步**,不是可选项。该帧完全由收到的 kResult 派生——
+  // payload 原样回显(整块拷贝,框架不解读)、session_id 与 message_id 沿用,**仅**改帧类型;
+  // CRC 由 ICodec::Encode 重算。不走 Send():它会强制盖新 session_id 与 kCommand。
+  Message reply = result_msg.value();
+  reply.frm_type = FrameType::kResponse;
+  if (auto sent = EncodeAndWrite(reply); !sent) {
+    return sent.error();  // 回应结果发送失败 ⇒ 整次交互返错。
+  }
+  return result_msg;
+}
+
 Coro::Result<void> ProtocolNode::Send(Message msg) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
