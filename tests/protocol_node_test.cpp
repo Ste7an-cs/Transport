@@ -692,3 +692,248 @@ TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
   ASSERT_TRUE(observed) << "旁路订阅者应另得一份副本";
   EXPECT_EQ(observed.value().payload, (std::vector<std::uint8_t>{5}));
 }
+
+// —— 6. 交互模式:RequestForResponse / RequestForResult(ADR-0010)————————————
+//
+// 两个方法的状态机全部活在**调用方 fiber 的局部变量**里(D1):节点不新增成员、不持有
+// 在途交互表,Dispatcher 也不认识"模式"。以下用例逐条验证 ADR-0010 的可观察后果。
+
+namespace {
+
+/// 受理阶段的重发策略,写法收口以免各用例散落字面量。
+transport::RetryPolicy Retry(std::chrono::milliseconds timeout, int attempts) {
+  transport::RetryPolicy retry;
+  retry.timeout = timeout;
+  retry.max_attempts = attempts;
+  return retry;
+}
+
+}  // namespace
+
+// ① 一次成功:发命令 → 回 kResponse → 返回该帧。
+TEST(ProtocolNode, RequestForResponseSucceedsOnFirstAttempt) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), Retry(500ms, 3)); });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  EXPECT_EQ(sent.frm_type, FrameType::kCommand);
+  EXPECT_EQ(sent.protocol_id, kProtocolId);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {7, 7})));
+  (void)caller.get();
+
+  ASSERT_TRUE(reply) << reply.error().message();
+  EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
+  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{7, 7}));
+  EXPECT_EQ(fx.transport.sent().size(), 1u) << "首次即受理,不应有重发";
+}
+
+// ② 重发:前 N−1 次不回,最后一次回 → 成功。断言实际发出 N 帧,且每帧 session_id 相同
+//    (D3:重发的是字节完全相同的原帧,原订阅横跨全部重发继续有效)。
+TEST(ProtocolNode, RequestForResponseRetransmitsSameFrameUntilAccepted) {
+  Fixture fx;
+  Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask(
+      [&] { reply = fx.node->RequestForResponse(Command(0x0010), Retry(60ms, 3)); });
+
+  // 前两次尝试不回应,等第三帧发出。
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return fx.transport.sent().size() >= 3u; }, 1000));
+  const Message first = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(first.session_id, first.message_id, FrameType::kResponse, {3})));
+  (void)caller.get();
+
+  ASSERT_TRUE(reply) << reply.error().message();
+  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{3}));
+  ASSERT_EQ(fx.transport.sent().size(), 3u) << "总发送次数应恰为 max_attempts";
+  for (std::size_t i = 0; i < 3u; ++i) {
+    const Message attempt = DecodeSent(fx.transport, i);
+    EXPECT_EQ(attempt.session_id, first.session_id) << "第 " << i << " 帧";
+    EXPECT_EQ(attempt.message_id, first.message_id) << "第 " << i << " 帧";
+    EXPECT_EQ(attempt.frm_type, FrameType::kCommand) << "第 " << i << " 帧";
+    EXPECT_EQ(fx.transport.sent()[i].bytes, fx.transport.sent()[0].bytes)
+        << "重发的应是**字节完全相同**的原帧,第 " << i << " 帧";
+  }
+}
+
+// ③ 次数耗尽 → kNotAccepted(**不是** kTimeout):其语义是"对端始终没有受理"(D12)。
+TEST(ProtocolNode, RequestForResponseReturnsNotAcceptedWhenAttemptsExhausted) {
+  Fixture fx;
+  auto reply = fx.node->RequestForResponse(Command(0x0010), Retry(40ms, 2));
+
+  ASSERT_FALSE(reply);
+  EXPECT_EQ(reply.error(), make_error_code(TransportErrc::kNotAccepted));
+  EXPECT_NE(reply.error(), make_error_code(TransportErrc::kTimeout))
+      << "受理阶段耗尽与'已受理但没出结果'是两类事实";
+  EXPECT_EQ(fx.transport.sent().size(), 2u) << "应恰好发出 max_attempts 帧";
+}
+
+// ④ 前置判据:策略非法 → kInvalidArgument;未 Start / 已关闭 → kClosed。
+TEST(ProtocolNode, InteractionMethodsRejectInvalidPolicyAndClosedNode) {
+  Fixture fx;
+  auto zero_attempts = fx.node->RequestForResponse(Command(0x0010), Retry(50ms, 0));
+  ASSERT_FALSE(zero_attempts);
+  EXPECT_EQ(zero_attempts.error(), make_error_code(TransportErrc::kInvalidArgument));
+
+  auto zero_timeout = fx.node->RequestForResponse(Command(0x0010), Retry(0ms, 3));
+  ASSERT_FALSE(zero_timeout);
+  EXPECT_EQ(zero_timeout.error(), make_error_code(TransportErrc::kInvalidArgument));
+
+  auto bad_result_timeout =
+      fx.node->RequestForResult(Command(0x0010), Retry(50ms, 3), 0x03F2, 0ms);
+  ASSERT_FALSE(bad_result_timeout);
+  EXPECT_EQ(bad_result_timeout.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_TRUE(fx.transport.sent().empty()) << "判据不通过时一帧都不该发出";
+
+  // 未 Start 的节点。
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode fresh(fake, MakeCodec(), BaseConfig());
+  auto before_start = fresh.RequestForResponse(Command(0x0010), Retry(50ms, 3));
+  ASSERT_FALSE(before_start);
+  EXPECT_EQ(before_start.error(), make_error_code(TransportErrc::kClosed));
+
+  // 已关闭的节点。
+  ASSERT_TRUE(fresh.Start());
+  ASSERT_TRUE(fresh.Close());
+  fresh.WaitClosed();
+  auto after_close =
+      fresh.RequestForResult(Command(0x0010), Retry(50ms, 3), 0x03F2, 50ms);
+  ASSERT_FALSE(after_close);
+  EXPECT_EQ(after_close.error(), make_error_code(TransportErrc::kClosed));
+  (void)fake.Close();
+}
+
+// ⑤ 完整链路:命令 → 受理 → 结果 → **我方回发一帧 kResponse**。
+//    该回应帧完全由收到的 kResult 派生(D8 / RT_NODE_002_f):payload 原样回显,
+//    session_id / message_id 沿用,**仅**帧类型改为 kResponse。
+TEST(ProtocolNode, RequestForResultRepliesWithDerivedResponseFrame) {
+  Fixture fx;
+  constexpr std::uint16_t kResultId = 0x03F2;
+  const std::vector<std::uint8_t> kResultPayload{4, 2, 0};
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResult(Command(0x0010), Retry(500ms, 3), kResultId, 500ms);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, kResultId, FrameType::kResult, kResultPayload)));
+  (void)caller.get();
+
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().frm_type, FrameType::kResult) << "返回的是结果那一帧";
+  EXPECT_EQ(outcome.value().payload, kResultPayload);
+
+  ASSERT_EQ(fx.transport.sent().size(), 2u) << "命令 + 回应结果,各一帧";
+  const Message reply = DecodeSent(fx.transport, 1);
+  EXPECT_EQ(reply.frm_type, FrameType::kResponse) << "仅此一处相对 kResult 有改动";
+  EXPECT_EQ(reply.session_id, sent.session_id) << "session_id 沿用";
+  EXPECT_EQ(reply.message_id, kResultId) << "message_id 沿用结果帧的";
+  EXPECT_EQ(reply.payload, kResultPayload) << "payload 原样回显";
+  EXPECT_EQ(reply.protocol_id, kProtocolId);
+}
+
+// ⑥ kResult **先于** kResponse 到达仍能成功——D4 的行为证据:两个订阅一起在发命令之前
+//    登记;若改成"收到受理再登记结果订阅",先到的结果帧会因无匹配而被丢弃,本用例必失败。
+TEST(ProtocolNode, RequestForResultAcceptsResultArrivingBeforeAck) {
+  Fixture fx;
+  constexpr std::uint16_t kResultId = 0x03F2;
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResult(Command(0x0010), Retry(500ms, 3), kResultId, 500ms);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  // **先**结果、**后**受理。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, kResultId, FrameType::kResult, {8})));
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  (void)caller.get();
+
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{8}));
+  ASSERT_EQ(fx.transport.sent().size(), 2u);
+  EXPECT_EQ(DecodeSent(fx.transport, 1).frm_type, FrameType::kResponse);
+}
+
+// ⑦ 受理后等结果超时 → kTimeout(区别于 ③ 的 kNotAccepted),且**不发生重发**(D2:
+//    kResult 未达意味着对端正在执行,重发有使其重复执行的风险)。
+TEST(ProtocolNode, RequestForResultTimesOutWithoutRetransmittingAfterAck) {
+  Fixture fx;
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResult(Command(0x0010), Retry(500ms, 3), 0x03F2, 80ms);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  (void)caller.get();
+
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_NE(outcome.error(), make_error_code(TransportErrc::kNotAccepted))
+      << "已受理,失败点在第二阶段";
+  EXPECT_EQ(fx.transport.sent().size(), 1u)
+      << "等结果阶段不得重发,失败时也不回应结果";
+}
+
+// ⑧ 受理阶段的**重复 kResponse**(重发引起)在该阶段完成后到达 → 归因
+//    kUnmatchedOrLateResponse。这是 D5"阶段一完成后立即注销 ack 订阅"的行为证据:
+//    不注销则重复回应继续落入信箱、被后续逻辑误读。
+TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsAttributedAsUnmatched) {
+  transport::CapturingTraceSink sink;
+  ProtocolNodeConfig config = BaseConfig();
+  config.trace_sink = &sink;
+  Fixture fx(std::move(config));
+  constexpr std::uint16_t kResultId = 0x03F2;
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResult(Command(0x0010), Retry(500ms, 3), kResultId, 500ms);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  // 让调用方 fiber 走完受理阶段(含 ack.Reset())再投重复回应。
+  boost::this_fiber::sleep_for(30ms);
+  ASSERT_EQ(DropCount(sink), 0u) << "首个受理帧被认领,不是丢弃";
+
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  EXPECT_TRUE(testutil::pumpFiberUntil(
+      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
+      << "阶段完成后的重复受理帧应无匹配、按迟到终结帧归因";
+
+  // 收尾:交付结果,让交互正常终结。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, kResultId, FrameType::kResult, {9})));
+  (void)caller.get();
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{9}));
+}
