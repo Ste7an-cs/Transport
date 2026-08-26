@@ -28,25 +28,37 @@ SRS **RT_NODE_002** 长期写着：
   每个方法跑在**调用方自己的 fiber** 上，其状态机的全部状态——当前阶段、已发送次数、原始命令帧——都是该函数的**局部变量**，随调用方栈存在。
   由此：节点里**不需要"在途交互表"**，`Dispatcher` 也**不需要认识模式**（它只认键）。这是本 ADR 最重要的结论——它把一个看似需要新机制的需求，化归为纯粹的调用方控制流。
 
+  **命名（2026-08-26 修正）**：不照搬协议原名。`withfeedback` / `needfeedback` 两词本身不表意，并列时无法分辨差别。改按**"等到哪一帧为止"**命名，并保留与协议原名的映射：
+
+  | 协议行为 | 接口 | 终结于 | 我方最后动作 |
+  |---|---|---|---|
+  | `noresponse` | `Send`（现有） | —（不等） | 无 |
+  | `needresponse` | **`RequestForResponse`** | 对端 `kResponse` | 无 |
+  | `withfeedback` | **`RequestForResult`** | 对端 `kResult` | 无 |
+  | `needfeedback` | **`RequestForResultAndConfirm`** | 对端 `kResult` | **回一帧 `kResponse`** |
+  | `repeating` | —（D11：本轮不做） | | |
+
+  `AndConfirm` 后缀直接表达了 ④ 相对 ③ 多做的那一步，调用点自解释。
+
 - **D2（四种模式的状态机）：**
 
   ```
-  ① noresponse
+  ① Send（noresponse）
      → kCommand                                        ⇒ 结束（不等）
 
-  ② needresponse
+  ② RequestForResponse（needresponse）
      → kCommand
-     ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kTimeout
+     ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
      ← kResponse                                       ⇒ 成功
 
-  ③ withfeedback
+  ③ RequestForResult（withfeedback）
      → kCommand
-     ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kTimeout
+     ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
      ← kResponse
      ⏱ 等 kResult   ──超时──▶ kTimeout（**不重发**）
      ← kResult                                         ⇒ 成功
 
-  ④ needfeedback
+  ④ RequestForResultAndConfirm（needfeedback）
      ……同 ③ 全部……
      ← kResult
      → kResponse（我方回确认）                          ⇒ 成功
@@ -73,7 +85,17 @@ SRS **RT_NODE_002** 长期写着：
   依据：接收侧的应答内容与时机是纯业务决策，框架无从代劳；且 ADR-0009 已确立"入站由订阅承载、消费样板交调用方"。
 
 - **D10（`Send` 与 `Request` 本轮均保留，重叠问题推迟）：** 新增三个方法，现有 `Send(Message)` 与 `Request(Message, timeout)` **不动**。
-  **明确记录的代价**：`Request`（总超时、无重发）与 `RequestNeedResponse`（单次超时 + 重发）**语义相近而不相同**，并存期间调用方容易用错。二者的合并/取舍**推迟决定**，不在本轮解决。
+  **明确记录的代价**：`Request`（总超时、无重发）与 `RequestForResponse`（单次超时 + 重发）**语义相近而不相同**，并存期间调用方容易用错。二者的合并/取舍**推迟决定**，不在本轮解决。
+
+- **D12（两阶段失败以不同错误码区分，新增 `kNotAccepted`）：** 在 `TransportErrc` 增加一个值：
+
+  | 失败点 | 返回 | 语义 |
+  |---|---|---|
+  | 阶段一：重发次数耗尽仍无 `kResponse` | **`kNotAccepted`**（新增） | 对端**始终没有受理** |
+  | 阶段二：已受理，等 `kResult` 超时 | `kTimeout`（现有） | 受理了但没出结果 |
+
+  依据：① 阶段一失败的本质**不是"超时"而是"未受理"**——重发 N 次都无回应，与"已受理但执行慢"是两类事实，用同一个码表达会丢失调用方需要的信息；② 只加**一个**值而非 `kAcceptTimeout`/`kResultTimeout` 两个，`kTimeout` 得以保持原义；③ `kNotAccepted` 在本协议之外也讲得通，不是为单一协议造的词。
+  **越层性说明**：`TransportErrc` 名字虽带 Transport，实为**全项目共用**的错误枚举（`ProtocolNode` 现已返回其 `kClosed`/`kTimeout`/`kConfiguration`），故加值不构成越层；SRS **RT_ERROR_003** 写的是"**最低**错误类别应包括……"，是下限而非穷举，加值不违反该条。
 
 - **D11（`repeating` 本轮不做）：** 第五种交互行为暂不定义。RT_NODE_002 相应改为"前四种已定义，`repeating` 仍为 TBD"。
 
@@ -82,7 +104,7 @@ SRS **RT_NODE_002** 长期写着：
 - **正面：** 一个看似要新机制的需求（多段交互 + 重试）**没有引入任何新机制**——完全由 `Dispatcher` 的既有性质（投递不终结订阅、键可部分匹配）加调用方控制流实现；节点不新增状态、不新增成员、无并发面变化；四种模式各自独立，互不影响。
 - **负面（明确接受）：**
   1. `Send`/`Request` 与新接口的语义重叠（D10）。
-  2. **两个阶段的超时都返回 `kTimeout`，调用方无法区分**"始终没等到受理"与"已受理但没等到结果"。返回值只有 `Message`，不带阶段信息。若日后需要区分，须引入新错误码或改变返回形状。
+  2. ~~两个阶段的超时都返回 `kTimeout`，调用方无法区分……~~ **本条已由 D12 解决（2026-08-26）**：阶段一失败返 `kNotAccepted`，阶段二返 `kTimeout`。
   3. 重发按 D3 沿用同一帧，故**要求对端能容忍重复命令**（幂等，或自行按 `session_id` 去重）。这是协议层假设，框架不校验。
   4. ③④ 的调用方必须知道结果帧的命令码（D7），比 `Request` 多一项协议知识。
 - **实现注记：** 重发时帧字节完全相同（D3），故可编码一次、重复写出，不必每次 `Encode`。
