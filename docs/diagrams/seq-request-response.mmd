@@ -7,16 +7,17 @@ sequenceDiagram
     participant T as ITransport
     participant R as 读-分发循环 fiber
 
-    C->>N: Request(req, timeout)
+    C->>N: RequestForResponse(req, {timeout, max_attempts})
     N->>N: NextSession() → session_id（uint8 自增，越 255 回绕）
     N->>N: 盖章 frm_type=kCommand / protocol_id / session_id
     Note over N,D: **先登记订阅、再发出请求**<br/>反之则回应可能先于订阅到达而被丢弃
     N->>D: Subscribe(ResponseTo(req))<br/>{session_id, message_id, kResponse} → Ticket
     N->>K: Encode(req) → bytes
     N->>T: AsyncWrite({bytes, Endpoint::Default()})
-    Note over N,T: fire-and-forget：入队即返，写出结果不回传<br/>故 timeout 是本调用唯一的兜底终结源
-    N->>D: Ticket.Wait(timeout - 已耗时)
+    Note over N,T: fire-and-forget：入队即返，写出结果不回传<br/>故 timeout 是本次尝试唯一的兜底终结源
+    N->>D: Ticket.Wait(timeout)　※ 单次尝试的时限，不做扣减
     Note over C: 调用方 fiber 在此挂起等待
+    Note over N,D: 本图画的是**首次尝试即命中**。超时则重发**字节完全相同**的原帧<br/>（session_id 不变，ADR-0010 D3），至多 max_attempts 次；<br/>耗尽返 kNotAccepted。四种模式的完整状态机见图 4-14。
 
     T-->>R: 对端回送的响应报文进入 read_queue
     R->>T: await(自己的读订阅 rx_) → Datagram

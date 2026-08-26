@@ -170,7 +170,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![请求-响应节点数据流图](diagrams/dataflow.svg)
 
-**图例说明**：出站（调用方 fiber）与入站（读-分发循环 fiber）两条独立流，经 `Dispatcher` 的 Dispatch→Wait 唤醒闭环。**投递份数为 0** 时才分流：终结帧归因 `unmatched-or-late-response`、业务帧交 `HandlerLoop`、无 handler 归因丢弃；坏帧由 codec 判定。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
+**图例说明**：出站（调用方 fiber）与入站（读-分发循环 fiber）两条独立流，经 `Dispatcher` 的 Dispatch→Wait 唤醒闭环。**投递份数为 0** 时才分流：终结帧归因 `unmatched-or-late-response`，其余业务帧**静默丢弃、不归因**（无订阅者是常态，ADR-0009 D5）；坏帧由 codec 判定。命中的订阅者各得一份副本，业务帧的消费由**宿主自有 fiber** 承担（ADR-0009 D2，节点不再内置 handler 通道）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
+
+> **变更（ADR-0009 D1/D2，#163）**：原文"业务帧交 `HandlerLoop`、无 handler 归因丢弃"已作废——`HandlerLoop` 与 `DropReason::kNoHandlerConfigured` 均已删除。图源 `dataflow.mmd` 早已改画为宿主消费 fiber，是本图例文字漏改。
 
 #### 4.2.4 请求-响应时序（MS_REQ_RESP）
 
@@ -178,7 +180,11 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![请求-响应时序图](diagrams/seq-request-response.svg)
 
-**图例说明**：`Request` happy path。两处关键：① **先登记订阅、再发出请求**——反之则回应可能先于订阅到达而被丢弃；② 写出是 **fire-and-forget**，不等实际发出也无从得知是否发出成功，故 `timeout` 是本调用**唯一**的兜底终结源。请求终结后订阅随 `Ticket` 析构自动注销；session_id 由 `uint8` 计数器自增给出，取用不会失败。
+**图例说明**：`RequestForResponse` 的 happy path（**首次尝试即命中**）。本图的用途是把**关联与唤醒闭环**画细——订阅登记、编码、写出、`Ticket` 生存期、读-分发 fiber 的投递路径；四种交互模式的**完整状态机**见 §4.2.12 图 4-14，两图互补而不重复。
+
+三处关键：① **先登记订阅、再发出请求**——反之则回应可能先于订阅到达而被丢弃；② 写出是 **fire-and-forget**，不等实际发出也无从得知是否发出成功，故 `timeout` 是本次尝试**唯一**的兜底终结源；③ `timeout` 是**单次尝试**的时限、**不做扣减**，超时即重发字节完全相同的原帧（`session_id` 不变，ADR-0010 D3），至多 `max_attempts` 次，耗尽返 `kNotAccepted`。请求终结后订阅随 `Ticket` 析构自动注销；session_id 由 `uint8` 计数器自增给出，取用不会失败。
+
+> **变更（ADR-0010 D10，2026-08-26）**：本图原以 `Request(Message, milliseconds)` 作画，该方法**已删除**（#171）；改以其等价替代 `RequestForResponse(req, {timeout, 1})` 重绘。原图例"`timeout` 是本调用唯一的兜底终结源"隐含**总超时**语义（旧 `Request` 的 `Wait(timeout - 已耗时)`），现已改为按次计时。
 
 #### 4.2.5 关闭收敛时序（MS_CLOSE）
 
@@ -271,8 +277,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - 接口类型：C++ 类/成员函数（`node/ProtocolNode.hpp`、`node/DdsNode.hpp`、`io/tcp/TcpServer.hpp`）。
 - 数据元素：`Message`、`std::chrono::milliseconds`（时限）、`RetryPolicy`（ADR-0010）、各 `*Config`、`MessageDispatcher::Key` / `Ticket`、`Coro::Result<Message>` / `Coro::Result<void>`。
   **变更（2026-08-26 核对）**：原文所列 `OperationOptions`（随 ADR-0006 D3 取消令牌一并退化为时限）、`InboundHandler`（随 ADR-0009 废止 handler 通道而删除）、`Status`（别名已删）**均已不存在**。
-- 通信方式：同步函数调用；`Request`/`Send`/`Publish`/`WaitClosed` 为协程内让出式（不阻塞线程）。
-- 协议特征：`ProtocolNode(transport,codec,config)` → `Start/Close/WaitClosed`、`Request(Message,options)→Result<Message>`、`Send(Message)`；`DdsNode` → `Request(Message,target,options)`、`Publish(Message,topic)`；`TcpServer(config,factory)` 每连接派生 node。
+- 通信方式：同步函数调用；`RequestFor*`/`Send`/`Publish`/`WaitClosed` 为协程内让出式（不阻塞线程）。
+- 协议特征：`ProtocolNode(transport,codec,config)` → `Start/Close/WaitClosed`、`Send(Message)`、`RequestForResponse(Message,RetryPolicy)`、`RequestForResult(Message,RetryPolicy,result_mid,result_timeout)`、`RequestForResultDirect(Message,RetryPolicy,result_mid)`、`Subscribe(Key)`；`DdsNode` → `Request(Message,target,options)`、`Publish(Message,topic)`；`TcpServer(config,factory)` 每连接派生 node。
+  **变更（ADR-0010，2026-08-26）**：`ProtocolNode::Request(Message,options)` **已删除**（D10，#171）——时限与重试改由 `RetryPolicy` **逐次传参**（D6），节点配置面上不再有任何时限缺省值（#173 删除 `ProtocolNodeConfig::default_request_timeout`）。所列 `DdsNode::Request` 是**另一个方法**（三参、DDS 侧），不受此变更影响。
 
 #### 4.3.3 编解码扩展点（JK_CODEC）
 - 优先级：高（公共扩展点）。
@@ -392,7 +399,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **公开面（4）**：`Start()` / `Close()` / `WaitClosed()` / `IsRunning()`。返回 `Coro::Result<void>` 而非 `bool`——`bool` 会把"已 `Running`（成功）"与"已 `Closing`/`Closed`（RT_LIFECYCLE_003 要求 `InvalidState`）"压成同值，且 RT_LIFECYCLE_007 要求校验失败可据错误改配置重试（ADR-0006 D2 保留）。观测接口 `CloseDropCount()` / `LastCloseLatency()` **已删除**（ADR-0008 D10）。
 
-**子类钩子（3）**：`DoStart()`（配置校验 + 传输就绪 + spawn 各 fiber）、`DoClose()`（发出全部汇合信号，**只发信号、不得等待任何 fiber**）、`DoJoin()`（join 本节点 spawn 的全部 fiber）。原 `ValidateConfig()` 并入 `DoStart()` 开头——它此前独立存在的唯一理由是绕开 `start_done_` 那个一次性 latch，latch 删除后两者行为一致。
+**子类钩子（3）**：`DoStart()`（配置校验 + 传输就绪 + spawn 各 fiber）、`DoClose()`（发出全部汇合信号，**只发信号、不得等待任何 fiber**）、`DoJoin()`（join 本节点 spawn 的全部 fiber）。原 `ValidateConfig()` 并入 `DoStart()` 开头——它此前独立存在的唯一理由是绕开 `start_done_` 那个一次性 latch，latch 删除后两者行为一致。**配置校验是钩子的可选职责而非必备动作**：子类若无可校验的配置项，`DoStart()` 直接做就绪与 spawn 即可（`ProtocolNode` 自 #173 起即属此列，见 §5.6）。
 
 **成员（4）**：`mutex_` / `lifecycle_` / `starting_` / `joined_`。原 `SharedCompletion` 三例（`start_done_` / `close_signalled_` / `closed_`）、`close_drop_count_`、`close_requested_at_`、`last_close_latency_` 全部删除。
 
@@ -418,6 +425,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 > - **再变更（ADR-0010 D10，2026-08-26）**：`Request(Message, milliseconds)` **已删除**——与 `RequestForResponse` 语义相近而不相同，后者以 `max_attempts = 1` 完全覆盖其行为。`Send` 保留。
 > - **当前公开面（截至 2026-08-26）**：构造 / 析构 / `Send(Message)` / `RequestForResponse` / `RequestForResult` / `RequestForResultDirect` / `Subscribe(Key)`，另继承基类的四个生命周期方法。
 > - **新增（ADR-0010，2026-08-26）**：三个交互模式方法 `RequestForResponse` / `RequestForResult` / `RequestForResultDirect`（见下"交互模式"）。`Send` 保留；`Request` 已删除（**D10**）。
+> - **配置面（#173，2026-08-26）**：`ProtocolNodeConfig` 现仅余 `protocol_id` 与 `trace_sink` —— `default_request_timeout` **已删除**。它是为已删除的 `Request`（单一总超时）而设，四种交互各阶段的时限是数量级不同的量，一个节点级缺省值套不上去（ADR-0010 **D6**：逐次传参）。由此 `ProtocolNode::ValidateConfig()` 失去唯一校验项、连同 `DoStart()` 中的调用一并删除（留一个恒成功的私有函数属死代码）。
+>   **"不得永不超时"的保护未随之丢失**，改由 `ValidateInteraction()` 的**参数校验**承担——它拒绝任何非正的 `RetryPolicy::timeout` / `result_timeout`（返 `kInvalidArgument`），比缺省值更硬：缺省值只在调用方省略时兜底，参数校验则**拒绝**。SRS §3.1.4.4 对应条文已同步作废。
 
 **单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ICodec`+`Dispatcher`（**ADR-0009**：不再组合 `HandlerLoop`）、**按引用借用** `ITransport`，协议特有语义全内联本类；DdsNode 复用同套基座仅换键字段（D10 实证）。
 

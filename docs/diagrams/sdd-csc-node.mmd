@@ -1,9 +1,12 @@
 classDiagram
     direction TB
     class ProtocolNode {
-        +Request(Message, milliseconds) Coro::Result~Message~
         +Send(Message) Coro::Result~void~
+        +RequestForResponse(Message, RetryPolicy)
+        +RequestForResult(Message, RetryPolicy, mid, ms)
+        +RequestForResultDirect(Message, RetryPolicy, mid)
         +Subscribe(Key) Ticket
+        -AwaitAccept() / EncodeAndWrite()
         -DecodeAndDispatch() / Dispatch()
         -NextSession() uint8
     }

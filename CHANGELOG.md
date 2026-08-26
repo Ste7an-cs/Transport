@@ -8,6 +8,46 @@
 
 ## [Unreleased]
 
+### 协议交互模式落地:四种交互各一个接口,`Request` 删除(ADR-0010,#166/#167/#168/#171/#173)
+
+> SRS **RT_NODE_002** 长期挂着的 TBD("五种交互行为的状态机、时序、重试与终结帧语义本版不细化")本轮**结清**:前四种定义完毕,`repeating` **废止**(不再是 TBD,而是不做)。
+>
+> **决定形状的观察**:线缆层的 `kResponse` 注释写着"即时回应(**中间或终结**)"——它是不是终结帧,**取决于当前是哪种模式**。终结性是**交互的属性,不是帧的属性**。若模式可变或存于节点,节点就必须为每次在途交互保存"当前处在哪个阶段"。
+>
+> **由此得到的核心结论**:四种模式**各给一个方法**,模式不作参数、不入节点状态。每个方法跑在**调用方自己的 fiber** 上,状态机的全部状态——阶段、已发送次数、原始命令帧——都是该方法的**局部变量**,随调用方栈存在。故节点**不需要"在途交互表"**、`Dispatcher` **不需要认识模式**;一个看似要新机制的需求(多段交互 + 重试)**新增机制为零**,完全由 `Dispatcher` 的既有性质(投递**不终结**订阅、键可部分匹配)加调用方控制流实现。
+
+**新增**
+
+- **新增** `ProtocolNode::RequestForResponse(Message, RetryPolicy)` —— 发命令 → 等 `kResponse`;超时重发,收到即结束。
+- **新增** `ProtocolNode::RequestForResult(Message, RetryPolicy, result_message_id, result_timeout)` —— 受理阶段同上,收到 `kResponse` 后**再等 `kResult`**,收到后**回一帧 `kResponse`** 然后结束。该回应帧**由收到的 `kResult` 帧派生**:payload 原样、`session_id`/`message_id` 不变,**仅改帧类型**,CRC 由 `ICodec::Encode` 重算(D8)。
+- **新增** `ProtocolNode::RequestForResultDirect(Message, RetryPolicy, result_message_id)` —— **属另一种协议**:没有受理阶段,发命令后直接等 `kResult`,收到即成功且**不回应**(D13)。
+- **新增** 公开类型 `RetryPolicy{timeout, max_attempts}`。时限与重试次数**逐次传参**、不进配置——受理与执行完成是**数量级不同**的等待,一个节点级缺省值套不上去(D6)。
+- **新增** 错误值 `TransportErrc::kNotAccepted`(**追加在末尾**,不改动既有值),区分两阶段失败:受理阶段重发耗尽仍无 `kResponse` 返 `kNotAccepted`(对端**始终没有受理**),已受理但等 `kResult` 超时返 `kTimeout`。只加一个值而非两个超时码——阶段一失败的本质**不是"超时"而是"未受理"**,且 `kTimeout` 得以保持原义(D12)。
+
+**破坏性变更**
+
+- **💥 破坏性** **删除** `ProtocolNode::Request(Message, milliseconds)`(D10,#171)。它与 `RequestForResponse` **语义相近而不相同**(总超时、无重发 vs 单次超时、可重发),并存只会让调用方在两个都能用的接口之间猜;而 **`RequestForResponse(req, {timeout, 1})` 完全覆盖其行为**——单次尝试时"总超时"与"单次超时"等价,**无能力缺口**。`Send` 保留(对应独立的 `noresponse` 行为,不与任何 `RequestFor*` 重叠)。`DdsNode::Request(Message, target, options)` 是**另一个方法**,不受影响。
+- **💥 破坏性** **删除** `ProtocolNodeConfig::default_request_timeout`(#173)。它是为已删除的 `Request` 而设,`Request` 去后**已无任何消费者**。连带删除失去唯一校验项的 `ProtocolNode::ValidateConfig()`。
+  **"不得永不超时"的保护并未丢失**,改由 `ValidateInteraction()` 的**参数校验**承担——它拒绝任何非正的 `timeout` / `result_timeout`(返 `kInvalidArgument`)。这比缺省值**更硬**:缺省值只在调用方省略时兜底,参数校验则**拒绝**。
+- **💥 破坏性** **废止** `repeating` 交互行为(D11)。它不再是"本版不细化的 TBD",而是明确不做。
+
+**四个易做错、已钉进代码注释的点**
+
+- 两个订阅(`kResponse` 与 `kResult`)**必须在发命令之前一起登记**——`kResult` 可能**先于** `kResponse` 到达,改成"收到受理再登记 result"会丢帧(D4)。
+- 受理阶段完成后**必须立即 `ack.Reset()`**——否则重发引出的**重复 `kResponse`** 会继续落入信箱;注销后它们成为无匹配终结帧,按 `kUnmatchedOrLateResponse` 归因(D5)。
+- **`RequestForResult` 在等 `kResult` 阶段不得重发**——`kResult` 未达意味着对端正在执行,重发有使其**重复执行**的风险(D2)。**但该规则只约束外部系统协议**:`RequestForResultDirect` 没有受理阶段、唯一的等待就是等结果,**不重发则命令帧一旦丢包即彻底失败**,故它**恰恰要在等结果阶段重发**、耗尽返 `kTimeout` 而非 `kNotAccepted`(D13)。两条相反的规则各有适用面,不矛盾。
+- **回应结果帧不得走 `Send()`**——`Send()` 会强制 `session_id = NextSession()` 且盖 `kCommand`,覆盖掉必须沿用的值;走私有 `EncodeAndWrite()`(D8)。
+
+**明确接受的代价**
+
+- 重发沿用同一 `session_id`、发**字节完全相同**的原帧,以**首帧为准**(D3);由此**要求对端能容忍重复命令**(幂等或自行去重)。这是协议层假设,**框架不校验**。
+- `RequestForResultDirect` 与其余三个方法**分属两种协议**、在同一节点上并存,调用方须自行确保方法与对端协议匹配,**框架不校验**(D13)。
+- `RequestForResult*` 的调用方必须知道**结果帧的命令码**(协议知识,框架不做映射规则,D7)。
+- **接收侧不建模**——宿主 `Subscribe` 自理,与 ADR-0009 方向一致(D9)。
+
+- **验证** 全量 **115 → 128 tests**,`--gtest_repeat=5` 五轮全绿、无挂起;构建零警告。#171 / #173 两次删除均**保持 128**(只改写调用与断言对象,不增删用例)。
+- **文档** 新增 ADR-0010(13 条决策 + 备选方案否决理由)与图 4-14 `seq-interaction-modes`;SRS RT_NODE_002 拆为 **RT_NODE_002_a..g**、RT_ERROR_003 加 `NotAccepted`、§3.1.4.4 总超时缺省值条文**作废**、TBD-001 关闭;SDD 新增 §4.2.12 与 **DD-14**、§5.5 交互模式骨架、§5.6 公开面与配置面同步;图 4-7 `seq-request-response` 改以 `RequestForResponse` 重绘,`arch-class` / `sdd-csc-node` 两图的 `ProtocolNode` 方法列表同步。
+
 ### 💥 删除 `HandlerLoop` 与 `DropReason::kNoHandlerConfigured`(ADR-0009 D2 收尾,#163)
 
 > ADR-0009 初稿称二者"因 `DdsNode` 仍在用而暂留",**该前提经核对不成立**:`src/node/DdsNode.cpp` 调用着 `MarkRunning()` / `transport_->Read()` / `transport_->Write()` / `SignalClose()` 四个已被 ADR-0006/0008 删除的接口,且**不在库源文件清单内**——它是重设计之前的代码而非活着的使用者。`HandlerLoop` 在当时的编译面里生产端与测试端**均无使用者**。
