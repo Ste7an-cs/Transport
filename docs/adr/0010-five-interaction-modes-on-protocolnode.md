@@ -30,41 +30,45 @@ SRS **RT_NODE_002** 长期写着：
 
   **命名（2026-08-26 修正）**：不照搬协议原名。`withfeedback` / `needfeedback` 两词本身不表意，并列时无法分辨差别。改按**"等到哪一帧为止"**命名，并保留与协议原名的映射：
 
-  | 协议行为 | 接口 | 终结于 | 我方最后动作 |
-  |---|---|---|---|
-  | `noresponse` | `Send`（现有） | —（不等） | 无 |
-  | `needresponse` | **`RequestForResponse`** | 对端 `kResponse` | 无 |
-  | `withfeedback` | **`RequestForResult`** | 对端 `kResult` | 无 |
-  | `needfeedback` | **`RequestForResultAndConfirm`** | 对端 `kResult` | **回一帧 `kResponse`** |
-  | `repeating` | —（D11：本轮不做） | | |
+  | 来源协议 | 协议行为 | 接口 | 帧序列 | 我方最后动作 |
+  |---|---|---|---|---|
+  | 外部系统协议 | `noresponse` | `Send`（现有） | → 命令 | 无 |
+  | 外部系统协议 | `needresponse` | **`RequestForResponse`** | → 命令 · ⏱← 回应 | 无 |
+  | 外部系统协议 | `withfeedback` **与** `needfeedback` | **`RequestForResult`** | → 命令 · ⏱← 回应 · ⏱← 结果 | **回一帧回应** |
+  | 外部系统协议 | `repeating` | —（**D11**：本轮不做） | | |
+  | **另一种协议** | —（该协议自有的交互） | **`RequestForResultDirect`** | → 命令 · ⏱← 结果（**无中间回应**） | 无 |
 
-  `AndConfirm` 后缀直接表达了 ④ 相对 ③ 多做的那一步，调用点自解释。
+  **修正（2026-08-26）**：`withfeedback` 与 `needfeedback` 经核实是**同一个通信模型**——都是「请求 → 等回应 → 等结果 → **回应结果**」。故二者合并为一个接口 `RequestForResult`，**回应结果是该模型固有的最后一步，不是可选项**；原先按"是否回确认"拆出的 `RequestForResultAndConfirm` 取消。
 
-- **D2（四种模式的状态机）：**
+- **D2（四种交互的状态机）：**
 
   ```
   ① Send（noresponse）
-     → kCommand                                        ⇒ 结束（不等）
+     → kCommand                                        ⇒ 结束（不等待）
 
   ② RequestForResponse（needresponse）
      → kCommand
      ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
      ← kResponse                                       ⇒ 成功
 
-  ③ RequestForResult（withfeedback）
+  ③ RequestForResult（withfeedback ＝ needfeedback）
      → kCommand
      ⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
-     ← kResponse
+     ← kResponse（受理）
      ⏱ 等 kResult   ──超时──▶ kTimeout（**不重发**）
-     ← kResult                                         ⇒ 成功
-
-  ④ RequestForResultAndConfirm（needfeedback）
-     ……同 ③ 全部……
      ← kResult
-     → kResponse（我方回确认 = 该 kResult 帧原样改帧类型）  ⇒ 成功
+     → kResponse（回应结果 ＝ 该 kResult 帧原样改帧类型）  ⇒ 成功
+
+  ④ RequestForResultDirect（另一种协议）
+     → kCommand
+     ⏱ 等 kResult   ──超时──▶ **重发** ──次数耗尽──▶ kTimeout
+     ← kResult                                         ⇒ 成功（**不回应**）
   ```
 
-  **重发只发生在第一阶段**（等 `kResponse`）。第二阶段（等 `kResult`）超时**直接结束，不重发**——依据：`kResult` 意味着对端正在执行，重发命令有使其重复执行的风险。
+  **①②③ 属外部系统协议**：其中②③ 的**重发只发生在等待受理阶段**；③ 的第二阶段（等 `kResult`）超时**直接终结、不重发**——依据：`kResult` 未达意味着**对端正在执行**，重发命令有使其**重复执行**的风险。
+
+  **④ 属另一种协议，不受上述规则约束**：它**没有受理阶段**，唯一的等待就是等 `kResult`，故**必须在该阶段重发**——否则命令帧一旦丢包，交互即彻底失败、无任何补救。两条规则并存不构成矛盾：**"等结果时不重发"是外部系统协议的约束，不是框架的普遍规则**。
+  ④ 重发耗尽返 `kTimeout` 而非 `kNotAccepted`——后者的语义是"对端**没有受理**"，而 ④ 根本不存在受理这一步（**D12**）。
 
 - **D3（重发沿用同一 `session_id`，以第一个响应为准）：** 重发的是**字节完全相同**的原帧，`session_id` 不变。因此原订阅横跨全部重发继续有效，**先到的那一帧即完成本阶段**，无需区分它是哪一次尝试的回应。
 
@@ -80,7 +84,7 @@ SRS **RT_NODE_002** 长期写着：
 - **D7（`kResult` 的命令码由调用方给出）：** 结果帧的 `message_id` 与请求帧**不同**，其对应关系是协议知识，框架不猜、不做映射规则，由调用方作为参数传入。
   **范围（2026-08-26 修正）**：本条只约束**入站** `kResult` 的订阅键。④ 的**出站确认帧**不适用——它的全部字段由收到的 `kResult` 派生，无调用方参数（见 **D8**）。
 
-- **D8（④ 的确认帧 = 收到的 `kResult` 帧原样改帧类型后回发）：** 确认帧由**收到的那一帧直接派生**，**不接受任何调用方参数**：
+- **D8（`RequestForResult` 末尾的回应帧 = 收到的 `kResult` 帧原样改帧类型后回发）：** 该回应帧由**收到的那一帧直接派生**，**不接受任何调用方参数**：
 
   | 字段 | 取值 |
   |---|---|
@@ -90,7 +94,7 @@ SRS **RT_NODE_002** 长期写着：
   | `frm_type` | **仅此一处改动**：`kResult` → `kResponse` |
   | CRC | 由 `ICodec::Encode` 重新计算（`SystemCodec.cpp:52`），`ProtocolNode` 不碰 |
 
-  由此 `RequestForResultAndConfirm` 与 `RequestForResult` **签名完全相同**，差别只在行为。
+  **该帧是 `RequestForResult` 模型固有的最后一步**，不是可选行为，故无独立接口（原 `RequestForResultAndConfirm` 已取消，见 **D1** 的修正）。
   **不破坏"框架不解读 payload"**：payload 是整块拷贝，框架不读其内部结构——`Message::payload` 的定位（"应用字节，框架不解读其语义"）得以保持。
   **不得走 `Send()`**：它会强制 `session_id = NextSession()` 与 `frm_type = kCommand`，覆盖掉需要沿用的值；应走不盖章的私有 `EncodeAndWrite()`。
 
@@ -108,7 +112,12 @@ SRS **RT_NODE_002** 长期写着：
   | 阶段二：已受理，等 `kResult` 超时 | `kTimeout`（现有） | 受理了但没出结果 |
 
   依据：① 阶段一失败的本质**不是"超时"而是"未受理"**——重发 N 次都无回应，与"已受理但执行慢"是两类事实，用同一个码表达会丢失调用方需要的信息；② 只加**一个**值而非 `kAcceptTimeout`/`kResultTimeout` 两个，`kTimeout` 得以保持原义；③ `kNotAccepted` 在本协议之外也讲得通，不是为单一协议造的词。
+  **④ `RequestForResultDirect` 的失败返 `kTimeout`**：它没有受理阶段，"未受理"这一事实不存在，重发耗尽的语义就是"始终没拿到结果"。
   **越层性说明**：`TransportErrc` 名字虽带 Transport，实为**全项目共用**的错误枚举（`ProtocolNode` 现已返回其 `kClosed`/`kTimeout`/`kConfiguration`），故加值不构成越层；SRS **RT_ERROR_003** 写的是"**最低**错误类别应包括……"，是下限而非穷举，加值不违反该条。
+
+- **D13（`RequestForResultDirect` 属另一种协议，与外部系统协议的三种并列于同一节点）：** 该交互（请求 → 直接等结果、无中间受理、结果不回应、等结果超时可重发）**不属于**外部系统协议的五种行为，是**另一种协议**自有的交互形态。
+  它仍由 `ProtocolNode` 承载而非另起节点类型——`ProtocolNode` 对线缆格式不透明（编解码经 `ICodec` 注入），协议差异体现在**用哪些帧类型、走哪种交互**，不构成新的节点类型。这与 ADR-0003 **D10**"协议无关机制可复用、协议特有语义内联"一致。
+  **由此产生的并存**：同一节点上四个交互方法分属**两种协议**，调用方须自行确保所用方法与对端协议匹配；框架不校验（它对协议语义不透明）。该风险记于「影响」。
 
 - **D11（`repeating` 本轮不做）：** 第五种交互行为暂不定义。RT_NODE_002 相应改为"前四种已定义，`repeating` 仍为 TBD"。
 
@@ -119,7 +128,9 @@ SRS **RT_NODE_002** 长期写着：
   1. `Send`/`Request` 与新接口的语义重叠（D10）。
   2. ~~两个阶段的超时都返回 `kTimeout`，调用方无法区分……~~ **本条已由 D12 解决（2026-08-26）**：阶段一失败返 `kNotAccepted`，阶段二返 `kTimeout`。
   3. 重发按 D3 沿用同一帧，故**要求对端能容忍重复命令**（幂等，或自行按 `session_id` 去重）。这是协议层假设，框架不校验。
-  4. ③④ 的调用方必须知道结果帧的命令码（D7），比 `Request` 多一项协议知识。
+  4. `RequestForResult` 与 `RequestForResultDirect` 的调用方必须知道**结果帧的命令码**（D7），比 `Request` 多一项协议知识。
+  5. **同一节点上并存两种协议的交互方法**（D13）：`Send`/`RequestForResponse`/`RequestForResult` 属外部系统协议，`RequestForResultDirect` 属另一种协议。调用方须自行确保所用方法与对端协议匹配，**框架不校验**（它对协议语义不透明）。
+  6. `RequestForResultDirect` 在等待结果阶段**会重发**，故其对端**同样须容忍重复命令**——与代价 3 同源，但适用面更广（③ 只在受理阶段重发，④ 在唯一的等待阶段重发）。
 - **实现注记：** 重发时帧字节完全相同（D3），故可编码一次、重复写出，不必每次 `Encode`。
 
 ## 备选方案（Alternatives considered）
@@ -129,3 +140,5 @@ SRS **RT_NODE_002** 长期写着：
 - **第二阶段也重发**：否决——`kResult` 意味着对端正在执行，重发命令有使其重复执行的风险（D2）。
 - **`kResult` 的命令码由框架按规则推导**（如 `cmd | 0x8000`）：否决——那是协议知识，写死任何规则都会在换协议时失效（D7）。
 - **同时给出接收侧的四个对应辅助**：否决——应答内容与时机是业务决策，且与 ADR-0009"消费样板交调用方"的方向相悖（D9）。
+- **为 `RequestForResultDirect` 所属的协议另起一个节点类型**：否决——`ProtocolNode` 对线缆格式不透明（编解码经 `ICodec` 注入），两种协议的差异只体现在"用哪些帧类型、走哪种交互"，不构成新的节点类型；另起节点会复制整套生命周期与分发骨架（D13）。
+- **按"是否回应结果"把 `RequestForResult` 拆成两个接口**（原 `RequestForResultAndConfirm`）：否决——经核实 `withfeedback` 与 `needfeedback` 是**同一个通信模型**，回应结果是该模型固有的最后一步而非可选项，拆开只会制造一个永远不该被单独调用的接口（D1 修正）。
