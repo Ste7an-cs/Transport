@@ -1,0 +1,64 @@
+sequenceDiagram
+    autonumber
+    participant C as 调用方 fiber
+    participant N as ProtocolNode
+    participant D as Dispatcher
+    participant T as ITransport
+    participant P as 对端
+
+    Note over C,P: 四种模式各一个方法；状态机全部跑在【调用方 fiber】上<br/>阶段/重发计数/原始帧 = 该方法的局部变量（ADR-0010 D1）
+
+    rect rgb(238, 245, 251)
+        Note over C,P: ① Send（noresponse）—— 发了不管
+        C->>N: Send(msg)
+        N->>T: AsyncWrite(kCommand)
+        T-->>P: kCommand
+        N-->>C: 立即返回（不等待）
+    end
+
+    rect rgb(232, 243, 234)
+        Note over C,P: ② RequestForResponse（needresponse）
+        C->>N: RequestForResponse(req, {timeout, max_attempts})
+        N->>D: Subscribe {sid, mid, kResponse}
+        Note over N,D: 【发命令之前】先登记订阅（D4）
+        loop 至多 max_attempts 次
+            N->>T: AsyncWrite(kCommand)  ← 每次字节完全相同，sid 不变（D3）
+            T-->>P: kCommand
+            N->>N: 等 kResponse（timeout）
+        end
+        P-->>D: kResponse
+        D-->>N: 首个到达者即终结本阶段（D3）
+        N-->>C: 成功 · 返回该帧 Message
+        Note over N,C: 次数耗尽仍无受理 ⇒ kNotAccepted（D12）
+    end
+
+    rect rgb(251, 246, 239)
+        Note over C,P: ③ RequestForResult（withfeedback）
+        C->>N: RequestForResult(req, retry, result_mid, result_timeout)
+        N->>D: Subscribe {sid, mid, kResponse}
+        N->>D: Subscribe {sid, result_mid, kResult}
+        Note over N,D: 两个订阅【一起】先登记 —— kResult 可能先到（D4）
+        N->>T: AsyncWrite(kCommand)（同上，可重发）
+        P-->>D: kResponse（受理）
+        D-->>N: 阶段一完成
+        N->>D: Reset 受理凭据（D5）
+        Note over N,D: 不注销则重发引出的重复受理帧会继续入信箱；<br/>注销后它们成为无匹配终结帧 → kUnmatchedOrLateResponse
+        N->>N: 等 kResult（result_timeout，【不重发】D2）
+        P-->>D: kResult
+        D-->>N: 阶段二完成
+        N-->>C: 成功 · 返回 kResult 帧 Message
+        Note over N,C: 阶段二超时 ⇒ kTimeout（区别于 kNotAccepted）
+    end
+
+    rect rgb(250, 240, 234)
+        Note over C,P: ④ RequestForResultAndConfirm（needfeedback）= ③ + 我方回确认
+        Note over C,N: ……前两阶段同 ③……
+        P-->>D: kResult
+        D-->>N: 阶段二完成
+        N->>T: AsyncWrite(kResponse) 确认帧
+        Note over N,T: 沿用对端 kResult 的 sid/mid，payload 由调用方给；<br/>不走 Send()（它会强制盖新 session_id）—— 走私有 EncodeAndWrite（D8）
+        T-->>P: kResponse
+        N-->>C: 成功 · 返回 kResult 帧 Message
+    end
+
+    Note over C,P: 接收侧（收到 kCommand 后如何应答）不建模，由宿主 Subscribe 自理（D9）<br/>repeating 本轮不定义（D11）
