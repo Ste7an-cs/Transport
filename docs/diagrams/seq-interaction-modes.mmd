@@ -51,12 +51,12 @@ sequenceDiagram
     end
 
     rect rgb(250, 240, 234)
-        Note over C,P: ④ RequestForResultAndConfirm（needfeedback）= ③ + 我方回确认
+        Note over C,P: ④ RequestForResultAndConfirm（needfeedback）= ③ + 我方回确认<br/>签名与 ③ 相同 —— 确认帧无调用方参数
         Note over C,N: ……前两阶段同 ③……
         P-->>D: kResult
         D-->>N: 阶段二完成
         N->>T: AsyncWrite(kResponse) 确认帧
-        Note over N,T: 沿用对端 kResult 的 sid/mid，payload 由调用方给；<br/>不走 Send()（它会强制盖新 session_id）—— 走私有 EncodeAndWrite（D8）
+        Note over N,T: 确认帧 = 收到的 kResult 帧【原样改帧类型】：<br/>payload 回显 · sid/mid 不变 · 仅 frm_type→kResponse · CRC 由 Encode 重算<br/>不走 Send()（它会强制盖新 session_id 与 kCommand）—— 走私有 EncodeAndWrite（D8）
         T-->>P: kResponse
         N-->>C: 成功 · 返回 kResult 帧 Message
     end

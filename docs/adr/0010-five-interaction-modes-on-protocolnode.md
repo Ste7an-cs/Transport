@@ -61,7 +61,7 @@ SRS **RT_NODE_002** 长期写着：
   ④ RequestForResultAndConfirm（needfeedback）
      ……同 ③ 全部……
      ← kResult
-     → kResponse（我方回确认）                          ⇒ 成功
+     → kResponse（我方回确认 = 该 kResult 帧原样改帧类型）  ⇒ 成功
   ```
 
   **重发只发生在第一阶段**（等 `kResponse`）。第二阶段（等 `kResult`）超时**直接结束，不重发**——依据：`kResult` 意味着对端正在执行，重发命令有使其重复执行的风险。
@@ -78,8 +78,21 @@ SRS **RT_NODE_002** 长期写着：
   依据：两阶段的等待是**数量级不同**的量——第一阶段是"对端受理"，第二阶段是"对端执行完"；且同一节点上不同命令的耐受度不同，不宜由节点级配置一刀切。
 
 - **D7（`kResult` 的命令码由调用方给出）：** 结果帧的 `message_id` 与请求帧**不同**，其对应关系是协议知识，框架不猜、不做映射规则，由调用方作为参数传入。
+  **范围（2026-08-26 修正）**：本条只约束**入站** `kResult` 的订阅键。④ 的**出站确认帧**不适用——它的全部字段由收到的 `kResult` 派生，无调用方参数（见 **D8**）。
 
-- **D8（④ 的确认帧沿用对端 `kResult` 的 `session_id`/`message_id`，payload 由调用方给）：** 该帧**不能走 `Send()`**——`Send()` 会强制 `session_id = NextSession()`，覆盖掉需要沿用的值。应走不盖章的内部写路径（现有私有 `EncodeAndWrite` 即满足）。
+- **D8（④ 的确认帧 = 收到的 `kResult` 帧原样改帧类型后回发）：** 确认帧由**收到的那一帧直接派生**，**不接受任何调用方参数**：
+
+  | 字段 | 取值 |
+  |---|---|
+  | `payload` | **原样回显** `kResult` 的 payload |
+  | `session_id` | 沿用（不变） |
+  | `message_id` | 沿用（不变） |
+  | `frm_type` | **仅此一处改动**：`kResult` → `kResponse` |
+  | CRC | 由 `ICodec::Encode` 重新计算（`SystemCodec.cpp:52`），`ProtocolNode` 不碰 |
+
+  由此 `RequestForResultAndConfirm` 与 `RequestForResult` **签名完全相同**，差别只在行为。
+  **不破坏"框架不解读 payload"**：payload 是整块拷贝，框架不读其内部结构——`Message::payload` 的定位（"应用字节，框架不解读其语义"）得以保持。
+  **不得走 `Send()`**：它会强制 `session_id = NextSession()` 与 `frm_type = kCommand`，覆盖掉需要沿用的值；应走不盖章的私有 `EncodeAndWrite()`。
 
 - **D9（接收侧不建模，维持现状）：** 本 ADR 只定义**发起方**的状态机。节点收到 `kCommand` 后如何回 `kResponse`/`kResult`、④ 中如何等待对方确认，仍由**宿主 `Subscribe` 后自行处理**，框架不提供对应的接收侧辅助。
   依据：接收侧的应答内容与时机是纯业务决策，框架无从代劳；且 ADR-0009 已确立"入站由订阅承载、消费样板交调用方"。

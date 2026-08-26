@@ -242,7 +242,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![交互模式时序图](diagrams/seq-interaction-modes.svg)
 
-**图例说明（ADR-0010 / RT_NODE_002_a..e）**：四种模式各一个方法，**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；④ 的确认帧**不走 `Send()`**（**D8**，它会强制盖新 `session_id`）。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
+**图例说明（ADR-0010 / RT_NODE_002_a..e）**：四种模式各一个方法，**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；④ 的确认帧**完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
 
 #### 4.3.1 接口标识和接口图
 
@@ -425,7 +425,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
   3. 第一阶段：发帧 → 等 `kResponse`，超时则**重发字节完全相同的原帧**（`session_id` 不变，**D3**），至多 `max_attempts` 次；耗尽返 **`kNotAccepted`**（**D12**）；
   4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，按 `kUnmatchedOrLateResponse` 归因；
   5. ③④ 第二阶段：等 `kResult`，超时返 `kTimeout`，**不重发**（**D2/D5**：`kResult` 未达意味着对端正在执行）；
-  6. ④ 收到 `kResult` 后回一帧 `kResponse`，**沿用对端该帧的 `session_id`/`message_id`**，payload 由调用方给；该帧**不得走 `Send()`**（它会强制 `session_id = NextSession()`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
+  6. ④ 收到 `kResult` 后回一帧确认，该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**不得走 `Send()`**（它会强制盖新 `session_id` 与 `kCommand`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
 
   **实现注记**：重发的帧字节完全相同，可编码一次重复写出，不必每次 `Encode`。
   **接收侧不建模**（**D9**）：节点收到 `kCommand` 后如何应答由宿主 `Subscribe` 自理，框架不提供对应辅助。
