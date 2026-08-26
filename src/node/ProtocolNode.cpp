@@ -64,19 +64,10 @@ ProtocolNode::~ProtocolNode() {
   WaitClosed();
 }
 
-Coro::Result<void> ProtocolNode::ValidateConfig() const {
-  // 默认请求超时须为正(SRS §3.1.4.4):写出为 fire-and-forget、断链不终结在途请求,
-  // 时限是唯一的兜底终结源;零或负值等价于"永不超时",将使请求挂至节点关闭。
-  if (config_.default_request_timeout <= std::chrono::milliseconds::zero()) {
-    return make_error_code(TransportErrc::kConfiguration);
-  }
-  return Coro::Result<void>{};
-}
-
 Coro::Result<void> ProtocolNode::DoStart() {
-  if (auto valid = ValidateConfig(); !valid) {
-    return valid;  // 停 Created,未取句柄、未 spawn,允许改配重试。
-  }
+  // 本节点的配置面已无需校验项:时限逐次传参(SRS §3.1.4.4 / ADR-0010 D6),"不得永不
+  // 超时"由 `ValidateInteraction` 的参数校验直接拒绝非正值,不再依赖启动期的配置校验。
+  //
   // **不启动 transport**:宿主已经启过。读侧取自己的一路订阅——关它只终止本节点,
   // 源队列与其它订阅者不受影响;写侧无句柄可取,直接调 transport_.Write()。
   rx_ = transport_.AsyncRead()->shared();

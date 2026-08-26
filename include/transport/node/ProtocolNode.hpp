@@ -105,21 +105,16 @@ struct RetryPolicy {
   int max_attempts = 1;
 };
 
-/// ProtocolNode 配置:默认外部协议 id + 默认请求超时 + 可选 Trace 出口。
+/// ProtocolNode 配置:默认外部协议 id + 可选 Trace 出口。
+///
+/// 交互时限**不在配置面上**(SRS §3.1.4.4):四种交互各阶段的时限是数量级不同的量,一个
+/// 节点级缺省值套不上去,故逐次传参(ADR-0010 D6)。"不得永不超时"的保护由
+/// `ValidateInteraction` 的参数校验直接承担——它**拒绝**任何非正时限。
 ///
 /// 入站业务不在配置面上——它由宿主经 `Subscribe(Key)` 自行登记(ADR-0009 D1),故本结构
 /// 既无处理器字段,也无业务队列容量字段(容量即订阅信箱的容量,ADR-0009 D3)。
 struct ProtocolNodeConfig {
   std::uint8_t protocol_id = 0;
-  /**
-   * 默认请求总超时(SRS §3.1.4.4):调用方未显式给出时限时以本值补齐。节点不接受
-   * "永不超时"的请求——链路断开不终结在途请求(重连对交互层透明),写出又是
-   * fire-and-forget 而不回传失败,故时限是在途请求唯一的兜底终结源;缺失该终结源的请求
-   * 将挂至节点关闭,与 RT_REQUEST_003"每个请求恰好终结一次"冲突。
-   *
-   * 须为正值,否则 `Start` 返 kConfiguration 并停在 Created(RT_LIFECYCLE_007)。
-   */
-  std::chrono::milliseconds default_request_timeout{30000};
   /// 可选 Trace 出口(ADR-0003 D13);非拥有,可为 nullptr。**观测的唯一出口**——本类不再
   /// 有任何计数器与 getter。本类在两个丢弃点(kBadFrame / kUnmatchedOrLateResponse)与
   /// send/recv/decode 边界上报事件。无订阅者的业务帧**不**在此列(ADR-0009 D5)。
@@ -335,10 +330,6 @@ class ProtocolNode : public NodeBase {
   void DoJoin() override;
 
  private:
-  /// @brief 校验 config(RT_LIFECYCLE_007):`default_request_timeout` 须为正值。非法返
-  ///        kConfiguration,节点停在 Created,允许宿主改配后重试。由 `DoStart()` 开头调用。
-  [[nodiscard]] Coro::Result<void> ValidateConfig() const;
-
   /**
    * @brief spawn 读-分发循环 fiber。
    *

@@ -54,16 +54,13 @@ namespace {
 
 constexpr std::uint8_t kProtocolId = 0x2A;
 
-/// 本夹具的默认请求时限。`Request` 删除后(ADR-0010 D10)需求-响应一律走
-/// `RequestForResponse`,时限必须显式给出;凡原先不带时限、由
-/// `config.default_request_timeout` 补齐的调用,一律改填本值——与 `BaseConfig()` 所设
-/// 的 200ms 同源,故用例的时限语义不变。
-constexpr auto kDefaultRequestTimeout = 200ms;
+/// 本文件用例的默认时限。时限不在配置面上、必须逐次显式给出(SRS §3.1.4.4 /
+/// ADR-0010 D6),凡用例本身不关心具体取值的调用一律填本值,使各用例时限语义一致。
+constexpr auto kCaseTimeout = 200ms;
 
 ProtocolNodeConfig BaseConfig() {
   ProtocolNodeConfig config;
   config.protocol_id = kProtocolId;
-  config.default_request_timeout = kDefaultRequestTimeout;
   return config;
 }
 
@@ -248,7 +245,7 @@ TEST(ProtocolNode, RequestIsTerminatedByMatchingResponse) {
   Fixture fx;
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask([&] {
-    reply = fx.node->RequestForResponse(Command(0x0010), {kDefaultRequestTimeout, 1});
+    reply = fx.node->RequestForResponse(Command(0x0010), {kCaseTimeout, 1});
   });
 
   ASSERT_TRUE(
@@ -393,7 +390,7 @@ TEST(ProtocolNode, MatchedResponseDoesNotReachBusinessSubscriber) {
 
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask([&] {
-    reply = fx.node->RequestForResponse(Command(0x0010), {kDefaultRequestTimeout, 1});
+    reply = fx.node->RequestForResponse(Command(0x0010), {kCaseTimeout, 1});
   });
   ASSERT_TRUE(
       testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
@@ -522,7 +519,7 @@ TEST(ProtocolNode, RequestAndSendRejectedBeforeStartAndAfterClose) {
   ProtocolNode node(fake, MakeCodec(), BaseConfig());
 
   EXPECT_EQ(
-      node.RequestForResponse(Command(0x0001), {kDefaultRequestTimeout, 1}).error(),
+      node.RequestForResponse(Command(0x0001), {kCaseTimeout, 1}).error(),
       make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Send(Command(0x0001)).error(),
             make_error_code(TransportErrc::kClosed));
@@ -531,7 +528,7 @@ TEST(ProtocolNode, RequestAndSendRejectedBeforeStartAndAfterClose) {
   ASSERT_TRUE(node.Close());
   node.WaitClosed();
   EXPECT_EQ(
-      node.RequestForResponse(Command(0x0001), {kDefaultRequestTimeout, 1}).error(),
+      node.RequestForResponse(Command(0x0001), {kCaseTimeout, 1}).error(),
       make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Send(Command(0x0001)).error(),
             make_error_code(TransportErrc::kClosed));
@@ -649,18 +646,32 @@ TEST(ProtocolNode, SubscriberExceptionIsIsolatedByCaller) {
   business.Join();
 }
 
-TEST(ProtocolNode, StartRejectsNonPositiveRequestTimeout) {
-  FakeTransport fake;
-  ASSERT_TRUE(fake.Start());
-  ProtocolNodeConfig config = BaseConfig();
-  config.default_request_timeout = 0ms;
-  ProtocolNode node(fake, MakeCodec(), std::move(config));
+// "不得永不超时"(SRS §3.1.4.4)的唯一保证:时限已无节点级缺省值,改由交互方法的参数
+// 校验直接**拒绝**任何非正时限——比缺省值更硬(缺省值只在调用方省略时兜底)。本用例接手
+// 原 `StartRejectsNonPositiveRequestTimeout` 对该要求的覆盖,断言对象由配置改为参数,并
+// 补上负值一支(零值一支另见 ④ / ⑬)。
+TEST(ProtocolNode, InteractionsRejectNonPositiveTimeout) {
+  Fixture fx;
 
-  auto started = node.Start();
-  ASSERT_FALSE(started);
-  EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
-  EXPECT_FALSE(node.IsRunning()) << "配置非法应停在 Created,允许改配后重试";
-  (void)fake.Close();
+  auto negative_timeout =
+      fx.node->RequestForResponse(Command(0x0010), {-1ms, 1});
+  ASSERT_FALSE(negative_timeout);
+  EXPECT_EQ(negative_timeout.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  auto negative_result_timeout = fx.node->RequestForResult(
+      Command(0x0010), {kCaseTimeout, 1}, 0x03F2, -1ms);
+  ASSERT_FALSE(negative_result_timeout);
+  EXPECT_EQ(negative_result_timeout.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  auto zero_result_timeout = fx.node->RequestForResult(
+      Command(0x0010), {kCaseTimeout, 1}, 0x03F2, 0ms);
+  ASSERT_FALSE(zero_result_timeout);
+  EXPECT_EQ(zero_result_timeout.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  EXPECT_TRUE(fx.transport.sent().empty()) << "时限非正时一帧都不该发出";
 }
 
 // —— 5. 分段交互与旁路监听 ————————————————————————————————————————————
