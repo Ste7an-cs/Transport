@@ -273,6 +273,45 @@ Coro::Result<Message> ProtocolNode::RequestForResult(
   return result_msg;
 }
 
+Coro::Result<Message> ProtocolNode::RequestForResultDirect(
+    Message req, RetryPolicy retry, std::uint16_t result_message_id) {
+  // 本交互只有一个等待阶段,其时限即 retry.timeout,故无独立的 result_timeout 需校验。
+  if (auto valid = ValidateInteraction(retry); !valid) {
+    return valid.error();
+  }
+  req.frm_type = FrameType::kCommand;
+  req.protocol_id = config_.protocol_id;
+  req.session_id = NextSession();
+
+  // **只有一个订阅**——本交互不存在受理帧(D13),故没有 ack 订阅可登记,也无 D5 的注销。
+  // 仍是"先登记、再发出":反之则结果帧可能先于订阅到达而被丢弃。
+  auto result = dispatcher_.Subscribe(
+      FrameOf(req.session_id, result_message_id, FrameType::kResult));
+
+  // **独立的重发循环,不走 AwaitAccept()**:那个骨架等 kResponse、耗尽返 kNotAccepted,
+  // 两处语义都不适用于本交互。
+  for (int attempt = 0; attempt < retry.max_attempts; ++attempt) {
+    // 重发的是**字节完全相同**的原帧(D3):req 全程不改,session_id 不变,故订阅横跨全部
+    // 重发继续有效,最先到达的那一帧即终结本次交互。
+    if (auto queued = EncodeAndWrite(req); !queued) {
+      return queued.error();  // 编码失败 / 生命周期非法——不属超时,不重试。
+    }
+    auto got = result.Wait(retry.timeout);
+    if (got) {
+      return got;  // 收到即成功,**不回应任何帧**(与 RequestForResult 的 D8 末步相反)。
+    }
+    if (got.error() != make_error_code(TransportErrc::kTimeout)) {
+      return got.error();  // kClosed 等终止原因直接透出,重试无意义。
+    }
+    // 超时 → 重发。本交互**在等结果阶段重发**(D13 / RT_NODE_002_g):它没有受理阶段,
+    // 唯一的等待就是等结果,不重发则命令帧一旦丢失即彻底失败、无任何补救。
+    // RT_NODE_002_c 的"等 kResult 不得重发"只约束外部系统协议,与本条并存不矛盾。
+  }
+  // D12:返 kTimeout 而**非** kNotAccepted——后者的语义是"对端没有受理",而本交互根本
+  // 不存在受理这一步,"未受理"这一事实不存在。
+  return make_error_code(TransportErrc::kTimeout);
+}
+
 Coro::Result<void> ProtocolNode::Send(Message msg) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
