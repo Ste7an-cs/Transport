@@ -10,7 +10,7 @@ SRS **RT_NODE_002** 长期写着：
 
 > 外部系统协议现有五种交互行为 `noresponse`、`needresponse`、`withfeedback`、`needfeedback`、`repeating` 的精确状态机、时序、重试和终结帧语义为 **TBD，本版不在此细化**。
 
-现在把前四种的语义定下来（`repeating` 本轮仍不讨论）。
+现在把前四种的语义定下来。**第五种 `repeating` 已于 2026-08-26 裁决废止**（不再需要，见 **D11**），故本 ADR 之后 RT_NODE_002 **无遗留 TBD**。
 
 线缆层的帧类型早已就位（`Message.hpp`，注意其值当前为**占位值**，真实对接时改为外部协议规定的字节）：
 
@@ -35,7 +35,6 @@ SRS **RT_NODE_002** 长期写着：
   | 外部系统协议 | `noresponse` | `Send`（现有） | → 命令 | 无 |
   | 外部系统协议 | `needresponse` | **`RequestForResponse`** | → 命令 · ⏱← 回应 | 无 |
   | 外部系统协议 | `withfeedback` **与** `needfeedback` | **`RequestForResult`** | → 命令 · ⏱← 回应 · ⏱← 结果 | **回一帧回应** |
-  | 外部系统协议 | `repeating` | —（**D11**：本轮不做） | | |
   | **另一种协议** | —（该协议自有的交互） | **`RequestForResultDirect`** | → 命令 · ⏱← 结果（**无中间回应**） | 无 |
 
   **修正（2026-08-26）**：`withfeedback` 与 `needfeedback` 经核实是**同一个通信模型**——都是「请求 → 等回应 → 等结果 → **回应结果**」。故二者合并为一个接口 `RequestForResult`，**回应结果是该模型固有的最后一步，不是可选项**；原先按"是否回确认"拆出的 `RequestForResultAndConfirm` 取消。
@@ -102,31 +101,19 @@ SRS **RT_NODE_002** 长期写着：
 - **D9（接收侧不建模，维持现状）：** 本 ADR 只定义**发起方**的状态机。节点收到 `kCommand` 后如何回 `kResponse`/`kResult`、④ 中如何等待对方确认，仍由**宿主 `Subscribe` 后自行处理**，框架不提供对应的接收侧辅助。
   依据：接收侧的应答内容与时机是纯业务决策，框架无从代劳；且 ADR-0009 已确立"入站由订阅承载、消费样板交调用方"。
 
-- **D10（`Send` 与 `Request` 本轮均保留，重叠问题推迟）：** 新增三个方法，现有 `Send(Message)` 与 `Request(Message, timeout)` **不动**。
-  **明确记录的代价**：`Request`（总超时、无重发）与 `RequestForResponse`（单次超时 + 重发）**语义相近而不相同**，并存期间调用方容易用错。二者的合并/取舍**推迟决定**，不在本轮解决。
+- **D10（删除 `Request`，`Send` 保留）——2026-08-26 裁决，原"推迟处置"作废：** 公开方法 `Request(Message, milliseconds)` **删除**。
+  依据：它与 `RequestForResponse` **语义相近而不相同**（前者总超时无重发，后者单次超时 + 重发），并存只会让调用方在两个都能用的接口间猜；而 `RequestForResponse` 以 `max_attempts = 1` 即完全覆盖 `Request` 的行为——**单次尝试时"总超时"与"单次超时"等价**，故不存在能力缺口。
+  `Send`（`noresponse`）**保留**：它对应一种独立的交互行为，不与任何 `RequestFor*` 重叠。
+  **破坏性变更**：须在 `CHANGELOG.md` 标注；SRS §3.2.2 接口变更登记同步。
 
-- **D12（两阶段失败以不同错误码区分，新增 `kNotAccepted`）：** 在 `TransportErrc` 增加一个值：
-
-  | 失败点 | 返回 | 语义 |
-  |---|---|---|
-  | 阶段一：重发次数耗尽仍无 `kResponse` | **`kNotAccepted`**（新增） | 对端**始终没有受理** |
-  | 阶段二：已受理，等 `kResult` 超时 | `kTimeout`（现有） | 受理了但没出结果 |
-
-  依据：① 阶段一失败的本质**不是"超时"而是"未受理"**——重发 N 次都无回应，与"已受理但执行慢"是两类事实，用同一个码表达会丢失调用方需要的信息；② 只加**一个**值而非 `kAcceptTimeout`/`kResultTimeout` 两个，`kTimeout` 得以保持原义；③ `kNotAccepted` 在本协议之外也讲得通，不是为单一协议造的词。
-  **④ `RequestForResultDirect` 的失败返 `kTimeout`**：它没有受理阶段，"未受理"这一事实不存在，重发耗尽的语义就是"始终没拿到结果"。
-  **越层性说明**：`TransportErrc` 名字虽带 Transport，实为**全项目共用**的错误枚举（`ProtocolNode` 现已返回其 `kClosed`/`kTimeout`/`kConfiguration`），故加值不构成越层；SRS **RT_ERROR_003** 写的是"**最低**错误类别应包括……"，是下限而非穷举，加值不违反该条。
-
-- **D13（`RequestForResultDirect` 属另一种协议，与外部系统协议的三种并列于同一节点；SRS 落点 RT_NODE_002_g）：** 该交互（请求 → 直接等结果、无中间受理、结果不回应、等结果超时可重发）**不属于**外部系统协议的五种行为，是**另一种协议**自有的交互形态。
-  它仍由 `ProtocolNode` 承载而非另起节点类型——`ProtocolNode` 对线缆格式不透明（编解码经 `ICodec` 注入），协议差异体现在**用哪些帧类型、走哪种交互**，不构成新的节点类型。这与 ADR-0003 **D10**"协议无关机制可复用、协议特有语义内联"一致。
-  **由此产生的并存**：同一节点上四个交互方法分属**两种协议**，调用方须自行确保所用方法与对端协议匹配；框架不校验（它对协议语义不透明）。该风险记于「影响」。
-
-- **D11（`repeating` 本轮不做）：** 第五种交互行为暂不定义。RT_NODE_002 相应改为"前四种已定义，`repeating` 仍为 TBD"。
+- **D11（`repeating` 废止）——2026-08-26 裁决，原"本轮不做"作废：** 第五种交互行为 `repeating` **不再需要**，从需求中**移除**而非继续挂 TBD。
+  RT_NODE_002 相应由"四种已定义、`repeating` 仍为 TBD"改为**全部已定义**——外部系统协议三种（`noresponse` / `needresponse` / `withfeedback` ＝ `needfeedback`）加另一种协议的直取结果交互，共四个接口，**无遗留 TBD**。
 
 ## 影响（Consequences）
 
 - **正面：** 一个看似要新机制的需求（多段交互 + 重试）**没有引入任何新机制**——完全由 `Dispatcher` 的既有性质（投递不终结订阅、键可部分匹配）加调用方控制流实现；节点不新增状态、不新增成员、无并发面变化；四种模式各自独立，互不影响。
 - **负面（明确接受）：**
-  1. `Send`/`Request` 与新接口的语义重叠（D10）。
+  1. ~~`Send`/`Request` 与新接口的语义重叠（D10）。~~ **已由 D10 的 2026-08-26 裁决解决**：`Request` 删除。
   2. ~~两个阶段的超时都返回 `kTimeout`，调用方无法区分……~~ **本条已由 D12 解决（2026-08-26）**：阶段一失败返 `kNotAccepted`，阶段二返 `kTimeout`。
   3. 重发按 D3 沿用同一帧，故**要求对端能容忍重复命令**（幂等，或自行按 `session_id` 去重）。这是协议层假设，框架不校验。
   4. `RequestForResult` 与 `RequestForResultDirect` 的调用方必须知道**结果帧的命令码**（D7），比 `Request` 多一项协议知识。

@@ -408,7 +408,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 > - **`session_id` 简化为自增计数器**：`std::uint8_t` 每次取用后自增、越过 255 自然回绕。0..255 空闲集、FIFO 退休窗口、RAII 租约与 `kResourceExhausted` 边界一并删除（推翻 RT_REQUEST_005/006）。
 > - **八个观测接口全部删除**，丢弃只经 `ITraceSink` 上报。
 > - 公开面收为 5 个：构造 / 析构 / `Request(Message, milliseconds)` / `Send(Message)` / `Subscribe(Key)`，另继承基类的四个生命周期方法。
-> - **新增（ADR-0010，2026-08-26）**：三个交互模式方法 `RequestForResponse` / `RequestForResult` / `RequestForResultDirect`（见下"交互模式"）。`Request` 与 `Send` 本轮保留（ADR-0010 **D10**），其与新接口的语义重叠推迟处置。
+> - **再变更（ADR-0010 D10，2026-08-26）**：`Request(Message, milliseconds)` **已删除**——与 `RequestForResponse` 语义相近而不相同，后者以 `max_attempts = 1` 完全覆盖其行为。`Send` 保留。
+> - **新增（ADR-0010，2026-08-26）**：三个交互模式方法 `RequestForResponse` / `RequestForResult` / `RequestForResultDirect`（见下"交互模式"）。`Send` 保留；`Request` 已删除（**D10**）。
 
 **单元设计决策（DD-3/DD-4）**：继承 `NodeBase`（生命周期），组合 `ICodec`+`Dispatcher`（**ADR-0009**：不再组合 `HandlerLoop`）、**按引用借用** `ITransport`，协议特有语义全内联本类；DdsNode 复用同套基座仅换键字段（D10 实证）。
 
@@ -514,7 +515,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 TBD-009** |
 | RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、MS_CONNECTION |
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
-| RT_NODE_002_a..g（四种交互模式，ADR-0010） | CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
+| RT_NODE_002_a..g（四种交互模式，ADR-0010；`repeating` 已废止，无遗留 TBD） | CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
 | RT_TCP_RECONNECT_001..005 | DD-11、DD-12 / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、MS_CONNECTION |
 | RT_TCP_RECONFIG_001..006 | CSU_IO（TcpClientTransport::ApplyConfig） |
 | RT_ERROR_001..003 | DD-5 / CSC_CORE / CSU_CORE |
