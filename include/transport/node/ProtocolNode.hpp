@@ -245,6 +245,51 @@ class ProtocolNode : public NodeBase {
       std::chrono::milliseconds result_timeout);
 
   /**
+   * @brief 交付一次**另一种协议**的"直取结果"交互(ADR-0010 D13 / RT_NODE_002_g)。
+   *
+   * ```
+   * → kCommand
+   * ⏱ 等 kResult ──超时──▶ 重发 ──次数耗尽──▶ kTimeout
+   * ← kResult                                ⇒ 成功(返回该帧,**不回应**)
+   * ```
+   *
+   * **它不是外部系统协议的第五种交互**:`Send` / `RequestForResponse` / `RequestForResult`
+   * 属外部系统协议,本方法属另一种协议,二者并存于同一节点(D13)。`ProtocolNode` 对线缆
+   * 格式不透明(编解码经 `ICodec` 注入),协议差异只体现在"用哪些帧类型、走哪种交互",
+   * 不构成新的节点类型,故不另起节点。
+   * **调用方须自行确保所用方法与对端协议匹配,框架不校验**——它对协议语义不透明(D13,
+   * 已记为明确接受的代价)。
+   *
+   * 与 `RequestForResult` **恰好相反的三条**,勿混:
+   * 1. **本交互在"等结果"阶段就重发**。`RequestForResult` 的"等 `kResult` 时不得重发"
+   *    (RT_NODE_002_c)**只约束外部系统协议**,不是框架的普遍规则(该条 2026-08-26 已明确
+   *    适用面)。本交互没有受理阶段,唯一的等待就是等结果——不重发则命令帧一旦丢包即
+   *    彻底失败、无任何补救(RT_NODE_002_g)。
+   * 2. **重发耗尽返 `kTimeout` 而非 `kNotAccepted`**(D12):后者的语义是"对端**没有受理**",
+   *    而本交互**根本不存在受理这一步**。
+   * 3. **收到 `kResult` 后不回应任何帧**(对比 D8:那是 `RequestForResult` 模型固有的最后
+   *    一步)。
+   *
+   * 因此本方法**不复用** `AwaitAccept()`:那个骨架等的是 `kResponse`、耗尽返 `kNotAccepted`,
+   * 两处语义都不对。它自带一个独立的重发循环,且**只登记一个订阅**(无受理帧可订)。
+   *
+   * 重发的是**字节完全相同**的原帧、`session_id` 不变(D3),以最先到达的那一帧为准;由此
+   * **要求对端能容忍重复命令**(幂等,或自行按 session_id 去重)——协议层假设,框架不校验。
+   * 因本交互在唯一的等待阶段重发,该要求的适用面比 `RequestForResult` 更广。
+   *
+   * @param req               请求 Message(payload + message_id 由调用方填);本节点盖
+   *                          kCommand / protocol_id / session_id。
+   * @param retry             重发策略。本交互**只有一个等待阶段**,其时限即
+   *                          `RetryPolicy::timeout`,故签名中**没有**独立的 result_timeout。
+   * @param result_message_id 结果帧的命令码。它与请求帧**不同**,其对应关系是协议知识,
+   *                          框架不猜、不做映射规则(D7),由调用方给出。
+   * @return 收到的 `kResult` 帧;或 kTimeout(重发次数耗尽,**非** kNotAccepted)、
+   *         kInvalidArgument(策略非法)、kClosed(未启动 / 已关闭)、编码错误。
+   */
+  [[nodiscard]] Coro::Result<Message> RequestForResultDirect(
+      Message req, RetryPolicy retry, std::uint16_t result_message_id);
+
+  /**
    * @brief noresponse fire-and-forget 出站:盖章 + 编码 + 交给传输,不期待应答。
    *
    * 本节点盖 frm_type(调用方给出的业务类型优先,否则取 kCommand)、默认 protocol_id,
@@ -337,7 +382,11 @@ class ProtocolNode : public NodeBase {
   ///        **不盖任何章**——这正是 D8 的回应结果帧走本函数而非 `Send()` 的原因。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
 
-  /// @brief 受理阶段(等 kResponse,超时重发),两个交互方法共用的私有骨架。
+  /// @brief 受理阶段(等 kResponse,超时重发),`RequestForResponse` 与 `RequestForResult`
+  ///        共用的私有骨架。
+  ///
+  /// **仅限外部系统协议**:`RequestForResultDirect` 不走本函数——它等的是 `kResult`、耗尽
+  /// 返 `kTimeout`,与本函数的两处语义都不同(ADR-0010 D13/D12)。
   ///
   /// **前置**:`ack_ticket` 须**已由调用者登记**——登记必须先于第一次发出(D4),且
   /// `RequestForResult` 还须与结果订阅一起登记,故不能挪进本函数。
@@ -348,7 +397,7 @@ class ProtocolNode : public NodeBase {
       const Message& req, const RetryPolicy& retry,
       MessageDispatcher::Ticket& ack_ticket);
 
-  /// @brief 两个交互方法共用的前置判据:节点在运行 + 重发策略合法。
+  /// @brief 三个交互方法共用的前置判据:节点在运行 + 重发策略合法。
   [[nodiscard]] Coro::Result<void> ValidateInteraction(
       const RetryPolicy& retry) const;
 

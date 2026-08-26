@@ -937,3 +937,177 @@ TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsAttributedAsUnmatched) {
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{9}));
 }
+
+// —— 7. 另一种协议的直取结果交互:RequestForResultDirect(ADR-0010 D13 / RT_NODE_002_g)——
+//
+// 本组与第 6 组**分属两种协议**。两条与 `RequestForResult` 恰好相反的规则各有一条用例作为
+// 行为分界证据:⑩ 证明"等结果阶段确实重发"(对比 ⑦ 的"不得重发"),⑪ 证明"失败返
+// kTimeout 而非 kNotAccepted"(对比 ③)。此外 ⑨ 证明"收到结果后不回应"(对比 ⑤ 的 D8
+// 末步),⑫ 证明"本交互不订阅受理帧,中途到达的 kResponse 无匹配、按迟到终结帧归因丢弃"。
+
+// ⑨ 一次成功:发命令 → 回 kResult → 返回该帧,且**我方未回发任何帧**。
+//    与 ⑤ 对照:`RequestForResult` 收到结果后必回一帧 kResponse(D8),本交互没有这一步。
+TEST(ProtocolNode, RequestForResultDirectSucceedsAndSendsNoReply) {
+  Fixture fx;
+  constexpr std::uint16_t kResultId = 0x03F2;
+  const std::vector<std::uint8_t> kResultPayload{4, 2, 0};
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResultDirect(Command(0x0010), Retry(500ms, 3), kResultId);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+  EXPECT_EQ(sent.frm_type, FrameType::kCommand);
+  EXPECT_EQ(sent.protocol_id, kProtocolId);
+  // **不发受理帧**:本交互没有受理阶段,直接投结果。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, kResultId, FrameType::kResult, kResultPayload)));
+  (void)caller.get();
+
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().frm_type, FrameType::kResult) << "返回的是结果那一帧";
+  EXPECT_EQ(outcome.value().payload, kResultPayload);
+  EXPECT_EQ(outcome.value().session_id, sent.session_id);
+  EXPECT_EQ(fx.transport.sent().size(), 1u)
+      << "只有那一条命令帧:收到 kResult 后**不回应任何帧**(与 RequestForResult 相反)";
+}
+
+// ⑩ **等结果阶段确实重发**——本交互与 `RequestForResult` 的行为分界证据之一
+//    (D13 / RT_NODE_002_g)。前 N−1 次不回结果,最后一次回 → 成功;断言实际发出 N 帧且
+//    逐帧 session_id 相同(D3)。对比 ⑦:`RequestForResult` 在等 kResult 时**不得**重发,
+//    那条规则(RT_NODE_002_c)只约束外部系统协议,不是框架的普遍规则。
+TEST(ProtocolNode, RequestForResultDirectRetransmitsWhileAwaitingResult) {
+  Fixture fx;
+  constexpr std::uint16_t kResultId = 0x03F2;
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome =
+        fx.node->RequestForResultDirect(Command(0x0010), Retry(60ms, 3), kResultId);
+  });
+
+  // 前两次尝试不投结果,等第三帧发出——这正是"在唯一的等待阶段重发"。
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return fx.transport.sent().size() >= 3u; }, 1000));
+  const Message first = DecodeSent(fx.transport, 0);
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(first.session_id, kResultId, FrameType::kResult, {3})));
+  (void)caller.get();
+
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{3}));
+  ASSERT_EQ(fx.transport.sent().size(), 3u)
+      << "总发送次数应恰为 max_attempts——等结果阶段重发了,且收到结果后不回应";
+  for (std::size_t i = 0; i < 3u; ++i) {
+    const Message attempt = DecodeSent(fx.transport, i);
+    EXPECT_EQ(attempt.session_id, first.session_id)
+        << "逐帧同一 session_id,第 " << i << " 帧";
+    EXPECT_EQ(attempt.message_id, first.message_id) << "第 " << i << " 帧";
+    EXPECT_EQ(attempt.frm_type, FrameType::kCommand) << "第 " << i << " 帧";
+    EXPECT_EQ(fx.transport.sent()[i].bytes, fx.transport.sent()[0].bytes)
+        << "重发的应是**字节完全相同**的原帧,第 " << i << " 帧";
+  }
+}
+
+// ⑪ 次数耗尽 → **kTimeout**(**不是** kNotAccepted)——行为分界证据之二(D12):
+//    kNotAccepted 的语义是"对端没有受理",而本交互根本不存在受理这一步。
+TEST(ProtocolNode, RequestForResultDirectReturnsTimeoutWhenAttemptsExhausted) {
+  Fixture fx;
+  auto outcome =
+      fx.node->RequestForResultDirect(Command(0x0010), Retry(40ms, 2), 0x03F2);
+
+  ASSERT_FALSE(outcome);
+  EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_NE(outcome.error(), make_error_code(TransportErrc::kNotAccepted))
+      << "本交互没有受理阶段,'未受理'这一事实不存在";
+  EXPECT_EQ(fx.transport.sent().size(), 2u)
+      << "应恰好发出 max_attempts 帧,且失败时不回应任何帧";
+}
+
+// ⑫ 中途到达的 kResponse **不影响本交互**:本交互不订阅受理帧,故该帧无匹配、按
+//    kUnmatchedOrLateResponse 归因丢弃,交互继续等结果并正常成功。
+TEST(ProtocolNode, RequestForResultDirectIgnoresInterveningResponseFrame) {
+  transport::CapturingTraceSink sink;
+  ProtocolNodeConfig config = BaseConfig();
+  config.trace_sink = &sink;
+  Fixture fx(std::move(config));
+  constexpr std::uint16_t kResultId = 0x03F2;
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome = fx.node->RequestForResultDirect(Command(0x0010), Retry(2000ms, 1),
+                                              kResultId);
+  });
+
+  ASSERT_TRUE(
+      testutil::pumpFiberUntil([&] { return !fx.transport.sent().empty(); }, 500));
+  const Message sent = DecodeSent(fx.transport, 0);
+
+  // 一条"同会话、同命令码"的受理帧——若本交互登记了 ack 订阅,它会被认领。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
+  EXPECT_TRUE(testutil::pumpFiberUntil(
+      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
+      << "本交互不订阅受理帧,该帧应无匹配、按迟到终结帧归因丢弃";
+  EXPECT_FALSE(outcome) << "交互不应被受理帧终结,应继续等结果";
+  EXPECT_EQ(fx.transport.sent().size(), 1u) << "受理帧不引起任何我方动作";
+
+  // 交互仍在等结果:投结果后正常成功。
+  ASSERT_TRUE(fx.transport.Deliver(
+      EncodeFrame(sent.session_id, kResultId, FrameType::kResult, {9})));
+  (void)caller.get();
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{9}));
+  EXPECT_EQ(fx.transport.sent().size(), 1u) << "成功后仍不回应任何帧";
+}
+
+// ⑬ 前置判据(D6 的 2026-08-26 补记):策略非法 → kInvalidArgument;未 Start / 已关闭 →
+//    kClosed。本方法只有一个等待阶段,其时限即 RetryPolicy::timeout,无独立 result_timeout。
+TEST(ProtocolNode, RequestForResultDirectRejectsInvalidPolicyAndClosedNode) {
+  Fixture fx;
+  auto zero_attempts =
+      fx.node->RequestForResultDirect(Command(0x0010), Retry(50ms, 0), 0x03F2);
+  ASSERT_FALSE(zero_attempts);
+  EXPECT_EQ(zero_attempts.error(), make_error_code(TransportErrc::kInvalidArgument));
+
+  auto negative_attempts =
+      fx.node->RequestForResultDirect(Command(0x0010), Retry(50ms, -1), 0x03F2);
+  ASSERT_FALSE(negative_attempts);
+  EXPECT_EQ(negative_attempts.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  auto zero_timeout =
+      fx.node->RequestForResultDirect(Command(0x0010), Retry(0ms, 3), 0x03F2);
+  ASSERT_FALSE(zero_timeout);
+  EXPECT_EQ(zero_timeout.error(), make_error_code(TransportErrc::kInvalidArgument));
+
+  auto negative_timeout =
+      fx.node->RequestForResultDirect(Command(0x0010), Retry(-5ms, 3), 0x03F2);
+  ASSERT_FALSE(negative_timeout);
+  EXPECT_EQ(negative_timeout.error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_TRUE(fx.transport.sent().empty()) << "判据不通过时一帧都不该发出";
+
+  // 未 Start 的节点。
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode fresh(fake, MakeCodec(), BaseConfig());
+  auto before_start =
+      fresh.RequestForResultDirect(Command(0x0010), Retry(50ms, 3), 0x03F2);
+  ASSERT_FALSE(before_start);
+  EXPECT_EQ(before_start.error(), make_error_code(TransportErrc::kClosed));
+
+  // 已关闭的节点。
+  ASSERT_TRUE(fresh.Start());
+  ASSERT_TRUE(fresh.Close());
+  fresh.WaitClosed();
+  auto after_close =
+      fresh.RequestForResultDirect(Command(0x0010), Retry(50ms, 3), 0x03F2);
+  ASSERT_FALSE(after_close);
+  EXPECT_EQ(after_close.error(), make_error_code(TransportErrc::kClosed));
+  (void)fake.Close();
+}
