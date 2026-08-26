@@ -6,8 +6,8 @@ flowchart LR
 
     TRANSPORT["transport<br/>（通信中间件 CSCI）"]
 
-    APP -->|装配 codec / 订阅入站业务帧<br/>Request / Send / Publish / 配置| TRANSPORT
-    TRANSPORT -->|Result / Message / 连接状态 / 观测计数 / Trace| APP
+    APP -->|"装配 codec / 订阅入站业务帧<br/>Send · RequestFor* · Publish / 配置<br/>传输的 Start·Close·WaitClosed 亦由宿主自理"| TRANSPORT
+    TRANSPORT -->|"Coro::Result~Message~ / 错误码 / 链路状态<br/>订阅信箱投递 / Trace 事件"| APP
 
     TRANSPORT -->|字节/样本收发 · connect/close| MEDIA
     MEDIA -->|到达字节/样本 · 断连/错误事件| TRANSPORT

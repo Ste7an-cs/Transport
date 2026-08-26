@@ -7,20 +7,34 @@ classDiagram
         +AsyncWrite(Datagram) Coro::Result~void~
         +LastError() / CurrentLinkState()
     }
-    class TcpTransport { +已连接字节管道 }
+    class TcpTransport {
+        <<排除于编译面>>
+        +已连接字节管道
+    }
     class TcpClientTransport {
+        <<排除于编译面 · 头文件仍引用已删除的 OperationOptions>>
         +连接状态机+自动重连+ApplyConfig
         +具体诊断（非多态缝）：State/WaitForState
         +Generation/AttemptCount/LastFailure
     }
     class UdpTransport {
+        <<当前编译面内唯一实现>>
         +报文+地址（peer）
         +socket 管理泵 + 读写双队列
         +silence_timeout：读超时兼重试间隔
     }
-    class SerialTransport { +串口字节流 }
-    class DdsTransport { +provider 跨线程有界交接 }
-    class TcpServer { +accept 每连接一 node }
+    class SerialTransport {
+        <<排除于编译面>>
+        +串口字节流
+    }
+    class DdsTransport {
+        <<排除于编译面>>
+        +provider 跨线程有界交接
+    }
+    class TcpServer {
+        <<排除于编译面>>
+        +accept 每连接一 node
+    }
     class IDdsProvider {
         <<interface>>
         +Init/Shutdown/Subscribe/Publish
@@ -35,4 +49,4 @@ classDiagram
     DdsTransport *-- IDdsProvider : 组合
     TcpServer ..> TcpTransport : 每连接接管
     note for ITransport "读写刻意不对称：读交出等待器句柄，\n超时/取消/扇出由调用方自理；\n写入队即返，结果只落 LastError()"
-    note for UdpTransport "ADR-0008 已落地；TCP / 串口 / DDS\n按同一形态后续跟进（当前排除于编译面）"
+    note for UdpTransport "ADR-0007/0008 已落地，是其余介质跟进的样板；\nTCP / 串口 / DDS 待按同一形态重构（排除于编译面）\n写队列满时丢最旧而 AsyncWrite 仍报成功 —— 见 #176"

@@ -1,8 +1,8 @@
 flowchart TB
     subgraph OUT["出站（调用方 fiber）"]
         direction LR
-        RQ["Request / Send<br/>NextSession + 盖章"]
-        SUB["Dispatcher.Subscribe(ResponseTo)<br/>（Send 不登记）"]
+        RQ["Send / RequestFor*<br/>NextSession + 盖章"]
+        SUB["Dispatcher.Subscribe(键)<br/>（Send 不登记；RequestForResult 登记两个）"]
         ENC["ICodec.Encode<br/>Message → 线缆字节"]
         WR["ITransport.AsyncWrite<br/>入队即返 · fire-and-forget"]
         WT["Ticket.Wait(timeout)<br/>挂起等唯一响应"]

@@ -28,6 +28,7 @@ classDiagram
         -NextSession() uint8
     }
     class DdsNode {
+        <<未编译的历史代码 · 重设计之前>>
         +Request(Message, target, options)
         +Publish(Message, topic)
         -Dispatch(kReply) / NextCorrelationId()
@@ -45,7 +46,7 @@ classDiagram
         +Ticket::Wait(timeout) Coro::Result~T~
     }
     class DdsHandlerContext {
-        <<仅 DdsNode 用（ADR-0009 过渡遗留）>>
+        <<未编译的历史代码 · 仅 DdsNode 用>>
         +Send()
         +RequestClose() 转调公开的 Close()
         +cancellation()
@@ -55,21 +56,34 @@ classDiagram
         +OnTrace(TraceEvent)
     }
 
-    class TcpTransport
+    class TcpTransport {
+        <<待按新形态跟进 · 排除于编译面>>
+    }
     class TcpClientTransport {
-        <<具体诊断，非多态缝>>
+        <<具体诊断，非多态缝 · 排除于编译面>>
         +State() ConnectionState
-        +WaitForState(target, options) Status
+        +WaitForState(target, OperationOptions) ⚠ 引用已删除类型
         +Generation() / AttemptCount() / LastFailure()
         +ApplyConfig(TcpClientConfig, version)
     }
-    class UdpTransport
-    class SerialTransport
-    class DdsTransport
-    class TcpServer
+    class UdpTransport {
+        <<当前编译面内唯一 ITransport 实现>>
+    }
+    class SerialTransport {
+        <<待按新形态跟进 · 排除于编译面>>
+    }
+    class DdsTransport {
+        <<待按新形态跟进 · 排除于编译面>>
+    }
+    class TcpServer {
+        <<待按新形态跟进 · 排除于编译面>>
+    }
     class SystemCodec
     class DatagramCodec
-    class DdsCodec
+    class LengthFieldCodec
+    class DdsCodec {
+        <<排除于编译面>>
+    }
 
     ITransport <|.. TcpTransport
     ITransport <|.. TcpClientTransport
@@ -78,6 +92,7 @@ classDiagram
     ITransport <|.. DdsTransport
     ICodec <|.. SystemCodec
     ICodec <|.. DatagramCodec
+    ICodec <|.. LengthFieldCodec
     ICodec <|.. DdsCodec
 
     ProtocolNode ..> ITransport : 借用（宿主启停）
@@ -87,6 +102,6 @@ classDiagram
     DdsNode *-- ITransport : 组合
     DdsNode *-- ICodec : 组合
     NodeBase <|-- DdsNode : 继承
-    DdsNode ..> DdsHandlerContext : 构造传入（过渡遗留）
+    DdsNode ..> DdsHandlerContext : 构造传入（历史代码）
     TcpServer ..> ProtocolNode : 每连接派生
     ProtocolNode ..> ITraceSink : 可选出口

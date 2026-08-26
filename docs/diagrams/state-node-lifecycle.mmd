@@ -2,7 +2,7 @@ stateDiagram-v2
     direction LR
     [*] --> Created
 
-    Created --> Created: DoStart 失败<br/>(配置非法等，可改配重试)
+    Created --> Created: DoStart 返错<br/>(可改配后重试；ProtocolNode 自 #173 起<br/>配置面已无校验项，见 SDD §5.4)
     Created --> Created: 并发 Start<br/>(另一次正在初始化 → kInvalidState)
     Created --> Running: Start 成功<br/>(DoStart 返回后由基类置位)
     Created --> Closed: 从未 Start 即 Close<br/>(无 fiber 可汇合)
@@ -32,6 +32,8 @@ stateDiagram-v2
     end note
 
     note right of Running
-        Request / Send 仅在 Running 放行；
-        Created / Closing / Closed 一律 kClosed
+        Send / RequestForResponse / RequestForResult /
+        RequestForResultDirect 仅在 Running 放行；
+        Created / Closing / Closed 一律 kClosed。
+        （Request 已随 ADR-0010 D10 删除）
     end note

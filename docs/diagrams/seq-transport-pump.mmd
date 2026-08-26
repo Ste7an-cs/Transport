@@ -47,7 +47,8 @@ sequenceDiagram
     WQ-->>W: 阻塞点①：等数据
     W->>W: 解析目的地（kDefault → config 默认对端）<br/>解析不了即丢该条并记 LastError，不占队头
     W->>S: 阻塞点②：等 socket 就绪 → writeDatagram
-    Note over W: 写出结果不回传调用方，只落 LastError()<br/>链路不可用时留在队列等恢复，恢复后按序全发
+    Note over W: 写出结果不回传调用方，只落 LastError()<br/>链路不可用时留在队列等恢复，恢复后按序发出
+    Note over X,WQ: ⚠ write_queue 是默认容量（1024）的有界队列，<br/>满时【静默丢最旧】且 push 仍返 success ——<br/>故积压超 1024 条时 AsyncWrite 报成功而数据已丢，<br/>"按序全发"不成立（见 #176）
 
     Note over T,RQ: Close()：四处打断（退避 / 读流 / 写泵两个阻塞点）+ 关 read_queue 并携终止原因
     Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放

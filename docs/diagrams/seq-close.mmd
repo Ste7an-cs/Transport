@@ -10,7 +10,7 @@ sequenceDiagram
 
     Note over X,B: Close() 只发信号，不含任何等待点<br/>故任何 fiber 都可调用（ADR-0008 D2）
     X->>B: Close()
-    B->>B: Running → Closing（立即拒新 Request/Send）
+    B->>B: Running → Closing（立即拒新 Send / RequestFor*）
     B->>N: DoClose()（锁外）
     N->>N: 关闭本节点的读订阅 rx_（AsyncRead()->shared()）<br/>源队列与其它订阅者不受影响
     N->>D: CloseAll(kClosed)：关闭全部订阅信箱<br/>在途请求恰好终结一次；订阅者的 await 亦终结（即协作取消信号）
