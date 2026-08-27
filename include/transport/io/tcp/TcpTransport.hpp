@@ -2,101 +2,160 @@
 
 /**
  * @file TcpTransport.hpp
- * @brief 协程原生 TCP 传输——已建立连接上的字节收发与发送完成语义。
+ * @brief 协程原生 TCP 客户端传输——socket 管理泵 + 内建透明重连的字节流管道。
  */
 
-#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <optional>
 #include <system_error>
 
-#include "transport/io/ITransport.hpp"
+#include "await/awaitable.hpp"  // Coro::Awaitable —— 队列与信号。
+#include "task/fibertask.h"     // Coro::FiberTask —— 泵 fiber 的结构化并发句柄。
 
-class QAbstractSocket;
+#include "transport/core/Endpoint.hpp"
+#include "transport/io/ITransport.hpp"
+#include "transport/io/tcp/TcpConfig.hpp"
+
+class QByteArray;
+class QTcpSocket;
 
 namespace transport {
 
 /**
- * @brief 协程原生 TCP 传输——只覆盖已建立连接上的字节收发与发送完成语义。
+ * @brief 协程原生 TCP 客户端传输——面向字节流、内建透明重连(ITransport 实现)。
  *
- * 连接建立、自动重连、运行时重配置不在本类职责(见连接管理 spec);构造时接管一个
- * 已连接的 QAbstractSocket,客户端与服务端已接受连接共享本实现,不向用户暴露
- * corosocket。发送路径遵守 ITransport 契约的可观察发送完成语义。
+ * **形态与 `UdpTransport` 同构**(ADR-0011 D2,ADR-0007 D1/D2/D3/D4 的样板):外层
+ * socket 管理泵负责连接/重连,内层数据泵把读到的字节切片投入 `read_queue`;队列
+ * **不随连接重建而更换**,故重连对调用方完全透明(DD-11)。三件套(`TcpTransport` /
+ * `TcpClientTransport` / `TcpClientConfig`)已收成本类一件(**D1**)——重连是 TCP 客户端的
+ * 固定语义,做成外层泵的一部分即可,不需要单设"重连外壳"一层。
  *
- * 读侧为泵形态(ADR-0007 D1/D4):`Start()` 起数据泵 fiber 把 readAll 流的每片字节转成
- * `Datagram` 投入内部 `read_queue`,`Read()` 只交出该队列句柄。写侧仍是同步背压语义
- * (`write_queue` 见 ADR-0007 D3,留后续票)。
+ * - **重连不是独立机制**(SDD §5.6.1 ①'):它就是外层 `while` 转第二圈。首连与重连
+ *   不作区分、走同一段代码;没有重连状态、没有重连专用 fiber。
+ * - **不自终**(ADR-0007 D2):连接失败、读流终止与静默超时一律回外层重试、无限重连,
+ *   唯一的退出条件是我方 `Close`;底层故障降为诊断事实留在 `LastError()`。
+ * - **唯一的时间量**(**D5**):`TcpConfig::silence_timeout` 三处共用——等连上 / 读静默
+ *   判链路坏 / 连不上时的退避。**不设** `connect_timeout`,也不为退避另设间隔。
+ * - **判活**(**D4**):对端断开事件是**主判据**(经 `readAll()` 流的自然终止到达,且
+ *   `corosocket` 在关流前先 `drain()`,**尾字节不丢**);静默超时降为**辅助**判据,只在
+ *   半开连接(对端进程消失、FIN 未达)时才轮得到。**不另订阅 `waitForDisconnected()`**
+ *   ——那是多余的第二条路径。
+ * - `AsyncRead()` 交出 `read_queue` 句柄(ADR-0007 D4),每个元素是**任意字节切片**、
+ *   不是一个完整帧(RT_TRANSPORT_003,组帧归 `ICodec`);`peer` 一律填固定对端(**D8**)。
+ * - **整个生命期一个 `QTcpSocket`**(**D3**):每轮末尾 `abort()` 使其回到
+ *   `UnconnectedState`,下轮在同一对象上重连,不新建 socket 对象。
+ *
+ * **`socket_->abort()` 是清理动作,不是打断手段**(**D15**,实测结论):Qt 的 `abort()`
+ * 在**连接中**的 socket 上不发 `errorOccurred`,而 `corosocket` 的 `waitForSignal` /
+ * `readAll` 都靠 socket error 或 `disconnected` 终结——故它在连接窗口内**唤不醒任何
+ * 等待**(实测挂满整个超时)。因此 `connect_waiter_` 与 `read_stream_` **持为成员**,
+ * `Close()` 逐个 `close()` 它们。UDP 没有这个窗口(其 `bind()` 同步),故其 `close()`
+ * 打断活跃读流是有效的——**这条不可照搬**。
+ *
+ * **单线程(fiber 协作式),不加锁**:泵由 `Start()` 用 `Coro::makeTask` 起,默认亲和是
+ * `fixed(调用线程)`,故它与本对象的全部公开方法跑在**同一个线程**上、只在 await 点交错。
+ * 代价是**公开方法必须在起它的那个执行域内调用**,这也正是 Qt 对象亲和的要求。
+ *
+ * 析构 `Close()` + `WaitClosed()`,后者 join 泵——故 fiber 不可能活过本对象。
+ *
+ * **本轮只交付读侧**(#179):`AsyncWrite()` 是占位,返 `kUnsupported`;写泵、`write_queue_`
+ * 与 `Close()` 的另两处打断(④ 写泵等数据、⑤ 写泵等连接就绪)归 #180。`socket_ready_`
+ * 已按设计建立并在每次连上时 `resolve()`,只是尚无消费者。
  */
-// 发送路径可观察语义细则:
-//   * RT_TRANSPORT_008 一次发送在帧字节全部离开框架用户态发送缓冲、进入操作系统
-//     发送缓冲后才报告成功;背压经协程 await 自然传导回发起方,不 fire-and-forget。
-//   * RT_TRANSPORT_007 同一 fiber 的先后发送按程序序上线;跨 fiber 并发发送被
-//     串行化为一致全序(按到达节点执行域的顺序)。
-//   * RT_TRANSPORT_004 并发写按到达顺序排队串行化(不拒绝),同一时刻至多一个在写
-//     帧,单帧字节不与另一帧交错。
-//   * RT_TRANSPORT_004.4 流式部分写失败返回 Io/Connection 并关闭本物理连接,
-//     不自动重发残缺帧。
-//   * RT_REQUEST_004.4 写入已开始后被取消/超时,底层尽力把帧写完(健康连接不
-//     截断);取消/超时的本地返回码由发起方(请求层)裁决,不由本类截断连接。
 class TcpTransport final : public ITransport {
  public:
-  using Clock = OperationOptions::Clock;
-
-  /// @brief 接管一个已建立连接的 socket(须与调用方处于同一执行域/线程)。
-  /// @param connected_socket 已连接的 QAbstractSocket,生命周期由本类接管。
-  explicit TcpTransport(QAbstractSocket* connected_socket);
+  /// @brief 以 TcpConfig 构造(尚未创建 socket);socket 在 `Start()` 内创建。
+  explicit TcpTransport(TcpConfig config);
+  /// @brief 析构:请求关闭、join 泵,再销毁 socket。
   ~TcpTransport() override;
 
   TcpTransport(const TcpTransport&) = delete;
   TcpTransport& operator=(const TcpTransport&) = delete;
 
-  /// @brief 进入 Running;须已持有已连接 socket。
-  /// @return 成功;非法生命周期或无 socket 返回 InvalidState。
+  /// @brief 校验配置、创建 `QTcpSocket`、起泵,进入 Running(须在节点执行域 fiber 内调用)。
+  ///
+  /// **不等首连成功**(SDD §5.6.1):`connect` 是异步的,就地等会把 `Start()` 变成一个
+  /// 最长一个 `silence_timeout` 的阻塞调用。故返回时 `CurrentLinkState()` 通常是
+  /// `kEstablishing`,首连未成**不算启动失败**(ADR-0007 D2)。
+  ///
+  /// @return 成功;配置非法(host 空 / port 为 0 / silence_timeout 非正)返
+  ///         `kConfiguration` 并**停在 `Created`**(未建 socket、未起泵,可改配后重试,
+  ///         RT_LIFECYCLE_007);非法生命周期(关闭中/已关闭)返 `kInvalidState`。
+  ///         已 Running 时重复调用为成功 no-op。
   Coro::Result<void> Start() override;
 
-  /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);每个元素是一片已到达字节
-  ///        (流式,一次一任意切片)。
-  /// @return `read_queue` 句柄:deadline/取消/是否 `shared()` 扇出由调用方自理,
-  ///         传输层不设单读守卫。**传输终结**表现为队列被 `close(kClosed)`——本类
-  ///         不重连,故对端断开/底层致命错误与我方关闭同以 kClosed 收敛,调用方
-  ///         `await` 得到它后应停止读取(RT_TRANSPORT_008 / ADR-0004 D1 经 D4 改写);
-  ///         底层成因经 LastError() 诊断。未 Start 时给出以 kInvalidState 关闭的句柄。
-  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> Read() override;
+  /// @brief 交出 `read_queue` 的等待器句柄(ADR-0007 D4);每个元素是**任意字节切片**,
+  ///        `peer` 一律为固定对端(`Endpoint::Net(config.host, config.port)`,D8)。
+  /// @return `read_queue` 句柄:deadline/取消/是否 `shared()` 扇出由调用方自理。
+  ///         **传输终结**表现为队列被 `close(kClosed)`,而**只有我方 `Close` 才终止**
+  ///         ——断链由泵内部透明重连消化,不向调用方暴露(DD-11);底层成因经
+  ///         `LastError()` 诊断。未 `Start()` 时给出以 `kInvalidState` 关闭的句柄。
+  [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead() override;
 
-  /// @brief 发送一帧;仅在帧字节全部离开框架用户态缓冲、进入操作系统发送缓冲后
-  ///        才报告成功(RT_TRANSPORT_008)。并发写按到达顺序排队串行化。
-  /// @param unit 待发送帧(目的地址在已连接 TCP 上被忽略)。
-  /// @return 成功;部分写失败 Io/Connection 并关闭本连接;关闭中 Closed。
-  Coro::Result<void> Write(SendUnit unit) override;
+  /// @brief **占位:本轮不实现写侧**(#179 只做读侧,写泵与写队列归 #180)。
+  /// @return 恒为 `kUnsupported`。
+  [[nodiscard]] Coro::Result<void> AsyncWrite(Datagram datagram) override;
 
-  /// @brief 请求关闭(幂等):撕连接、唤醒在途读写等待者。
-  Coro::Result<void> RequestClose() override;
+  /// @brief 请求关闭(幂等,**只发信号不等收敛**):打断重连退避、等连上与读等待三处,
+  ///        随后由泵自行跑完收尾(关 `read_queue`、落 Closed)。
+  Coro::Result<void> Close() override;
 
-  /// @brief 等待完全关闭(支持多等待者)。
-  /// @param options 仅 `deadline` 生效;取消令牌已随共享完成量轻量化移除(ADR-0006 D3)。
-  Coro::Result<void> WaitClosed(OperationOptions options = {}) override;
+  /// @brief join 泵 fiber,返回即它不再触碰本对象。未 `Start()` 或已 join 过时立即返回。
+  void WaitClosed() override;
 
-  // 发送侧可观测——I/O 事实,非"连接健康"裁决(判活留给协议层)。
+  /// @brief 是否处于 Running(泵在跑;链路是否连上另见 `CurrentLinkState()`)。
+  [[nodiscard]] bool IsRunning() const;
 
-  /// @brief 当前处于 Write 中的 fiber 数(排队 + 在写);并发时可 >1,反映背压积压。
-  [[nodiscard]] std::size_t SendWaiterDepth() const;
-  /// @brief 最近一次发送完成的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastSendTime()
-      const override;
-  /// @brief 最近一次收到字节的时刻(尚无则空)。
-  [[nodiscard]] std::optional<Clock::time_point> LastReceiveTime()
-      const override;
+  // 观测面——I/O 事实。三个 TCP 独有的诊断方法(`Generation()` / `AttemptCount()` /
+  // `LastFailure()`)与 `State()` / `WaitForState()` 已随 ADR-0011 D9/D12 删除。
+
   /// @brief 最近一次操作错误(无则默认构造的 error_code)。
   [[nodiscard]] std::error_code LastError() const override;
 
-  /// @brief 当前链路可用性(RT_TRANSPORT_009):已接管连接存续 → `kUp`;未 Start、
-  ///        对端断开或已关闭 → `kDown`。本类不管理连接,故永不出现 `kEstablishing`。
+  /// @brief 当前链路可用性——**无状态成员,当场由 `lifecycle_` 与 `socket_->state()`
+  ///        算出**(D12)。已连接 → `kUp`;未 `Start()` / 已关闭 → `kDown`;连接中、
+  ///        主机名解析中与**退避重连中**一律 `kEstablishing`。
+  ///
+  /// 最后一支是 TCP 与 UDP 的**真正分歧**(UDP 未绑定即报 `kDown`,永不出现
+  /// `kEstablishing`)。**定位**:统一的 I/O 事实查询,**不面向业务调用方**,仅供诊断与
+  /// 测试观测——重连对交互层完全透明,链路不可用时发送入队等待,调用方不必先查链路。
   [[nodiscard]] LinkState CurrentLinkState() const override;
 
-  struct State;  // 不透明:定义在 .cpp,仅供实现内部命名。
-
  private:
-  std::shared_ptr<State> state_;
+  /// @brief `Start()` 的一次性配置校验(D14):非法返 `kConfiguration`。
+  [[nodiscard]] Coro::Result<void> ValidateConfig() const;
+  /// @brief 泵 fiber:外层管连接的建立/重建/退避,内层把字节切片投入 `read_queue_`;
+  ///        退出后关读队列、落 Closed。
+  void RunSocketPump();
+
+  TcpConfig config_;
+  QTcpSocket* socket_{nullptr};  ///< 整个生命期只一个(D3);Start 建、析构销。
+  Endpoint peer_;                ///< 固定对端,构造时由 config 算出(D8)。
+
+  LifecycleState lifecycle_{LifecycleState::kCreated};
+  bool joined_{false};  ///< WaitClosed 已 join:`FiberTask::get()` 是一次性的。
+  std::error_code last_error_;
+  /// 每次连上 +1。**纯内部记账**(D9/D12):不对外暴露、不驱动任何控制流、不做代际隔离,
+  /// 唯一用途是 Trace 事件的归类与内部判重。
+  std::uint32_t generation_{0};
+
+  /// 对外读队列:**不随连接重建而更换**——这正是"重连对调用方透明"的载体。
+  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue_{
+      std::make_shared<Coro::Awaitable<Datagram>>()};
+  /// 泵 → 写泵的"可以写了"通告(复用一个,不换代)。本轮已按设计 resolve,**尚无消费者**
+  /// ——写泵归 #180。
+  std::shared_ptr<Coro::Awaitable<void>> socket_ready_{
+      std::make_shared<Coro::Awaitable<void>>()};
+  /// 只为打断重连退避:退避须用独立的延时原语(拿"在未连接的 socket 上建读流"当退避会
+  /// 被当场关闭、退化为紧转,`UdpTransport` 的注释记着同一个坑)。
+  std::shared_ptr<Coro::Awaitable<void>> close_signal_{
+      std::make_shared<Coro::Awaitable<void>>()};
+  /// 【每轮重建】等连上的句柄——**持为成员只为供 `Close()` 打断**(D15)。
+  std::shared_ptr<Coro::Awaitable<void>> connect_waiter_;
+  /// 【每轮重建】读流句柄——同上(D15)。
+  std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream_;
+
+  std::shared_ptr<Coro::FiberTask<void>> pump_;  ///< WaitClosed join。
 };
 
 }  // namespace transport

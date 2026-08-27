@@ -60,6 +60,7 @@ add_library(transport STATIC
   src/node/NodeBase.cpp
   src/node/ProtocolNode.cpp
   src/io/udp/UdpTransport.cpp
+  src/io/tcp/TcpTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
 )
@@ -101,6 +102,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dispatcher_test.cpp
     tests/coro_harness_test.cpp
     tests/udp_transport_test.cpp
+    tests/tcp_transport_test.cpp
     tests/protocol_node_test.cpp
     # —— 以下用例仍在旧 ITransport / NodeBase 面上，随重设计逐个迁移后再放回 ——
     #   protocol_node_handler_test / protocol_node_lifecycle_test
