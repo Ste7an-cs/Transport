@@ -168,7 +168,10 @@ void UdpTransport::RunSocketPump() {
                                    static_cast<std::uint16_t>(dg.senderPort()))};
         if (read_queue_->channel()->push(std::move(out)) !=
             boost::fibers::channel_op_status::success) {
-          break;  // read_queue 已关闭(我方 Close)→ 停止投递,回外层判生命周期。
+          // read_queue 已关闭 → 停止投递,回外层判生命周期。两种成因:我方 Close,
+          // 或**某个订阅者调了 close()**——后者是整流传播的(AsyncTask 417790c 起),
+          // 会连本队列一并关掉。ProtocolNode::DoClose() 走的正是后一条,系有意为之。
+          break;
         }
       }
     } else {
