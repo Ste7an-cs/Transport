@@ -1,39 +1,43 @@
 #include "transport/io/tcp/TcpTransport.hpp"
 
+#include <chrono>
 #include <cstdint>
-#include <deque>
-#include <mutex>
-#include <string>
+#include <system_error>
 #include <utility>
 
 #include <boost/fiber/channel_op_status.hpp>
 
 #include <QAbstractSocket>
 #include <QByteArray>
-#include <QHostAddress>
-#include <QPointer>
+#include <QNetworkProxy>
+#include <QString>
+#include <QTcpSocket>
 
 #include "await/awaitable.hpp"
 #include "await/corosocket.hpp"
 #include "await/detail/socketerror.hpp"
-#include "task/fibertask.h"  // Coro::makeTask —— 数据泵 fiber。
+#include "task/fibertask.h"
 #include "transport/core/Error.hpp"
-#include "transport/core/SharedCompletion.hpp"
+
+// TcpTransport.cpp — 见 .hpp。本轮(#179)只有一条 fiber:管理泵(管连接 + 收字节)。
+// 写泵与 write_queue 归 #180。单线程 fiber 协作,成员不加锁(见 .hpp 的"单线程,不加锁")。
 
 namespace transport {
 namespace {
 
-// 把 Qt socket 错误映射到传输错误类别:对端主动关闭 / 网络层断裂归 Connection,
-// 其余读写故障归 Io(RT_TRANSPORT_004.4 允许 Io 或 Connection)。
-// 用途:**写路径**的失败原因(ADR-0004 D1:kConnection 此后仅存于写路径)与
-// LastError() 诊断;读路径的终止一律以 kClosed 呈现,不用本映射作返回值。
+// 把 Qt socket 错误映射到传输错误类别:连接与链路断裂归 Connection,其余读写故障归 Io。
+// **一律不自终**(ADR-0007 D2 / ADR-0011 D14)——这里产出的只是 `LastError()` 的诊断
+// 事实,包括"致命 socket I/O 错误",泵照样无限重连。
 std::error_code MapSocketError(std::error_code error) {
   if (error.category() == Coro::detail::socket_error_category()) {
     switch (static_cast<QAbstractSocket::SocketError>(error.value())) {
-      case QAbstractSocket::RemoteHostClosedError:
-      case QAbstractSocket::NetworkError:
       case QAbstractSocket::ConnectionRefusedError:
+      case QAbstractSocket::RemoteHostClosedError:
+      case QAbstractSocket::HostNotFoundError:
+      case QAbstractSocket::NetworkError:
         return make_error_code(TransportErrc::kConnection);
+      case QAbstractSocket::SocketTimeoutError:
+        return make_error_code(TransportErrc::kTimeout);
       default:
         return make_error_code(TransportErrc::kIo);
     }
@@ -41,366 +45,241 @@ std::error_code MapSocketError(std::error_code error) {
   return make_error_code(TransportErrc::kIo);
 }
 
-}  // namespace
-
-struct TcpTransport::State {
-  mutable std::mutex mutex;
-  QPointer<QAbstractSocket> socket;
-  // 唯一的 readAll 流(channel 支撑):持有一条、反复 await 取下一片(RT_TRANSPORT_003
-  // 流式一次一切片)。在 Start 建立,复用修好的 corosocket 读原语。
-  std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
-  // 对外 read_queue(ADR-0007 D1/D4):数据泵是唯一生产者,`Read()` 只交出本句柄。
-  // 构造即建、整个生命周期只此一条。容量策略未定(TBD-009):沿用 AsyncTask 默认;
-  // **字节流介质丢中段即帧错乱**,该默认是已登记的活跃隐患(#152 / ADR-0007 D6),
-  // 本轮不处置——泵一取到切片就立刻转投,常态队深约 1。
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue{
-      std::make_shared<Coro::Awaitable<Datagram>>()};
-  LifecycleState lifecycle{LifecycleState::kCreated};
-  // 对端地址,Start 时从已连接 socket 缓存(对已连接 TCP 恒定):投入 read_queue 的
-  // Datagram.peer 恒填为对端 Endpoint::Net(TCP from 恒为对端,见 CONTEXT.md)。
-  std::string peer_host;
-  std::uint16_t peer_port{0};
-  bool active_write{false};  // 写槽是否被占。
-  std::size_t send_waiters{0};
-  // 并发写按到达顺序排队等待写槽(RT_TRANSPORT_004/007 串行化,不拒绝)。
-  std::deque<std::shared_ptr<Coro::Awaitable<void>>> write_queue;
-  std::optional<Clock::time_point> last_send;
-  std::optional<Clock::time_point> last_recv;
-  std::error_code last_error;
-  SharedCompletion<void> closed;
-};
-
-namespace {
-
-// 关闭一次:进入 Closing、撕 socket、关读流令数据泵退出、以 kClosed 关 read_queue 唤醒
-// 全部读者与排队写等待者;无在途写时直接落到 Closed 并完成 closed(有在途写则由
-// ExitWrite 完成)。读侧不再有"在途读"这一状态(单读守卫随 ADR-0007 D4 删除),故不等读者。
-void BeginClose(const std::shared_ptr<TcpTransport::State>& state) {
-  QPointer<QAbstractSocket> socket;
-  std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream;
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
-  std::deque<std::shared_ptr<Coro::Awaitable<void>>> queued_writes;
-  bool complete = false;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kClosed) {
-      return;
-    }
-    state->lifecycle = LifecycleState::kClosing;
-    socket = state->socket;
-    read_stream = state->read_stream;
-    read_queue = state->read_queue;
-    queued_writes.swap(state->write_queue);  // 唤醒排队写等待者以 kClosed 收敛。
-    if (!state->active_write) {
-      state->lifecycle = LifecycleState::kClosed;
-      complete = true;
-    }
-  }
-  if (socket) {
-    socket->abort();  // 立即唤醒在途读写等待者(以错误收敛)。
-  }
-  if (read_stream) {
-    read_stream->close(make_error_code(TransportErrc::kClosed));  // 令数据泵退出。
-  }
-  // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,调用方 await 得到它;
-  // 我方关闭同时丢弃残留(改造前关闭后发起的读一律得 kClosed、取不到残留)。
-  CloseDatagramQueue(read_queue, make_error_code(TransportErrc::kClosed));
-  for (const auto& gate : queued_writes) {
-    gate->close(make_error_code(TransportErrc::kClosed));
-  }
-  if (complete) {
-    state->closed.Complete(Coro::Result<void>{});
-  }
-}
-
-// 数据泵(ADR-0007 D1 内层循环):反复 await readAll 流,把每片字节转成 Datagram 投入
-// read_queue,直至流终止。本类不重连(连接终结即传输终结),故流终止即以 kClosed 关
-// read_queue——与改造前"Read 一律以 kClosed 收敛"等价;底层成因仍降为 LastError() 诊断。
-// **不改生命周期**:对端断开时本类保持 Running(链路可用性问 socket),与改造前一致。
-void RunReadPump(const std::shared_ptr<TcpTransport::State>& state,
-                 const std::shared_ptr<Coro::Awaitable<QByteArray>>& stream,
-                 const std::shared_ptr<Coro::Awaitable<Datagram>>& read_queue) {
-  const auto channel = read_queue->channel();
-  for (;;) {
-    Coro::Result<QByteArray, std::error_code> chunk = Coro::await(stream);
-    if (chunk) {
-      const QByteArray& bytes = chunk.value();
-      Datagram datagram;
-      datagram.bytes.assign(
-          reinterpret_cast<const std::uint8_t*>(bytes.constData()),
-          reinterpret_cast<const std::uint8_t*>(bytes.constData()) +
-              bytes.size());
-      {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->last_recv = OperationOptions::Clock::now();
-        // TCP from 恒为对端:source 填 Start 时缓存的对端地址(CONTEXT.md 读-分发循环)。
-        datagram.peer = Endpoint::Net(state->peer_host, state->peer_port);
-      }
-      if (channel->push(std::move(datagram)) !=
-          boost::fibers::channel_op_status::success) {
-        return;  // read_queue 已关闭(我方 Close)→ 停止投递。
-      }
-      continue;
-    }
-    if (chunk.error().category() == Coro::detail::socket_error_category()) {
-      // 已连接 socket 上的底层致命错误(对端 reset、网络断裂):本类不重连,连接终结
-      // 即传输终结,底层成因降为诊断事实留在 LastError()。
-      const std::error_code mapped = MapSocketError(chunk.error());
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_error = mapped;
-    }
-    // channel 无错误关闭:对端正常关闭,或我方关闭。本类不重连,二者对调用方同一
-    // 含义——传输终结、停止读取(ADR-0004 D1 终止语义单一化,表达经 ADR-0007 D4 改写)。
-    read_queue->close(make_error_code(TransportErrc::kClosed));
-    return;
-  }
-}
-
-// 写槽持有者收尾:回退等待者计数,并把写槽移交队首等待者(FIFO 串行化);关闭中
-// 则唤醒全部排队者以 kClosed 收敛,不再移交。若正在关闭且无其他在途操作则落 Closed。
-void ExitWrite(const std::shared_ptr<TcpTransport::State>& state) {
-  std::shared_ptr<Coro::Awaitable<void>> next_gate;
-  std::deque<std::shared_ptr<Coro::Awaitable<void>>> closed_gates;
-  bool complete = false;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->send_waiters > 0) {
-      state->send_waiters -= 1;
-    }
-    if (state->lifecycle == LifecycleState::kClosing) {
-      state->active_write = false;
-      closed_gates.swap(state->write_queue);
-      state->lifecycle = LifecycleState::kClosed;  // 读侧已无在途操作可等。
-      complete = true;
-    } else if (!state->write_queue.empty()) {
-      next_gate = state->write_queue.front();  // 写槽移交队首,active_write 保持真。
-      state->write_queue.pop_front();
-    } else {
-      state->active_write = false;
-    }
-  }
-  for (const auto& gate : closed_gates) {
-    gate->close(make_error_code(TransportErrc::kClosed));
-  }
-  if (next_gate) {
-    next_gate->resolve();
-    next_gate->close();
-  }
-  if (complete) {
-    state->closed.Complete(Coro::Result<void>{});
-  }
-}
-
-// 排队等待者在关闭时被唤醒(从未取得写槽):仅回退等待者计数。
-void LeaveWriteQueue(const std::shared_ptr<TcpTransport::State>& state) {
-  std::lock_guard<std::mutex> lock(state->mutex);
-  if (state->send_waiters > 0) {
-    state->send_waiters -= 1;
+// 归因:只落 `LastError()`,不改控制流。三条成因里**我方 Close 不记**——它不是故障
+// (`Awaitable::close()` 无错误码时以 `no_message` 收敛,故此处恰好落在两支之外)。
+void Attribute(std::error_code cause, std::error_code& sink) {
+  if (cause == std::make_error_code(std::errc::timed_out)) {
+    sink = make_error_code(TransportErrc::kTimeout);
+  } else if (cause.category() == Coro::detail::socket_error_category()) {
+    sink = MapSocketError(cause);
   }
 }
 
 }  // namespace
 
-TcpTransport::TcpTransport(QAbstractSocket* connected_socket)
-    : state_(std::make_shared<State>()) {
-  state_->socket = connected_socket;
-}
+TcpTransport::TcpTransport(TcpConfig config)
+    : config_(std::move(config)),
+      // 固定对端,构造时算出一次(D8):读侧每个切片的 peer 都是它。
+      peer_(Endpoint::Net(config_.host, config_.port)) {}
 
 TcpTransport::~TcpTransport() {
-  BeginClose(state_);
-  // socket 由 State 持有;detached 的刷完 fiber 也持有 State,故 socket 存活至最后
-  // 一个引用释放。此处只请求删除,corosocket 内部用 QPointer 防悬空。
-  if (state_->socket) {
-    state_->socket->deleteLater();
+  (void)Close();
+  WaitClosed();  // join 泵:返回即它不再触碰本对象,可安全销毁 socket。
+  if (socket_) {
+    socket_->deleteLater();
   }
+}
+
+// 配置校验(D14):**在 `Start()` 里一次性做**,这是 SRS「不可重试失败」清单中"无效配置"
+// 一项的落点——非法配置根本不进入重连循环。
+Coro::Result<void> TcpTransport::ValidateConfig() const {
+  if (config_.host.empty() || config_.port == 0) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  // **须为正,没有"0 = 禁用"这一档**(与 UDP 的差异):合一之后它同时是等连上的时限与
+  // 重连退避间隔,零值直接退化为紧循环(端口未监听时内核立即回 RST,connect 微秒级失败,
+  // 烧 CPU 且向对端刷 SYN)。故不能照抄 UDP 的"非正回落默认值"。
+  if (config_.silence_timeout <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  return Coro::Result<void>{};
 }
 
 Coro::Result<void> TcpTransport::Start() {
-  const auto state = state_;
-  std::shared_ptr<Coro::Awaitable<QByteArray>> stream;
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kRunning) {
-      return Coro::Result<void>{};
-    }
-    if (state->lifecycle != LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (!state->socket) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    state->lifecycle = LifecycleState::kRunning;
-    // 缓存对端地址(已连接 TCP 恒定):投入 read_queue 的 Datagram.peer 恒填为对端。
-    state->peer_host = state->socket->peerAddress().toString().toStdString();
-    state->peer_port = state->socket->peerPort();
-    // 建立唯一 readAll 流(持有一条、反复 await);初始 drain 会收下订阅前已到达的
-    // 字节,故不丢首片。
-    state->read_stream = Coro::coro(state->socket.data()).readAll();
-    stream = state->read_stream;
-    read_queue = state->read_queue;
+  if (lifecycle_ == LifecycleState::kRunning) {
+    return Coro::Result<void>{};
   }
-  // 起数据泵(ADR-0007 D1):在本执行域 fiber 内反复取字节片投 read_queue。句柄不留存:
-  // 泵只触碰以 shared_ptr 持有的 State / 流 / 队列,故本类析构后仍安全收敛。
-  Coro::makeTask([state, stream, read_queue] {
-    RunReadPump(state, stream, read_queue);
-  });
+  if (lifecycle_ != LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (auto valid = ValidateConfig(); !valid) {
+    // **停在 `Created`**:未建 socket、未起泵,允许改配后重试(RT_LIFECYCLE_007)。
+    last_error_ = valid.error();
+    return valid.error();
+  }
+  // socket 在本 fiber(节点执行域)内创建,守 Qt 对象亲和纪律。
+  socket_ = new QTcpSocket();
+  socket_->setProxy(QNetworkProxy::NoProxy);  // #123:不继承环境级代理策略。
+  lifecycle_ = LifecycleState::kRunning;
+
+  // **不就地 connect**(与 UDP 的一处差异):`UdpTransport::Start()` 就地 bind 一次是因为
+  // bind 同步且瞬时;TCP 的 connect 是异步的,就地等会把 `Start()` 变成一个最长一个
+  // silence_timeout 的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是
+  // kEstablishing,"首连未成不算启动失败"(ADR-0007 D2)。
+  pump_ = std::make_shared<Coro::FiberTask<void>>(
+      Coro::makeTask([this] { RunSocketPump(); }));
   return Coro::Result<void>{};
 }
 
-// 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
-// 自理。未 Start 时给一个以 kInvalidState 关闭的句柄;关闭中/已关闭或对端断开时,
-// read_queue 已被关闭并携带 kClosed,await 即得终止原因。
-std::shared_ptr<Coro::Awaitable<Datagram>> TcpTransport::Read() {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  if (state_->lifecycle == LifecycleState::kCreated) {
-    return ClosedDatagramQueue(make_error_code(TransportErrc::kInvalidState));
-  }
-  return state_->read_queue;
-}
+// 泵 fiber(ADR-0011 D2,与 `UdpTransport::RunSocketPump()` 同构):
+//
+//   while (!closing) {
+//     connect_waiter = connectToHost;              ← 句柄存成员,供 Close 打断 (D15)
+//     if (await_for(connect_waiter, timeout)) {
+//       ++generation; socket_ready 先清后发;
+//       read_stream = readAll();                   ← 同样存成员 (D15)
+//       for(;;) { r = await_for(read_stream, timeout); if (r) push else break }
+//     } else { 归因; await_for(close_signal, timeout) }   ← 退避
+//     abort()                                      ← 每轮末尾无条件清理,不是打断手段
+//   }
+//
+// **重连不是独立机制**:它就是本 while 转第二圈;首连与重连走同一段代码,不作区分。
+// 三处的 timeout 是**同一个量**(D5):等连上 / 多久没数据算链路坏 / 多久重试一次。
+void TcpTransport::RunSocketPump() {
+  const std::chrono::milliseconds timeout = config_.silence_timeout;
 
-Coro::Result<void> TcpTransport::Write(SendUnit unit) {
-  const auto state = state_;
-  std::shared_ptr<Coro::Awaitable<void>> slot_gate;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (state->lifecycle != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);
-    }
-    // 发送等待者:自进入 Write 起计数(排队 + 在写),反映发送侧背压积压(3.4.4)。
-    state->send_waiters += 1;
-    if (!state->active_write) {
-      state->active_write = true;  // 写槽空闲 → 立即取得。
-    } else {
-      // 写槽被占 → 按到达顺序排队等待(RT_TRANSPORT_004/007 串行化,不拒绝)。
-      slot_gate = std::make_shared<Coro::Awaitable<void>>();
-      state->write_queue.push_back(slot_gate);
-    }
-  }
+  while (lifecycle_ < LifecycleState::kClosing) {
+    // 发起连接并等待。用的就是那一个量——**不设单独的 connect_timeout**(D5)。
+    // 句柄**存成成员**,因为 `Close()` 要靠 `close()` 它来打断:实测 `abort()` 在连接
+    // 窗口内唤不醒任何等待(D15)。
+    connect_waiter_ = Coro::coro(socket_).connectToHost(
+        QString::fromStdString(config_.host), config_.port);
+    auto connected = Coro::await_for(connect_waiter_, timeout);
+    if (connected) {
+      ++generation_;  // 纯内部记账(D9/D12):不驱动任何控制流。
 
-  if (slot_gate) {
-    if (!Coro::await(slot_gate)) {
-      // 关闭时被唤醒:从未取得写槽 → 仅回退等待者计数。
-      LeaveWriteQueue(state);
-      return make_error_code(TransportErrc::kClosed);
-    }
-  }
+      // 通告写泵(#180 的消费者;本轮无人取)。**先清后发**:每轮外层都是一次真实的
+      // down→up 跃迁,而写泵停在"等数据"时没人来取,不清就会一直堆积。信号因此恒定
+      // 只有 0 或 1 个 token。
+      socket_ready_->channel()->discard_pending();
+      socket_ready_->resolve();
 
-  // —— 已持有写槽 ——
-  QPointer<QAbstractSocket> socket;
-  bool running = false;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    running = state->lifecycle == LifecycleState::kRunning;
-    socket = state->socket;
-  }
-  if (!running) {  // 等待写槽期间已进入关闭。
-    ExitWrite(state);
-    return make_error_code(TransportErrc::kClosed);
-  }
-
-  // 失败即关本物理连接,不自动重发:先进入关闭(排队写等待者以 kClosed 收敛、不
-  // 移交写槽),再释放写槽。
-  auto fail = [&state](std::error_code mapped) -> Coro::Result<void> {
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_error = mapped;
-    }
-    BeginClose(state);
-    ExitWrite(state);
-    return Coro::Result<void>{mapped};
-  };
-
-  // 把整帧全部交给 Qt 用户态发送缓冲、并等待其刷入操作系统发送缓冲:只有整帧字节
-  // 全部离开框架用户态缓冲(bytesToWrite()==0)才报告成功(RT_TRANSPORT_008)。
-  // 处理短写:socket->write() 返回 0≤n<total 时循环写剩余字节。背压经 await 传导。
-  const char* data = reinterpret_cast<const char*>(unit.bytes.data());
-  const qint64 total = static_cast<qint64>(unit.bytes.size());
-  qint64 offset = 0;
-  for (;;) {
-    if (!socket) {
-      return fail(make_error_code(TransportErrc::kConnection));
-    }
-    const qint64 remaining = total - offset;
-    if (remaining <= 0 && socket->bytesToWrite() <= 0) {
-      break;  // 整帧字节已全部进入操作系统发送缓冲 → 发送完成。
-    }
-    // waiter 先于本轮 write 创建,避免快速的 bytesWritten 被漏掉(见 AsyncTask
-    // socket_pingpong 示例);已刷空时循环顶部的守卫保证不会空等。
-    auto flushed = Coro::coro(socket.data()).waitForBytesWritten();
-    if (remaining > 0) {
-      const qint64 n = socket->write(data + offset, remaining);
-      if (n < 0) {
-        return fail(make_error_code(TransportErrc::kIo));
+      // 每代重建读流(旧流已随上一轮 abort 死掉);建流时会 drain 订阅前已到的字节。
+      // 同样**存成成员**供 Close 打断(D15)。
+      read_stream_ = Coro::coro(socket_).readAll();
+      for (;;) {
+        auto chunk = Coro::await_for(read_stream_, timeout);
+        if (!chunk) {
+          // 三条成因**不作区分**,一律 break 回外层重连:
+          //   ① 对端断开 —— **主判据**(D4),经流的自然终止到达(`readAll()` 在
+          //      disconnected 与 socket error 上都先 `drain()` 再关流,**尾字节不丢**,
+          //      故**不需要**另订阅 `waitForDisconnected()`);
+          //   ② 静默超时 —— **辅助判据**(D4),只在半开连接(FIN 未达)时才轮到它;
+          //   ③ 我方 Close —— 由 while 判据接住,不记归因。
+          Attribute(chunk.error(), last_error_);
+          break;
+        }
+        // chunk 是**任意字节切片**,不是一个完整帧(RT_TRANSPORT_003);组帧归 ICodec。
+        // `readAll()` 只推送非空切片,故此处无须判空。
+        const QByteArray& bytes = chunk.value();
+        const auto* first =
+            reinterpret_cast<const std::uint8_t*>(bytes.constData());
+        Datagram out{{first, first + bytes.size()}, peer_};  // peer 固定对端(D8)。
+        if (read_queue_->channel()->push(std::move(out)) !=
+            boost::fibers::channel_op_status::success) {
+          // read_queue 已关闭 → 停止投递,回外层判生命周期。两种成因:我方 Close,
+          // 或**某个订阅者调了 close()**——后者是整流传播的(AsyncTask 417790c 起),
+          // 会连本队列一并关掉,系有意为之。
+          break;
+        }
       }
-      offset += n;
+      read_stream_.reset();
+    } else {
+      // 连不上:归因后退避。**必须用独立的延时原语**——拿"在未连接的 socket 上建读流"
+      // 当退避会被当场关闭、退化为紧转(`UdpTransport` 的注释记着同一个坑)。
+      // close_signal_ 被 Close 关闭时立即返回,故退避可提前打断。
+      Attribute(connected.error(), last_error_);
+      Coro::await_for(close_signal_, timeout);
     }
-    Coro::Result<void, std::error_code> drained = Coro::await(flushed);
-    if (!drained) {
-      // 刷完途中连接断裂 = 流式部分写失败(RT_TRANSPORT_004.4)。
-      return fail(MapSocketError(drained.error()));
-    }
+    connect_waiter_.reset();
+    // 每轮末尾**无条件 abort()**(D3):socket 回 UnconnectedState,状态、缓冲与挂起的
+    // 信号一并清除,下一轮从这一个确定状态重建——不必区分上轮怎么结束的,也**不需要
+    // 新建 socket 对象**。注意它是**清理动作,不是打断手段**(D15)。
+    socket_->abort();
   }
 
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->last_send = Clock::now();
+  // 收尾:关读队列、落 Closed。**没有完成量**——外部的 `WaitClosed()` 直接 join 本
+  // fiber,那才是"可安全释放"的充分条件。(#180 起,此处须先 join 写泵。)
+  // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,残留一并丢弃。
+  CloseQueue(read_queue_, make_error_code(TransportErrc::kClosed));
+  lifecycle_ = LifecycleState::kClosed;
+}
+
+// 交出 read_queue 句柄(ADR-0007 D4):未 Start 时给一个以 kInvalidState 关闭的句柄;
+// 已关闭时 read_queue 已被泵以 kClosed 关闭,await 即得终止原因。
+std::shared_ptr<Coro::Awaitable<Datagram>> TcpTransport::AsyncRead() {
+  if (lifecycle_ == LifecycleState::kCreated) {
+    return ClosedQueue<Datagram>(make_error_code(TransportErrc::kInvalidState));
   }
-  ExitWrite(state);
+  return read_queue_;
+}
+
+// **占位:本轮(#179)只做读侧**。写泵、write_queue 与写侧的两处 Close 打断归 #180——
+// 刻意不做"临时能用"的实现,以免它成为写侧设计的既成事实。
+Coro::Result<void> TcpTransport::AsyncWrite(Datagram /*datagram*/) {
+  return make_error_code(TransportErrc::kUnsupported);
+}
+
+// 请求关闭(幂等):**打断点缺一不可**——漏一处,`Close()` 落在对应窗口时就要挂满一个
+// `silence_timeout`。只发信号,不等收敛(收尾由泵自己跑完)。
+//
+// | # | 阻塞点                                  | 打断者                    |
+// |---|------------------------------------------|---------------------------|
+// | ① | 泵:`await_for(close_signal_, timeout)` 退避 | `close_signal_->close()`  |
+// | ② | 泵:`await_for(connect_waiter_, timeout)` 等连上 | `connect_waiter_->close()` |
+// | ③ | 泵:`await_for(read_stream_, timeout)` 读等待 | `read_stream_->close()`   |
+// | ④⑤| 写泵的两个阻塞点                          | **#180**                  |
+//
+// ②③ **不能用 `socket_->abort()` 代替**(D15,实测):Qt 的 abort() 在连接中的 socket 上
+// 不发 errorOccurred,而 corosocket 的 waitForSignal / readAll 都靠 socket error 或
+// disconnected 终结——实测 abort() 两处都唤不醒、挂满整个超时,持句柄 close() 则 1ms 内
+// 双双唤醒。UDP 没有"连接中"这个窗口,故其 `socket_->close()` 打断读流有效,**不可照搬**。
+Coro::Result<void> TcpTransport::Close() {
+  if (lifecycle_ >= LifecycleState::kClosing) {
+    return Coro::Result<void>{};  // 幂等。
+  }
+  const std::error_code closed = make_error_code(TransportErrc::kClosed);
+  if (lifecycle_ == LifecycleState::kCreated) {
+    lifecycle_ = LifecycleState::kClosed;  // 从未 Start:无泵可停。
+    CloseQueue(read_queue_, closed);
+    return Coro::Result<void>{};
+  }
+  lifecycle_ = LifecycleState::kClosing;
+
+  close_signal_->close(closed);  // ① 打断重连退避。
+  if (connect_waiter_) {
+    connect_waiter_->close(closed);  // ② 打断"等连上"。
+  }
+  if (read_stream_) {
+    read_stream_->close(closed);  // ③ 打断读等待。
+  }
+  socket_ready_->close(closed);  // ⑤ 本轮无消费者,与 #180 的写泵对齐先关上。
   return Coro::Result<void>{};
 }
 
-Coro::Result<void> TcpTransport::RequestClose() {
-  BeginClose(state_);
-  return Coro::Result<void>{};
-}
-
-Coro::Result<void> TcpTransport::WaitClosed(OperationOptions options) {
-  {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
+// join 泵 fiber。返回即它不再触碰本对象——这是"可安全释放"的充分条件,
+// `Awaitable::close()` 给不了(它只保证等待者被唤醒)。`get()` 是一次性的(底层 boost
+// future 取过即失效),故用 joined_ 闩保证幂等。
+void TcpTransport::WaitClosed() {
+  if (joined_ || !pump_) {
+    return;  // 已 join 过,或从未 Start:无可汇合者。
   }
-  return state_->closed.Wait(std::move(options));
+  joined_ = true;
+  (void)pump_->get();
 }
 
-std::size_t TcpTransport::SendWaiterDepth() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->send_waiters;
+bool TcpTransport::IsRunning() const {
+  return lifecycle_ == LifecycleState::kRunning;
 }
 
-std::optional<TcpTransport::Clock::time_point> TcpTransport::LastSendTime()
-    const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_send;
-}
+std::error_code TcpTransport::LastError() const { return last_error_; }
 
-std::optional<TcpTransport::Clock::time_point> TcpTransport::LastReceiveTime()
-    const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_recv;
-}
-
-std::error_code TcpTransport::LastError() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_error;
-}
-
-// 链路可用性以 socket 的当前连接态为准而非以生命周期推断:对端断开时本类不改
-// lifecycle(读侧只以 kClosed 收敛,不重连),故 Running 期仍须问 socket 才能
-// 如实报告"连接已不存续"。
+// **无状态成员,当场算出**(D12)。最后一支是与 UDP 的**真正分歧**:UDP 未绑定即报
+// kDown("UDP 无连接,故永不出现 kEstablishing"),TCP 在退避重连期间报 kEstablishing
+// ——泵仍会重试,链路是"正在建立",不是"没了"。
 LinkState TcpTransport::CurrentLinkState() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  if (state_->lifecycle != LifecycleState::kRunning || !state_->socket) {
+  if (lifecycle_ != LifecycleState::kRunning || !socket_) {
     return LinkState::kDown;
   }
-  return state_->socket->state() == QAbstractSocket::ConnectedState
-             ? LinkState::kUp
-             : LinkState::kDown;
+  switch (socket_->state()) {
+    case QAbstractSocket::ConnectedState:
+      return LinkState::kUp;
+    case QAbstractSocket::ConnectingState:
+    case QAbstractSocket::HostLookupState:
+      return LinkState::kEstablishing;
+    default:
+      return LinkState::kEstablishing;  // 未连接但泵仍会重试。
+  }
 }
 
 }  // namespace transport
