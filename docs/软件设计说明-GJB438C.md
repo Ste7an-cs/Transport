@@ -92,7 +92,7 @@
 
 **图例说明**：实线箭头读作"A 使用/组合 B"，虚线为可选依赖。`CSC_NODE` 组合 `CSC_CODEC`+`CSC_IO`、依赖 `CSC_CORE`；`CSC_CODEC`/`CSC_IO` 各依赖 `CSC_CORE`；全体运行于 `AsyncTask`；`CSC_IO` 的 Qt socket/串口依赖在宿主未启用 Qt 时不编译。整体单向依赖、上层不被下层反向引用。总体类关系见附图 `arch-class.svg`（`ITransport`/`ICodec`/node/core 的组合 ▷ 与实现 △）。
 
-框内标注了**当前编译面**：`CSC_IO` 仅 `UdpTransport` 一个实现在编译面内，TCP（重构方案见 ADR-0011）/串口/DDS 与 `TcpServer` 待按 ADR-0007 的新形态跟进；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
+框内标注了**当前编译面**：`CSC_IO` 有 **`UdpTransport` 与 `TcpTransport`** 两个实现在编译面内——TCP 已按 **ADR-0011** 重构完毕（#179 读侧 / #180 写侧 / #181 用例判定）。**串口 / DDS 与 `TcpServer` 待按同一形态跟进**；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
 
 > **变更（ADR-0006/0008/0009）**：`CSC_CORE` 框原列 `Result/Status`、`Cancellation`、`SharedCompletion` 三项——`Result`/`Status` 本就只是别名、已随 `core/Result.hpp` 删除（改用 `Coro::Result`），`SharedCompletion` 已删除（改用 `Awaitable::close()` 广播 + `FiberTask::get()` 汇合）。`Cancellation` **文件仍在且随库编译、亦有自己的测试**，但 ADR-0006 D3 取消令牌退化为时限之后，**库的活代码里已无使用者**，故在框内标注其性质而非直接抹去。`Dispatcher` 原被同时画进 `CSC_NODE`——它实际位于 `core/`，已归入 `CSC_CORE` 一处。
 
@@ -280,7 +280,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.13 TCP 传输泵与重连（MS_TCP_PUMP）
 
-**图 4-15（`seq-tcp-pump`）** —— ADR-0011 定稿的**目标形态**，尚未实现。
+**图 4-15（`seq-tcp-pump`）** —— ADR-0011 定稿的形态，**已实现**（#179 读侧 / #180 写侧）。
 
 ![TCP 传输泵与重连时序图](diagrams/seq-tcp-pump.svg)
 
@@ -518,14 +518,14 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ### 5.6 传输层详细设计（CSU_IO）
 
-**单元设计决策（ADR-0007 D1，UDP 先行）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**本轮仅 `UdpTransport` 落地该形态**，`TcpClientTransport` 已是其前身（#109 的连接泵 + 对外通道），`TcpTransport`/`SerialTransport` 待跟进（队列策略差异见 TBD-009）。
+**单元设计决策（ADR-0007 D1，UDP 先行；TCP 已于 ADR-0011 跟进）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**本轮仅 `UdpTransport` 落地该形态**，`TcpClientTransport` 已是其前身（#109 的连接泵 + 对外通道），`TcpTransport`/`SerialTransport` 待跟进（队列策略差异见 TBD-009）。
 连接管理（TCP 客户端）与纯管道分离并**维持两层**（ADR-0004 D8：合并只会复制收发语义）；TCP 客户端内部改为**连接泵 + 对外通道**（ADR-0004 D6）；DDS 跨线程有界交接闭合 ADR-0001 未决项。
 
 **设计约束**：并发写串行化保留（RT_TRANSPORT_004；其"单读"约束已随 ADR-0007 D4 删除，`AsyncRead()` 交出等待器句柄、是否共享由调用方 `shared()` 决定）、**发送完成语义与背压已撤销**（DD-6）；UDP/DDS 单次一报文/样本，过大发送前失败；**读取终止语义**（DD-11）：不可重连介质致命错误返 `kClosed`，可重连介质链路中断**对调用方透明**（`Read` 挂起至新链路就绪，不返回任何断链错误）；socket/串口在节点执行域 fiber 内创建（亲和纪律）。
 
 **软件逻辑**：见 `src/io/*`。
 
-> **实况标注（2026-08-26 核对）**：下表中**只有 `UdpTransport` 已按 ADR-0007/0008 的新形态实现并参与编译**。`SerialTransport` / `DdsTransport` / `TcpServer` 三行描述的是**重设计之前的形态**，其源文件当前**不在 `CMakeLists.txt` 的库源清单内**（编译面收窄至 UDP + ProtocolNode），行内提及的 `Read()`、`BoundedQueue` 等已是历史 API。这些单元的复活与改写属"编译面恢复"。
+> **实况标注（2026-08-28 核对）**：下表中 **`UdpTransport` 与 `TcpTransport` 已按新形态实现并参与编译**（后者依 ADR-0011，#179/#180/#181）。`SerialTransport` / `DdsTransport` / `TcpServer` 三行描述的是**重设计之前的形态**，其源文件当前**不在 `CMakeLists.txt` 的库源清单内**（编译面收窄至 UDP + ProtocolNode），行内提及的 `Read()`、`BoundedQueue` 等已是历史 API。这些单元的复活与改写属"编译面恢复"。
 >
 > **`TcpTransport` 一行是例外**：它描述的是 **ADR-0011 定稿的目标形态**（尚未实现），不是历史代码。当前 `src/io/tcp/` 下的三个 .cpp 仍是重设计之前的实现，且 `TcpClientTransport.hpp:126` 引用着已删除的 `OperationOptions`、**头文件本身无法编译**。
 
@@ -543,7 +543,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 5.6.1 `TcpTransport` 三条路径的详细设计（ADR-0011）
 
-> **目标形态，尚未实现。** 下列伪代码是实现票的依据；与 `UdpTransport` 同名部件一一对应，差异处已标注。
+> **已实现**（ADR-0011，#179/#180；测试见 `tests/tcp_transport_test.cpp` 等四个文件）。下列伪代码是当初实现票的依据，与落地代码一致；与 `UdpTransport` 同名部件一一对应，差异处已标注。
 
 ##### 成员（与 UDP 对齐，无连接状态枚举）
 
@@ -982,7 +982,7 @@ done
 | 图 4-12 | 状态 | MS_TICKET | `state-dispatch-ticket.mmd` |
 | 图 4-13 | 时序 | MS_TRANSPORT_PUMP | `seq-transport-pump.mmd`（ADR-0007 引入） |
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
-| 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**目标形态，尚未实现**） |
+| 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**已实现**，#179/#180） |
 | 附图 | 类图 | 总体 | `arch-class.mmd` |
 
 ---

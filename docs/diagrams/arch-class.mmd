@@ -57,17 +57,12 @@ classDiagram
     }
 
     class TcpTransport {
-        <<待按新形态跟进 · 排除于编译面>>
-    }
-    class TcpClientTransport {
-        <<具体诊断，非多态缝 · 排除于编译面>>
-        +State() ConnectionState
-        +WaitForState(target, OperationOptions) ⚠ 引用已删除类型
-        +Generation() / AttemptCount() / LastFailure()
-        +ApplyConfig(TcpClientConfig, version)
+        <<编译面内 · ADR-0011 重构完毕>>
+        +socket 管理泵 + 读写双队列
+        +连接管理内建（固定间隔重连、不自终）
     }
     class UdpTransport {
-        <<当前编译面内唯一 ITransport 实现>>
+        <<编译面内 · ADR-0007 样板>>
     }
     class SerialTransport {
         <<待按新形态跟进 · 排除于编译面>>
@@ -86,7 +81,6 @@ classDiagram
     }
 
     ITransport <|.. TcpTransport
-    ITransport <|.. TcpClientTransport
     ITransport <|.. UdpTransport
     ITransport <|.. SerialTransport
     ITransport <|.. DdsTransport

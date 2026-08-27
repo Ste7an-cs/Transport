@@ -7,7 +7,7 @@ sequenceDiagram
     participant RD as node 读-分发循环
     participant P as Dispatcher 订阅索引
 
-    Note over CL,IN: 【TCP 尚未按 ADR-0007/0008 的新形态重构，当前排除于编译面】<br/>本图画的是断链处置【决策】（DD-11）；机制名已对齐当前接口
+    Note over CL,IN: 【TCP 已按 ADR-0011 重构完毕并进入编译面】（#179/#180/#181）。<br/>本图画的是断链处置【决策】（DD-11），仍然成立；<br/>但图中的 TcpClientTransport/内层 TcpTransport 两层结构已随 D1 合并为一个 TcpTransport，<br/>泵形态见图 4-15。本图待随之重绘。
     Note over CL,IN: Connected（代际 N）：内层收字节 → 推对外通道
     RD->>CH: await(rx_) 等待下一段字节
 
