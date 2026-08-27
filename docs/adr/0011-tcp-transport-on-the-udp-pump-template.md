@@ -179,9 +179,12 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
 
   | 探针 | 场景 | 结果 |
   |---|---|---|
-  | 1 | socket 处于 `ConnectingState` 时 `abort()` | **唤不醒** `waitForConnected()`——挂满 3000ms 超时才返回 |
-  | 2 | 同上，`abort()` 对 `readAll()` 流 | **唤不醒**——同样挂满 3000ms |
+  | 1 | socket 处于 **`ConnectingState`** 时 `abort()` | **唤不醒** `waitForConnected()`——挂满 3000ms 超时才返回 |
+  | 2 | socket 处于 **`ConnectingState`** 时 `abort()`，对 `readAll()` 流 | **唤不醒**——同样挂满 3000ms |
   | 3 | 持句柄并 `close()` | **1 毫秒内两处均唤醒** |
+
+  **补充（#179 的负向对照实测，2026-08-28）**：socket 处于 **`ConnectedState`** 时，`abort()` **确实能**终结 `readAll()` 流（实测 0ms）——因为它会发 `disconnected` / `errorOccurred`。故上表第 2 行的"唤不醒"**只对连接窗口成立**，不是关于 `abort()` 与 `readAll()` 的普遍结论。
+  **但这不改变本决策**：连接窗口（`ConnectingState`）依然无人覆盖，而 `Close()` 可能恰好落在其中。#179 的负向对照同时测得：去掉 `read_stream_->close()` 后，读等待打断退化为**挂满 2949ms**——因为本设计的 `Close()` **根本不调 `abort()`**（它只在泵每轮末尾作清理）。三处句柄打断仍然**缺一不可**。
 
   成因：Qt 的 `QAbstractSocket::abort()` 在**连接中**的 socket 上**不发 `errorOccurred`**，而 `corosocket` 的 `waitForSignal` / `readAll` 都是靠 socket error 或 `disconnected` 终结的。
 
