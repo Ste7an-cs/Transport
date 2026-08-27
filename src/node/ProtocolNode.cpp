@@ -69,7 +69,7 @@ Coro::Result<void> ProtocolNode::DoStart() {
   // 超时"由 `ValidateInteraction` 的参数校验直接拒绝非正值,不再依赖启动期的配置校验。
   //
   // **不启动 transport**:宿主已经启过。读侧取自己的一路订阅——关它只终止本节点,
-  // 源队列与其它订阅者不受影响;写侧无句柄可取,直接调 transport_.Write()。
+  // 各订阅者各得全量副本;写侧无句柄可取,直接调 transport_.Write()。
   rx_ = transport_.AsyncRead()->shared();
 
   // 本节点只 spawn 这一条 fiber。入站业务的消费 fiber 属宿主,由其自行 spawn 与 join。
@@ -78,9 +78,13 @@ Coro::Result<void> ProtocolNode::DoStart() {
 }
 
 Coro::Result<void> ProtocolNode::DoClose() {
-  // 关的是**本节点**,不是传输。close 自己那一路读订阅 → 读循环的 await 立即得到终止
-  // 错误而退出;源 read_queue 与其它订阅者不受影响(AsyncTask shared() 语义)。
+  // close 本节点这一路读订阅 → 读循环的 await 立即得到终止错误而退出。
   // 残留数据一并丢弃:关闭即停止交付。
+  //
+  // **close 是整流传播的**(AsyncTask 417790c 起):它关闭 hub 表里全部消费者队列,
+  // 源 read_queue 与同一条传输上的其它订阅者**一并终结**。这是**有意为之**——
+  // 节点关闭即读侧终结,宿主随后关传输,两者一起关。
+  // 不用"析构句柄只退订自己"那条路径:它唤不醒此刻正阻塞在 await(rx_) 里的读循环。
   if (rx_) {
     rx_->close(make_error_code(TransportErrc::kClosed));
     rx_->channel()->discard_pending();

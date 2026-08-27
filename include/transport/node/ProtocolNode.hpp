@@ -28,10 +28,17 @@
  * 本节点只按引用借用它:读侧取它的读队列句柄,写侧调它的 `Write()`。链路的绑定、静默超时、重连、退避**全部是传输内部的事**,
  * 节点既不发起也不观测。
  *
- * 因此读侧走 `AsyncRead()->shared()`,**本节点拿自己的一路订阅**:关闭时只 `close` 自己
- * 这一路即可让读循环退出,源队列与其它订阅者不受影响(AsyncTask `shared()` 的语义:
- * 订阅句柄的 `close()` 只终止自己这一路)。这是"节点关闭不等于传输关闭"的实现载体,
- * 也让多个节点能共用一条传输。
+ * 因此读侧走 `AsyncRead()->shared()`,**本节点拿自己的一路订阅**:`DoClose()` 关闭它,
+ * 读循环的 `await` 随即得到终止错误而退出。
+ *
+ * **注意 `close()` 是整流传播的**:AsyncTask `417790c` 起,`Awaitable::close()` 关闭 hub 表里
+ * **全部**消费者队列——源队列与同一条传输上的其它订阅者**一并终结**。这是**有意为之**:
+ * 节点关闭即读侧终结,宿主随后关传输。若只想退订自己而不影响他人,新语义下的做法是
+ * **析构句柄**(`~Awaitable()` 内部 `hub_->detach()`),本类不用该路径——它唤不醒正阻塞在
+ * `await(rx_)` 上的读循环。
+ *
+ * 由此:多个节点**可以**共用一条传输并各得全量副本,但它们在关闭上是**一荣俱荣**——
+ * 任一节点 `Close()` 即终结整条读流,不支持独立关停。
  *
  * 写侧调 `transport.AsyncWrite(bytes)`——**fire-and-forget**,入队即完成调用方责任。目的地恒传
  * `Endpoint::Default()`,由传输解析成它自己配置的默认对端:本类传输无关,不知道也不该知道
@@ -383,8 +390,9 @@ class ProtocolNode : public NodeBase {
   std::unique_ptr<ICodec> codec_;
   ProtocolNodeConfig config_;
 
-  /// 本节点在传输 `read_queue` 上的独立订阅(`shared()`):关闭它只终止本节点这一路,
-  /// 源队列与其它订阅者不受影响。`DoStart` 建立,`DoClose` 关闭。
+  /// 本节点在传输 `read_queue` 上的订阅(`shared()`):各订阅者各得全量副本、互不竞争。
+  /// `DoStart` 建立,`DoClose` 关闭——**关闭是整流传播的**,连源队列与其它订阅者一并终结
+  /// (AsyncTask `417790c` 起的 `Awaitable::close()` 语义,有意为之)。
   std::shared_ptr<Coro::Awaitable<Datagram>> rx_;
   /// 读-分发循环的结构化并发句柄;`DoJoin()` 让出式 join 之。
   std::shared_ptr<Coro::FiberTask<void>> read_task_;

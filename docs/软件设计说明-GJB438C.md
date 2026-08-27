@@ -432,7 +432,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 ### 5.5 交互节点详细设计（CSU_PROTOCOLNODE / CSU_DDSNODE）
 
 > **变更（ADR-0008 D5/D6/D7）**：`ProtocolNode` 已重写，下文中与之冲突处以本注为准。
-> - **不再拥有、也不启停传输**：改为按引用借用，宿主负责传输的 `Start` / `Close` / `WaitClosed`；读侧走 `AsyncRead()->shared()` 取独立订阅，`DoClose()` 只关闭该订阅，源队列与其它订阅者不受影响。由此一条传输可被多个节点共用。
+> - **不再拥有、也不启停传输**：改为按引用借用，宿主负责传输的 `Start` / `Close` / `WaitClosed`；读侧走 `AsyncRead()->shared()` 取自己的一路订阅，`DoClose()` 关闭它。
+>   **更正（2026-08-27，AsyncTask 升至 `417790c`）**：原文"**只**关闭该订阅，源队列与其它订阅者**不受影响**"表述有误——`Awaitable::close()` 自上游 `3818265` 起**整流传播**，关闭 hub 表里全部消费者队列（实测确认）。**这正是要的语义**：节点关闭即读侧终结，宿主随后关传输。故准确表述是：一条传输**可**被多个节点共用并各得全量副本，但**任一节点 `Close()` 即终结整条读流**，不支持独立关停。详见 ADR-0008 D5 的更正注。
 > - **请求关联改由 `Dispatcher`**：`PendingTable`、`CorrelationKeyStrategy`、`ProtocolKey`、`kResponseMarker` 及"响应命令码归一化"全部删除。键提取收为一行 `make_tuple(session_id, message_id, frm_type)`——帧类型成为键的独立字段后，请求与回应可直接区分。新增公开的 `Subscribe(Key)` 供分段交互与旁路监听。
 > - **`session_id` 简化为自增计数器**：`std::uint8_t` 每次取用后自增、越过 255 自然回绕。0..255 空闲集、FIFO 退休窗口、RAII 租约与 `kResourceExhausted` 边界一并删除（推翻 RT_REQUEST_005/006）。
 > - **八个观测接口全部删除**，丢弃只经 `ITraceSink` 上报。
