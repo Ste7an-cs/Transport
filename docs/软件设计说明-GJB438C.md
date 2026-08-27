@@ -223,7 +223,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 > **变更（#173 / #163，2026-08-26）**：原文"在途请求由各自**总超时（缺省 30 秒）**/取消/关闭终结"两处已不成立——节点级缺省超时 `default_request_timeout` **已删除**（时限改为必填、逐次传参），取消令牌亦随 ADR-0006 D3 退化为时限。归因项数原记"七项减六项"，其后「无 handler」一项随 handler 通道废止而删除（#163），现为**五项**。
 >
-> **本图（及图 4-11）描述的 TCP 侧尚未按 ADR-0007/0008 的新形态重构、当前排除于编译面**；图中保留的是断链处置**决策**（DD-11），机制名已对齐当前接口（`Read()` → `await(rx_)`、`RequestClose()` → `Close()`、`PendingTable` → `Dispatcher` 订阅索引）。TCP 重构时需连同本图一并复核。
+> **本图描述的 TCP 侧尚未按 ADR-0007/0008/0011 的新形态重构、当前排除于编译面**；图中保留的是断链处置**决策**（DD-11），机制名已对齐当前接口（`Read()` → `await(rx_)`、`RequestClose()` → `Close()`、`PendingTable` → `Dispatcher` 订阅索引）。TCP 重构时需连同本图一并复核。
 
 #### 4.2.7 节点生命周期状态（MS_NODE_LIFECYCLE）
 
@@ -233,19 +233,17 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **图例说明**：`Created→Running→Closing→Closed`。`Running` 由基类在 `DoStart()` 返回后置位（不再由子类中途回调）；`Closing→Closed` 由 `WaitClosed()` 的 `DoJoin()` 驱动。**并发 Start 不共享结果**——另一次正在初始化时返 `kInvalidState`（旧形态的一次性 latch 会让重试拿到陈旧失败，#150）。**不再需要重入守卫或使用契约**：`Close()` 拆成只发信号之后，内部工作单元直调它是安全的（ADR-0008 D2）。
 
-#### 4.2.8 TCP 连接状态机（MS_CONNECTION）
+#### 4.2.8 ~~TCP 连接状态机（MS_CONNECTION）~~ —— 已撤销
 
-**图 4-11（`state-connection`）**
-
-![TCP 客户端连接状态机](diagrams/state-connection.svg)
-
-**图例说明**：`Disconnected/Connecting/Connected/Reconnecting` + 连接代际递增；**固定重连间隔**（缺省 1s；四套退避参数——倍率/上限/抖动/稳定重置——已随 **ADR-0005 D4** 一并撤销）；端点热更新掐断当前尝试立即重试。
-
-> **变更（ADR-0011 D9，2026-08-27）**：这四个状态自本轮起是**传输内部**的设计要求，**不再有对外查询接口**——`State()` 与 `WaitForState()` 均已删除，对外只呈现 `LinkState` 三值：`Disconnected` → `kDown`，`Connecting`/`Reconnecting` → `kEstablishing`，`Connected` → `kUp`（RT_LIFECYCLE_002 的变更注）。连接代际同样转为**内部记账**，`Generation()` 随 `AttemptCount()` / `LastFailure()` 一并删除，观测统一走 `ITraceSink`（与 ADR-0008 **D10** 同向）。
+> **本节与图 4-11 已撤销（ADR-0011 **D12**，2026-08-27）。** 节号与图号**保留不复用**，以免打断既有交叉引用与追溯登记。
 >
-> **状态机并入 `TcpTransport`**（**D1**）：本状态机原本"完全内于 `TcpClientTransport`"，该类已并入 `TcpTransport`，状态机随之成为其外层 socket 管理泵的内部形态——`Connecting` 即泵在等 `connected`，`Reconnecting` 即泵停在 `await_for(close_signal, reconnect_interval)` 的退避上，`Connected` 即泵在内层读流循环里。**状态不再是显式的枚举变量驱动，而是泵所处的代码位置**；保留枚举仅为诊断与 Trace 归类。
+> **撤销理由：该状态机没有对应的代码实体。** 原图画 `Disconnected/Connecting/Connected/Reconnecting` 四状态 + 跃迁，但按 ADR-0011 的设计，`TcpTransport` **不持有连接状态枚举、也没有驱动跃迁的代码**——这四个"状态"实际是**外层泵所处的代码位置**：`Connecting` 是泵在等 `connected`，`Reconnecting` 是泵停在 `await_for(close_signal, reconnect_interval)` 的退避上，`Connected` 是泵在内层读流循环里。
 >
-> **端点热更新（`ApplyConfig`）的去留本轮待定**（**D11**）——图中该跃迁暂存，待专门讨论后确认或删除。
+> **而"泵所处的代码位置"正是图 4-15 画的东西**，且那张图有代码对应。两图讲同一件事、只有一张有实体，故删去无实体的一张。**内容并入 §4.2.13（图 4-15）。**
+>
+> **链路可用性不受影响**：`CurrentLinkState()` 保留，但它**不需要**任何状态成员——与 `UdpTransport.cpp:320` 同法，当场由 `lifecycle_` 与 `socket_->state()` 算出：未 Running 或无 socket → `kDown`；`ConnectedState` → `kUp`；`ConnectingState`/`HostLookupState`/未连接但泵仍会重试 → `kEstablishing`。最后一支是 TCP 与 UDP 的真正分歧——UDP 未绑定即报 `kDown`（"UDP 无连接，故**永不出现** `kEstablishing`"），而 `kEstablishing` 的枚举注释本就写着"正在建立（TCP 连接中 / **退避重连中**）；仅具连接管理的传输会给出"，这一支正是它存在的理由。
+>
+> **`ApplyConfig` 热更新的去留仍为待定**（**D11**），与本撤销无关。
 
 #### 4.2.9 订阅凭据生存期状态（MS_TICKET）
 
@@ -298,6 +296,19 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 **两处刻意与 UDP 保持一致**：① **整个生命期一个 `QTcpSocket`**——每轮末尾 `abort()` 使其回到 `UnconnectedState`，下轮在同一对象上重连（**D3**，对应 UDP 的 bind→close→再 bind）；② **不自终**——连接失败、读流终止、静默超时一律回外层重试，唯一退出条件是我方 `Close`（沿用 ADR-0007 D2）。
 
 **写侧的一条不变式被主动放弃**：`UdpTransport` 头注释写着"取到 socket 到写出之间无挂起点，该不变式**只对 UDP 成立**"。TCP 本可用代际号补上，本设计**选择不补**（**D7**）——断链时写出去半条即半条，由对端重同步。由此两个写泵在这一点上重新一致，且 `RT_TRANSPORT_004` 仍然满足：它禁止的是两帧字节**交错**（单消费者写泵保证），断链**截断**是另一回事。
+
+**连接状态并入本图（ADR-0011 D12）**：原 §4.2.8 / 图 4-11 的四状态机已撤销——`TcpTransport` **不持有连接状态枚举、也没有驱动跃迁的代码**。四个"状态"即本图外层泵的四个代码位置：
+
+| 原状态 | 泵所处位置 | `CurrentLinkState()` |
+|---|---|---|
+| `Disconnected` | 未 `Start` / 已 `Close`（泵未起或已退出） | `kDown` |
+| `Connecting` | 泵在等 `connected`（`connect_timeout` 内） | `kEstablishing` |
+| `Reconnecting` | 泵停在 `await_for(close_signal, reconnect_interval)` 退避 | `kEstablishing` |
+| `Connected` | 泵在内层读流循环里 | `kUp` |
+
+**`CurrentLinkState()` 不需要任何状态成员**——与 `UdpTransport.cpp:320` 同法，当场由 `lifecycle_` 与 `socket_->state()` 算出。TCP 与 UDP 在此有一处真正的分歧：UDP 未绑定即报 `kDown`（其注释明写"UDP 无连接，故**永不出现** `kEstablishing`"），而 TCP 在**退避重连期间应报 `kEstablishing`**——`LinkState` 的枚举注释本就写着"正在建立（TCP 连接中 / **退避重连中**）；仅具连接管理的传输会给出"，这一支正是它存在的理由。
+
+> **`CurrentLinkState()` 的定位（ADR-0011 D12）**：它是**统一的 I/O 事实查询，不面向业务调用方**，仅供**诊断与测试**观测。重连对交互层**完全透明**（DD-11），`ProtocolNode` 不消费它——经核实，`CurrentLinkState()` 在**生产代码中零使用者**，全部命中位于 `tests/`。链路不可用时发送**入队等待**（RT_TCP_RECONNECT_003），调用方不必也不应先查链路状态再决定是否发送。
 
 **丢弃策略见 DD-15。**
 
@@ -526,7 +537,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
 | TcpServer | corotcpserver accept 循环 fiber；每连接经 NodeFactory 派生 ProtocolNode + supervisor fiber |
 
-**执行时序/状态**：见 §4.2.8（连接状态机）、§4.2.10（传输层泵与双队列）、§4.2.11（动态生命周期）。
+**执行时序/状态**：见 §4.2.13（TCP 传输泵与重连，图 4-15）、§4.2.10（传输层泵与双队列）、§4.2.11（动态生命周期）。
 
 ### 5.7 编解码层详细设计（CSU_CODEC）
 
@@ -555,7 +566,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | MS_NODE_DATAFLOW / MS_REQ_RESP | 执行方案 | RT_REQUEST、RT_NODE_003 | §4.2.3、§4.2.4 |
 | MS_CLOSE / MS_NODE_LIFECYCLE | 执行方案 | RT_LIFECYCLE_001/003–007 | §4.2.5、§4.2.7 |
 | MS_TRANSPORT_PUMP | 执行方案 | RT_TRANSPORT_008/010、RT_IF_UDP、RT_LIFECYCLE_008 | §4.2.10 |
-| MS_LINK_DOWN / MS_CONNECTION | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008、RT_LIFECYCLE_002 | §4.2.6、§4.2.8 |
+| MS_LINK_DOWN | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008 | §4.2.6 |
+| ~~MS_CONNECTION~~ | **已撤销**（ADR-0011 D12）——无代码实体，并入 MS_TCP_PUMP | RT_LIFECYCLE_002 | §4.2.13 |
 | MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..g | §4.2.12 |
 | MS_TCP_PUMP | 执行方案 | RT_TCP_RECONNECT_001..005、RT_TRANSPORT_003/004/010 | §4.2.13 |
 | MS_TICKET | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
@@ -584,10 +596,10 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | RT_REQUEST_001..006 | DD-8 / CSC_NODE / CSU_DISPATCHER、CSU_PROTOCOLNODE / MS_REQ_RESP、MS_TICKET（**RT_REQUEST_005/006 已由 ADR-0008 D7 推翻**） |
 | ~~RT_HANDLER_001..006~~ | **整组废止（ADR-0009）**，由 RT_INBOUND 取代；废止/承接对照见 SRS §3.1.5 引言 |
 | RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 TBD-009** |
-| RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、MS_CONNECTION |
+| RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、**MS_TCP_PUMP**（原 MS_CONNECTION，已撤销） |
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
 | RT_NODE_002_a..g（四种交互模式，ADR-0010；`repeating` 已废止，无遗留 TBD） | **DD-14** / CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
-| RT_TCP_RECONNECT_001..005 | DD-11、DD-12 / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、MS_CONNECTION |
+| RT_TCP_RECONNECT_001..005 | DD-11、DD-12、**DD-15** / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、**MS_TCP_PUMP**（原 MS_CONNECTION，已撤销） |
 | RT_TCP_RECONFIG_001..006 | CSU_IO（`TcpTransport::ApplyConfig`）—— **本轮待定**（ADR-0011 **D11**），去留未裁决 |
 | RT_ERROR_001..003 | DD-5 / CSC_CORE / CSU_CORE |
 | RT_TRACE_001/002 | DD-10 / CSC_CORE / CSU_CORE / JK_TRACE |
@@ -642,7 +654,7 @@ done
 | 图 4-8 | 时序 | MS_CLOSE | `seq-close.mmd` |
 | 图 4-9 | 时序 | MS_LINK_DOWN | `seq-link-down.mmd`（原名 `seq-generation-isolation.mmd`，#112 改名并按新流程重绘） |
 | 图 4-10 | 状态 | MS_NODE_LIFECYCLE | `state-node-lifecycle.mmd` |
-| 图 4-11 | 状态 | MS_CONNECTION | `state-connection.mmd` |
+| ~~图 4-11~~ | ~~状态~~ | ~~MS_CONNECTION~~ | **已撤销**（ADR-0011 D12）：无代码实体，内容并入图 4-15。图号保留不复用。 |
 | 图 4-12 | 状态 | MS_TICKET | `state-dispatch-ticket.mmd` |
 | 图 4-13 | 时序 | MS_TRANSPORT_PUMP | `seq-transport-pump.mmd`（ADR-0007 引入） |
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
