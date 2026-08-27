@@ -585,6 +585,139 @@ bool TcpTransport::Connect() {
 
 **与 UDP 的差异只有一处**：UDP 的 `bind()` 同步且瞬时，TCP 的 `connectToHost` 是异步的、需要 `connect_timeout`。**这正是三个时间量不能合并成一个的原因**（D5）。
 
+
+##### ①' 重连的完整设计
+
+**重连不是一个独立机制，而是外层泵 `while` 循环的自然结果。** 本设计里没有"重连模块"、没有重连状态、没有重连专用 fiber——`Connect()` 失败就退避、成功就进内层读流；内层一 `break` 就回到 `while` 顶部再 `Connect()`。**"重连"只是这个循环转了第二圈。**
+
+**首连与重连不作区分**：泵的第一圈就是首连，此后每一圈都是重连，走同一段代码。由此不存在"首连失败"与"重连失败"两套处置。
+
+###### 触发源（三条，内层 `break` 的三个成因）
+
+| # | 触发 | 到达方式 | 归因 |
+|---|---|---|---|
+| ① | **对端断开** | `readAll()` 流被 `disconnected` / socket error 关闭（**已先 `drain()` 尾字节**）→ `await_for` 返错 | `MapSocketError`，或对端正常关闭时不记 |
+| ② | **静默超时** | `await_for(stream, silence_timeout)` 超时 | `kTimeout` |
+| ③ | **我方 `Close`** | `socket_->abort()` 打断读流 | 不记——不是故障 |
+
+**三者在内层不作区分，一律 `break` 回外层**：①② 由外层重新 `Connect()` 消化，③ 由 `while (lifecycle_ < kClosing)` 判据接住。这与 `UdpTransport` 的处置**逐字相同**，只是 ① 的成因由"读流终止"具体化为"对端断开"。
+
+**①是主判据、②是辅助判据（D4）**：正常断链走 ①，**立刻**发现；② 只在**半开连接**（对端进程消失、FIN 未达、socket 仍显示 `Connected`）时才轮得到。UDP 相反——它无连接、无断开事件，② 是其**唯一**判据。
+
+###### 完整流转
+
+```
+                        ┌──────────────────────────────────────────┐
+   Start()              │                                          │
+     │                  ▼                                          │
+     │   ┌────────► Connect()  ── 失败 ──► await_for(close_signal, │
+     │   │              │                   reconnect_interval)     │
+     │   │              │ 成功                    │                 │
+     │   │              ▼                         │                 │
+     │   │   socket_ready.discard_pending()       │                 │
+     │   │   socket_ready.resolve()   ← 通告写泵  │                 │
+     │   │   generation_ + 1                      │                 │
+     │   │              │                         │                 │
+     │   │              ▼                         │                 │
+     │   │   stream = readAll()                   │                 │
+     │   │   loop { await_for(stream, silence)    │                 │
+     │   │          → push 切片 }                 │                 │
+     │   │              │ break（①②③ 之一）      │                 │
+     │   │              ▼                         │                 │
+     │   └───── socket_->abort() ◄────────────────┘                 │
+     │            （每轮末尾无条件）                                 │
+     │                  │                                          │
+     │                  └──────► while (lifecycle_ < kClosing) ─────┘
+     ▼                                    │ 否
+   返回（不等首连成功）                    ▼
+                              join 写泵 → 关 read_queue → Closed
+```
+
+###### `Start()` 不等首连成功
+
+```cpp
+Coro::Result<void> TcpTransport::Start() {
+  if (lifecycle_ != LifecycleState::kCreated) return kInvalidState;
+  if (auto v = ValidateConfig(); !v) return v.error();     // ← 见下"配置校验"
+  socket_ = new QTcpSocket();                              // 本 fiber 内创建，守 Qt 对象亲和
+  socket_->setProxy(QNetworkProxy::NoProxy);               // #123：不继承环境级代理策略
+  lifecycle_ = LifecycleState::kRunning;
+  write_pump_ = makeTask([this]{ RunWritePump(); });
+  pump_       = makeTask([this]{ RunSocketPump(); });
+  return {};                                               // 【不就地 connect】
+}
+```
+
+**与 UDP 的一处差异**：`UdpTransport::Start()` **就地做一次 `Bind()`**，好让 `LocalPort()` / `CurrentLinkState()` 在返回后即可如实观测。TCP **不这么做**——`connect` 是异步的、要等 `connect_timeout`，就地做会把 `Start()` 变成一个最长 5 秒的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是 `kEstablishing`。
+
+**"首连未成不算启动失败"**（沿用 ADR-0007 D2）：`Start()` 成功仅表示两条泵已起。宿主**不需要**等待首连——链路不可用时发送**入队等待**（RT_TCP_RECONNECT_003），故调用方可以 `Start()` 后立即发送。
+
+###### 配置校验：`Start()` 时一次，失败停在 `Created`
+
+**这是 TCP 与当前 `ProtocolNode` 的一处对照**：`ProtocolNode` 自 #173 起配置面上**已无任何校验项**；而 `TcpTransport` **有**，因为它的配置里有真正会导致灾难的值。
+
+| 字段 | 约束 | 若不校验的后果 |
+|---|---|---|
+| `host` | 非空 | 连不上且错误信息无意义 |
+| `port` | 非 0 | 同上 |
+| `connect_timeout` | `[100ms, 60s]`（SRS §3.1.7.4） | 过小则永远连不上；过大则单次尝试卡住数分钟 |
+| `reconnect_interval` | **须为正** | **零间隔退化为紧循环**——对端主机在而端口未监听时内核立即回 RST，`connect` 微秒级失败，烧 CPU 且向对端刷 SYN |
+| `silence_timeout` | `>= 0`（0 = 禁用） | 负值语义不明 |
+
+校验失败返 `kConfiguration`，**停在 `Created`**、未建 socket、未起泵，允许改配后重试（`RT_LIFECYCLE_007`）。
+
+**这也是 SRS「不可重试失败」清单的落点**（SRS §3.1.7.4）。该清单在"**不自终**"的新形态下如此调和：
+
+| SRS 的"不可重试失败" | 新形态下的处置 |
+|---|---|
+| 无效配置 | **`Start()` 时一次性拒绝**，根本不进入重连循环 |
+| 非法生命周期操作 | `Start()`/`AsyncWrite` 的前置判据返 `kInvalidState` / `kClosed` |
+| 显式关闭 | `while (lifecycle_ < kClosing)` 判据接住，泵正常退出 |
+| 运行时退出 | `readAll()` 订阅了 `QCoreApplication::aboutToQuit`，流随之关闭 → 走触发源 ① |
+| 内部不变量破坏 | 不设专门处置——本设计无跨轮不变量（每轮末尾 `abort()` 回到确定状态） |
+
+**其余一切失败都是可重试的**，一律降为 `LastError()` 的诊断事实，泵**无限重试、不自终**（ADR-0007 **D2**）。SRS 的"可重试失败"清单（拒绝连接、连接超时、网络不可达、临时 DNS 失败、对端关闭或复位、致命 socket I/O 错误）**全部落在这一支**——**包括原本会自终的"致命 socket I/O 错误"**（ADR-0007 D2 已把 ADR-0005 D5 的自终适用介质缩小，本设计沿用）。
+
+###### 退避：固定间隔，可被 `Close` 提前打断
+
+```cpp
+Coro::await_for(close_signal_, config_.reconnect_interval);
+```
+
+**必须用独立的延时原语**，不能拿"在未连接的 socket 上建读流"当退避——`UdpTransport` 的注释记着同一个坑（未 bind 的 socket 上建流会被当场关闭，`await_for` 0ms 返回 `no_message`，退避退化为紧转）。
+
+`close_signal_` 被 `Close()` 关闭时**立即返回**，故退避可提前打断——否则一次 `Close()` 最坏要等一个 `reconnect_interval`。
+
+**无倍率、上限、抖动、稳定重置**（沿用 ADR-0005 **D4**，四套参数已撤销）。保留非零间隔的**唯一**理由是上表 `reconnect_interval` 那一行的紧循环，与"退避"这一策略无关。
+
+###### 重连期间：读侧与写侧的行为
+
+**两条队列不随连接重建而更换**——这是"重连对调用方透明"的实现基础。
+
+| | 重连期间 | 恢复后 |
+|---|---|---|
+| **读侧** | `read_queue` 无新数据入队；调用方的 `await(rx_)` **自然挂起**，不返回错误、不感知断链（DD-11） | 新链路首字节照常入队；**残尾与首字节可能拼成错帧**，由 codec 重同步（代价 3） |
+| **写侧** | 写泵停在**阻塞点②**（等 `socket_ready_`）；`AsyncWrite` 照常**入队即返、返回成功**（RT_TCP_RECONNECT_003："投入发送队列等待链路恢复，不拒绝、不丢弃"） | 泵 `resolve()` 通告 → 写泵醒 → 按序发出积压 |
+
+**积压超过 1024 条时静默丢最旧**（**D6**）——这是 RT_TCP_RECONNECT_003 那句"不拒绝、不丢弃"的**限定**：不拒绝始终成立，不丢弃只在**未超界时**成立。
+
+**`socket_ready_` 的"先清后发"**：每轮外层都是一次真实的 down→up 跃迁，而写泵停在"等数据"（阻塞点①）时没人来取就绪信号，不清就会一直堆积。写泵若正停在阻塞点②，队列本就是空的，清是空操作、随后的 `resolve()` 照常叫醒它——**信号因此恒定只有 0 或 1 个 token**。
+
+###### 代际（`generation_`）：只用于记账，不参与任何判定
+
+每次 `Connect()` 成功 `+1`。**它不驱动任何控制流**：
+
+- **不对外暴露**（`Generation()` 已随 **D9** 删除）；
+- **写侧不校验代际**（**D7**）——断链时半条即半条；
+- **不做代际隔离**——交互层不再于断链时批量终结在途请求（**DD-12**，代际隔离已撤销）；
+- 唯一用途是 **Trace 事件的归类**与内部判重。
+
+**为什么仍然保留**：断链重连若在诊断时无法分辨"哪一次连接"，Trace 事件将无法归组。这是纯观测需求，成本是一个 `std::uint32_t`。
+
+###### 与节点层的关系：完全不通知（DD-11）
+
+断链**不向交互层发任何信号**。节点保持 `Running`，读循环没有断链分支，在途交互**不被批量终结**——各自由**逐次传参**的阶段时限（ADR-0010 **D6**）或节点关闭时的 `Dispatcher::CloseAll` 终结。这是 `MS_LINK_DOWN`（图 4-9）画的内容，本设计不改其结论，只把机制名对齐到新形态。
+
 ##### ② 读路径 —— `RunSocketPump()`（外层 socket 管理 + 内层数据泵）
 
 ```cpp
