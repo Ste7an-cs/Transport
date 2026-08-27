@@ -19,8 +19,8 @@
 #include "task/fibertask.h"
 #include "transport/core/Error.hpp"
 
-// TcpTransport.cpp — 见 .hpp。本轮(#179)只有一条 fiber:管理泵(管连接 + 收字节)。
-// 写泵与 write_queue 归 #180。单线程 fiber 协作,成员不加锁(见 .hpp 的"单线程,不加锁")。
+// TcpTransport.cpp — 见 .hpp。两条 fiber:管理泵(管连接 + 收字节)与写泵(发字节)。
+// 单线程 fiber 协作,成员不加锁(见 .hpp 的"单线程,不加锁")。
 
 namespace transport {
 namespace {
@@ -64,7 +64,7 @@ TcpTransport::TcpTransport(TcpConfig config)
 
 TcpTransport::~TcpTransport() {
   (void)Close();
-  WaitClosed();  // join 泵:返回即它不再触碰本对象,可安全销毁 socket。
+  WaitClosed();  // join 两条泵:返回即它们都不再触碰本对象,可安全销毁 socket。
   if (socket_) {
     socket_->deleteLater();
   }
@@ -105,7 +105,10 @@ Coro::Result<void> TcpTransport::Start() {
   // **不就地 connect**(与 UDP 的一处差异):`UdpTransport::Start()` 就地 bind 一次是因为
   // bind 同步且瞬时;TCP 的 connect 是异步的,就地等会把 `Start()` 变成一个最长一个
   // silence_timeout 的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是
-  // kEstablishing,"首连未成不算启动失败"(ADR-0007 D2)。
+  // kEstablishing,"首连未成不算启动失败"(ADR-0007 D2)——调用方可以 Start() 后立即
+  // 发送,链路不可用时报文在写队列里等(RT_TCP_RECONNECT_003)。
+  write_pump_ = std::make_shared<Coro::FiberTask<void>>(
+      Coro::makeTask([this] { RunWritePump(); }));
   pump_ = std::make_shared<Coro::FiberTask<void>>(
       Coro::makeTask([this] { RunSocketPump(); }));
   return Coro::Result<void>{};
@@ -188,11 +191,73 @@ void TcpTransport::RunSocketPump() {
     socket_->abort();
   }
 
-  // 收尾:关读队列、落 Closed。**没有完成量**——外部的 `WaitClosed()` 直接 join 本
-  // fiber,那才是"可安全释放"的充分条件。(#180 起,此处须先 join 写泵。)
+  // 收尾:**先 join 写泵**(确保它不再碰 socket),再关读队列、落 Closed。**没有完成量**
+  // ——外部的 `WaitClosed()` 直接 join 本 fiber,那才是"可安全释放"的充分条件。
   // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,残留一并丢弃。
+  if (write_pump_) {
+    (void)write_pump_->get();
+  }
   CloseQueue(read_queue_, make_error_code(TransportErrc::kClosed));
   lifecycle_ = LifecycleState::kClosed;
+}
+
+// 写泵 fiber(ADR-0007 D3):两个阻塞点,**串行**(AsyncTask 无 select,也不需要多路等待)。
+// 单消费者天然保证写入串行化(RT_TRANSPORT_004:两帧字节不交错)。
+//
+// 不变式:**取到 socket 到写出之间没有挂起点**——`write()` 交给 Qt 内部写缓冲即返回,而
+// 我们**不等刷出**(D13),故写泵 fiber 不可能在"判 Connected"与"write"之间被调度走、
+// 让管理泵把 socket abort 掉。`UdpTransport` 写泵注释里那条同名不变式写着"只对 UDP 成立
+// (串口/TCP 的写有挂起点)",D13 之后**对 TCP 同样成立**,两个写泵结构完全同构。
+void TcpTransport::RunWritePump() {
+  for (;;) {
+    // ── 阻塞点①:等数据 ──(Close 关 write_queue 唤醒)
+    auto item = Coro::await(write_queue_);
+    if (!item) {
+      return;  // 队列被关闭 → 退出(残留报文随之丢弃)。
+    }
+    const Datagram& unit = item.value();
+    // `unit.peer` **被忽略**(D8):TCP 点对点,一律发往 config 里的固定对端。**不判
+    // kInvalidArgument**——那会让恒发 Endpoint::Default()(或填了别的目的地)的"传输无关
+    // 调用方"在 TCP 上跑不起来。**这与 UDP 相反**:UDP 解析不了目的地会丢该条并记
+    // LastError,因为它一次一报文、目的地是报文的一部分;TCP 的目的地是连接本身。
+
+    // ── 阻塞点②:等连接就绪 ──(Close 关 socket_ready 唤醒)
+    // 链路不可用时就停在这里,报文留在队列里等,**不丢弃、不回传错误**
+    // (RT_TCP_RECONNECT_003);恢复后管理泵 resolve() 叫醒本泵,按序发出积压。
+    bool connected = false;
+    while (lifecycle_ < LifecycleState::kClosing) {
+      if (socket_->state() == QAbstractSocket::ConnectedState) {
+        connected = true;
+        break;
+      }
+      socket_ready_->channel()->discard_pending();  // 清陈旧标记,再等下次就绪通告。
+      if (!Coro::await(socket_ready_)) {
+        break;  // 信号被 Close 关闭 → 退出。
+      }
+    }
+    if (!connected) {
+      return;
+    }
+
+    // ── 写出 ──【同步,无挂起点】(D13)
+    // `setWriteBufferSize` 全仓未设(Qt 默认 0 = 无上限),故 write() 接受全部数据后立即
+    // 返回。**不等 bytesWritten、不等 bytesToWrite() == 0**:写本就是 fire-and-forget
+    // (ADR-0007 D3),等刷出不改变该语义、只让写泵多挂起一次。已接受的代价是 Qt 内部写
+    // 缓冲无上限——要给它设界会让 write() 真的开始短写,须连同 D13 与 D7 重新评审。
+    const auto size = static_cast<qint64>(unit.bytes.size());
+    const qint64 n =
+        socket_->write(reinterpret_cast<const char*>(unit.bytes.data()), size);
+    if (n < 0) {
+      // 写失败 → **放弃本条**,只落诊断事实(不自终、不回传调用方)。
+      last_error_ =
+          MapSocketError(Coro::detail::socket_error_code(socket_->error()));
+    } else if (n != size) {
+      // 短写视为链路异常:**放弃残余,不循环重试**——既然不等刷出,短写就没有可等的
+      // 东西。残余丢失落在 D7 的既定范围内:写了半条即半条,由对端重同步。
+      last_error_ = make_error_code(TransportErrc::kIo);
+    }
+    // 回阻塞点①取下一条。
+  }
 }
 
 // 交出 read_queue 句柄(ADR-0007 D4):未 Start 时给一个以 kInvalidState 关闭的句柄;
@@ -204,13 +269,28 @@ std::shared_ptr<Coro::Awaitable<Datagram>> TcpTransport::AsyncRead() {
   return read_queue_;
 }
 
-// **占位:本轮(#179)只做读侧**。写泵、write_queue 与写侧的两处 Close 打断归 #180——
-// 刻意不做"临时能用"的实现,以免它成为写侧设计的既成事实。
-Coro::Result<void> TcpTransport::AsyncWrite(Datagram /*datagram*/) {
-  return make_error_code(TransportErrc::kUnsupported);
+// 送入写队列即返(ADR-0007 D3):**不等待实际发出**,返回成功仅表示"已入队"。写出的一切
+// 结果(socket 写失败、短写)都在写泵里,只落 LastError(),不回传。
+//
+// **链路不可用时同样返回成功**(RT_TCP_RECONNECT_003):报文在队列里等,写泵停在阻塞点②。
+// 但队列有界 1024 且满时**静默丢最旧**(D6),故那句"不拒绝、不丢弃"的"不丢弃"只在未超界
+// 时成立——已知且已接受(#176),此处**不作归因**。
+Coro::Result<void> TcpTransport::AsyncWrite(Datagram datagram) {
+  if (lifecycle_ == LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kClosed);
+  }
+  // `datagram.peer` 不在此处解析,也不校验(D8):写泵一律忽略它。
+  if (write_queue_->channel()->push(std::move(datagram)) !=
+      boost::fibers::channel_op_status::success) {
+    return make_error_code(TransportErrc::kClosed);  // 队列已关闭 = 传输终结。
+  }
+  return Coro::Result<void>{};
 }
 
-// 请求关闭(幂等):**打断点缺一不可**——漏一处,`Close()` 落在对应窗口时就要挂满一个
+// 请求关闭(幂等):**五处打断缺一不可**——漏一处,`Close()` 落在对应窗口时就要挂满一个
 // `silence_timeout`。只发信号,不等收敛(收尾由泵自己跑完)。
 //
 // | # | 阻塞点                                  | 打断者                    |
@@ -218,7 +298,8 @@ Coro::Result<void> TcpTransport::AsyncWrite(Datagram /*datagram*/) {
 // | ① | 泵:`await_for(close_signal_, timeout)` 退避 | `close_signal_->close()`  |
 // | ② | 泵:`await_for(connect_waiter_, timeout)` 等连上 | `connect_waiter_->close()` |
 // | ③ | 泵:`await_for(read_stream_, timeout)` 读等待 | `read_stream_->close()`   |
-// | ④⑤| 写泵的两个阻塞点                          | **#180**                  |
+// | ④ | 写泵:`await(write_queue_)` 等数据         | `write_queue_->close()` + `discard_pending()` |
+// | ⑤ | 写泵:`await(socket_ready_)` 等连接就绪    | `socket_ready_->close()`  |
 //
 // ②③ **不能用 `socket_->abort()` 代替**(D15,实测):Qt 的 abort() 在连接中的 socket 上
 // 不发 errorOccurred,而 corosocket 的 waitForSignal / readAll 都靠 socket error 或
@@ -243,11 +324,14 @@ Coro::Result<void> TcpTransport::Close() {
   if (read_stream_) {
     read_stream_->close(closed);  // ③ 打断读等待。
   }
-  socket_ready_->close(closed);  // ⑤ 本轮无消费者,与 #180 的写泵对齐先关上。
+  write_queue_->close(closed);                 // ④ 唤醒写泵阻塞点①(等数据)。
+  write_queue_->channel()->discard_pending();  // 未发出的残留随之丢弃(不等刷出,D13)。
+  socket_ready_->close(closed);                // ⑤ 唤醒写泵阻塞点②(等连接就绪)。
   return Coro::Result<void>{};
 }
 
-// join 泵 fiber。返回即它不再触碰本对象——这是"可安全释放"的充分条件,
+// join 管理泵 fiber(它内部已先 join 写泵)。返回即两条 fiber 都不再触碰本对象——这是
+// "可安全释放"的充分条件,
 // `Awaitable::close()` 给不了(它只保证等待者被唤醒)。`get()` 是一次性的(底层 boost
 // future 取过即失效),故用 joined_ 闩保证幂等。
 void TcpTransport::WaitClosed() {
