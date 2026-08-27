@@ -1,0 +1,60 @@
+sequenceDiagram
+    autonumber
+    participant X as 宿主 / node
+    participant T as TcpTransport（公开面）
+    participant P as socket 管理泵 fiber
+    participant W as 写泵 fiber
+    participant S as QTcpSocket（唯一对象）
+    participant RQ as read_queue
+    participant WQ as write_queue（内部）
+
+    Note over T,P: Start()：先校验配置（D14，非法返 kConfiguration 并停在 Created），<br/>再起两条泵后【随即返回】——【不就地 connect】：connect 是异步的、要等<br/>silence_timeout，就地做会把 Start() 变成最长一个 timeout 的阻塞调用。<br/>（UDP 就地 bind 一次，TCP 不这么做——首连未成不算启动失败）
+    X->>T: Start()
+    T->>P: spawn 管理泵
+    T->>W: spawn 写泵
+    T-->>X: Coro::Result~void~{}
+
+    rect rgba(200,220,255,0.25)
+    Note over P,S: 管理泵 —— 连接、读数据与超时判断同在这一条 fiber 内
+    loop 未被 Close
+        P->>S: connectToHost + 等 connected（silence_timeout —— 【同一个量】D5）
+        alt 连接失败/超时
+            S-->>P: 错误
+            Note over P: await_for(close_signal, silence_timeout)——退避用的仍是【同一个量】（D5）；<br/>固定间隔，无倍率/上限/抖动/稳定重置。【必须用独立延时原语】：<br/>拿未连接的 socket 建读流当退避会紧转。close_signal 被 Close 关闭时立即返回。<br/>不自终、无限重试，唯一退出条件是我方 Close（ADR-0007 D2）
+        else 连接成功
+            Note over P,S: 代际 +1（【纯内部记账】，Generation() 已随 D9 删除）——不驱动任何控制流：<br/>写侧不校验代际（D7）、不做代际隔离（DD-12 已撤销）；<br/>唯一用途是 Trace 事件归类与内部判重
+            P->>S: readAll() 建流（一次，反复 await）
+            rect rgba(220,255,220,0.25)
+            loop 内层数据泵
+                S-->>P: await_for(stream, silence_timeout) 取到【任意字节切片】
+                P->>RQ: push（peer 填固定对端，D8）
+            end
+            Note over P: 【重连的三个触发源】——内层 break 的三个成因，不作区分：<br/>① 对端断开：readAll 流被 disconnected/error 关闭（已先 drain 尾字节）→ 主判据<br/>② 静默超时：await_for 超时 → 辅助判据，只在半开连接（FIN 未达）时轮到<br/>③ 我方 Close：abort 打断读流 → 由 while 判据接住<br/>①② 由外层重新 Connect() 消化；区别只落在 LastError() 的归因上
+            end
+        end
+        Note over P,S: 每轮末尾无条件 abort() —— socket 回 UnconnectedState，<br/>状态/缓冲/挂起信号一并清除，下轮在【同一对象】上重连（D3）
+    end
+    end
+
+    Note over X,RQ: AsyncRead() 只交出 read_queue 句柄，不返回数据
+    X->>T: AsyncRead()
+    T-->>X: shared_ptr~Awaitable~Datagram~~
+    Note over X: 每个元素是【字节流的一段】，不是一个完整帧 —— <br/>组帧由 ICodec 负责（与 UDP「一元素一报文」的关键差别）
+
+    Note over X,WQ: AsyncWrite(Datagram) 只判生命周期与入队
+    X->>T: AsyncWrite({bytes, peer})
+    T->>WQ: push（peer 被忽略，一律发往固定对端，D8）
+    T-->>X: Coro::Result~void~{}（仅表示已入队）
+    WQ-->>W: 阻塞点①：等数据
+    W->>S: 阻塞点②：等连接就绪
+    W->>S: write() —— 同步、【无挂起点】，不等刷出（D13）
+    Note over W: D13：交给 Qt 内部缓冲即算完成。写本就是 fire-and-forget（ADR-0007 D3），<br/>等刷出不改变该语义、只让写泵多挂起一次。短写视为链路异常：放弃残余、记 LastError。<br/>代价：Qt 内部写缓冲无上限，是有界 write_queue 挡不住的那一段。
+    Note over W: 由此"取到 socket 到写出之间无挂起点"这条不变式【对 TCP 也成立】——<br/>UdpTransport 原注释"只对 UDP 成立"的差异被消除，两个写泵结构同构。
+    Note over W: 【不做代际号校验】（D7）：半帧来自 Qt 异步刷出未完成时断链、abort 丢弃残余，<br/>由对端自行重同步；单消费者写泵已保证两帧不交错（RT_TRANSPORT_004）
+
+    Note over X,WQ: 【重连期间】两条队列不随连接重建而更换——这是"重连对调用方透明"的基础。<br/>读侧：无新数据入队，调用方的 await(rx_) 自然挂起，不返错、不感知断链（DD-11）。<br/>写侧：写泵停在阻塞点②；AsyncWrite 照常入队即返、返回成功<br/>（RT_TCP_RECONNECT_003"投入发送队列等待链路恢复"）。恢复后按序发出积压。
+
+    Note over T,RQ: ⚠ 两条队列均为默认有界 1024 + 静默丢最旧（D6）。<br/>丢中段会毁掉跨越丢弃点的那一帧，靠 codec 逐字节重同步 +<br/>交互层重发补救；Send 无重发，丢弃即永久丢失。丢弃当前无归因（#152/#176）
+
+    Note over T,P: Close()：【五个动作，五个阻塞点，一一对应】(D15) —— close_signal.close()（退避）、<br/>connect_waiter.close()（等连上）、read_stream.close()（读等待）、<br/>write_queue.close()（等数据）、socket_ready.close()（等连接就绪）；<br/>另关 read_queue 并携终止原因，另加一次 abort()（清理，【不是打断手段】）。<br/>⚠ 实测：ConnectingState 下 abort() 对 waitForConnected 与 readAll 流【双双唤不醒】，<br/>均挂满超时；持句柄 close() 则 1ms 内唤醒。故 ②③ 必须各自持句柄打断，缺一不可。
+    Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放
