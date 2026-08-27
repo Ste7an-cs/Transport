@@ -1,0 +1,43 @@
+sequenceDiagram
+    autonumber
+    participant N as DdsNode
+    participant T as DdsTransport（ITransport 七方法）
+    participant RQ as read_queue（Coro::Awaitable）
+    participant WQ as write_queue（mutex+condvar，【不是 FiberChannel】）
+    participant W as 专属 OS 线程
+    participant P as IDdsProvider
+    participant PEER as 对端
+
+    Note over N,PEER: 【与三介质的形态差异只有两处】，且都不是偏好，是被实测逼出来的：<br/>① 谁推读队列：三介质是泵 fiber，DDS 是 listener 在【外来线程】上 → DDS 读侧【无泵 fiber】<br/>② 写侧执行体：三介质是写泵 fiber，DDS 是【专属 OS 线程】——write() 的阻塞是线程级<br/>其余（双队列、ITransport 七方法、fire-and-forget 写、有界丢最旧）逐条相同。
+
+    rect rgba(220,255,220,0.25)
+    Note over T,PEER: 读侧 —— 【无泵 fiber】
+    PEER-->>P: 样本到达
+    P-->>P: on_data_available（【外来线程】）→ take() 全部可用样本
+    P->>RQ: 逐条 push（外来线程 → fiber，【已实测安全】：<br/>4 线程并发 8000/8000、20000 条无空洞、唤醒 avg 28µs；<br/>机理：push 只做 lock+push_back+notify_all，【无等待路径】）
+    N->>T: AsyncRead()
+    T-->>N: shared_ptr~Awaitable~Datagram~~　※ 与三介质【签名与语义完全一致】
+    N->>RQ: await(rx_) → Datagram{bytes, peer=kTopic}
+    Note over N: 读循环 Decode → Dispatch，键 {topic, correlation_id, kind}
+    end
+
+    Note over P,RQ: ⚠【明确接受的代价】listener 一搬走样本，DDS 即认为已交付、<br/>对 publisher 的背压随之解除（实测我方队列满时静默丢 3976/5000 而 push_fail=0）。<br/>RELIABLE 在本地队列这一层被架空 —— 2026-08-28 裁决"不优先使用 DDS 自身机制"的直接后果。
+
+    rect rgba(255,235,220,0.25)
+    Note over N,PEER: 写侧 —— 【专属 OS 线程】，不是写泵 fiber
+    N->>T: AsyncWrite({bytes, peer=kTopic})
+    T->>WQ: push（fiber → 普通线程，【不能用 FiberChannel】：<br/>其 pop 在非协程线程上会 crash，故用 mutex+condvar+deque）
+    T-->>N: Coro::Result~void~{}　※【入队即返】，fire-and-forget 契约照旧
+    WQ-->>W: 取出一条
+    W->>P: Publish()　※ 同步，可能 park【本线程】至多 max_blocking_time
+    P->>PEER: 样本发出
+    Note over W: 实测 write() 的阻塞是【线程级】（同一线程连续 park 100.05ms）；<br/>用 fiber 会卡死整条线程上的【所有】fiber。<br/>ASYNCHRONOUS_PUBLISH_MODE 绕不过去（实测 178/200 超时）——<br/>它挪走的是网络发送，而 write() 仍须先把样本放进 history，卡的是【准入】。
+    Note over W: 写出结果（含 RETCODE_TIMEOUT）【不回传、只落 LastError()】——与三介质逐字相同。<br/>代价：背压信号被丢弃，调用方无从知道"这条因对端消费不过来而没发出去"。
+    end
+
+    Note over N,PEER: 请求-响应照【RequestForResultDirect】（ADR-0010 D13）——单阶段：<br/>kRequest → 等 kReply，超时即【重发】（同 correlation_id、字节相同的原帧），至多 max_attempts 次；<br/>收到即成功、【不回应】；耗尽返 kTimeout（不是 kNotAccepted——本模型没有受理这一步）。<br/>四条纪律里三条不适用：只登记一个订阅 / 无 ack.Reset() / 【等结果恰恰要重发】/ 不回应。<br/>仍沿用两条：先登记再发出（Dispatcher 用法固有）、重发以首帧为准。
+    Note over N,PEER: ⚠ 重发的依据与 ADR-0010 不同：那边是"命令帧丢包即彻底失败",<br/>而 DDS 是 RELIABLE 的、网络层不会丢。【这里丢的是我方的队列】——<br/>read_queue 有界 1024 静默丢最旧,且 listener 搬走后 DDS 即认为已交付、背压解除。<br/>RELIABLE 覆盖不到这一段,重发正是对它的补救。代价:对端须能容忍重复请求。
+
+    Note over T,RQ: ⚠ read_queue 沿用默认【有界 1024 + 静默丢最旧】，与三介质逐字相同（DD-15）。<br/>kDdsHandoffOverflow 删除（五项→四项）：它与三介质的接收队列同类，三者都不单设归因项。
+
+    Note over T,P: Close()：关 read_queue（携终止原因）、置 wq_stopping 并 notify 专属线程、<br/>provider->Shutdown()。WaitClosed()：join 专属线程。<br/>⚠ Shutdown() 能否打断在途阻塞的 Publish【未实测】——若不能，Close 最坏等一个 max_blocking_time。

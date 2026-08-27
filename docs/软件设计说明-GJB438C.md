@@ -90,6 +90,24 @@
   **这条分歧决定了一件更大的事**——串口**不能自终**（ADR-0012 **D1**，TBD-005 关闭）。"致命错误 → 自终"要求一个"致命错误"判据，而串口在流层面拿不到；唯一可得的是静默超时，用它判自终会把"对端暂时不发数据"误判为设备死亡。故串口改为**重开、不自终**，与 UDP/TCP 同构。
 
   **写路径连判活都做不了**：实测串口设备消失后 `write()` **照样返回成功**、`bytesToWrite()` **永不下降**——判活只能落在读侧。
+- **DD-17 DDS 的两处形态差异源于"数据在谁的线程上到达"与"写会阻塞谁"（满足 RT_IF_DDS、RT_IN_INTERFACE_003；ADR-0013 D1/D2/D3）：** DDS 沿用与三介质相同的**读写双队列**与完整的 `ITransport` 契约，差异**只有两处**，且两处都不是设计偏好，而是**被实测事实逼出来的**：
+
+  | | UDP / TCP / 串口 | **DDS** | 依据 |
+  |---|---|---|---|
+  | **谁推读队列** | **泵 fiber**——从 socket/device 的读流取数后推 | **listener，在外来线程上** | DDS 的样本经 provider 回调到达，不存在"可 await 的读流" |
+  | **写侧执行体** | **写泵 fiber** | **专属 OS 线程** | `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms）；用 fiber 会卡死整条线程上的**所有** fiber |
+
+  **两处都建立在实测之上：**
+
+  1. **外来线程 → fiber 的 `FiberChannel::push` 安全**（4 线程并发 8000/8000、20000 条严格连续无空洞、唤醒时延 avg 28µs / max 70µs）。机理已核到源码——`push` 只做 `lock` + `push_back` + `notify_all`，**无等待路径**；其文档那句 crash 警告**只针对 `pop`**。故 listener 可直推，读侧**连泵 fiber 都省了**。
+  2. **反方向不能用 `FiberChannel`**——`write_queue` 的消费方是普通线程，而 `pop` 在非协程线程上会 crash。故 `write_queue` 用 `std::mutex` + `condition_variable` + `std::deque`，**不是 `Coro::Awaitable`**。
+
+  **`ASYNCHRONOUS_PUBLISH_MODE` 绕不过写阻塞**（实测 178/200 超时）：该模式挪走的是**网络发送**，而 `write()` 仍须先把样本**放进 writer 的 history**；`RELIABLE` + 满时卡住的是**准入**，与发布模式无关。故专属线程不可省。
+
+  **由此 `AsyncWrite` 的 fire-and-forget 契约完整成立**：阻塞发生在专属线程上，业务 fiber 早已返回；写出结果（含 `RETCODE_TIMEOUT`）不回传、只落 `LastError()`——与三介质逐字相同。**代价是背压信号被丢弃**：调用方无从知道"这条因对端消费不过来而没发出去"。
+
+  **一处明确接受的代价**：listener 一搬走样本，**DDS 即认为已交付、对 publisher 的背压随之解除**（实测我方队列满时静默丢 3976/5000 而 `push_fail=0`）——`RELIABLE` 在本地队列这一层被架空。这是 2026-08-28 裁决"**不优先使用 DDS 自身机制**"的直接后果。
+
 
 
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**五项** `DropReason` 之一（原七项：`kGenerationIsolationDrop` 随 ADR-0004 D3 移除，`kNoHandlerConfigured` 随 ADR-0009 于 #163 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
@@ -346,6 +364,28 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **判活判据的三介质分歧见 DD-16**，队列丢弃策略见 **DD-15**。
 
+#### 4.2.15 DDS 双队列与专属写线程（MS_DDS_DUAL_QUEUE）
+
+**图 4-17（`seq-dds-dual-queue`）** —— ADR-0013 定稿的**目标形态**，尚未实现。
+
+![DDS 双队列与专属写线程](diagrams/seq-dds-dual-queue.svg)
+
+**图例说明**：DDS 沿用与三介质相同的**读写双队列**与完整的 `ITransport` 契约；**形态差异只有两处**，且两处都不是设计偏好，而是**被实测事实逼出来的**（详见 **DD-17**）：
+
+| | UDP / TCP / 串口 | **DDS** |
+|---|---|---|
+| **谁推读队列** | 泵 fiber 从读流取数后推 | **listener，在外来线程上** → **读侧无泵 fiber** |
+| **写侧执行体** | 写泵 fiber | **专属 OS 线程** —— `write()` 的阻塞是**线程级** |
+| 其余（双队列 / 七方法 / fire-and-forget 写 / 有界丢最旧） | | **逐条相同** |
+
+**两处最容易做错的**：① **`write_queue` 不能是 `FiberChannel`** —— 消费方是普通线程，而 `pop` 在非协程线程上会 crash；② **不得用写泵 fiber 代替专属线程** —— `Publish` 会 park 调用线程，fiber 会卡死整条线程上的所有 fiber，且 `ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（实测 178/200 超时，它挪走的是网络发送而非准入）。
+
+**请求-响应照 `RequestForResultDirect`**（ADR-0010 **D13**）：`kRequest` → 等 `kReply`，**超时即重发**（同 `correlation_id`、字节相同的原帧），至多 `max_attempts` 次；**收到即成功、不回应**；耗尽返 **`kTimeout`**（不是 `kNotAccepted`——本模型根本没有受理这一步）。
+
+**四条纪律里三条不适用**（这正是它与 `RequestForResult` 的分界）：只登记一个订阅（无受理）、无 `ack.Reset()`、**等结果阶段恰恰要重发**、不回应。**仍沿用两条**：先登记再发出（`Dispatcher` 用法的固有要求）、重发沿用同一 `correlation_id` 且以首帧为准。
+
+> **重发的依据与 ADR-0010 不同，须写明**：ADR-0010 那边是"命令帧丢包即彻底失败"，而 **DDS 是 `RELIABLE` 的、网络层不会丢**。**这里丢的是我方的队列**——`read_queue` 有界 1024 静默丢最旧（**DD-15**），且 listener 一搬走样本 DDS 即认为已交付、背压解除。**`RELIABLE` 覆盖不到这一段，重发正是对它的补救。** 代价：**对端须能容忍重复请求**（幂等或自行去重），框架不校验。
+
 ### 4.3 接口设计
 
 #### 4.3.1 接口标识和接口图
@@ -575,7 +615,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 >    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
 > 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
-| DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
+| **DdsTransport**（ADR-0013 重构后，**目标形态、尚未实现**） | **读写双队列，完整实现 `ITransport`**，与三介质同形。**读侧无泵 fiber**——provider 的 listener 在**外来线程**上 `take()` 后直接 `push` 进 `read_queue`（跨线程 `push` 已实测安全）；`AsyncRead()` 交出该句柄。**写侧 `AsyncWrite` 入队即返**（fire-and-forget 照旧），由**一条专属 OS 线程**从 `write_queue` 取出并 `Publish`——因 `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms），用 fiber 会卡死整条线程上的所有 fiber。**QoS 统一一套**（**D4**）。链路可用性由 `matched` + `Liveliness` 提供（**D9**）。 |
+
+> **DDS 与三介质的形态差异只有两处**（ADR-0013）：① **谁在推读队列**——三介质是泵 fiber 从读流取数后推，DDS 是 listener 在外来线程上推，**故 DDS 读侧没有泵 fiber**；② **写侧是 OS 线程而非 fiber 写泵**——`Publish` 的阻塞是线程级，这是四个介质里**唯一需要额外线程**的一处。其余（双队列、`ITransport` 七方法、fire-and-forget 写、有界丢最旧）**逐条相同**。
 | TcpServer | corotcpserver accept 循环 fiber；每连接经 NodeFactory 派生 ProtocolNode + supervisor fiber |
 
 **执行时序/状态**：见 §4.2.13（TCP 传输泵与重连，图 4-15）、§4.2.10（传输层泵与双队列）、§4.2.11（动态生命周期）。
@@ -921,7 +963,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 
 | 设计单元 | 类型 | 对应 SRS 需求 | 章节 |
 |---|---|---|---|
-| DD-1..DD-16 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
+| DD-1..DD-17 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
 | CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | §4.1.1、§5.1 |
 | CSC_IO | 部件 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 | §4.1.2、§5.6 |
 | CSC_CODEC | 部件 | RT_CODEC、RT_IF_SYSFRAME | §4.1.3、§5.7 |
@@ -935,6 +977,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..g | §4.2.12 |
 | MS_TCP_PUMP | 执行方案 | RT_TCP_RECONNECT_001..005、RT_TRANSPORT_003/004/010 | §4.2.13 |
 | MS_SERIAL_PUMP | 执行方案 | RT_IF_SERIAL、RT_TRANSPORT_003/009/010、RT_NODE_006 | §4.2.14 |
+| MS_DDS_DUAL_QUEUE | 执行方案 | RT_IF_DDS、RT_IN_INTERFACE_003、RT_NODE_007、RT_TRANSPORT_010 | §4.2.15 |
 | MS_TICKET | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.11 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
@@ -971,7 +1014,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | RT_DATA_MESSAGE/STATE/CONFIG/BUFFER | CSC_CORE、CSC_NODE / CSU_CORE、CSU_DISPATCHER（**RT_DATA_BUFFER 的队列上界与观测计数已随 ADR-0008 D8/D10 回退**） |
 | RT_IN_INTERFACE_001..005 | DD-1 / JK_TRANSPORT、JK_CODEC、JK_PROVIDER、JK_NODE_API |
 | RT_IF_API/SYSFRAME/TCP/UDP/SERIAL/DDS | JK_NODE_API、JK_CODEC、JK_TRANSPORT / CSU_IO、CSU_CODEC |
-| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-16 / 全体单元 |
+| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-17 / 全体单元 |
 | RT_PERFORMANCE/TESTABILITY/SECURITY | 留 P6（不在本设计说明范围） |
 
 ---
@@ -1025,6 +1068,7 @@ done
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
 | 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**已实现**，#179/#180） |
 | 图 4-16 | 时序 | MS_SERIAL_PUMP | `seq-serial-pump.mmd`（ADR-0012 引入；**已实现**，#193/#194） |
+| 图 4-17 | 时序 | MS_DDS_DUAL_QUEUE | `seq-dds-dual-queue.mmd`（ADR-0013 引入；**目标形态，尚未实现**） |
 | 附图 | 类图 | 总体 | `arch-class.mmd` |
 
 ---
