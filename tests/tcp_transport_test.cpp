@@ -27,7 +27,24 @@
 // `readAll()` 流随之终止。D15 的"abort 唤不醒 readAll"成立的前提是 socket 仍在
 // **ConnectingState**。结论不变(**②③ 仍须持句柄 close**),只是 ③ 的失效场景更窄。
 //
-// 写侧(`AsyncWrite`)本轮是返 kUnsupported 的占位,归 #180,故不在此测。
+// 写侧(#180)另有两组,见文件后半:数据面(回环发字节 / `peer` 被忽略(D8)/ 按序
+// (RT_TRANSPORT_004)/ 链路不可用时入队即返(RT_TCP_RECONNECT_003))与写侧生命周期 +
+// **另两处打断**(④⑤)+ **不等刷出**(D13)。
+//
+// 写侧两处打断同样做了负向对照(silence_timeout = 3s):
+//
+//   | 打断           | 五处齐备 | 去掉该处   |
+//   |----------------|----------|-----------|
+//   | ④ 写泵等数据   | 0 ms     | **永久挂死**(>30s 被 timeout 杀) |
+//   | ⑤ 写泵等就绪   | 0 ms     | **永久挂死**(同上)              |
+//
+// **写侧比读侧更严**:读侧三处用的是 `await_for`,漏一处最坏挂满一个 silence_timeout;
+// 写侧两处是**无限期** `await`(写没有"超时该干什么"的语义),漏一处就是**永久挂死**
+// ——`WaitClosed()` join 管理泵,而管理泵收尾时要先 join 写泵。
+//
+// D13(不等刷出)也有负向对照:在 `write()` 后加 `while(bytesToWrite()>0)
+// waitForBytesWritten(3000)`,`CloseDoesNotWaitForFlush` 由 **11 ms 涨到 165 460 ms**
+// (4 MiB 灌给一个不读的对端)。**不等刷出**这一条是可观测的,不只是风格选择。
 // -----------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
@@ -89,7 +106,10 @@ std::uint16_t GrabFreePort() {
 // 真实回环服务端:监听 + 取已接受连接(接受的 socket 归 server 所有,随其析构)。
 class LoopbackServer {
  public:
-  LoopbackServer() { EXPECT_TRUE(server_.listen(QHostAddress::LocalHost, 0)); }
+  // port 传 0 = 让内核挑一个;传具体端口用于"先连不上、后起服务"的重连用例。
+  explicit LoopbackServer(std::uint16_t port = 0) {
+    EXPECT_TRUE(server_.listen(QHostAddress::LocalHost, port));
+  }
 
   std::uint16_t port() const {
     return static_cast<std::uint16_t>(server_.serverPort());
@@ -110,6 +130,23 @@ class LoopbackServer {
 std::vector<std::uint8_t> Bytes(const char* text) {
   const std::string s(text);
   return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
+Datagram Unit(const char* text, Endpoint peer = Endpoint::Default()) {
+  return Datagram{Bytes(text), std::move(peer)};
+}
+
+// 在服务端侧收满 want 字节(或超时)。`bytesAvailable()` 由事件循环推进,`pumpFiberUntil`
+// 的 fiber sleep 既让出调度器又跑 Qt 事件,故不必 waitForReadyRead。
+QByteArray RecvAtLeast(QTcpSocket* peer, int want, int budget_ms = 3000) {
+  QByteArray got;
+  pumpFiberUntil(
+      [&] {
+        got += peer->readAll();
+        return got.size() >= want;
+      },
+      budget_ms);
+  return got;
 }
 
 std::chrono::milliseconds Since(std::chrono::steady_clock::time_point began) {
@@ -325,7 +362,9 @@ TEST(CoroTcpTransport, LifecycleBeforeStartAndIdempotentClose) {
   auto got = AwaitRead(handle, 0ms);
   ASSERT_FALSE(got);
   EXPECT_EQ(got.error(), make_error_code(TransportErrc::kInvalidState));
-  EXPECT_FALSE(t.AsyncWrite({}));  // 写侧本轮是占位(#180)。
+  auto written = t.AsyncWrite({});  // 未 Start:写侧同样报非法生命周期。
+  ASSERT_FALSE(written);
+  EXPECT_EQ(written.error(), make_error_code(TransportErrc::kInvalidState));
 
   ASSERT_TRUE(t.Close());  // 从未 Start:无泵可停。
   ASSERT_TRUE(t.Close());  // 幂等。
@@ -352,4 +391,190 @@ TEST(CoroTcpTransport, CloseTerminatesReadQueueAndBlocksRestart) {
   auto restarted = t.Start();
   ASSERT_FALSE(restarted);
   EXPECT_EQ(restarted.error(), make_error_code(TransportErrc::kInvalidState));
+}
+
+// —— 7. 写侧数据面(#180)——————————————————————————————————————————————
+
+// AC(RT_TRANSPORT_003):`AsyncWrite` 的字节原样出现在对端,一字不差。
+TEST(CoroTcpTransport, WritesBytesToPeer) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }));
+
+  ASSERT_TRUE(t.AsyncWrite(Unit("hello-write")));
+  EXPECT_EQ(RecvAtLeast(peer, 11), QByteArray("hello-write"));
+  EXPECT_FALSE(t.LastError()) << "正常写出不该留下诊断事实";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// AC(D8):`peer` **一律忽略**——填一个与配置完全不同的 `Endpoint::Net`,报文仍发往配置的
+// 固定对端,且**不返 kInvalidArgument**。这正是"传输无关的调用方换传输即可运行"的落点;
+// 与 `UdpTransport` 相反(它按 peer 解析目的地、解析不了就丢该条并记 LastError)。
+TEST(CoroTcpTransport, IgnoresPeerAndAlwaysSendsToConfiguredEndpoint) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }));
+
+  // 三种 peer:默认 / 黑洞地址 / 一个本介质无此语义的 Topic —— 一视同仁。
+  ASSERT_TRUE(t.AsyncWrite(Unit("a", Endpoint::Default())));
+  ASSERT_TRUE(t.AsyncWrite(Unit("b", Endpoint::Net(kBlackhole, 9))));
+  ASSERT_TRUE(t.AsyncWrite(Unit("c", Endpoint::Topic("no-such-medium"))));
+
+  EXPECT_EQ(RecvAtLeast(peer, 3), QByteArray("abc"))
+      << "peer 未被忽略:某一条没发到配置的固定对端";
+  EXPECT_NE(t.LastError(), make_error_code(TransportErrc::kInvalidArgument))
+      << "TCP 不得因 peer 非默认而判非法(D8)";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// AC(RT_TRANSPORT_004):单消费者写泵保证串行化——连发 N 条,对端收到的字节序列与发出
+// 顺序**逐字一致**、两条不交错。
+TEST(CoroTcpTransport, PreservesWriteOrder) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }));
+
+  QByteArray expected;
+  for (int i = 0; i < 32; ++i) {
+    const std::string unit = "<" + std::to_string(i) + ">";
+    ASSERT_TRUE(t.AsyncWrite(Unit(unit.c_str())));
+    expected += QByteArray::fromStdString(unit);
+  }
+  EXPECT_EQ(RecvAtLeast(peer, expected.size()), expected) << "写出乱序或字节交错";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// AC(RT_TCP_RECONNECT_003):**链路不可用时 `AsyncWrite` 照常入队即返、返回成功**
+// ——不阻塞、不返错;写泵停在阻塞点②等 `socket_ready_`,链路恢复后按序发出积压。
+TEST(CoroTcpTransport, QueuesWhileLinkDownAndFlushesAfterReconnect) {
+  const std::uint16_t port = GrabFreePort();  // 先无人监听:连必被 RST。
+  TcpTransport t(ConfigFor(kLoopback, port, 200ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(pumpFiberUntil([&t] { return static_cast<bool>(t.LastError()); }, 1000))
+      << "未进入'连不上'的状态,后续断言无意义";
+  ASSERT_NE(t.CurrentLinkState(), LinkState::kUp);
+
+  // 链路不可用时写:立即返回成功(入队即返),不是 kClosed、也不阻塞。
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.AsyncWrite(Unit("queued-1")));
+  ASSERT_TRUE(t.AsyncWrite(Unit("queued-2")));
+  EXPECT_LT(Since(began), 100ms) << "AsyncWrite 阻塞了(应入队即返)";
+
+  // 现在把服务端起在同一端口:泵下一轮即连上,积压按序发出。
+  LoopbackServer server(port);
+  ASSERT_EQ(server.port(), port);
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr) << "泵未重连上";
+  EXPECT_EQ(RecvAtLeast(peer, 16), QByteArray("queued-1queued-2"))
+      << "链路恢复后积压未按序发出";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// —— 8. 写侧生命周期与 `Close()` 的两处打断(#180)——————————————————————
+
+// AC:未 `Start()` → kInvalidState;`Close()` 后 → kClosed(队列已终结)。
+TEST(CoroTcpTransport, WriteRejectsOutsideRunning) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 1000ms));
+
+  auto before = t.AsyncWrite(Unit("too-early"));
+  ASSERT_FALSE(before);
+  EXPECT_EQ(before.error(), make_error_code(TransportErrc::kInvalidState));
+
+  ASSERT_TRUE(t.Start());
+  ASSERT_NE(server.Accept(), nullptr);
+  ASSERT_TRUE(t.AsyncWrite(Unit("ok")));  // Running:成功。
+
+  ASSERT_TRUE(t.Close());
+  auto closing = t.AsyncWrite(Unit("too-late"));  // Closing。
+  ASSERT_FALSE(closing);
+  EXPECT_EQ(closing.error(), make_error_code(TransportErrc::kClosed));
+
+  t.WaitClosed();
+  auto after = t.AsyncWrite(Unit("way-too-late"));  // Closed。
+  ASSERT_FALSE(after);
+  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+}
+
+// 【打断之四:写泵停在**等数据**】连上后一字节不写,写泵钉在 `await(write_queue_)` 上
+// ——那是**无限期**等待(不是 await_for),漏了 `write_queue_->close()` 就是**永久挂死**,
+// 而不只是挂满一个 silence_timeout。AC:`Close()` 关写队列即刻唤醒。
+TEST(CoroTcpTransport, CloseWhileWritePumpWaitsForDataConvergesPromptly) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }));
+  boost::this_fiber::sleep_for(50ms);  // 写泵已进到"等数据"里(队列始终为空)。
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断写泵的'等数据'";
+}
+
+// 【打断之五:写泵停在**等连接就绪**】连黑洞地址(SYN 无应答)且**有待发数据**:写泵取到
+// 数据后判 socket 未连上,钉在 `await(socket_ready_)` 上——同样是无限期等待。
+// AC:`socket_ready_->close()` 即刻唤醒(注意管理泵此刻钉在"等连上",靠打断 ② 收敛)。
+TEST(CoroTcpTransport, CloseWhileWritePumpWaitsForLinkConvergesPromptly) {
+  TcpTransport t(ConfigFor(kBlackhole, 9, 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(t.AsyncWrite(Unit("never-sent")));  // 入队即返,链路永不就绪。
+  boost::this_fiber::sleep_for(100ms);            // 写泵已进到"等连接就绪"里。
+  ASSERT_NE(t.CurrentLinkState(), LinkState::kUp);
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断写泵的'等连接就绪'";
+}
+
+// 【D13 的行为证据:不等刷出】连发一大批后**立即** `Close()`。AC:`WaitClosed()` 迅速
+// 返回——写泵不等 `bytesWritten`、不等 `bytesToWrite() == 0`,已交给 Qt 内部写缓冲而未
+// 刷出的部分随 `abort()` 丢弃。**故意不断言"全部送达"**:丢弃是预期行为(D7/D13)。
+TEST(CoroTcpTransport, CloseDoesNotWaitForFlush) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }));
+
+  // 一大批(对端一字节不读),内核 socket 缓冲很快填满,余下的全压在 Qt 内部写缓冲里
+  // ——那正是**有界的 write_queue_ 挡不住的那一段**(D13 明确接受的代价)。
+  const std::string blob(64 * 1024, 'x');
+  for (int i = 0; i < 64; ++i) {  // 4 MiB
+    ASSERT_TRUE(t.AsyncWrite(Unit(blob.c_str())));
+  }
+  // 【关键】让出,好让写泵真的跑起来把这批交给 Qt——否则本用例只是在测"空队列上 Close"。
+  boost::this_fiber::sleep_for(100ms);
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 等了刷出(D13:写出后不得再 await)";
+  // 未刷出的部分随 `abort()` 丢弃——**不断言"全部送达"**,丢弃是预期行为(D7/D13)。
 }

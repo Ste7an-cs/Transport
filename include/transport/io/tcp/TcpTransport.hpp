@@ -42,6 +42,18 @@ namespace transport {
  *   ——那是多余的第二条路径。
  * - `AsyncRead()` 交出 `read_queue` 句柄(ADR-0007 D4),每个元素是**任意字节切片**、
  *   不是一个完整帧(RT_TRANSPORT_003,组帧归 `ICodec`);`peer` 一律填固定对端(**D8**)。
+ * - `AsyncWrite()` **入队即返**(ADR-0007 D3):返回成功仅表示"已入队",写出的一切结果
+ *   只落 `LastError()`、不回传。链路不可用时照常入队,写泵停在"等连接就绪"上,恢复后
+ *   按序发出积压(RT_TCP_RECONNECT_003)——**但积压超过队列上界时静默丢最旧**(**D6**)。
+ * - **写不等刷出**(**D13**):`socket_->write()` 把字节交给 Qt 内部写缓冲即返回,写泵
+ *   **不等 `bytesWritten`、不等 `bytesToWrite() == 0`**。写本就是 fire-and-forget,等刷出
+ *   不改变该语义、只让写泵多挂起一次。代价是 **Qt 内部写缓冲无上限**(`setWriteBufferSize`
+ *   未设,Qt 默认 0 = 无上限),它是有界 `write_queue_` 挡不住的那一段;要给它设上界会让
+ *   `write()` 真的开始短写,须连同 D13 与 D7 重新评审,**本轮不设**。
+ * - 由此**写泵没有任何挂起点**:`UdpTransport` 写泵那条"取到 socket 到写出之间没有挂起点"
+ *   的不变式**对本类同样成立**,两个写泵在结构上完全同构(TCP 侧只是把"等 bind 就绪"换成
+ *   "等连接就绪")。**单消费者写泵**保证 `RT_TRANSPORT_004`(并发写串行化、两帧字节不交错);
+ *   断链把一帧截断**不属于交错**,半条即半条,由对端重同步(**D7**)。
  * - **整个生命期一个 `QTcpSocket`**(**D3**):每轮末尾 `abort()` 使其回到
  *   `UnconnectedState`,下轮在同一对象上重连,不新建 socket 对象。
  *
@@ -56,11 +68,8 @@ namespace transport {
  * `fixed(调用线程)`,故它与本对象的全部公开方法跑在**同一个线程**上、只在 await 点交错。
  * 代价是**公开方法必须在起它的那个执行域内调用**,这也正是 Qt 对象亲和的要求。
  *
- * 析构 `Close()` + `WaitClosed()`,后者 join 泵——故 fiber 不可能活过本对象。
- *
- * **本轮只交付读侧**(#179):`AsyncWrite()` 是占位,返 `kUnsupported`;写泵、`write_queue_`
- * 与 `Close()` 的另两处打断(④ 写泵等数据、⑤ 写泵等连接就绪)归 #180。`socket_ready_`
- * 已按设计建立并在每次连上时 `resolve()`,只是尚无消费者。
+ * 析构 `Close()` + `WaitClosed()`,后者 join 管理泵(管理泵内部已先 join 写泵)——故两条
+ * fiber 都不可能活过本对象。
  */
 class TcpTransport final : public ITransport {
  public:
@@ -92,15 +101,28 @@ class TcpTransport final : public ITransport {
   ///         `LastError()` 诊断。未 `Start()` 时给出以 `kInvalidState` 关闭的句柄。
   [[nodiscard]] std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead() override;
 
-  /// @brief **占位:本轮不实现写侧**(#179 只做读侧,写泵与写队列归 #180)。
-  /// @return 恒为 `kUnsupported`。
+  /// @brief 送入写队列即返(ADR-0007 D3):**不等待实际发出**,更**不等刷出**(D13)。
+  ///
+  /// `datagram.peer` **被忽略**(**D8**):TCP 点对点,任何值都发往配置的固定对端,
+  /// **不判 `kInvalidArgument`**——那会让"传输无关的调用方"(恒发 `Endpoint::Default()`
+  /// 或填了别的目的地)在 TCP 上跑不起来。这与 `UdpTransport` 不同,后者解析不了目的地
+  /// 会丢该条并记 `LastError()`。
+  ///
+  /// 链路不可用时**照常入队、返回成功**(RT_TCP_RECONNECT_003:"投入发送队列等待链路
+  /// 恢复,不拒绝、不丢弃")。**"不丢弃"有限定**:`write_queue_` 默认有界 1024 且
+  /// **静默丢最旧**(**D6**),积压超界即丢,`push` 仍报成功——已知且已接受(见 #176)。
+  ///
+  /// @return 成功仅表示**已入队**;未 `Start()` 返 `kInvalidState`,关闭中/已关闭返
+  ///         `kClosed`。写出的一切结果(socket 写失败、短写)只落 `LastError()`,不回传。
   [[nodiscard]] Coro::Result<void> AsyncWrite(Datagram datagram) override;
 
-  /// @brief 请求关闭(幂等,**只发信号不等收敛**):打断重连退避、等连上与读等待三处,
-  ///        随后由泵自行跑完收尾(关 `read_queue`、落 Closed)。
+  /// @brief 请求关闭(幂等,**只发信号不等收敛**):打断管理泵的三处(退避 / 等连上 /
+  ///        读等待)与写泵的两处(等数据 / 等连接就绪),**五处缺一不可**;随后由管理泵
+  ///        自行跑完收尾(join 写泵、关 `read_queue`、落 Closed)。
   Coro::Result<void> Close() override;
 
-  /// @brief join 泵 fiber,返回即它不再触碰本对象。未 `Start()` 或已 join 过时立即返回。
+  /// @brief join 管理泵 fiber(它内部已先 join 写泵),返回即两条 fiber 都不再触碰本对象。
+  ///        未 `Start()` 或已 join 过时立即返回。
   void WaitClosed() override;
 
   /// @brief 是否处于 Running(泵在跑;链路是否连上另见 `CurrentLinkState()`)。
@@ -125,8 +147,11 @@ class TcpTransport final : public ITransport {
   /// @brief `Start()` 的一次性配置校验(D14):非法返 `kConfiguration`。
   [[nodiscard]] Coro::Result<void> ValidateConfig() const;
   /// @brief 泵 fiber:外层管连接的建立/重建/退避,内层把字节切片投入 `read_queue_`;
-  ///        退出后关读队列、落 Closed。
+  ///        退出后 join 写泵、关读队列、落 Closed。
   void RunSocketPump();
+  /// @brief 写泵 fiber:从 `write_queue_` 取出并写 socket。两个阻塞点(等数据 / 等连接
+  ///        就绪),串行;**写出段无挂起点**(D13)。
+  void RunWritePump();
 
   TcpConfig config_;
   QTcpSocket* socket_{nullptr};  ///< 整个生命期只一个(D3);Start 建、析构销。
@@ -142,8 +167,11 @@ class TcpTransport final : public ITransport {
   /// 对外读队列:**不随连接重建而更换**——这正是"重连对调用方透明"的载体。
   std::shared_ptr<Coro::Awaitable<Datagram>> read_queue_{
       std::make_shared<Coro::Awaitable<Datagram>>()};
-  /// 泵 → 写泵的"可以写了"通告(复用一个,不换代)。本轮已按设计 resolve,**尚无消费者**
-  /// ——写泵归 #180。
+  /// 内部写队列。元素的 `peer` **不读作目的地**(与 UDP 的一处分歧):TCP 点对端固定,
+  /// 写泵一律忽略它(**D8**)。有界 1024 且满时静默丢最旧(**D6**)。
+  std::shared_ptr<Coro::Awaitable<Datagram>> write_queue_{
+      std::make_shared<Coro::Awaitable<Datagram>>()};
+  /// 管理泵 → 写泵的"可以写了"通告(复用一个,不换代;**先清后发**恒定 0 或 1 个 token)。
   std::shared_ptr<Coro::Awaitable<void>> socket_ready_{
       std::make_shared<Coro::Awaitable<void>>()};
   /// 只为打断重连退避:退避须用独立的延时原语(拿"在未连接的 socket 上建读流"当退避会
@@ -155,7 +183,8 @@ class TcpTransport final : public ITransport {
   /// 【每轮重建】读流句柄——同上(D15)。
   std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream_;
 
-  std::shared_ptr<Coro::FiberTask<void>> pump_;  ///< WaitClosed join。
+  std::shared_ptr<Coro::FiberTask<void>> pump_;        ///< WaitClosed join。
+  std::shared_ptr<Coro::FiberTask<void>> write_pump_;  ///< 管理泵收尾时先 join。
 };
 
 }  // namespace transport
