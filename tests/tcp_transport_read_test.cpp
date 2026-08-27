@@ -1,10 +1,21 @@
-// 协程原生 TcpTransport 读侧契约真实回环集成测试。
-// 在 fiber 调度器(coro_test_main)内用本机 TCP 回环验证读侧可观察契约:
-// Datagram.peer 为对端地址、对端断开 → Closed(不重连,终止语义单一)、
-// 我方 RequestClose → Closed、
-// 带 deadline 的读超时 → Timeout 且不停流(可再读)、单读守卫已删除(并发第二个读者
-// 不再被拒,ADR-0007 D4)。连接建立由测试夹具完成(非本类职责)。
-// 逐读 cancellation 为 out-of-scope(循环级中断靠 RequestClose),本文件不覆盖。
+// -----------------------------------------------------------------------------
+// tcp_transport_read_test.cpp — 读句柄的两条**调用方侧**契约(#181 迁移件)
+//
+// 本文件是旧同名文件按 ADR-0011 的新接口面重写后的残余。旧文件建在
+// `TcpTransport(QTcpSocket*)`(已连接的裸管道)+ `OperationOptions` / `RequestClose()`
+// 之上,其五条用例只有两条在新形态下仍然成立、且 `tcp_transport_test.cpp`(#179/#180)
+// **未覆盖**,即本文件的两条;另三条的处置见 #181 的判定表:
+//
+//   · `SourceIsPeerEndpoint`  → 已被 `CoroTcpTransport.DeliversBytesWithFixedPeer` 取代
+//     (且 peer 语义已由 **D8** 改为固定对端,不再取自 socket 的 peerAddress);
+//   · `PeerDisconnectYieldsClosed` → **行为已撤销**(**D1/D2**:断链不再终结传输,泵透明
+//     重连;反向事实见 `CoroTcpTransport.ReconnectsTransparentlyOnSameReadHandle`);
+//   · `RequestCloseWakesPendingReadWithClosed` → 已被
+//     `CoroTcpTransport.CloseTerminatesReadQueueAndBlocksRestart` 取代。
+//
+// 这两条讲的都是**读句柄对调用方的性质**(超时不是终结、句柄不独占),与
+// `tcp_transport_test.cpp` 里"泵/链路/打断"那七组是两个层面的事,故独立成文件。
+// -----------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -14,231 +25,141 @@
 #include <boost/fiber/operations.hpp>
 #include <gtest/gtest.h>
 
+#include <QByteArray>
 #include <QHostAddress>
 #include <QTcpServer>
 #include <QTcpSocket>
 
 #include "await/awaitable.hpp"
-#include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/io/tcp/TcpConfig.hpp"
 #include "transport/io/tcp/TcpTransport.hpp"
 
 using namespace std::chrono_literals;
-using transport::Datagram;
-using transport::Endpoint;
-using transport::OperationOptions;
-using transport::SendUnit;
+using testutil::AwaitRead;
+using testutil::pumpFiberUntil;
+using transport::LinkState;
+using transport::TcpConfig;
 using transport::TcpTransport;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 namespace {
 
-// 建立一对已连接的回环 socket(客户端 + 服务端已接受);连接建立不在被测类职责。
-bool MakeConnectedPair(QTcpServer& server, QTcpSocket*& client,
-                       QTcpSocket*& accepted) {
-  if (!server.listen(QHostAddress::LocalHost, 0)) {
-    return false;
-  }
-  const quint16 port = server.serverPort();
-  client = new QTcpSocket();
-  auto connected =
-      Coro::coro(client).connectToHost(QHostAddress::LocalHost, port);
-  if (!Coro::await_for(connected, 2s)) {
-    return false;
-  }
-  if (!testutil::pumpFiberUntil([&] { return server.hasPendingConnections(); },
-                                2000)) {
-    return false;
-  }
-  accepted = server.nextPendingConnection();
-  if (!accepted) {
-    return false;
-  }
-  accepted->setParent(nullptr);  // 交由 TcpTransport 管理生命周期。
-  return true;
+constexpr char kLoopback[] = "127.0.0.1";
+
+TcpConfig ConfigFor(std::uint16_t port, std::chrono::milliseconds silence) {
+  TcpConfig config;
+  config.host = kLoopback;
+  config.port = port;
+  config.silence_timeout = silence;
+  return config;
 }
 
-SendUnit Frame(std::vector<std::uint8_t> bytes) {
-  return SendUnit{std::move(bytes), Endpoint::Default()};
+// 真实回环服务端;`Accept()` 交出已接受的 socket(归 server 所有,随其析构)。
+class LoopbackServer {
+ public:
+  LoopbackServer() { EXPECT_TRUE(server_.listen(QHostAddress::LocalHost, 0)); }
+
+  std::uint16_t port() const {
+    return static_cast<std::uint16_t>(server_.serverPort());
+  }
+
+  QTcpSocket* Accept(int budget_ms = 3000) {
+    if (!pumpFiberUntil([this] { return server_.hasPendingConnections(); },
+                        budget_ms)) {
+      return nullptr;
+    }
+    return server_.nextPendingConnection();
+  }
+
+ private:
+  QTcpServer server_;
+};
+
+std::vector<std::uint8_t> Bytes(const char* text) {
+  const std::string s(text);
+  return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
+// 【#132 的修法】`Accept()` 只说明**服务端**完成了三次握手,不说明**客户端**的泵已跑到
+// "连上"、建好读流。此后立刻操作传输是 #132 那条竞态的原型,故一律先等到 kUp 再动手。
+bool WaitLinkUp(const TcpTransport& t, int budget_ms = 3000) {
+  return pumpFiberUntil([&t] { return t.CurrentLinkState() == LinkState::kUp; },
+                        budget_ms);
 }
 
 }  // namespace
 
-// 读侧契约:Datagram.peer 填为对端 Endpoint::Net(ip, port)(取自已连接 socket 的
-// peerAddress/peerPort;TCP from 恒为对端)。
-TEST(CoroTcpTransportRead, SourceIsPeerEndpoint) {
-  QTcpServer server;
-  QTcpSocket* client = nullptr;
-  QTcpSocket* accepted = nullptr;
-  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
-  // receiver 接管服务端 accepted socket,其对端即客户端 client。
-  const std::string expected_host = accepted->peerAddress().toString().toStdString();
-  const std::uint16_t expected_port = accepted->peerPort();
-  ASSERT_GT(expected_port, 0U);
-  TcpTransport sender(client);
-  TcpTransport receiver(accepted);
-  ASSERT_TRUE(sender.Start());
-  ASSERT_TRUE(receiver.Start());
+// AC:**调用方的 deadline 到期不是流的终结**——`AwaitRead` 超时返 kTimeout 后,同一个
+// 句柄照常交付后续到达的字节。超时属于调用方一侧的等待策略(ADR-0007 D4:句柄交出,
+// deadline 由调用方自理),队列**只有我方 `Close` 才终止**。
+TEST(CoroTcpTransportRead, CallerTimeoutDoesNotTerminateTheHandle) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  QTcpSocket* peer = server.Accept();
+  ASSERT_NE(peer, nullptr);
+  ASSERT_TRUE(WaitLinkUp(t));
 
-  const std::vector<std::uint8_t> frame(16, 0x5A);
-  ASSERT_TRUE(sender.Write(Frame(frame)));
+  auto rx = t.AsyncRead();  // 【全程只取这一次句柄】
 
-  OperationOptions options;
-  options.deadline = OperationOptions::Clock::now() + 3s;
-  auto r = testutil::ReadOnce(receiver, options);
-  ASSERT_TRUE(r) << r.error().message();
-  EXPECT_EQ(r.value().peer.kind, Endpoint::Kind::kNet);
-  EXPECT_EQ(r.value().peer.host, expected_host);
-  EXPECT_EQ(r.value().peer.port, expected_port);
-}
-
-// 读侧契约(RT_TRANSPORT_008 / ADR-0004 D1):本类不重连,连接终结即传输终结,故
-// 对端断开 → 在途 Read 以 Closed 收敛(与我方关闭同一终止语义,调用方停止读取)。
-TEST(CoroTcpTransportRead, PeerDisconnectYieldsClosed) {
-  QTcpServer server;
-  QTcpSocket* client = nullptr;
-  QTcpSocket* accepted = nullptr;
-  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
-  TcpTransport receiver(accepted);
-  ASSERT_TRUE(receiver.Start());
-
-  std::error_code read_err;
-  bool read_ok = true;
-  Coro::Awaitable<void> entered;
-  auto reader = Coro::makeTask([&] {
-    entered.resolve();
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = testutil::ReadOnce(receiver, options);
-    read_ok = static_cast<bool>(r);
-    if (!r) {
-      read_err = r.error();
-    }
-  });
-  ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让 Read 挂起在流上。
-  client->disconnectFromHost();  // 对端正常关闭。
-
-  EXPECT_TRUE(reader.get());
-  EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
-  client->deleteLater();
-}
-
-// 读侧契约:我方 RequestClose → 在途 Read 以 Closed 收敛。
-TEST(CoroTcpTransportRead, RequestCloseWakesPendingReadWithClosed) {
-  QTcpServer server;
-  QTcpSocket* client = nullptr;
-  QTcpSocket* accepted = nullptr;
-  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
-  TcpTransport receiver(accepted);
-  ASSERT_TRUE(receiver.Start());
-
-  std::error_code read_err;
-  bool read_ok = true;
-  Coro::Awaitable<void> entered;
-  auto reader = Coro::makeTask([&] {
-    entered.resolve();
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = testutil::ReadOnce(receiver, options);
-    read_ok = static_cast<bool>(r);
-    if (!r) {
-      read_err = r.error();
-    }
-  });
-  ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让 Read 挂起在流上。
-  EXPECT_TRUE(receiver.RequestClose());  // 我方关闭。
-
-  EXPECT_TRUE(reader.get());
-  EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
-  client->deleteLater();
-}
-
-// 读侧契约:带 deadline 的 Read 超时 → Timeout,且不停流——超时后再次 Read 仍可拿到
-// 后续到达的数据。
-TEST(CoroTcpTransportRead, DeadlineTimeoutDoesNotStopStream) {
-  QTcpServer server;
-  QTcpSocket* client = nullptr;
-  QTcpSocket* accepted = nullptr;
-  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
-  TcpTransport sender(client);
-  TcpTransport receiver(accepted);
-  ASSERT_TRUE(sender.Start());
-  ASSERT_TRUE(receiver.Start());
-
-  // 无数据到达 → 短 deadline 的 Read 超时。
-  OperationOptions timeout_opts;
-  timeout_opts.deadline = OperationOptions::Clock::now() + 60ms;
-  auto timed_out = testutil::ReadOnce(receiver, timeout_opts);
+  // 对端一字未发 → 短 deadline 的等待以 kTimeout 收敛。
+  auto timed_out = AwaitRead(rx, 60ms);
   ASSERT_FALSE(timed_out);
   EXPECT_EQ(timed_out.error(), make_error_code(TransportErrc::kTimeout));
 
-  // 流未停:后续数据到达后再次 Read 成功拿到。
-  const std::vector<std::uint8_t> frame(16, 0x77);
-  ASSERT_TRUE(sender.Write(Frame(frame)));
-  OperationOptions read_opts;
-  read_opts.deadline = OperationOptions::Clock::now() + 3s;
-  auto again = testutil::ReadOnce(receiver, read_opts);
+  // 流未停:后续字节照常从**同一个句柄**取到。
+  peer->write(QByteArray("after-timeout"));
+  peer->flush();
+  auto again = AwaitRead(rx, 2000ms);
   ASSERT_TRUE(again) << again.error().message();
-  std::vector<std::uint8_t> got(again.value().bytes.begin(),
-                                again.value().bytes.end());
-  // readAll 可能一次不满整帧,补读至满。
-  while (got.size() < frame.size()) {
-    OperationOptions more;
-    more.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = testutil::ReadOnce(receiver, more);
-    ASSERT_TRUE(r) << r.error().message();
-    got.insert(got.end(), r.value().bytes.begin(), r.value().bytes.end());
-  }
-  EXPECT_EQ(got, frame);
-  client->deleteLater();
+  EXPECT_EQ(again.value().bytes, Bytes("after-timeout"))
+      << "调用方超时把读流终结了(超时只应结束这一次等待)";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
 }
 
-// 读侧契约(ADR-0007 D4):单读守卫已删除——已有在途读者时并发第二个读者**不再被拒**,
-// 两者同挂在 read_queue 上抢占式共读,无数据则各按自己的 deadline 以 kTimeout 收敛。
-TEST(CoroTcpTransportRead, ConcurrentSecondReadIsNotRejected) {
-  QTcpServer server;
-  QTcpSocket* client = nullptr;
-  QTcpSocket* accepted = nullptr;
-  ASSERT_TRUE(MakeConnectedPair(server, client, accepted));
-  TcpTransport receiver(accepted);
-  ASSERT_TRUE(receiver.Start());
+// AC(ADR-0007 D4):**单读守卫已删除**——已有在途读者时,并发的第二个读者不再被拒
+// (不返 kInvalidState),而是同挂在同一条 read_queue 上,无数据则各按自己的 deadline
+// 以 kTimeout 收敛。
+TEST(CoroTcpTransportRead, ConcurrentSecondReaderIsNotRejected) {
+  LoopbackServer server;
+  TcpTransport t(ConfigFor(server.port(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_NE(server.Accept(), nullptr);
+  ASSERT_TRUE(WaitLinkUp(t));
 
-  // 第一个读者挂起在流上(无数据、带较短 deadline 便于收尾)。
+  // 第一个读者先挂到队列上(带较短 deadline 便于收尾)。
   Coro::Awaitable<void> entered;
   bool first_ok = true;
-  std::error_code first_err;
+  std::error_code first_error;
   auto reader = Coro::makeTask([&] {
     entered.resolve();
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 300ms;
-    auto r = testutil::ReadOnce(receiver, options);
+    auto r = testutil::ReadOnce(t, 400ms);
     first_ok = static_cast<bool>(r);
     if (!r) {
-      first_err = r.error();
+      first_error = r.error();
     }
   });
   ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让第一个读者先挂到 read_queue 上。
+  boost::this_fiber::sleep_for(30ms);  // 让第一个读者真正挂到队列上。
 
-  // 并发第二个读者:不再返 kInvalidState,而是同样挂起、按自己的 deadline 超时。
-  OperationOptions options;
-  options.deadline = OperationOptions::Clock::now() + 200ms;
-  auto second = testutil::ReadOnce(receiver, options);
+  // 并发第二个读者:**不得**被拒。
+  auto second = testutil::ReadOnce(t, 200ms);
   ASSERT_FALSE(second);
-  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState))
+      << "第二个读者被单读守卫拒了(该守卫已随 ADR-0007 D4 删除)";
   EXPECT_EQ(second.error(), make_error_code(TransportErrc::kTimeout));
 
-  // 收尾:第一个读者超时返回,不影响流语义。
+  // 收尾:第一个读者按自己的 deadline 超时返回,读流语义不受影响。
   EXPECT_TRUE(reader.get());
   EXPECT_FALSE(first_ok);
-  EXPECT_EQ(first_err, make_error_code(TransportErrc::kTimeout));
-  client->deleteLater();
+  EXPECT_EQ(first_error, make_error_code(TransportErrc::kTimeout));
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
 }

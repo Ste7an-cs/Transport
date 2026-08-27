@@ -103,7 +103,13 @@ if(TRANSPORT_BUILD_TESTS)
     tests/coro_harness_test.cpp
     tests/udp_transport_test.cpp
     tests/tcp_transport_test.cpp
+    tests/tcp_transport_read_test.cpp
+    tests/tcp_transport_reconnect_test.cpp
     tests/protocol_node_test.cpp
+    tests/protocol_node_tcp_e2e_test.cpp
+    # —— 以下两个 TCP 用例继续停摆，各有明确的待决依据（#181 的判定）——
+    #   tcp_client_reconfig_test（`ApplyConfig` 热更新的去留待 ADR-0011 D11 裁决）
+    #   tcp_server_accept_test（`TcpServer` 本轮不做，ADR-0011 D10）
     # —— 以下用例仍在旧 ITransport / NodeBase 面上，随重设计逐个迁移后再放回 ——
     #   protocol_node_handler_test / protocol_node_lifecycle_test
     #   protocol_node_capacity_test / protocol_node_udp_test / transport_contract_test
