@@ -47,12 +47,12 @@ sequenceDiagram
     T-->>X: Coro::Result~void~{}（仅表示已入队）
     WQ-->>W: 阻塞点①：等数据
     W->>S: 阻塞点②：等连接就绪
-    W->>S: 短写循环：while(left>0) write() → 满则 await bytesWritten
-    W->>S: 阻塞点③：刷出 —— while(bytesToWrite()>0) await bytesWritten（D13）
-    Note over W: D13：等刷到内核，使 Qt 内部写缓冲不成为【无界的第三条队列】；<br/>背压由此落在有界的 write_queue 上。代价：每条一次往返，吞吐略降。
-    Note over W: 【不做代际号校验】（D7）：断链时写出去半条即半条，<br/>由对端自行重同步；单消费者写泵已保证两帧不交错（RT_TRANSPORT_004）
+    W->>S: write() —— 同步、【无挂起点】，不等刷出（D13）
+    Note over W: D13：交给 Qt 内部缓冲即算完成。写本就是 fire-and-forget（ADR-0007 D3），<br/>等刷出不改变该语义、只让写泵多挂起一次。短写视为链路异常：放弃残余、记 LastError。<br/>代价：Qt 内部写缓冲无上限，是有界 write_queue 挡不住的那一段。
+    Note over W: 由此"取到 socket 到写出之间无挂起点"这条不变式【对 TCP 也成立】——<br/>UdpTransport 原注释"只对 UDP 成立"的差异被消除，两个写泵结构同构。
+    Note over W: 【不做代际号校验】（D7）：半帧来自 Qt 异步刷出未完成时断链、abort 丢弃残余，<br/>由对端自行重同步；单消费者写泵已保证两帧不交错（RT_TRANSPORT_004）
 
     Note over T,RQ: ⚠ 两条队列均为默认有界 1024 + 静默丢最旧（D6）。<br/>丢中段会毁掉跨越丢弃点的那一帧，靠 codec 逐字节重同步 +<br/>交互层重发补救；Send 无重发，丢弃即永久丢失。丢弃当前无归因（#152/#176）
 
-    Note over T,P: Close()：【四个动作覆盖六个阻塞点】—— close_signal.close()（退避）、<br/>socket->abort()（连接等待 + 读流 + 刷出等待三处）、<br/>write_queue.close()（等数据）、socket_ready.close()（等连接就绪）；<br/>另关 read_queue 并携终止原因。漏一处即一次收敛挂死。
+    Note over T,P: Close()：【四个动作覆盖五个阻塞点】—— close_signal.close()（退避）、<br/>socket->abort()（连接等待 + 读流两处）、<br/>write_queue.close()（等数据）、socket_ready.close()（等连接就绪）；<br/>另关 read_queue 并携终止原因。漏一处即一次收敛挂死。
     Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放

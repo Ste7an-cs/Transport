@@ -639,7 +639,7 @@ void TcpTransport::RunSocketPump() {
 
 **这也是 D4「主判据/辅助判据」的实现形态**：正常断链由流终止立刻发现，静默超时只在**半开连接**（对端进程消失、FIN 未达、socket 仍显示 `Connected`）时才轮得到。
 
-##### ③ 写路径 —— `RunWritePump()`（三个阻塞点）
+##### ③ 写路径 —— `RunWritePump()`（两个阻塞点，与 UDP 同构）
 
 ```cpp
 void TcpTransport::RunWritePump() {
@@ -659,36 +659,35 @@ void TcpTransport::RunWritePump() {
       if (!Coro::await(socket_ready_)) return;
     }
 
-    // ── 阻塞点③：短写循环 ──【TCP 特有，UDP 没有这一段】
-    const char* p = 数据首址(unit); qint64 left = 字节数(unit);
-    while (left > 0) {
-      const qint64 n = socket_->write(p, left);
-      if (n < 0) { last_error_ = MapSocketError(...); break; }   // 断链/错误 → 放弃本条
-      p += n; left -= n;
-      if (left == 0) break;
-      // Qt 内部写缓冲已满：等它刷出一部分再续写。
-      if (!Coro::await(Coro::coro(socket_).waitForBytesWritten())) break;
-      if (socket_->state() != QAbstractSocket::ConnectedState) break;   // 断链 → 放弃残余
+    // ── 写出 ──【同步，无挂起点】(D13)
+    // setWriteBufferSize 全仓未设（Qt 默认 0 = 无上限），故 write() 接受全部数据后
+    // 立即返回。【不等 bytesWritten、不等 bytesToWrite() == 0】——写本就是
+    // fire-and-forget（ADR-0007 D3），等刷出不改变该语义、只让写泵多挂起一次。
+    const qint64 size = 字节数(unit);
+    const qint64 n = socket_->write(数据首址(unit), size);
+    if (n < 0) {
+      last_error_ = MapSocketError(...);          // 写失败 → 放弃本条
+    } else if (n != size) {
+      last_error_ = make_error_code(TransportErrc::kIo);   // 短写视为链路异常：
+      // 【放弃残余，不循环重试】—— 既然不等刷出，短写就没有可等的东西。
+      // 残余丢失落在 D7 的既定范围内：写了半条即半条，由对端重同步。
     }
-
-    // 刷到内核，使 Qt 内部缓冲不成为【无界的第三条队列】—— 见下"为什么要等刷出"。
-    while (socket_->bytesToWrite() > 0 &&
-           socket_->state() == QAbstractSocket::ConnectedState) {
-      if (!Coro::await(Coro::coro(socket_).waitForBytesWritten())) break;
-    }
-    // left > 0 或刷出中途断链 ⇒ 【写了半条】：不补写、不回滚、不归因到调用方 (D7)，
-    // 由对端自行重同步。写出的一切结果都不回传（ADR-0007 D3，fire-and-forget）。
+    // 回阻塞点①取下一条。
   }
 }
 ```
 
-**为什么要等刷出（`bytesToWrite() == 0`）**：`QAbstractSocket::write()` 把数据收进 **Qt 自己的内部写缓冲**即返回，几乎从不短写。若写泵不等刷出就取下一条，Qt 内部缓冲会**无界增长**——那等于凭空多出一条我们控制不了的队列，而本设计的前提是"数据面只有两条队列"（RT_TRANSPORT_010）。等刷出使**背压落在有界的 `write_queue_` 上**，代价是每条报文一次往返、吞吐略降。
+**写泵由此没有挂起点（D13）**，这带来一个结构性结果：`UdpTransport` 头注释中那条不变式——"**取到 socket 到写出之间没有挂起点**"——**对 TCP 也成立**。原注释写着"该不变式**只对 UDP 成立**（串口/TCP 的写有挂起点）"，本设计**消除了这条差异**：两个写泵在结构上完全同构，TCP 侧只多了"等连接就绪"这一个阻塞点的语义（UDP 是"等 bind 就绪"）。
+
+**半帧从何而来（与 D7 的衔接）**：既然写泵自身无挂起点，半帧就**不是**"写到一半被调度走"造成的；而是 `write()` 把字节交给 Qt 内部缓冲后，其**异步刷出**尚未完成时链路断开、`abort()` 丢弃了未刷出的部分。成因在 Qt 侧，我方无从保证、也**不打算**保证（**D7**）。
+
+**明确接受的代价：Qt 内部写缓冲无上限。** 链路长时间慢或断时，已交给 Qt 的字节在其内部缓冲里积压——这是**有界的 `write_queue_` 挡不住的部分**（它只挡"还没交给 Qt"的那一段）。若需给它设上界，可调 `setWriteBufferSize(N)`，但那会让 `write()` **真的开始短写**，届时须连同 **D13** 与 **D7** 一并重新评审。**本轮不设。**
 
 **单消费者写泵保证 `RT_TRANSPORT_004`**（并发写串行化、两帧字节不交错）。**断链截断不属于交错**——它是一帧被切断，不是两帧被穿插。
 
-##### ④ `Close()` 的打断点：四个动作覆盖六个阻塞点
+##### ④ `Close()` 的打断点：四个动作覆盖五个阻塞点
 
-`UdpTransport::Close()` 的注释写着"**四处打断缺一不可**——漏一处即一次收敛挂死"。TCP 的阻塞点比 UDP 多两个（连接等待、刷出等待），但仍是**四个动作**：
+`UdpTransport::Close()` 的注释写着"**四处打断缺一不可**——漏一处即一次收敛挂死"。TCP 的阻塞点比 UDP 多一个（连接等待），但仍是**四个动作**：
 
 | # | 阻塞点 | 由谁打断 |
 |---|---|---|
@@ -697,9 +696,8 @@ void TcpTransport::RunWritePump() {
 | ③ | 管理泵：`await_for(stream, silence_timeout)` 读等待 | `socket_->abort()` |
 | ④ | 写泵：`await(write_queue_)` 等数据 | `write_queue_->close()` + `discard_pending()` |
 | ⑤ | 写泵：`await(socket_ready_)` 等连接就绪 | `socket_ready_->close()` |
-| ⑥ | 写泵：`await(waitForBytesWritten)` 刷出等待 | `socket_->abort()` |
 
-**`socket_->abort()` 一处覆盖 ②③⑥**，故 `Close()` 的动作数与 UDP 相同。`Close()` **只发信号、不等收敛**，收尾由管理泵自己跑完；`WaitClosed()` join 管理泵（其内部已先 join 写泵），返回即"两条 fiber 都不再触碰本对象"。
+**`socket_->abort()` 一处覆盖 ②③**，故 `Close()` 的动作数与 UDP 相同。`Close()` **只发信号、不等收敛**，收尾由管理泵自己跑完；`WaitClosed()` join 管理泵（其内部已先 join 写泵），返回即"两条 fiber 都不再触碰本对象"。
 
 ##### ⑤ `CurrentLinkState()` —— 无状态成员，当场算出
 
