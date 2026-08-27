@@ -539,6 +539,187 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **执行时序/状态**：见 §4.2.13（TCP 传输泵与重连，图 4-15）、§4.2.10（传输层泵与双队列）、§4.2.11（动态生命周期）。
 
+
+#### 5.6.1 `TcpTransport` 三条路径的详细设计（ADR-0011）
+
+> **目标形态，尚未实现。** 下列伪代码是实现票的依据；与 `UdpTransport` 同名部件一一对应，差异处已标注。
+
+##### 成员（与 UDP 对齐，无连接状态枚举）
+
+```cpp
+TcpConfig                                   config_;
+QTcpSocket*                                 socket_;         // 【整个生命期一个对象】(D3)
+LifecycleState                              lifecycle_;      // Created/Running/Closing/Closed
+std::error_code                             last_error_;
+std::uint32_t                               generation_{0};  // 内部记账，不对外 (D9/D12)
+Endpoint                                    peer_;           // 固定对端，构造时由 config 算出 (D8)
+std::shared_ptr<Coro::Awaitable<Datagram>>  read_queue_;     // 有界 1024 丢最旧 (D6)
+std::shared_ptr<Coro::Awaitable<Datagram>>  write_queue_;    // 同上
+std::shared_ptr<Coro::Awaitable<void>>      socket_ready_;   // 泵→写泵：可以写了
+std::shared_ptr<Coro::Awaitable<void>>      close_signal_;   // 打断退避
+Coro::FiberTask<void>*                      write_pump_;     // 由管理泵 join
+```
+
+**没有 `ConnectionState` 成员**（D12）：连接状态是泵所处的代码位置，`CurrentLinkState()` 当场由 `lifecycle_` 与 `socket_->state()` 算出。
+
+##### ① 重连路径 —— `Connect()`
+
+```cpp
+// 返回 true 表示此刻已连接。失败【不自终】，仅落 LastError（ADR-0007 D2）。
+bool TcpTransport::Connect() {
+  // connectToHost 自身即"已连接则立即成功"，本判据只为表达意图。
+  // 首轮之外恒为假 —— 上一轮末尾的 abort() 已把 socket 置为 UnconnectedState。
+  if (socket_->state() == QAbstractSocket::ConnectedState) return true;
+
+  auto ok = Coro::await_for(
+      Coro::coro(socket_).connectToHost(config_.host, config_.port),
+      config_.connect_timeout);                      // ← 与 UDP 的 Bind() 唯一不同：异步 + 超时
+  if (!ok) {
+    last_error_ = MapSocketError(...);               // 超时 / 拒绝 / 不可达，一律降为诊断事实
+    return false;                                    // 由外层退避后重试
+  }
+  ++generation_;                                     // 内部记账 (D9/D12)
+  return true;
+}
+```
+
+**与 UDP 的差异只有一处**：UDP 的 `bind()` 同步且瞬时，TCP 的 `connectToHost` 是异步的、需要 `connect_timeout`。**这正是三个时间量不能合并成一个的原因**（D5）。
+
+##### ② 读路径 —— `RunSocketPump()`（外层 socket 管理 + 内层数据泵）
+
+```cpp
+void TcpTransport::RunSocketPump() {
+  while (lifecycle_ < LifecycleState::kClosing) {
+    if (Connect()) {
+      // 通告写泵。【先清后发】：每轮外层都是一次真实的 down→up 跃迁，而写泵停在
+      // "等数据"时没人来取，不清就会一直堆积。信号因此恒定只有 0 或 1 个 token。
+      socket_ready_->channel()->discard_pending();
+      socket_ready_->resolve();
+
+      // 每代重建读流（旧流已随上一轮 abort 死掉）。
+      auto stream = Coro::coro(socket_).readAll();
+      for (;;) {
+        auto chunk = Coro::await_for(stream, config_.silence_timeout);
+        if (!chunk) {
+          // 归因只落 LastError，不改控制流。三条成因【不作区分】，一律 break 回外层重连：
+          //   ① 对端断开 —— 【主判据】(D4)，经流的自然终止到达；
+          //   ② 静默超时 —— 【辅助判据】(D4)，只在半开连接（FIN 未达）时才轮到它；
+          //   ③ 我方 Close —— 由 while 判据接住。
+          if (chunk.error() == std::errc::timed_out) {
+            last_error_ = make_error_code(TransportErrc::kTimeout);
+          } else if (是 socket 错误) {
+            last_error_ = MapSocketError(chunk.error());
+          }
+          break;
+        }
+        // chunk 是【任意字节切片】，不是一个完整帧（RT_TRANSPORT_003）；组帧归 ICodec。
+        Datagram out{ 转字节(chunk.value()), peer_ };   // peer 固定对端 (D8)
+        if (read_queue_->channel()->push(std::move(out)) != success) {
+          break;   // read_queue 已关闭（我方 Close）→ 停止投递，回外层判生命周期
+        }
+      }
+    } else {
+      // 连接失败的退避。close_signal_ 被 Close 关闭时立即返回，故退避可提前打断。
+      Coro::await_for(close_signal_, config_.reconnect_interval);
+    }
+    // 每轮末尾【无条件 abort()】(D3)：socket 回 UnconnectedState，状态、缓冲与挂起的
+    // 信号一并清除，下一轮从这一个确定状态重建 —— 不必区分上轮是怎么结束的，
+    // 也【不需要新建 socket 对象】。对已断开的 socket 调 abort() 是空操作。
+    socket_->abort();
+  }
+
+  // 收尾：先 join 写泵（确保它不再碰 socket），再关读队列、落 Closed。
+  if (write_pump_) (void)write_pump_->get();
+  CloseQueue(read_queue_, make_error_code(TransportErrc::kClosed));
+  lifecycle_ = LifecycleState::kClosed;
+}
+```
+
+**断链为什么不需要单独订阅 `waitForDisconnected()`**：`corosocket.hpp` 的 `readAll()` 在 `disconnected` 与 socket error 两个信号上**都先 `drain()` 残留字节、再 `channel->close()`**。故断链经由**读流的自然终止**到达读泵，且**尾字节不丢**。`readAll()` 亦只推送非空切片，本循环无须判空。
+
+**这也是 D4「主判据/辅助判据」的实现形态**：正常断链由流终止立刻发现，静默超时只在**半开连接**（对端进程消失、FIN 未达、socket 仍显示 `Connected`）时才轮得到。
+
+##### ③ 写路径 —— `RunWritePump()`（三个阻塞点）
+
+```cpp
+void TcpTransport::RunWritePump() {
+  for (;;) {
+    // ── 阻塞点①：等数据 ──（Close 关 write_queue 唤醒）
+    auto item = Coro::await(write_queue_);
+    if (!item) return;                       // 队列被关闭 → 退出（残留随之丢弃）
+    const Datagram& unit = item.value();
+    // unit.peer 【被忽略】：TCP 点对点，一律发往固定对端 (D8)。不判 kInvalidArgument ——
+    // 那会让"传输无关的调用方"在 TCP 上跑不起来。
+
+    // ── 阻塞点②：等连接就绪 ──（Close 关 socket_ready 唤醒）
+    for (;;) {
+      if (lifecycle_ >= LifecycleState::kClosing) return;
+      if (socket_->state() == QAbstractSocket::ConnectedState) break;
+      socket_ready_->channel()->discard_pending();     // 清陈旧标记
+      if (!Coro::await(socket_ready_)) return;
+    }
+
+    // ── 阻塞点③：短写循环 ──【TCP 特有，UDP 没有这一段】
+    const char* p = 数据首址(unit); qint64 left = 字节数(unit);
+    while (left > 0) {
+      const qint64 n = socket_->write(p, left);
+      if (n < 0) { last_error_ = MapSocketError(...); break; }   // 断链/错误 → 放弃本条
+      p += n; left -= n;
+      if (left == 0) break;
+      // Qt 内部写缓冲已满：等它刷出一部分再续写。
+      if (!Coro::await(Coro::coro(socket_).waitForBytesWritten())) break;
+      if (socket_->state() != QAbstractSocket::ConnectedState) break;   // 断链 → 放弃残余
+    }
+
+    // 刷到内核，使 Qt 内部缓冲不成为【无界的第三条队列】—— 见下"为什么要等刷出"。
+    while (socket_->bytesToWrite() > 0 &&
+           socket_->state() == QAbstractSocket::ConnectedState) {
+      if (!Coro::await(Coro::coro(socket_).waitForBytesWritten())) break;
+    }
+    // left > 0 或刷出中途断链 ⇒ 【写了半条】：不补写、不回滚、不归因到调用方 (D7)，
+    // 由对端自行重同步。写出的一切结果都不回传（ADR-0007 D3，fire-and-forget）。
+  }
+}
+```
+
+**为什么要等刷出（`bytesToWrite() == 0`）**：`QAbstractSocket::write()` 把数据收进 **Qt 自己的内部写缓冲**即返回，几乎从不短写。若写泵不等刷出就取下一条，Qt 内部缓冲会**无界增长**——那等于凭空多出一条我们控制不了的队列，而本设计的前提是"数据面只有两条队列"（RT_TRANSPORT_010）。等刷出使**背压落在有界的 `write_queue_` 上**，代价是每条报文一次往返、吞吐略降。
+
+**单消费者写泵保证 `RT_TRANSPORT_004`**（并发写串行化、两帧字节不交错）。**断链截断不属于交错**——它是一帧被切断，不是两帧被穿插。
+
+##### ④ `Close()` 的打断点：四个动作覆盖六个阻塞点
+
+`UdpTransport::Close()` 的注释写着"**四处打断缺一不可**——漏一处即一次收敛挂死"。TCP 的阻塞点比 UDP 多两个（连接等待、刷出等待），但仍是**四个动作**：
+
+| # | 阻塞点 | 由谁打断 |
+|---|---|---|
+| ① | 管理泵：`await_for(close_signal_, reconnect_interval)` 退避 | `close_signal_->close()` |
+| ② | 管理泵：`await_for(connectToHost, connect_timeout)` 连接等待 | `socket_->abort()` |
+| ③ | 管理泵：`await_for(stream, silence_timeout)` 读等待 | `socket_->abort()` |
+| ④ | 写泵：`await(write_queue_)` 等数据 | `write_queue_->close()` + `discard_pending()` |
+| ⑤ | 写泵：`await(socket_ready_)` 等连接就绪 | `socket_ready_->close()` |
+| ⑥ | 写泵：`await(waitForBytesWritten)` 刷出等待 | `socket_->abort()` |
+
+**`socket_->abort()` 一处覆盖 ②③⑥**，故 `Close()` 的动作数与 UDP 相同。`Close()` **只发信号、不等收敛**，收尾由管理泵自己跑完；`WaitClosed()` join 管理泵（其内部已先 join 写泵），返回即"两条 fiber 都不再触碰本对象"。
+
+##### ⑤ `CurrentLinkState()` —— 无状态成员，当场算出
+
+```cpp
+LinkState TcpTransport::CurrentLinkState() const {
+  if (lifecycle_ != LifecycleState::kRunning || !socket_) return LinkState::kDown;
+  switch (socket_->state()) {
+    case QAbstractSocket::ConnectedState:                          return LinkState::kUp;
+    case QAbstractSocket::ConnectingState:
+    case QAbstractSocket::HostLookupState:                         return LinkState::kEstablishing;
+    default:                                                       return LinkState::kEstablishing;
+    // ↑ 未连接但泵仍会重试 —— 这一支是 TCP 与 UDP 的【真正分歧】。
+    //   UDP 未绑定即报 kDown（"UDP 无连接，故永不出现 kEstablishing"）；
+    //   而 kEstablishing 的枚举注释本就写着"正在建立（TCP 连接中 / 退避重连中）"。
+  }
+}
+```
+
+**定位见 §4.2.13**：统一的 I/O 事实查询，**不面向业务调用方**，仅供诊断与测试观测。
+
 ### 5.7 编解码层详细设计（CSU_CODEC）
 
 **单元设计决策**：`ICodec` 可有状态（`SystemCodec` 单线程喂滚动缓冲）或无状态并发（`DdsCodec` 多 listener 线程并发喂）；坏帧诊断 + 重同步。
