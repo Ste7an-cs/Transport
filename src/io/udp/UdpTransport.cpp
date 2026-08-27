@@ -203,10 +203,13 @@ void UdpTransport::RunSocketPump() {
 // 不变式:**取到 socket 到写出之间没有挂起点**——writeDatagram 同步非阻塞,故泵 fiber
 // 不可能在中间被调度起来解绑 socket,由此不需要代际号校验。
 //
-// **该不变式现在对 TCP 也成立**(ADR-0011 **D13**,2026-08-27):TcpTransport 的写泵
-// `write()` 之后**不等刷出**——不等 bytesWritten、不等 bytesToWrite() == 0,故写出段同样
-// 无挂起点。原注此处写着"只对 UDP 成立(串口/TCP 的写有挂起点)",那是 TCP 尚未重构时的
-// 判断;**串口未重构,仍待核**。两个写泵在这一点上已结构同构。
+// **该不变式对 TCP 与串口同样成立**——原注此处写着"只对 UDP 成立(串口/TCP 的写有挂起
+// 点)",那是二者尚未重构时的判断,现已【逐条实测证伪】:
+//   TCP(ADR-0011 D13,2026-08-27):写泵 write() 之后**不等刷出**,写出段无挂起点。
+//   串口(ADR-0012 D8,2026-08-28):实测 QSerialPort::write(4096) 返 4096(不短写)、
+//     bytesToWrite() 立刻查是 4096(不同步刷出)、50ms 后归 0 —— 与 QTcpSocket::write()
+//     逐条一致。
+// **三个写泵在这一点上结构完全同构**,本悬案关闭。
 void UdpTransport::RunWritePump() {
   for (;;) {
     // ── 阻塞点①:等数据 ──(Close 关 write_queue 唤醒)
