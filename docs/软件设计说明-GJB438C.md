@@ -71,6 +71,12 @@
   由此：节点**无"在途交互表"**、无新增成员，`Dispatcher` **不需要认识模式**（它只认键）。一个看似要新机制的需求（多段交互 + 重试）因此**新增机制为零**——完全由 `Dispatcher` 的既有性质（投递**不终结**订阅、键可部分匹配）加调用方控制流实现。
   **两条相反的重发规则并存**：`RequestForResult`（外部系统协议）**等结果时不重发**（对端正在执行，重发有重复执行风险）；`RequestForResultDirect`（另一种协议）**等结果时必须重发**（它无受理阶段，不重发则丢包即彻底失败）。前者是**该协议的约束，非框架普遍规则**（ADR-0010 D2/D13）。
   详见 §5.5「交互模式」与 §4.2.12（图 4-14）。
+- **DD-15 字节流介质沿用同一套队列丢弃策略，不另设（满足 RT_TRANSPORT_003/010、RT_TCP_RECONNECT_003；ADR-0011 D6）：** `read_queue`/`write_queue` 在**所有介质**上一律沿用 AsyncTask 默认的「**有界 1024 + 静默丢弃队首最旧值**」，**不为 TCP/串口另设策略**。
+  这**推翻了 ADR-0007 D6 的预设**——原文称"该推理不适用于字节流介质：`readAll()` 吐的是任意字节切片而非完整包，丢中段即帧错乱，TCP/串口跟进时**必须**另定策略"。
+  **推翻的依据是丢弃后果已有两层现成补救**：① **codec 自带重同步**——`ScanSystemFrames`（`SystemCodec.cpp:71`）逐字节扫 4 字节帧头，CRC 不匹配即右移一字节继续扫，未消费的尾巴留在 `buffer_` 与下批字节拼接，故**丢弃只毁掉跨越丢弃点的那一帧，其后的帧照常解出**；② **交互层重发**——三个 `RequestFor*` 均带重发（ADR-0010），被毁的那帧由重发补回。
+  **另一半依据是"另定策略"在当前原语上做不到**：经核实 `FiberChannel` 的 `push` **只有非阻塞 drop-oldest 一种模式**、**无公开 `size()`**、且丢弃时 `push` 仍返 `success`——**溢出本身不可观测**。故"大容量 + 溢出即判链路不可用"无从实现（检测不到溢出），"有界 + 满时阻塞生产者"则须先改 AsyncTask（加 `size()` 令泵自行节流，或加阻塞 push）。两者均被推迟，非否决。
+  **两条代价须随本决策一并记住**：① **`Send`（noresponse）不在第二层补救内**——它无重试，丢弃即永久丢失，故队列丢弃对四种交互的后果**不均等**；② **丢弃当前无归因**，`push` 返 `success`、外部观测不到，SRS §3.6 的 `Σ命名原因 == 总丢弃` 恒等式在此路径上**不成立**（#152/#176 同源）。
+  详见 §4.2.13（图 4-15）与 ADR-0011「明确接受的代价」。
 
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**五项** `DropReason` 之一（原七项：`kGenerationIsolationDrop` 随 ADR-0004 D3 移除，`kNoHandlerConfigured` 随 ADR-0009 于 #163 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
 
@@ -86,14 +92,14 @@
 
 **图例说明**：实线箭头读作"A 使用/组合 B"，虚线为可选依赖。`CSC_NODE` 组合 `CSC_CODEC`+`CSC_IO`、依赖 `CSC_CORE`；`CSC_CODEC`/`CSC_IO` 各依赖 `CSC_CORE`；全体运行于 `AsyncTask`；`CSC_IO` 的 Qt socket/串口依赖在宿主未启用 Qt 时不编译。整体单向依赖、上层不被下层反向引用。总体类关系见附图 `arch-class.svg`（`ITransport`/`ICodec`/node/core 的组合 ▷ 与实现 △）。
 
-框内标注了**当前编译面**：`CSC_IO` 仅 `UdpTransport` 一个实现在编译面内，TCP/串口/DDS 与 `TcpServer` 待按 ADR-0007 的新形态跟进；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
+框内标注了**当前编译面**：`CSC_IO` 仅 `UdpTransport` 一个实现在编译面内，TCP（重构方案见 ADR-0011）/串口/DDS 与 `TcpServer` 待按 ADR-0007 的新形态跟进；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
 
 > **变更（ADR-0006/0008/0009）**：`CSC_CORE` 框原列 `Result/Status`、`Cancellation`、`SharedCompletion` 三项——`Result`/`Status` 本就只是别名、已随 `core/Result.hpp` 删除（改用 `Coro::Result`），`SharedCompletion` 已删除（改用 `Awaitable::close()` 广播 + `FiberTask::get()` 汇合）。`Cancellation` **文件仍在且随库编译、亦有自己的测试**，但 ADR-0006 D3 取消令牌退化为时限之后，**库的活代码里已无使用者**，故在框内标注其性质而非直接抹去。`Dispatcher` 原被同时画进 `CSC_NODE`——它实际位于 `core/`，已归入 `CSC_CORE` 一处。
 
 | 部件 | 目录 | 主要内容 | 响应需求 |
 |---|---|---|---|
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
-| **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`TcpClientTransport`、`TcpServer`、`IDdsProvider` | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
+| **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`IDdsProvider`；`TcpServer`（本轮不做，ADR-0011 D10）（**已合并**：`TcpClientTransport` 并入 `TcpTransport`，ADR-0011 D1） | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
 | **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`；`DdsNode`、`DdsHandlerContext`（未编译的历史代码，待复活重写）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
@@ -106,7 +112,7 @@
 #### 4.1.2 传输层部件（CSC_IO）
 
 - **用途**：介质无关的纯字节管道，向节点提供协程 await 式拉模型（`Read` 一次一片）与统一 I/O 观测面（含**链路可用性**）；连接管理（TCP 客户端自动重连）与服务端 accept。响应 RT_TRANSPORT_*、RT_TCP_RECONNECT/RECONFIG、RT_IF_*。
-- **主要内容**：接口 `ITransport`（内部缝，**唯一**——`IConnectionObservable` 已随 ADR-0004 D2 取消）；实现 `TcpTransport`（已连接）、`TcpClientTransport`（连接管理）、`UdpTransport`、`SerialTransport`、`DdsTransport`、`TcpServer`；provider `IDdsProvider`（Fake/FastDDS）。
+- **主要内容**：接口 `ITransport`（内部缝，**唯一**——`IConnectionObservable` 已随 ADR-0004 D2 取消）；实现 `TcpTransport`（**连接管理内建**，ADR-0011 D1 合并 `TcpClientTransport` 后的单一 TCP 客户端实现）、`UdpTransport`、`SerialTransport`、`DdsTransport`；`TcpServer`（本轮不做，D10）；provider `IDdsProvider`（Fake/FastDDS）。
 - **类图**：见图 4-2。
 - **关系与结构**：依赖 CSC_CORE；被 CSC_NODE 组合（node 持 `unique_ptr<ITransport>`）。
 
@@ -233,7 +239,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![TCP 客户端连接状态机](diagrams/state-connection.svg)
 
-**图例说明**：`Disconnected/Connecting/Connected/Reconnecting` + 连接代际递增；**固定重连间隔 1s**（指数退避已撤销，见 ADR-0005）；端点热更新掐断当前尝试立即重试。**本状态机完全内于 `TcpClientTransport`**——代际用于其自身内部记账与诊断（`Generation()`），交互层不感知（ADR-0004 D2/D3/D7）；对外只经**链路可用性**与 `Read` 的二义终止呈现。
+**图例说明**：`Disconnected/Connecting/Connected/Reconnecting` + 连接代际递增；**固定重连间隔**（缺省 1s；四套退避参数——倍率/上限/抖动/稳定重置——已随 **ADR-0005 D4** 一并撤销）；端点热更新掐断当前尝试立即重试。
+
+> **变更（ADR-0011 D9，2026-08-27）**：这四个状态自本轮起是**传输内部**的设计要求，**不再有对外查询接口**——`State()` 与 `WaitForState()` 均已删除，对外只呈现 `LinkState` 三值：`Disconnected` → `kDown`，`Connecting`/`Reconnecting` → `kEstablishing`，`Connected` → `kUp`（RT_LIFECYCLE_002 的变更注）。连接代际同样转为**内部记账**，`Generation()` 随 `AttemptCount()` / `LastFailure()` 一并删除，观测统一走 `ITraceSink`（与 ADR-0008 **D10** 同向）。
+>
+> **状态机并入 `TcpTransport`**（**D1**）：本状态机原本"完全内于 `TcpClientTransport`"，该类已并入 `TcpTransport`，状态机随之成为其外层 socket 管理泵的内部形态——`Connecting` 即泵在等 `connected`，`Reconnecting` 即泵停在 `await_for(close_signal, reconnect_interval)` 的退避上，`Connected` 即泵在内层读流循环里。**状态不再是显式的枚举变量驱动，而是泵所处的代码位置**；保留枚举仅为诊断与 Trace 归类。
+>
+> **端点热更新（`ApplyConfig`）的去留本轮待定**（**D11**）——图中该跃迁暂存，待专门讨论后确认或删除。
 
 #### 4.2.9 订阅凭据生存期状态（MS_TICKET）
 
@@ -256,7 +268,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 #### 4.2.11 对象/线程/协程的动态创建与删除（MS_DYNAMIC_LIFECYCLE）
 
 - **fiber（一个 node 内）**：`Start` 时 spawn 读-分发循环 fiber，**共一条**（ADR-0009 D1：内置 handler 消费者 fiber 已废止；订阅者的消费 fiber 属**宿主**，不计入节点内部工作单元）；`Close` **不再 spawn 任何 fiber**，且不含等待点——汇合由 `WaitClosed()` 在调用方 fiber 上 `FiberTask::get()` join 读循环完成（ADR-0008 D2）。**reactor fiber 已随 ADR-0004 D2/D3 取消，finalizer fiber 已随 ADR-0005 D1 取消。** 均由 AsyncTask `makeTask` 创建、返回即终止。
-- **传输连接代际（内于传输层）**：`TcpClientTransport` 的 connect-loop fiber 每次成功物理连接创建一个内层 `TcpTransport`（`Generation()`+1），断链销毁旧内层、隔固定间隔（1s）后建新代际；断链**不向交互层发任何信号**（完全透明，DD-11）。交互层不参与。
+- **传输连接代际（内于传输层）**：`TcpTransport` 的 socket 管理泵每次成功物理连接使内部代际计数 +1；断链后 `abort()` 当前 socket、隔固定间隔（缺省 1s）在**同一 socket 对象**上重连建新代际（ADR-0011 **D3**：不新建对象，`abort()` 已把状态、缓冲与挂起信号一并清除；`Generation()` 已随 **D9** 删除，代际仅内部记账）；断链**不向交互层发任何信号**（完全透明，DD-11）。交互层不参与。
 - **DDS 交接**：`DdsTransport` `Start` 对每 topic `Subscribe`，listener 回调在外线程构造 `Sample` 非阻塞 `Push`；`RequestClose` 先 `Unsubscribe` 停投递 → 交接边界 `Close` 唤醒在途 `Read` → provider `Shutdown`；迟到回调只捕获交接边界共享句柄、不触碰已销毁对象。
 - **TcpServer 子 node**：每接受一条连接经 NodeFactory 派生 `ProtocolNode` + supervisor fiber；对端断开 → supervisor 驱动该 node `Closing→Closed` 并注销（连接生命=节点生命）。
 
@@ -267,6 +279,27 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 ![交互模式时序图](diagrams/seq-interaction-modes.svg)
 
 **图例说明（ADR-0010 / RT_NODE_002_a..g）**：四个方法分属**两种协议**——`Send`/`RequestForResponse`/`RequestForResult` 属外部系统协议（其中 `withfeedback` 与 `needfeedback` 为**同一模型**，合用 `RequestForResult`），`RequestForResultDirect` 属另一种协议。**状态机全部跑在调用方 fiber 上**——阶段、已发送次数与原始命令帧都是该方法的局部变量，故节点无"在途交互表"、`Dispatcher` 不认识模式（**D1**）。图中标出四个易错点：② ③ ④ 的订阅**必须在发命令之前登记**（**D4**，`kResult` 可能先于 `kResponse` 到达）；阶段一完成后**立即注销受理凭据**（**D5**，否则重发引出的重复受理帧继续入信箱）；第二阶段超时**不重发**（**D2**，`kResult` 未达意味着对端正在执行）；`RequestForResult` **末尾的回应帧完全由收到的 `kResult` 派生**（**D8**：仅改帧类型，payload/sid/mid 原样，CRC 由编码重算），且**不走 `Send()`**（它会强制盖新 `session_id`）——注意 `RequestForResultDirect` **不回应任何帧**，二者相反。两阶段的失败以不同错误码区分：阶段一耗尽为 `kNotAccepted`、阶段二超时为 `kTimeout`（**D12**）。接收侧不建模（**D9**），`repeating` 本轮不定义（**D11**）。
+
+#### 4.2.13 TCP 传输泵与重连（MS_TCP_PUMP）
+
+**图 4-15（`seq-tcp-pump`）** —— ADR-0011 定稿的**目标形态**，尚未实现。
+
+![TCP 传输泵与重连时序图](diagrams/seq-tcp-pump.svg)
+
+**图例说明**：与图 4-13（UDP 泵）**同构**，差异集中在四处，均已在图上标出：
+
+| | UDP（图 4-13） | TCP（本图） |
+|---|---|---|
+| 外层动作 | `bind` —— 同步且瞬时 | `connectToHost` + 等 `connected` —— **异步，自带 `connect_timeout`** |
+| 判活主判据 | `silence_timeout`（无连接，**唯一**判据） | **对端断开事件**；静默超时降为**辅助**（半开检测，**D4**） |
+| 队列元素 | 一条**完整报文** | **任意字节切片**——组帧归 `ICodec`（RT_TRANSPORT_003） |
+| 写侧 | `writeDatagram` 原子，无挂起点 | `write` **会短写**，刷缓冲有挂起点；**仍不做代际号校验**（**D7**） |
+
+**两处刻意与 UDP 保持一致**：① **整个生命期一个 `QTcpSocket`**——每轮末尾 `abort()` 使其回到 `UnconnectedState`，下轮在同一对象上重连（**D3**，对应 UDP 的 bind→close→再 bind）；② **不自终**——连接失败、读流终止、静默超时一律回外层重试，唯一退出条件是我方 `Close`（沿用 ADR-0007 D2）。
+
+**写侧的一条不变式被主动放弃**：`UdpTransport` 头注释写着"取到 socket 到写出之间无挂起点，该不变式**只对 UDP 成立**"。TCP 本可用代际号补上，本设计**选择不补**（**D7**）——断链时写出去半条即半条，由对端重同步。由此两个写泵在这一点上重新一致，且 `RT_TRANSPORT_004` 仍然满足：它禁止的是两帧字节**交错**（单消费者写泵保证），断链**截断**是另一回事。
+
+**丢弃策略见 DD-15。**
 
 ### 4.3 接口设计
 
@@ -480,12 +513,14 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **软件逻辑**：见 `src/io/*`。
 
-> **实况标注（2026-08-26 核对）**：下表中**只有 `UdpTransport` 已按 ADR-0007/0008 的新形态实现并参与编译**。`TcpTransport` / `TcpClientTransport` / `SerialTransport` / `DdsTransport` / `TcpServer` 五行描述的是**重设计之前的形态**，其源文件当前**不在 `CMakeLists.txt` 的库源清单内**（编译面收窄至 UDP + ProtocolNode），行内提及的 `Read()`、`BoundedQueue` 等已是历史 API。这些单元的复活与改写属"编译面恢复"。
+> **实况标注（2026-08-26 核对）**：下表中**只有 `UdpTransport` 已按 ADR-0007/0008 的新形态实现并参与编译**。`SerialTransport` / `DdsTransport` / `TcpServer` 三行描述的是**重设计之前的形态**，其源文件当前**不在 `CMakeLists.txt` 的库源清单内**（编译面收窄至 UDP + ProtocolNode），行内提及的 `Read()`、`BoundedQueue` 等已是历史 API。这些单元的复活与改写属"编译面恢复"。
+>
+> **`TcpTransport` 一行是例外**：它描述的是 **ADR-0011 定稿的目标形态**（尚未实现），不是历史代码。当前 `src/io/tcp/` 下的三个 .cpp 仍是重设计之前的实现，且 `TcpClientTransport.hpp:126` 引用着已删除的 `OperationOptions`、**头文件本身无法编译**。
 
 | 单元 | 关键逻辑 |
 |---|---|
-| TcpTransport | 接管已连接 socket；复用 corosocket `readAll` 流；写路径**并发写按到达序串行化**（不再等字节进内核）；对端断开 → `Read` 返 `kClosed`（不可重连，DD-11） |
-| TcpClientTransport | connect-loop fiber 持 socket 跑状态机 `Connecting/Connected/Reconnecting`，建连后以流式读取器持续取数投入**对外通道**；`Read` 从该通道取；断链**不发信号**，connect-loop 转入重连、`Read` 自然挂起至新链路数据到达（完全透明，DD-11）。`Write` **直操当前 socket**（重连期立即返 `kConnection`，不缓存——RT_TCP_RECONNECT_003），不经通道。`abort()+deleteLater()` 管超时；**固定重连间隔 1s**（ADR-0005）；`ApplyConfig`/`Generation()`/`AttemptCount()` 等降级为**具体方法**（ADR-0004 D7）。**已知缺口**：对外通道无界（见 §7.2） |
+| **TcpTransport**（ADR-0011 重构后） | **socket 管理泵 + 读写双队列**，与 `UdpTransport` 同构。外层泵：`connectToHost` + 等 `connected`（`connect_timeout`）→ 成功则建 `readAll` 流、`await_for(stream, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal, reconnect_interval)` 退避。**每轮末尾无条件 `abort()`**，socket 回 `UnconnectedState`，下轮在**同一对象**上重连（**D3**，与 UDP 的 bind→close→再 bind 同模式）。写泵两个阻塞点（等数据 / 等连接就绪），短写循环刷缓冲；**不做代际号校验**——断链时半条即半条，由对端重同步（**D7**）。判活以**断开事件为主**、静默超时为辅（半开检测，**D4**）。**不自终**，唯一退出条件是我方 `Close`。 |
+| ~~TcpClientTransport~~ | **已并入 `TcpTransport`**（ADR-0011 **D1**）：重连是 TCP 客户端的固定语义（RT_TCP_RECONNECT_001 不设开关），做成外层泵的一部分即可，无需单设包装类。原分层的理由是"`TcpServer` 复用裸管道"，但服务端连接**不重连**、外层泵形态本就不同，复用的是数据面而非泵形态。 |
 | UdpTransport | **socket 管理泵 + 读写双队列**（ADR-0007，样板实现）。外层循环：按配置 bind → 失败**按 `silence_timeout` 所定间隔（默认 5 s）重试、无限重试**，唯一退出条件是我方 `Close`（**不自终**，RT_LIFECYCLE_008 的介质清单已去掉 UDP）。内层循环：`await` 报文流（带**静默超时**，可配、`0` 禁用、默认禁用）→ 投入 `read_queue`；流终止或静默超时 → 退出内层回外层重建。`Read()` 交出 `read_queue` 句柄;`Write()` 投入 `write_queue` 即返（fire-and-forget，链路不可用时排队等待恢复，恢复后按序全部发出）。寻址 kDefault→config 默认 / kNet→ip:port |
 | SerialTransport | coroiodevice 字节流；设备断开/致命 → `Read` 返 `kClosed`（不重连，TBD-005） |
 | DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
@@ -511,7 +546,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 | 设计单元 | 类型 | 对应 SRS 需求 | 章节 |
 |---|---|---|---|
-| DD-1..DD-14 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
+| DD-1..DD-15 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
 | CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | §4.1.1、§5.1 |
 | CSC_IO | 部件 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 | §4.1.2、§5.6 |
 | CSC_CODEC | 部件 | RT_CODEC、RT_IF_SYSFRAME | §4.1.3、§5.7 |
@@ -522,6 +557,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | MS_TRANSPORT_PUMP | 执行方案 | RT_TRANSPORT_008/010、RT_IF_UDP、RT_LIFECYCLE_008 | §4.2.10 |
 | MS_LINK_DOWN / MS_CONNECTION | 执行方案 | RT_TCP_RECONNECT、RT_TRANSPORT_008、RT_LIFECYCLE_002 | §4.2.6、§4.2.8 |
 | MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..g | §4.2.12 |
+| MS_TCP_PUMP | 执行方案 | RT_TCP_RECONNECT_001..005、RT_TRANSPORT_003/004/010 | §4.2.13 |
 | MS_TICKET | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.11 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
@@ -552,13 +588,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
 | RT_NODE_002_a..g（四种交互模式，ADR-0010；`repeating` 已废止，无遗留 TBD） | **DD-14** / CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |
 | RT_TCP_RECONNECT_001..005 | DD-11、DD-12 / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、MS_CONNECTION |
-| RT_TCP_RECONFIG_001..006 | CSU_IO（TcpClientTransport::ApplyConfig） |
+| RT_TCP_RECONFIG_001..006 | CSU_IO（`TcpTransport::ApplyConfig`）—— **本轮待定**（ADR-0011 **D11**），去留未裁决 |
 | RT_ERROR_001..003 | DD-5 / CSC_CORE / CSU_CORE |
 | RT_TRACE_001/002 | DD-10 / CSC_CORE / CSU_CORE / JK_TRACE |
 | RT_DATA_MESSAGE/STATE/CONFIG/BUFFER | CSC_CORE、CSC_NODE / CSU_CORE、CSU_DISPATCHER（**RT_DATA_BUFFER 的队列上界与观测计数已随 ADR-0008 D8/D10 回退**） |
 | RT_IN_INTERFACE_001..005 | DD-1 / JK_TRANSPORT、JK_CODEC、JK_PROVIDER、JK_NODE_API |
 | RT_IF_API/SYSFRAME/TCP/UDP/SERIAL/DDS | JK_NODE_API、JK_CODEC、JK_TRANSPORT / CSU_IO、CSU_CODEC |
-| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-14 / 全体单元 |
+| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-15 / 全体单元 |
 | RT_PERFORMANCE/TESTABILITY/SECURITY | 留 P6（不在本设计说明范围） |
 
 ---
@@ -573,7 +609,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | JK / MS / DD | 接口（本文 ID）/ 执行方案-图（本文 ID）/ 设计决策（本文 ID） |
 | 缝（seam） | 可测替换点（接口边界） |
 | 节点所属执行域 | node 首次启动绑定的稳定 fiber 调度域 |
-| 连接代际 | 每次成功物理连接递增的单调计数；**内于 `TcpClientTransport`**，仅作其内部记账与诊断，交互层不感知（ADR-0004 D3） |
+| 连接代际 | 每次成功物理连接递增的单调计数；**内于 `TcpTransport`**（ADR-0011 D1 合并后），仅作其内部记账与诊断，交互层不感知（ADR-0004 D3） |
 | 链路可用性 | 所有介质同形的当前 I/O 事实（链路此刻是否可用），经 `ITransport` 基类暴露；不含连接管理策略（ADR-0004 D2） |
 | ~~四方仲裁~~ | **已作废（2026-08-26 核对）**：原指"Resolve/超时/取消/FailAll 经**表锁 find+erase** 抢占终结权"。`PendingTable` 及其表锁仲裁已随 ADR-0008 D6 删除（改由 `Dispatcher` 按键投递）；请求取消能力亦已撤销（ADR-0008 D8 + 2026-08-26 裁决）。现行终结方为**三方**：响应 / 超时 / 关闭·断连 |
 | loss=0 harness | 断言"无静默丢失"的测试：Σ命名计数 = 总丢弃。**覆盖面已收窄**（SRS §3.4.4）：无订阅者的业务帧不归因（ADR-0009 D5）、队列满时丢最旧且无计数（TBD-009 / #152）均不在其内；且该 harness 当前**不参与编译** |
@@ -610,6 +646,7 @@ done
 | 图 4-12 | 状态 | MS_TICKET | `state-dispatch-ticket.mmd` |
 | 图 4-13 | 时序 | MS_TRANSPORT_PUMP | `seq-transport-pump.mmd`（ADR-0007 引入） |
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
+| 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**目标形态，尚未实现**） |
 | 附图 | 类图 | 总体 | `arch-class.mmd` |
 
 ---

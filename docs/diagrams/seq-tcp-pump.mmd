@@ -1,0 +1,55 @@
+sequenceDiagram
+    autonumber
+    participant X as 宿主 / node
+    participant T as TcpTransport（公开面）
+    participant P as socket 管理泵 fiber
+    participant W as 写泵 fiber
+    participant S as QTcpSocket（唯一对象）
+    participant RQ as read_queue
+    participant WQ as write_queue（内部）
+
+    Note over T,P: Start()：起两条泵后随即返回<br/>（首次 connect 未成不算启动失败）
+    X->>T: Start()
+    T->>P: spawn 管理泵
+    T->>W: spawn 写泵
+    T-->>X: Coro::Result~void~{}
+
+    rect rgba(200,220,255,0.25)
+    Note over P,S: 管理泵 —— 连接、读数据与超时判断同在这一条 fiber 内
+    loop 未被 Close
+        P->>S: connectToHost + 等 connected（connect_timeout）
+        alt 连接失败/超时
+            S-->>P: 错误
+            Note over P: await_for(close_signal, reconnect_interval) 固定间隔后重试<br/>不自终，唯一退出条件是我方 Close（ADR-0011 D2）
+        else 连接成功
+            Note over P,S: 代际 +1（【内部记账】，Generation() 已随 D9 删除）
+            P->>S: readAll() 建流（一次，反复 await）
+            rect rgba(220,255,220,0.25)
+            loop 内层数据泵
+                S-->>P: await_for(stream, silence_timeout) 取到【任意字节切片】
+                P->>RQ: push（peer 填固定对端，D8）
+            end
+            Note over P: 三条成因不作区分，一律 break 回外层重连：<br/>① 对端断开（【主判据】）② 静默超时（半开检测，【辅】D4）③ 我方 Close<br/>区别只落在 LastError() 的归因上
+            end
+        end
+        Note over P,S: 每轮末尾无条件 abort() —— socket 回 UnconnectedState，<br/>状态/缓冲/挂起信号一并清除，下轮在【同一对象】上重连（D3）
+    end
+    end
+
+    Note over X,RQ: AsyncRead() 只交出 read_queue 句柄，不返回数据
+    X->>T: AsyncRead()
+    T-->>X: shared_ptr~Awaitable~Datagram~~
+    Note over X: 每个元素是【字节流的一段】，不是一个完整帧 —— <br/>组帧由 ICodec 负责（与 UDP「一元素一报文」的关键差别）
+
+    Note over X,WQ: AsyncWrite(Datagram) 只判生命周期与入队
+    X->>T: AsyncWrite({bytes, peer})
+    T->>WQ: push（peer 被忽略，一律发往固定对端，D8）
+    T-->>X: Coro::Result~void~{}（仅表示已入队）
+    WQ-->>W: 阻塞点①：等数据
+    W->>S: 阻塞点②：等连接就绪 → 短写循环（write + 等 bytesWritten）
+    Note over W: 【不做代际号校验】（D7）：断链时写出去半条即半条，<br/>由对端自行重同步；单消费者写泵已保证两帧不交错（RT_TRANSPORT_004）
+
+    Note over T,RQ: ⚠ 两条队列均为默认有界 1024 + 静默丢最旧（D6）。<br/>丢中段会毁掉跨越丢弃点的那一帧，靠 codec 逐字节重同步 +<br/>交互层重发补救；Send 无重发，丢弃即永久丢失。丢弃当前无归因（#152/#176）
+
+    Note over T,P: Close()：四处打断（退避 / 连接等待 / 读流 / 写泵两个阻塞点）+ 关 read_queue 并携终止原因
+    Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放
