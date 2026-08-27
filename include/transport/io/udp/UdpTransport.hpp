@@ -56,7 +56,9 @@ namespace transport {
 // 与 TCP 的差异:UDP `writeDatagram` 是同步非阻塞的单报文原子发送——要么整报文
 // 进入操作系统发送缓冲、要么失败,无短写/部分写、无背压刷缓冲循环。写泵是
 // `write_queue` 的**单消费者**,写入串行化由此天然保证(RT_TRANSPORT_004 保留的那半);
-// 且"状态检查 → 写出"之间无挂起点,故不需要代际号校验(该不变式只对 UDP 成立)。
+// 且"状态检查 → 写出"之间无挂起点,故不需要代际号校验。
+// **"无挂起点"这条现在对 TCP 也成立**(ADR-0011 **D13**):TcpTransport 写完不等刷出。
+// 原注"该不变式只对 UDP 成立"是 TCP 尚未重构时的判断,已不准确;**串口未重构,仍待核**。
 // 报文边界由内核保持,一次读恰好一条报文(RT_IF_UDP)。
 class UdpTransport final : public ITransport {
  public:
