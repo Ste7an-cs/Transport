@@ -8,8 +8,8 @@ stateDiagram-v2
     Connecting --> Connecting: 端点热更新<br/>(掐断当前尝试，立即以新端点重试)
 
     Connected --> Reconnecting: 对端断连<br/>(waitForDisconnected 唤醒)
-    Reconnecting --> Connecting: 退避到期<br/>(1s×2 上限 30s ±20% jitter)
-    Reconnecting --> Reconnecting: 端点热更新<br/>(重置退避级别)
+    Reconnecting --> Connecting: 重连间隔到期<br/>(固定间隔，缺省 1s；ADR-0005 D4)
+    Reconnecting --> Reconnecting: 端点热更新<br/>(立即以新端点重试)
 
     Connected --> Disconnected: Close()（只发信号）
     Connecting --> Disconnected: Close()（只发信号）
@@ -17,10 +17,9 @@ stateDiagram-v2
     Disconnected --> [*]
 
     note right of Connected
-        稳定 ≥ stable_reset_after 后
-        下次断开重置退避级别；
-        代际仅内于本传输记账/诊断，
-        交互层不感知（ADR-0004 D2/D3）
+        重连间隔固定，无倍率/上限/抖动/稳定重置
+        —— 四套退避参数已随 ADR-0005 D4 撤销；
+        代际仅内于本传输记账/诊断，交互层不感知
     end note
 
     note left of Disconnected
