@@ -43,15 +43,20 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
   ```
   外层泵（socket 管理）:
     while (未被 Close) {
-      if (已连接 || Connect())            // Connect 替代 UDP 的 Bind
+      connect_waiter_ = coro(socket).connectToHost(host, port)   // 存成员，供 Close 打断 (D15)
+      if (await_for(connect_waiter_, timeout))                   // ← 同一个量 (D5)
+        generation_ + 1
         socket_ready.discard_pending(); resolve()
-        stream = readAll 流
-        for (;;) { r = await_for(stream, silence);
+        read_stream_ = coro(socket).readAll()                    // 存成员，供 Close 打断 (D15)
+        for (;;) { r = await_for(read_stream_, timeout);         // ← 同一个量
                    if (!r) { 归因落 LastError; break }
                    push(切片) }
+        read_stream_.reset()
       else
-        await_for(close_signal, reconnect_interval)
-      socket->abort()                     // 替代 UDP 的 close()
+        归因落 LastError
+        await_for(close_signal, timeout)                         // ← 退避，同一个量
+      connect_waiter_.reset()
+      socket->abort()                     // 清理，【不是打断手段】(D15)
     }
 
   写泵:
@@ -75,16 +80,25 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
 - **D4（判活：断开事件为主，静默超时为辅）：** TCP 有真正的断开事件，它是链路坏了的**主判据**；`silence_timeout` 降为**补充**，用于检测**半开连接**（对端进程消失但 FIN 未达，socket 仍显示 Connected）。
   这与 UDP 相反：UDP 无连接、无断开事件，`silence_timeout` 是其**唯一**主动判据。
 
-- **D5（固定间隔重连，三个时间量不合并）：** 沿用 ADR-0005 **D4**——重连间隔**固定**，无倍率、上限、抖动、稳定重置四套参数。
-  **但不照 UDP 合并为单一时间量**。UDP 把 `silence_timeout` 一个量兼作读超时与重试间隔，前提是它的 `bind` **同步且瞬时**、不需要第三个量；TCP 的 `connect` 是**异步**的，自带一个超时，该技巧不能整体搬运。故保留三个量：
+- **D5（唯一的时间量：等连上 / 读静默 / 重连退避三处共用一个）：** 沿用 ADR-0005 **D4** 的固定间隔（无倍率、上限、抖动、稳定重置），并**照 `UdpTransport` 合并为单一时间量**。
 
-  | 量 | 含义 | 缺省 |
-  |---|---|---|
-  | `connect_timeout` | 单次连接尝试的超时，超时即 `abort` | 5s |
-  | `reconnect_interval` | 相邻两次尝试的固定间隔 | 1s |
-  | `silence_timeout` | 读静默多久判链路坏（半开检测），0 禁用 | 5s |
+  ```cpp
+  struct TcpConfig {
+    std::string   host = "127.0.0.1";
+    std::uint16_t port = 0;
+    /// 唯一的时间量，三处共用：等连上 / 读静默判链路坏 / 连不上时的重连间隔。
+    std::chrono::milliseconds silence_timeout{5000};
+    ITraceSink* trace_sink = nullptr;
+  };
+  ```
 
-  `reconnect_interval` **须为正**：对端主机在而端口未监听时内核立即回 RST，`connect` 微秒级失败，零间隔会退化为紧循环（烧 CPU 且向对端刷 SYN）。这是保留非零间隔的唯一理由，与"退避"无关。
+  这与 `UdpTransport` 的做法**逐字相同**——其泵注释写着"两处的 timeout 是**同一个量**：有链路时它是'多久没数据算坏'，没链路时它是'多久试一次 bind'"。TCP 只是多了第三处用途（等连上），仍是同一个量。
+
+  **连接不设单独的时限**：`connectToHost` 的等待用的就是这个量，不再有 `connect_timeout` 这个旋钮。**由此三个旋钮收成一个。**
+
+  **`silence_timeout` 须为正，不再有"0 = 禁用"这一档。** UDP 允许 0（禁用静默判活，内部回落到默认值），TCP 不行——**它同时是重连退避间隔**，0 会退化为紧循环（对端主机在而端口未监听时内核立即回 RST，`connect` 微秒级失败，烧 CPU 且向对端刷 SYN）。该校验见 **D14**。
+
+  > **本条推翻本 ADR 初稿的 D5。** 初稿保留 `connect_timeout` / `reconnect_interval` / `silence_timeout` 三个量，理由是"UDP 的 `bind` 同步且瞬时、不需要第三个量；TCP 的 `connect` 是异步的、自带一个超时，该技巧不能整体搬运"。**该理由不成立**——异步的 `connect` 同样可以用这一个量来等，"自带超时"并不要求它是**独立**的旋钮。2026-08-27 裁决：三个合一。
 
 - **D6（队列策略：沿用默认有界 1024 + 丢最旧，不为字节流另设）：** 推翻 ADR-0007 **D6** 的预设。丢中段确实导致帧错乱，但**错帧在本项目里有两层现成的补救**：
   1. **codec 自带重同步**——`ScanSystemFrames`（`SystemCodec.cpp:71`）逐字节扫 4 字节帧头，CRC 不匹配即 `off += 1` 继续扫，未消费的尾巴留在 `buffer_` 与下批字节拼接。丢弃只会毁掉跨越丢弃点的那一帧，**其后的帧照常解出**。
@@ -139,9 +153,9 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
   | 字段 | 约束 | 若不校验的后果 |
   |---|---|---|
   | `host` / `port` | 非空 / 非 0 | 连不上且错误信息无意义 |
-  | `connect_timeout` | `[100ms, 60s]`（SRS §3.1.7.4） | 过小则永远连不上；过大则单次尝试卡住数分钟 |
-  | `reconnect_interval` | **须为正** | **零间隔退化为紧循环**（RST 微秒级失败，烧 CPU 且向对端刷 SYN） |
-  | `silence_timeout` | `>= 0`（0 = 禁用） | 负值语义不明 |
+  | `silence_timeout` | **须为正**（**D5** 合一后是唯一的时间量） | 三重后果：① 零值退化为**紧循环**（RST 微秒级失败，烧 CPU 且向对端刷 SYN）；② 等连上无时限；③ 静默判活失效 |
+
+  **合一使校验反而更关键**（**D5**）：原先 `silence_timeout == 0` 只是"禁用静默判活"这一档可选行为，如今它同时是**等连上的时限**与**重连退避间隔**，零值直接导致紧循环。故 TCP **不设**"0 = 禁用"这一档，与 UDP 不同。
 
   **与 `ProtocolNode` 的对照**：后者自 #173 起配置面上**已无任何校验项**（时限改为逐次传参，保护移交 `ValidateInteraction` 的参数校验）。`TcpTransport` **有**校验，因为它的配置里存在真正会导致灾难的值——尤以 `reconnect_interval == 0` 的紧循环为甚。**"节点无配置校验"不是可推广的结论**，不要据此推断传输也不该有。
 
@@ -158,6 +172,24 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
   **其余一切失败都可重试**，一律降为 `LastError()` 的诊断事实、无限重试。SRS 的"可重试失败"清单全部落在这一支，**包括原本会自终的"致命 socket I/O 错误"**（ADR-0007 D2 已缩小 ADR-0005 D5 自终的适用介质，本设计沿用）。
 
   详细设计见 SDD **§5.6.1 ①'**。
+
+- **D15（泵的两个等待点由我方句柄打断；`socket_->abort()` 在连接窗口内唤不醒任何等待）：** 管理泵的 `connect_waiter_`（等连上）与 `read_stream_`（读等待）**持为成员**，`Close()` 直接 `close()` 它们；`socket_->abort()` **保留但降为清理动作，不再充当打断手段**。
+
+  **依据是三个实测探针**（2026-08-27，临时加入 `udp_transport_test.cpp` 后已撤）：
+
+  | 探针 | 场景 | 结果 |
+  |---|---|---|
+  | 1 | socket 处于 `ConnectingState` 时 `abort()` | **唤不醒** `waitForConnected()`——挂满 3000ms 超时才返回 |
+  | 2 | 同上，`abort()` 对 `readAll()` 流 | **唤不醒**——同样挂满 3000ms |
+  | 3 | 持句柄并 `close()` | **1 毫秒内两处均唤醒** |
+
+  成因：Qt 的 `QAbstractSocket::abort()` 在**连接中**的 socket 上**不发 `errorOccurred`**，而 `corosocket` 的 `waitForSignal` / `readAll` 都是靠 socket error 或 `disconnected` 终结的。
+
+  > **本条推翻本 ADR 初稿的说法。** 初稿的 `Close()` 打断点表写着"**`socket_->abort()` 一处覆盖连接等待与读等待两处**，故动作数与 UDP 相同"。**实测证伪**：在连接窗口内它一处也覆盖不了。UDP 没有这个问题——它的 `bind()` 是同步的，不存在"连接中"这一窗口，其 `socket_->close()` 打断活跃读流是实测有效的。
+  >
+  > 若不改：`Close()` 若恰好落在一次连不上的连接尝试中，最坏要等**一整个 `silence_timeout`**（5s）才收敛——而 D5 合并时间量之后这个窗口反而变长了（原 `connect_timeout` 也是 5s，但原设计同样有此缺陷，只是没被发现）。
+
+  **代价**：多两个成员与两处 `Close()` 动作。`Close()` 的动作数由 UDP 的四个增至**五个**（`close_signal_` / `connect_waiter_` / `read_stream_` / `write_queue_` / `socket_ready_`），另加一次非打断性的 `abort()`。**这是必要的复杂度，不是可省的**——UDP 的"四处打断缺一不可，漏一处即一次收敛挂死"在这里是"五处"。
 
 ## 明确接受的代价
 

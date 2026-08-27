@@ -288,7 +288,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 | | UDP（图 4-13） | TCP（本图） |
 |---|---|---|
-| 外层动作 | `bind` —— 同步且瞬时 | `connectToHost` + 等 `connected` —— **异步，自带 `connect_timeout`** |
+| 外层动作 | `bind` —— 同步且瞬时 | `connectToHost` + 等 `connected` —— **异步**，但等待用的是**同一个时间量**（D5，不设单独的 `connect_timeout`） |
 | 判活主判据 | `silence_timeout`（无连接，**唯一**判据） | **对端断开事件**；静默超时降为**辅助**（半开检测，**D4**） |
 | 队列元素 | 一条**完整报文** | **任意字节切片**——组帧归 `ICodec`（RT_TRANSPORT_003） |
 | 写侧 | `writeDatagram` 原子，无挂起点 | `write` **会短写**，刷缓冲有挂起点；**仍不做代际号校验**（**D7**） |
@@ -302,8 +302,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | 原状态 | 泵所处位置 | `CurrentLinkState()` |
 |---|---|---|
 | `Disconnected` | 未 `Start` / 已 `Close`（泵未起或已退出） | `kDown` |
-| `Connecting` | 泵在等 `connected`（`connect_timeout` 内） | `kEstablishing` |
-| `Reconnecting` | 泵停在 `await_for(close_signal, reconnect_interval)` 退避 | `kEstablishing` |
+| `Connecting` | 泵在等 `connected`（`silence_timeout` 内） | `kEstablishing` |
+| `Reconnecting` | 泵停在 `await_for(close_signal, silence_timeout)` 退避 | `kEstablishing` |
 | `Connected` | 泵在内层读流循环里 | `kUp` |
 
 **`CurrentLinkState()` 不需要任何状态成员**——与 `UdpTransport.cpp:320` 同法，当场由 `lifecycle_` 与 `socket_->state()` 算出。TCP 与 UDP 在此有一处真正的分歧：UDP 未绑定即报 `kDown`（其注释明写"UDP 无连接，故**永不出现** `kEstablishing`"），而 TCP 在**退避重连期间应报 `kEstablishing`**——`LinkState` 的枚举注释本就写着"正在建立（TCP 连接中 / **退避重连中**）；仅具连接管理的传输会给出"，这一支正是它存在的理由。
@@ -531,7 +531,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 | 单元 | 关键逻辑 |
 |---|---|
-| **TcpTransport**（ADR-0011 重构后） | **socket 管理泵 + 读写双队列**，与 `UdpTransport` 同构。外层泵：`connectToHost` + 等 `connected`（`connect_timeout`）→ 成功则建 `readAll` 流、`await_for(stream, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal, reconnect_interval)` 退避。**每轮末尾无条件 `abort()`**，socket 回 `UnconnectedState`，下轮在**同一对象**上重连（**D3**，与 UDP 的 bind→close→再 bind 同模式）。写泵两个阻塞点（等数据 / 等连接就绪），短写循环刷缓冲；**不做代际号校验**——断链时半条即半条，由对端重同步（**D7**）。判活以**断开事件为主**、静默超时为辅（半开检测，**D4**）。**不自终**，唯一退出条件是我方 `Close`。 |
+| **TcpTransport**（ADR-0011 重构后） | **socket 管理泵 + 读写双队列**，与 `UdpTransport` 同构。外层泵：`connectToHost` + 等 `connected`（**用那唯一的 `silence_timeout`**，D5）→ 成功则建 `readAll` 流、`await_for(stream, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal, silence_timeout)` 退避。**每轮末尾无条件 `abort()`**，socket 回 `UnconnectedState`，下轮在**同一对象**上重连（**D3**，与 UDP 的 bind→close→再 bind 同模式）。写泵两个阻塞点（等数据 / 等连接就绪），短写循环刷缓冲；**不做代际号校验**——断链时半条即半条，由对端重同步（**D7**）。判活以**断开事件为主**、静默超时为辅（半开检测，**D4**）。**不自终**，唯一退出条件是我方 `Close`。 |
 | ~~TcpClientTransport~~ | **已并入 `TcpTransport`**（ADR-0011 **D1**）：重连是 TCP 客户端的固定语义（RT_TCP_RECONNECT_001 不设开关），做成外层泵的一部分即可，无需单设包装类。原分层的理由是"`TcpServer` 复用裸管道"，但服务端连接**不重连**、外层泵形态本就不同，复用的是数据面而非泵形态。 |
 | UdpTransport | **socket 管理泵 + 读写双队列**（ADR-0007，样板实现）。外层循环：按配置 bind → 失败**按 `silence_timeout` 所定间隔（默认 5 s）重试、无限重试**，唯一退出条件是我方 `Close`（**不自终**，RT_LIFECYCLE_008 的介质清单已去掉 UDP）。内层循环：`await` 报文流（带**静默超时**，可配、`0` 禁用、默认禁用）→ 投入 `read_queue`；流终止或静默超时 → 退出内层回外层重建。`Read()` 交出 `read_queue` 句柄;`Write()` 投入 `write_queue` 即返（fire-and-forget，链路不可用时排队等待恢复，恢复后按序全部发出）。寻址 kDefault→config 默认 / kNet→ip:port |
 | SerialTransport | coroiodevice 字节流；设备断开/致命 → `Read` 返 `kClosed`（不重连，TBD-005） |
@@ -558,34 +558,29 @@ std::shared_ptr<Coro::Awaitable<Datagram>>  read_queue_;     // 有界 1024 丢�
 std::shared_ptr<Coro::Awaitable<Datagram>>  write_queue_;    // 同上
 std::shared_ptr<Coro::Awaitable<void>>      socket_ready_;   // 泵→写泵：可以写了
 std::shared_ptr<Coro::Awaitable<void>>      close_signal_;   // 打断退避
+std::shared_ptr<Coro::Awaitable<void>>      connect_waiter_; // 【每轮重建】等连上，供 Close 打断 (D15)
+std::shared_ptr<Coro::Awaitable<QByteArray>> read_stream_;   // 【每轮重建】读流，供 Close 打断 (D15)
 Coro::FiberTask<void>*                      write_pump_;     // 由管理泵 join
 ```
 
 **没有 `ConnectionState` 成员**（D12）：连接状态是泵所处的代码位置，`CurrentLinkState()` 当场由 `lifecycle_` 与 `socket_->state()` 算出。
 
-##### ① 重连路径 —— `Connect()`
+##### ① 唯一的时间量（D5）
 
 ```cpp
-// 返回 true 表示此刻已连接。失败【不自终】，仅落 LastError（ADR-0007 D2）。
-bool TcpTransport::Connect() {
-  // connectToHost 自身即"已连接则立即成功"，本判据只为表达意图。
-  // 首轮之外恒为假 —— 上一轮末尾的 abort() 已把 socket 置为 UnconnectedState。
-  if (socket_->state() == QAbstractSocket::ConnectedState) return true;
-
-  auto ok = Coro::await_for(
-      Coro::coro(socket_).connectToHost(config_.host, config_.port),
-      config_.connect_timeout);                      // ← 与 UDP 的 Bind() 唯一不同：异步 + 超时
-  if (!ok) {
-    last_error_ = MapSocketError(...);               // 超时 / 拒绝 / 不可达，一律降为诊断事实
-    return false;                                    // 由外层退避后重试
-  }
-  ++generation_;                                     // 内部记账 (D9/D12)
-  return true;
-}
+struct TcpConfig {
+  std::string   host = "127.0.0.1";
+  std::uint16_t port = 0;
+  /// 唯一的时间量，三处共用：等连上 / 读静默判链路坏 / 连不上时的重连间隔。
+  /// **须为正**——它同时是退避间隔，零值退化为紧循环（D14）。
+  std::chrono::milliseconds silence_timeout{5000};
+  ITraceSink* trace_sink = nullptr;
+};
 ```
 
-**与 UDP 的差异只有一处**：UDP 的 `bind()` 同步且瞬时，TCP 的 `connectToHost` 是异步的、需要 `connect_timeout`。**这正是三个时间量不能合并成一个的原因**（D5）。
+与 `UdpTransport` 的做法**逐字相同**——其泵注释写着"两处的 timeout 是**同一个量**：有链路时它是'多久没数据算坏'，没链路时它是'多久试一次 bind'"。TCP 只是多了第三处用途（**等连上**），仍是同一个量；**连接不设单独的时限**。
 
+**与 UDP 的一处不同**：UDP 允许 `silence_timeout == 0`（禁用静默判活，内部回落到默认值），**TCP 不允许**——它同时是重连退避间隔，零值会退化为紧循环。故 TCP 无"0 = 禁用"这一档。
 
 ##### ①' 重连的完整设计
 
@@ -612,7 +607,7 @@ bool TcpTransport::Connect() {
    Start()              │                                          │
      │                  ▼                                          │
      │   ┌────────► Connect()  ── 失败 ──► await_for(close_signal, │
-     │   │              │                   reconnect_interval)     │
+     │   │              │                   silence_timeout)        │
      │   │              │ 成功                    │                 │
      │   │              ▼                         │                 │
      │   │   socket_ready.discard_pending()       │                 │
@@ -649,7 +644,7 @@ Coro::Result<void> TcpTransport::Start() {
 }
 ```
 
-**与 UDP 的一处差异**：`UdpTransport::Start()` **就地做一次 `Bind()`**，好让 `LocalPort()` / `CurrentLinkState()` 在返回后即可如实观测。TCP **不这么做**——`connect` 是异步的、要等 `connect_timeout`，就地做会把 `Start()` 变成一个最长 5 秒的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是 `kEstablishing`。
+**与 UDP 的一处差异**：`UdpTransport::Start()` **就地做一次 `Bind()`**，好让 `LocalPort()` / `CurrentLinkState()` 在返回后即可如实观测。TCP **不这么做**——`connect` 是异步的、要等一个 `silence_timeout`，就地做会把 `Start()` 变成一个最长一个 timeout 的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是 `kEstablishing`。
 
 **"首连未成不算启动失败"**（沿用 ADR-0007 D2）：`Start()` 成功仅表示两条泵已起。宿主**不需要**等待首连——链路不可用时发送**入队等待**（RT_TCP_RECONNECT_003），故调用方可以 `Start()` 后立即发送。
 
@@ -661,9 +656,9 @@ Coro::Result<void> TcpTransport::Start() {
 |---|---|---|
 | `host` | 非空 | 连不上且错误信息无意义 |
 | `port` | 非 0 | 同上 |
-| `connect_timeout` | `[100ms, 60s]`（SRS §3.1.7.4） | 过小则永远连不上；过大则单次尝试卡住数分钟 |
-| `reconnect_interval` | **须为正** | **零间隔退化为紧循环**——对端主机在而端口未监听时内核立即回 RST，`connect` 微秒级失败，烧 CPU 且向对端刷 SYN |
-| `silence_timeout` | `>= 0`（0 = 禁用） | 负值语义不明 |
+| `silence_timeout` | **须为正**（**D5** 合一后是唯一的时间量） | 三重后果：① 零值退化为**紧循环**（对端主机在而端口未监听时内核立即回 RST，`connect` 微秒级失败，烧 CPU 且向对端刷 SYN）；② 等连上无时限；③ 静默判活失效 |
+
+**合一使校验反而更关键**：原先 `silence_timeout == 0` 只是"禁用静默判活"这一档可选行为；如今它同时是**等连上的时限**与**重连退避间隔**，零值直接导致紧循环。故 TCP **不设**"0 = 禁用"这一档，与 UDP 不同。
 
 校验失败返 `kConfiguration`，**停在 `Created`**、未建 socket、未起泵，允许改配后重试（`RT_LIFECYCLE_007`）。
 
@@ -682,14 +677,14 @@ Coro::Result<void> TcpTransport::Start() {
 ###### 退避：固定间隔，可被 `Close` 提前打断
 
 ```cpp
-Coro::await_for(close_signal_, config_.reconnect_interval);
+Coro::await_for(close_signal_, config_.silence_timeout);   // 唯一的时间量 (D5)
 ```
 
 **必须用独立的延时原语**，不能拿"在未连接的 socket 上建读流"当退避——`UdpTransport` 的注释记着同一个坑（未 bind 的 socket 上建流会被当场关闭，`await_for` 0ms 返回 `no_message`，退避退化为紧转）。
 
-`close_signal_` 被 `Close()` 关闭时**立即返回**，故退避可提前打断——否则一次 `Close()` 最坏要等一个 `reconnect_interval`。
+`close_signal_` 被 `Close()` 关闭时**立即返回**，故退避可提前打断——否则一次 `Close()` 最坏要等一个 `silence_timeout`。
 
-**无倍率、上限、抖动、稳定重置**（沿用 ADR-0005 **D4**，四套参数已撤销）。保留非零间隔的**唯一**理由是上表 `reconnect_interval` 那一行的紧循环，与"退避"这一策略无关。
+**无倍率、上限、抖动、稳定重置**（沿用 ADR-0005 **D4**，四套参数已撤销），且**不再是独立旋钮**——退避间隔就是那唯一的 `silence_timeout`（**D5**）。保留非零间隔的**唯一**理由是上表那一行的紧循环，与"退避"这一策略无关。
 
 ###### 重连期间：读侧与写侧的行为
 
@@ -723,17 +718,23 @@ Coro::await_for(close_signal_, config_.reconnect_interval);
 
 ```cpp
 void TcpTransport::RunSocketPump() {
+  const auto timeout = config_.silence_timeout;   // 【唯一的时间量】(D5)，三处共用
   while (lifecycle_ < LifecycleState::kClosing) {
-    if (Connect()) {
+    // 发起连接并等待。用的就是那一个量——【不设单独的 connect_timeout】(D5)。
+    // 句柄【存成成员】，因为 Close() 要靠 close() 它来打断：实测 abort() 在连接
+    // 窗口内唤不醒任何等待（D15）。
+    connect_waiter_ = Coro::coro(socket_).connectToHost(config_.host, config_.port);
+    if (Coro::await_for(connect_waiter_, timeout)) {
+      ++generation_;                              // 纯内部记账 (D9/D12)
       // 通告写泵。【先清后发】：每轮外层都是一次真实的 down→up 跃迁，而写泵停在
       // "等数据"时没人来取，不清就会一直堆积。信号因此恒定只有 0 或 1 个 token。
       socket_ready_->channel()->discard_pending();
       socket_ready_->resolve();
 
-      // 每代重建读流（旧流已随上一轮 abort 死掉）。
-      auto stream = Coro::coro(socket_).readAll();
+      // 每代重建读流（旧流已随上一轮 abort 死掉）。同样【存成成员】供 Close 打断 (D15)。
+      read_stream_ = Coro::coro(socket_).readAll();
       for (;;) {
-        auto chunk = Coro::await_for(stream, config_.silence_timeout);
+        auto chunk = Coro::await_for(read_stream_, timeout);   // ← 同一个量
         if (!chunk) {
           // 归因只落 LastError，不改控制流。三条成因【不作区分】，一律 break 回外层重连：
           //   ① 对端断开 —— 【主判据】(D4)，经流的自然终止到达；
@@ -752,13 +753,17 @@ void TcpTransport::RunSocketPump() {
           break;   // read_queue 已关闭（我方 Close）→ 停止投递，回外层判生命周期
         }
       }
+      read_stream_.reset();
     } else {
-      // 连接失败的退避。close_signal_ 被 Close 关闭时立即返回，故退避可提前打断。
-      Coro::await_for(close_signal_, config_.reconnect_interval);
+      // 连不上：归因后退避。close_signal_ 被 Close 关闭时立即返回，故退避可提前打断。
+      last_error_ = MapSocketError(...);          // 不自终，降为诊断事实
+      Coro::await_for(close_signal_, timeout);    // ← 退避，仍是同一个量
     }
+    connect_waiter_.reset();
     // 每轮末尾【无条件 abort()】(D3)：socket 回 UnconnectedState，状态、缓冲与挂起的
     // 信号一并清除，下一轮从这一个确定状态重建 —— 不必区分上轮是怎么结束的，
     // 也【不需要新建 socket 对象】。对已断开的 socket 调 abort() 是空操作。
+    // 注意它是【清理动作，不是打断手段】—— 实测在连接窗口内它唤不醒任何等待 (D15)。
     socket_->abort();
   }
 
@@ -819,19 +824,25 @@ void TcpTransport::RunWritePump() {
 
 **单消费者写泵保证 `RT_TRANSPORT_004`**（并发写串行化、两帧字节不交错）。**断链截断不属于交错**——它是一帧被切断，不是两帧被穿插。
 
-##### ④ `Close()` 的打断点：四个动作覆盖五个阻塞点
+##### ④ `Close()` 的打断点：五个动作，五个阻塞点，一一对应
 
-`UdpTransport::Close()` 的注释写着"**四处打断缺一不可**——漏一处即一次收敛挂死"。TCP 的阻塞点比 UDP 多一个（连接等待），但仍是**四个动作**：
+`UdpTransport::Close()` 的注释写着"**四处打断缺一不可**——漏一处即一次收敛挂死"。TCP 是**五处**：
 
 | # | 阻塞点 | 由谁打断 |
 |---|---|---|
-| ① | 管理泵：`await_for(close_signal_, reconnect_interval)` 退避 | `close_signal_->close()` |
-| ② | 管理泵：`await_for(connectToHost, connect_timeout)` 连接等待 | `socket_->abort()` |
-| ③ | 管理泵：`await_for(stream, silence_timeout)` 读等待 | `socket_->abort()` |
+| ① | 管理泵：`await_for(close_signal_, timeout)` 退避 | `close_signal_->close()` |
+| ② | 管理泵：`await_for(connect_waiter_, timeout)` 等连上 | **`connect_waiter_->close()`**（D15） |
+| ③ | 管理泵：`await_for(read_stream_, timeout)` 读等待 | **`read_stream_->close()`**（D15） |
 | ④ | 写泵：`await(write_queue_)` 等数据 | `write_queue_->close()` + `discard_pending()` |
 | ⑤ | 写泵：`await(socket_ready_)` 等连接就绪 | `socket_ready_->close()` |
 
-**`socket_->abort()` 一处覆盖 ②③**，故 `Close()` 的动作数与 UDP 相同。`Close()` **只发信号、不等收敛**，收尾由管理泵自己跑完；`WaitClosed()` join 管理泵（其内部已先 join 写泵），返回即"两条 fiber 都不再触碰本对象"。
+另加一次 `socket_->abort()`——**它是清理动作，不是打断手段**。
+
+> **这推翻了本节初稿的说法。** 初稿写着"`socket_->abort()` 一处覆盖 ②③，故动作数与 UDP 相同"。**实测证伪**（D15 的三个探针）：socket 处于 `ConnectingState` 时 `abort()` 对 `waitForConnected()` 与 `readAll()` 流**双双唤不醒**，均挂满 3000ms 超时；而持句柄 `close()` **1 毫秒内**两处都醒。
+>
+> 成因：Qt 的 `QAbstractSocket::abort()` 在**连接中**的 socket 上**不发 `errorOccurred`**，而 `corosocket` 的 `waitForSignal` / `readAll` 都靠 socket error 或 `disconnected` 终结。UDP 没有这个窗口——它的 `bind()` 是同步的，其 `socket_->close()` 打断活跃读流是实测有效的。
+>
+> 若不改：`Close()` 若恰好落在一次连不上的连接尝试中，最坏要等**一整个 `silence_timeout`** 才收敛。故 ②③ 必须各自持句柄打断，**缺一不可**。`Close()` **只发信号、不等收敛**，收尾由管理泵自己跑完；`WaitClosed()` join 管理泵（其内部已先 join 写泵），返回即"两条 fiber 都不再触碰本对象"。
 
 ##### ⑤ `CurrentLinkState()` —— 无状态成员，当场算出
 
