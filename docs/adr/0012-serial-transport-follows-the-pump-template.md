@@ -67,7 +67,11 @@
 
 - **D4（判活：静默超时是**唯一**主动判据——**反转 ADR-0011 D4**）：** ADR-0011 为 TCP 定的是"对端断开事件为主判据、静默超时为辅"。**串口反转回 UDP 形态**：没有断开事件（背景 ①），`silence_timeout` 是"链路坏了"的**唯一**主动判据。
 
-- **D5（读泵必须显式跳过空切片——串口独有）：** `coroiodevice::readAll()` 的 push **不判空**（`ch->push(dev->readAll())`），而 `corosocket::readAll()` 有 `if(!bytes.isEmpty())` 守卫。实测：设备重开后读流**立刻吐一个 0 字节切片**。
+- **D5（读泵必须显式跳过空切片——串口独有）：** `coroiodevice::readAll()` 的 `readyRead` 处理器是 `ch->push(dev->readAll())`——**无 `bytesAvailable()` 判断、无 `isEmpty()` 守卫**；而其**初次 drain** 那一处**有** `bytesAvailable() > 0` 检查，`corosocket::readAll()` 更是两处都有 `if(!bytes.isEmpty())`。**故空切片是 `coroiodevice` 独有的结构性缺口。**
+
+  > **依据的校准（2026-08-28，#193 实测）**：本条初稿写"实测：设备重开后读流**立刻吐一个 0 字节切片**"（源自 #186）。**#193 的实现复核未能复现**——去掉那一行 `continue` 后用例仍通过，且加计数探针跑完整个串口用例集（含拔线后）**一次空切片都没观测到**（Qt 5.15 / Linux PTY）。
+  >
+  > **本决策不变，但依据改为结构性的那一条**：守卫确实缺失，空推送在 `readyRead` 携零字节时必然发生；是否触发依 Qt 版本与设备驱动而异。相应地，`tests/serial_transport_test.cpp` 中该用例的定位是**契约断言**，而非已复现故障的回归——测试注释已写明。
 
   故串口读泵须显式 `if (chunk->isEmpty()) continue;`。**UDP/TCP 都不需要这一行**——这是串口独有的一处，且是"照抄样板就会漏"的典型。
 

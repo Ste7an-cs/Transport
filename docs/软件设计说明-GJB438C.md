@@ -571,7 +571,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | **SerialTransport**（ADR-0012 重构后，**目标形态、尚未实现**） | **设备管理泵 + 读写双队列**，与 `Udp`/`TcpTransport` 同构。外层泵：`open()`（**同步**，故无"等连上"这一处）→ 成功则建 `readAll` 流、`await_for(read_stream_, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal_, silence_timeout)` 退避。每轮末尾 `port->close()`，下轮在**同一对象**上重开。**唯一时间量** `silence_timeout` 两处共用（读静默 / 退避），比 TCP 少一处。**静默超时是唯一主动判据**（**D4 反转**：串口无断开事件）。**读泵须显式跳过空切片**（**D5**，串口独有）。**不自终**——TBD-005 已关闭，串口自动重开、与 TCP 同构。 |
 
 > **三处"照抄样板就会漏"的串口独有点**（ADR-0012）：
-> 1. **跳空切片**（**D5**）——`coroiodevice::readAll()` 的 push **不判空**（`ch->push(dev->readAll())`），而 `corosocket::readAll()` 有 `if(!bytes.isEmpty())` 守卫；实测设备重开后读流**立刻吐一个 0 字节切片**。UDP/TCP 都不需要这一行。
+> 1. **跳空切片**（**D5**）——`coroiodevice::readAll()` 的 `readyRead` 处理器是 `ch->push(dev->readAll())`，**无 `bytesAvailable()` 判断、无 `isEmpty()` 守卫**；其初次 drain 处**有**该检查，`corosocket::readAll()` 两处都有。**这是 `coroiodevice` 独有的结构性缺口**，UDP/TCP 都不需要这一行。
+>    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
 > 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
 | DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
