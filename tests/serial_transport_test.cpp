@@ -1,12 +1,52 @@
-// 协程原生 SerialTransport 契约真实 PTY 回环集成测试。
+// -----------------------------------------------------------------------------
+// serial_transport_test.cpp — 协程原生 SerialTransport 真实 PTY 回环集成测试(ADR-0012)
 //
-// 确定化手段:用 openpty() 造一对 master/slave 伪终端;SerialTransport 以 slave 的
-// /dev/pts/N 路径打开真实 QSerialPort(QSerialPort 在 PTY 上工作,已实测 open +
-// setBaudRate 生效、双向字节流、拔线时连发 ResourceError)。测试侧直接用 master fd
-// 的原始 read/write 充当串口对端,在 fiber 调度器内 pump 推进 Qt 事件循环。
-// 覆盖:字节流回环(切片任意)、配置(非默认波特率 + 非法配置/设备)、断开致命
-// (Closing→Closed 不重连)、单读者、超时不停流、我方 RequestClose。
-// 逐读 cancellation 为 out-of-scope(循环级中断靠 RequestClose),同 TcpTransport。
+// 确定化手段:用 `openpty()` 造一对 master/slave 伪终端;被测传输以 slave 的
+// `/dev/pts/N` 路径打开真实 `QSerialPort`,测试侧直接用 master fd 的原始 read/write 充当
+// 串口对端,在 fiber 调度器(coro_test_main)内 pump 推进 Qt 事件循环。
+//
+// **一个关键的对端观测手段**(本文件多处依赖):Linux 上 slave 的最后一个 fd 关闭后,
+// master 的 `read()` 返 **EIO**;slave 被重新打开后又回到 EAGAIN。故"设备被关了"与
+// "设备又开了"在**对端侧直接可观测**——`Close→退避→Open` 这一整圈不必靠固定 sleep 猜,
+// 全部断言因此是**事件驱动**的(`pumpFiberUntil`)。
+//
+// 覆盖九组事实:
+//   1. 配置校验(D12):六项非法配置 → kConfiguration 且**停在 Created**;改配可再 Start;
+//   2. 回环收字节:切片入队,`peer` 为**固定设备端点**(D9);
+//   3. 回环发字节:`peer` **被忽略**、任何值都写往那一个设备(D9,不判 kInvalidArgument);
+//   4. ⭐ **空切片被跳过**(**D5** 的回归证据):制造设备重开,断言调用方一侧**从未**取到
+//      0 字节的 `Datagram`;
+//   5. **静默超时触发重开**(**D4**):对端不发数据 → 对端观测到设备被关、随即重开,
+//      **同一个 `AsyncRead()` 句柄**照常收到重开后的数据(重开对调用方透明);
+//   6. **不自终**(**D1**,TBD-005 关闭的行为证据):设备不存在时 `Start()` 成功,数个
+//      `silence_timeout` 后仍 Running、`LastError()` 有值、读队列未被终结;
+//   7. **`Close()` 的四处打断**(**D6**):退避中 / 读等待中 / 写泵等数据 / 写泵等设备
+//      就绪,四条一条不能少,均须**远小于 `silence_timeout`** 收敛;
+//   8. `CurrentLinkState()` **只有两值**(**D10**):退避重开期间恒为 kDown,
+//      **不出现 kEstablishing**;
+//   9. 生命周期:未 Start 的读写、`Close()` 幂等、`WaitClosed()` 后可安全析构。
+//
+// 第 4 与第 7 组是本文件的核心。两组都做过负向对照(实测数字见 PR 正文):
+//
+//   | 打断(silence_timeout = 3s) | 四处齐备 | 去掉该处          |
+//   |------------------------------|----------|-------------------|
+//   | ① 退避                       | 0 ms     | 2900 ms           |
+//   | ② 读等待                     | 0 ms     | 2950 ms           |
+//   | ③ 写泵等数据                 | 0 ms     | **永久挂死**(>40s 被 timeout 杀) |
+//   | ④ 写泵等设备就绪             | 0 ms     | **永久挂死**(同上) |
+//
+// **写侧比读侧更严**:读侧两处用的是 `await_for`,漏一处最坏挂满一个 silence_timeout;
+// 写侧两处是**无限期** `await`,漏一处就是**永久挂死**——`WaitClosed()` join 管理泵,
+// 而管理泵收尾时要先 join 写泵。
+//
+// 注:**② 有两条独立有效的路径**——`read_stream_->close()` 与 `Close()` 里的
+// `port_->close()`(走 `aboutToClose`,ADR-0012 D6 的实测结论)。逐个去掉时另一条会顶上,
+// 各自仍 0 ms 收敛;上表 ② 的 2950 ms 是**同时去掉两者**测得的。这与 TCP 恰好相反
+// (其 `abort()` 在连接窗口内唤不醒任何等待,故 D15 要求必须持句柄 close)。
+//
+// **全部实测建立在 PTY 上,真实硬件未验**——这是 ADR-0012 已登记的代价③,本票不改变。
+// -----------------------------------------------------------------------------
+#include <errno.h>
 #include <fcntl.h>
 #include <pty.h>
 #include <unistd.h>
@@ -22,438 +62,552 @@
 
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
-#include "task/fibertask.h"
-#include <memory>
-
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/Message.hpp"
-#include "transport/node/ProtocolNode.hpp"
-#include "transport/io/serial/SerialTransport.hpp"
-#include "transport/codec/SystemCodec.hpp"
 #include "transport/io/serial/SerialConfig.hpp"
+#include "transport/io/serial/SerialTransport.hpp"
 
 using namespace std::chrono_literals;
+using testutil::AwaitRead;
+using testutil::pumpFiberUntil;
 using transport::Datagram;
 using transport::Endpoint;
-using transport::OperationOptions;
-using transport::SendUnit;
+using transport::LinkState;
 using transport::SerialConfig;
 using transport::SerialTransport;
-using transport::FrameType;
-using transport::Message;
-using transport::ProtocolNode;
-using transport::Result;
-using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 namespace {
 
-// 一对 PTY:master 为原始 fd(测试侧对端),slave_name 为 /dev/pts/N(被测串口打开)。
-struct PtyPair {
-  int master = -1;
-  std::string slave_name;
-  bool ok = false;
+// 必不存在的设备路径:用来把泵**钉在退避**里(`open()` 恒失败)。
+constexpr char kMissingDevice[] = "/dev/tty-no-such-serial-193";
+
+// 一对 PTY:master 为原始 fd(测试侧对端),slave 为 `/dev/pts/N`(被测传输打开)。
+class PtyPair {
+ public:
+  PtyPair() {
+    int slave = -1;
+    char name[256] = {0};
+    ok_ = ::openpty(&master_, &slave, name, nullptr, nullptr) == 0;
+    if (!ok_) {
+      return;
+    }
+    ::close(slave);  // 由 QSerialPort 按名字重新打开 slave(故"最后一个 slave fd"归它)。
+    ::fcntl(master_, F_SETFL, ::fcntl(master_, F_GETFL, 0) | O_NONBLOCK);
+    slave_name_ = name;
+  }
+  ~PtyPair() {
+    if (master_ >= 0) {
+      ::close(master_);
+    }
+  }
+  PtyPair(const PtyPair&) = delete;
+  PtyPair& operator=(const PtyPair&) = delete;
+
+  bool ok() const { return ok_; }
+  int master() const { return master_; }
+  /// 交出 master fd 的所有权(此后析构不再关它)——供"拔线"用例自行关闭。
+  int detach_master() {
+    const int fd = master_;
+    master_ = -1;
+    return fd;
+  }
+  const std::string& slave() const { return slave_name_; }
+
+ private:
+  int master_ = -1;
+  std::string slave_name_;
+  bool ok_ = false;
 };
 
-PtyPair MakePty() {
-  PtyPair p;
-  int slave = -1;
-  char name[256] = {0};
-  if (openpty(&p.master, &slave, name, nullptr, nullptr) != 0) {
-    return p;
+// 对端侧一次非阻塞排空(EAGAIN 即无更多数据;slave 全部 fd 关闭时为 EIO,同样返回)。
+void DrainPeer(int master, std::vector<std::uint8_t>* sink) {
+  std::uint8_t buf[512];
+  for (;;) {
+    const ssize_t r = ::read(master, buf, sizeof(buf));
+    if (r <= 0) {
+      return;
+    }
+    sink->insert(sink->end(), buf, buf + r);
   }
-  ::close(slave);  // 由 QSerialPort 按名字重新打开 slave。
-  ::fcntl(p.master, F_SETFL, ::fcntl(p.master, F_GETFL, 0) | O_NONBLOCK);
-  p.slave_name = name;
-  p.ok = true;
-  return p;
 }
 
-SendUnit Frame(std::vector<std::uint8_t> bytes) {
-  return SendUnit{std::move(bytes), Endpoint::Default()};
+SerialConfig ConfigFor(const std::string& device,
+                       std::chrono::milliseconds silence) {
+  SerialConfig config;
+  config.device = device;
+  config.silence_timeout = silence;
+  return config;
 }
 
-// 在 fiber 内 pump,直到从 master 读满 n 字节或超时;返回已读字节(字节流,切片任意)。
-std::vector<std::uint8_t> ReadMaster(int master, std::size_t n, int budget_ms) {
+std::vector<std::uint8_t> Bytes(const char* text) {
+  const std::string s(text);
+  return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
+Datagram Unit(const char* text, Endpoint peer = Endpoint::Default()) {
+  return Datagram{Bytes(text), std::move(peer)};
+}
+
+// 在对端(master)侧收满 want 字节(或超时);字节流,切片任意。
+std::vector<std::uint8_t> RecvAtLeast(int master, std::size_t want,
+                                      int budget_ms = 3000) {
   std::vector<std::uint8_t> got;
-  testutil::pumpFiberUntil(
+  pumpFiberUntil([&] { DrainPeer(master, &got); return got.size() >= want; },
+                 budget_ms);
+  return got;
+}
+
+// 把读队列里此刻**已积压**的全部切片取空(逐次短等待,直到一次超时为止)。
+// 用于第 4 组:空切片若被投出来,一定还躺在有界队列里。
+std::vector<Coro::Result<Datagram>> DrainRead(
+    const std::shared_ptr<Coro::Awaitable<Datagram>>& rx,
+    std::chrono::milliseconds quiet = 200ms) {
+  std::vector<Coro::Result<Datagram>> out;
+  for (;;) {
+    auto got = AwaitRead(rx, quiet);
+    if (!got) {
+      return out;  // 队列已空(kTimeout)或已终结(kClosed)。
+    }
+    out.push_back(std::move(got));
+  }
+}
+
+std::chrono::milliseconds Since(std::chrono::steady_clock::time_point began) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - began);
+}
+
+}  // namespace
+
+// —— 1. 配置校验(D12)——————————————————————————————————————————————————
+
+// AC:六项非法配置一律返 kConfiguration,且**停在 Created**——未起泵(`IsRunning()` 假)、
+// 读句柄仍以 kInvalidState 关闭(该错误只在 Created 才给);改配后可再 Start 成功。
+TEST(CoroSerialTransport, RejectsInvalidConfigAndStaysCreated) {
+  SerialConfig bad[6];
+  bad[0] = ConfigFor("", 1000ms);                     // device 空。
+  bad[1] = ConfigFor(kMissingDevice, 1000ms);
+  bad[1].baud_rate = 0;                               // 波特率为 0。
+  bad[2] = ConfigFor(kMissingDevice, 0ms);            // 无"0 = 禁用"这一档(与 UDP 异)。
+  bad[3] = ConfigFor(kMissingDevice, -5ms);           // 负值同理。
+  bad[4] = ConfigFor(kMissingDevice, 1000ms);
+  bad[4].data_bits = 99;                              // 数据位越界。
+  bad[5] = ConfigFor(kMissingDevice, 1000ms);
+  bad[5].stop_bits = 3;                               // 停止位越界。
+
+  for (const SerialConfig& config : bad) {
+    SerialTransport t(config);
+    auto started = t.Start();
+    ASSERT_FALSE(started);
+    EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
+    EXPECT_FALSE(t.IsRunning());
+    EXPECT_EQ(t.CurrentLinkState(), LinkState::kDown);
+    auto handle = t.AsyncRead();
+    auto got = AwaitRead(handle, 0ms);
+    ASSERT_FALSE(got);
+    EXPECT_EQ(got.error(), make_error_code(TransportErrc::kInvalidState))
+        << "配置校验失败后未停在 Created";
+  }
+
+  // 校验非法的 parity 单列一条(char 值域):'X' 不在 N/E/O 内。
+  SerialConfig bad_parity = ConfigFor(kMissingDevice, 1000ms);
+  bad_parity.parity = 'X';
+  SerialTransport rejected(bad_parity);
+  auto parity_started = rejected.Start();
+  ASSERT_FALSE(parity_started);
+  EXPECT_EQ(parity_started.error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  // 配置合法即可 Start——校验是配置的属性,不是实例的死刑。
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport good(ConfigFor(pty.slave(), 1000ms));
+  EXPECT_TRUE(good.Start());
+  EXPECT_TRUE(good.IsRunning());
+  EXPECT_EQ(good.CurrentLinkState(), LinkState::kUp)
+      << "open() 是同步的,Start() 返回后链路即应可观测(与 TCP 的差异)";
+  EXPECT_TRUE(good.Close());
+  good.WaitClosed();
+}
+
+// —— 2. 回环收字节 ——————————————————————————————————————————————————
+
+// AC(RT_TRANSPORT_003 / D9):对端发出的字节原样入队(切片,不是帧),`peer` 是
+// **固定设备端点**——串口无 peer 概念,不从设备上取来源,且每一片都相同。
+TEST(CoroSerialTransport, DeliversBytesWithFixedDevicePeer) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_EQ(t.CurrentLinkState(), LinkState::kUp);
+  auto rx = t.AsyncRead();
+
+  const std::string payload = "hello-serial";
+  ASSERT_EQ(::write(pty.master(), payload.data(), payload.size()),
+            static_cast<ssize_t>(payload.size()));
+
+  std::vector<std::uint8_t> got;
+  Endpoint first_peer;
+  bool first = true;
+  while (got.size() < payload.size()) {
+    auto chunk = AwaitRead(rx, 2000ms);
+    ASSERT_TRUE(chunk) << chunk.error().message();
+    EXPECT_FALSE(chunk.value().bytes.empty()) << "投出了空切片(D5)";
+    if (first) {
+      first_peer = chunk.value().peer;
+      first = false;
+    } else {
+      EXPECT_EQ(chunk.value().peer.kind, first_peer.kind)
+          << "同一设备的切片给出了不同的 peer";
+    }
+    got.insert(got.end(), chunk.value().bytes.begin(),
+               chunk.value().bytes.end());
+  }
+  EXPECT_EQ(got, Bytes("hello-serial"));
+  // 固定设备端点(D9):`Endpoint` 现有三 kind 里只有 kDefault 能如实表达单设备介质
+  // ——既非 kNet 的 ip:port,也非 kTopic 的 DDS 主题。
+  EXPECT_EQ(first_peer.kind, Endpoint::Kind::kDefault);
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// —— 3. 回环发字节 ——————————————————————————————————————————————————
+
+// AC(RT_TRANSPORT_003 / D9):`AsyncWrite` 的字节原样出现在设备对端;`peer` **一律
+// 忽略**——填 kNet / kTopic 也照样写往那一个设备,且**不返 kInvalidArgument**。
+// 这与 `UdpTransport` 相反(它按 peer 解析目的地、解析不了就丢该条并记 LastError)。
+TEST(CoroSerialTransport, WritesBytesIgnoringPeer) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(t.Start());
+
+  ASSERT_TRUE(t.AsyncWrite(Unit("a", Endpoint::Default())));
+  ASSERT_TRUE(t.AsyncWrite(Unit("b", Endpoint::Net("192.0.2.1", 9))));
+  ASSERT_TRUE(t.AsyncWrite(Unit("c", Endpoint::Topic("no-such-medium"))));
+
+  EXPECT_EQ(RecvAtLeast(pty.master(), 3), Bytes("abc"))
+      << "peer 未被忽略:某一条没写到配置的那个设备";
+  EXPECT_NE(t.LastError(), make_error_code(TransportErrc::kInvalidArgument))
+      << "串口不得因 peer 非默认而判非法(D9)";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// —— 4. ⭐ 空切片被跳过(D5 的回归证据)————————————————————————————————
+
+// AC(**D5**):`coroiodevice::readAll()` 的 push **不判空**(`ch->push(dev->readAll())`),
+// 而 `corosocket::readAll()` 有 `if(!bytes.isEmpty())` 守卫——故**串口读泵必须显式
+// `if (chunk->isEmpty()) continue;`**,UDP/TCP 都不需要这一行。
+//
+// 本用例制造真实的设备重开(静默超时驱动),然后把读队列**整个取空**:断言取到的每一个
+// `Datagram` 都非空,且取到的字节**恰好只有对端真发的那些**。若重开吐出 0 字节切片而
+// 实现漏了那一行,该切片会躺在有界队列里,本用例当场失败。
+//
+// **如实登记一处未复现**:本环境(Qt 5.15 / Linux PTY)下做过负向对照——把实现里那一行
+// `if (bytes.isEmpty()) continue;` 去掉后本用例**仍然通过**,且在读泵里加计数探针跑完
+// 整个串口用例集,**一次空切片都没观测到**(包括拔线之后)。即 #186 记录的"设备重开后
+// 读流立刻吐一个 0 字节切片"**在本环境未能复现**。那一行**仍然保留**:它是 ADR-0012
+// **D5** 的明文决策、成本一行、且 `coroiodevice::readAll()` 的 `ch->push(dev->readAll())`
+// 确实**不判空**(源码级事实,与 `corosocket` 的 `if(!bytes.isEmpty())` 守卫相对),
+// 空切片能否出现只取决于 Qt 在何种条件下发一次"无字节可读的 `readyRead`"。
+// 本用例因此是**契约断言**(调用方永不取到空 `Datagram`),而非一条已复现故障的回归。
+TEST(CoroSerialTransport, NeverDeliversEmptyChunksAcrossDeviceReopen) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 200ms));  // 短静默:快速逼出重开。
+  ASSERT_TRUE(t.Start());
+  auto rx = t.AsyncRead();  // 【全程只取这一次句柄】
+
+  // 逼出一整圈"关设备 → 重开设备"(对端不发一个字节,静默超时是唯一驱动)。
+  // 门槛是**事件**而非固定 sleep:`LastError()` 变 kTimeout 即静默判据已触发,那正是
+  // `break → port_->close() → 下一轮 Open()` 这一圈的入口(归因就落在 break 之前)。
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.LastError() == make_error_code(TransportErrc::kTimeout); },
+      3000))
+      << "静默超时未触发(重开这一圈根本没发生,后续断言无意义)";
+
+  // 重开之后设备照常工作:对端发一批真数据。**数据能到达本身就是重开成功的证据**
+  // ——泵在上一步已把设备关掉,不重开就一个字节也收不到。
+  const std::string payload = "after-reopen";
+  ASSERT_EQ(::write(pty.master(), payload.data(), payload.size()),
+            static_cast<ssize_t>(payload.size()));
+
+  // 把队列整个取空:每一片都必须非空,且拼起来恰好只有真数据。
+  std::vector<std::uint8_t> assembled;
+  std::size_t empty_chunks = 0;
+  ASSERT_TRUE(pumpFiberUntil(
       [&] {
-        std::uint8_t buf[256];
-        for (;;) {
-          const ssize_t r = ::read(master, buf, sizeof(buf));
-          if (r > 0) {
-            got.insert(got.end(), buf, buf + r);
-          } else {
-            break;  // EAGAIN / 无更多数据。
+        for (auto& chunk : DrainRead(rx, 50ms)) {
+          if (chunk.value().bytes.empty()) {
+            ++empty_chunks;
           }
+          assembled.insert(assembled.end(), chunk.value().bytes.begin(),
+                           chunk.value().bytes.end());
         }
-        return got.size() >= n;
+        return assembled.size() >= payload.size();
       },
-      budget_ms);
-  return got;
+      3000))
+      << "重开后的数据没有从同一个句柄取到";
+  EXPECT_EQ(empty_chunks, 0u)
+      << "读泵投出了 0 字节切片——D5 的那一行 `if (chunk->isEmpty()) continue;` 丢了";
+  EXPECT_EQ(assembled, Bytes("after-reopen"))
+      << "取到的字节不止对端真发的那些(混入了空切片或残留)";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
 }
 
-// 在 fiber 内 pump,通过被测传输读满 n 字节(字节流,切片任意)。
-std::vector<std::uint8_t> ReadTransport(SerialTransport& t, std::size_t n,
-                                        int budget_ms) {
+// —— 5. 静默超时触发重开(D4)————————————————————————————————————————
+
+// AC(**D4**,反转 ADR-0011 D4):串口**没有断开事件**,`silence_timeout` 是"链路坏了"
+// 的**唯一**主动判据。对端长时间不发数据 → 泵判链路坏 → `close()` → 重开。
+//
+// **"关掉了"这一步怎么证**:`close()` 与紧接着的 `open()` 之间**没有任何挂起点**(串口的
+// `open()` 是同步的),故对端那个"slave 全部 fd 已关 → read 返 EIO"的窗口**宽度为零**,
+// 测试 fiber 根本调度不到——直接观测行不通。本用例改用一条**决定性**的判据:
+//
+//   先让静默超时打一圈(`LastError()` 变 kTimeout,且重开后的设备照常收字节),
+//   再**拔线**(关掉 pty master,`/dev/pts/N` 随之消失),然后断言链路变 `kDown`。
+//
+// 这一步之所以决定性:据 ADR-0012 背景 ①(实测),拔线后 `readAll()` 流**完全不终止**、
+// `isOpen()` **仍为 true**——即**如果泵不主动 `close()`,链路永远不会变 kDown**。故
+// kDown 只可能来自"静默超时 → 泵主动关设备 → 重开失败(设备已不在)"这一整圈。
+// 顺带也证了**不自终**(D1):此后仍 Running,只是退避重试。
+TEST(CoroSerialTransport, SilenceTimeoutClosesAndReopensDevice) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 200ms));
+  ASSERT_TRUE(t.Start());
+  auto rx = t.AsyncRead();  // 【全程只取这一次句柄】
+  ASSERT_EQ(t.CurrentLinkState(), LinkState::kUp);
+
+  // ① 静默超时触发,并归因到 LastError(它是串口判活的唯一主动判据)。
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.LastError() == make_error_code(TransportErrc::kTimeout); },
+      3000))
+      << "静默超时未触发/未归因";
+
+  // ② 重开成功且**对调用方透明**:重开后的数据照常从**同一个句柄**取到——泵刚把设备
+  //    关过,不重开就一个字节也收不到。
+  const std::string payload = "post-reopen";
+  ASSERT_EQ(::write(pty.master(), payload.data(), payload.size()),
+            static_cast<ssize_t>(payload.size()));
   std::vector<std::uint8_t> got;
-  const auto stop = OperationOptions::Clock::now() + std::chrono::milliseconds(budget_ms);
-  while (got.size() < n && OperationOptions::Clock::now() < stop) {
-    OperationOptions opts;
-    opts.deadline = OperationOptions::Clock::now() + 200ms;
-    auto r = testutil::ReadOnce(t, opts);
-    if (r) {
-      got.insert(got.end(), r.value().bytes.begin(), r.value().bytes.end());
-    } else if (r.error() != make_error_code(TransportErrc::kTimeout)) {
-      break;  // 非超时错误(断开/关闭)→ 停止。
-    }
-  }
-  return got;
-}
-
-}  // namespace
-
-// 回环:被测传输 Write → master 读到相同字节(字节流)。source 为中立默认目的地。
-TEST(CoroSerialTransport, TransportWriteReachesPeer) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  const std::vector<std::uint8_t> frame(32, 0x5A);
-  ASSERT_TRUE(t.Write(Frame(frame)));
-  const std::vector<std::uint8_t> got = ReadMaster(pty.master, frame.size(), 3000);
-  EXPECT_EQ(got, frame);
-
-  ::close(pty.master);
-}
-
-// 回环:master 写 → 被测传输 Read 读到相同字节;Datagram.peer 为默认目的地。
-TEST(CoroSerialTransport, PeerWriteReachesTransport) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  const std::vector<std::uint8_t> frame(48, 0x3C);
-  ASSERT_EQ(::write(pty.master, frame.data(), frame.size()),
-            static_cast<ssize_t>(frame.size()));
-
-  OperationOptions opts;
-  opts.deadline = OperationOptions::Clock::now() + 3s;
-  auto first = testutil::ReadOnce(t, opts);
-  ASSERT_TRUE(first) << first.error().message();
-  EXPECT_EQ(first.value().peer.kind, Endpoint::Kind::kDefault);
-  std::vector<std::uint8_t> got(first.value().bytes.begin(),
-                                first.value().bytes.end());
-  while (got.size() < frame.size()) {
-    auto more = ReadTransport(t, frame.size() - got.size(), 2000);
-    got.insert(got.end(), more.begin(), more.end());
-    if (more.empty()) break;
-  }
-  EXPECT_EQ(got, frame);
-
-  ::close(pty.master);
-}
-
-// 配置生效:非默认波特率(9600)+ 完整参数应用后双向回环仍通。
-TEST(CoroSerialTransport, NonDefaultBaudConfigApplied) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  cfg.baud_rate = 9600;
-  cfg.data_bits = 8;
-  cfg.stop_bits = 1;
-  cfg.parity = 'N';
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  const std::vector<std::uint8_t> frame(16, 0xA5);
-  ASSERT_TRUE(t.Write(Frame(frame)));
-  const std::vector<std::uint8_t> got = ReadMaster(pty.master, frame.size(), 3000);
-  EXPECT_EQ(got, frame);
-
-  ::close(pty.master);
-}
-
-// 配置非法:数据位越界 → Configuration(参数应用路径可判别)。
-TEST(CoroSerialTransport, InvalidConfigYieldsConfiguration) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  cfg.data_bits = 99;  // 非法。
-  SerialTransport t(cfg);
-  auto s = t.Start();
-  EXPECT_FALSE(s);
-  EXPECT_EQ(s.error(), make_error_code(TransportErrc::kConfiguration));
-  ::close(pty.master);
-}
-
-// 打开失败:不存在的设备路径 → Connection。
-TEST(CoroSerialTransport, OpenFailureYieldsConnection) {
-  SerialConfig cfg;
-  cfg.device = "/dev/tty-nonexistent-serial-xyz";
-  SerialTransport t(cfg);
-  auto s = t.Start();
-  EXPECT_FALSE(s);
-  EXPECT_EQ(s.error(), make_error_code(TransportErrc::kConnection));
-}
-
-// 断开致命(RT_TRANSPORT_008 / ADR-0004 D1):设备致命错误(对端 master 关闭)→ 在途
-// Read 以 Closed 收敛(串口不重连,链路终结即传输终结),传输 Closing→Closed;
-// WaitClosed 完成。底层成因(Connection)降为诊断事实,留在 LastError()。
-TEST(CoroSerialTransport, PeerDisconnectIsFatalClosingToClosed) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  std::error_code read_err;
-  bool read_ok = true;
-  Coro::Awaitable<void> entered;
-  auto reader = Coro::makeTask([&] {
-    entered.resolve();
-    OperationOptions opts;
-    opts.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = testutil::ReadOnce(t, opts);
-    read_ok = static_cast<bool>(r);
-    if (!r) read_err = r.error();
-  });
-  ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让 Read 挂起在流上。
-  ::close(pty.master);                  // 拔线:slave 端 hangup。
-
-  EXPECT_TRUE(reader.get());
-  EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
-  EXPECT_EQ(t.LastError(), make_error_code(TransportErrc::kConnection));
-
-  // 致命 → 已 Closing→Closed:WaitClosed 立即完成,后续 Read 返回 Closed(不重连)。
-  OperationOptions wopts;
-  wopts.deadline = OperationOptions::Clock::now() + 2s;
-  EXPECT_TRUE(t.WaitClosed(wopts));
-  auto after = testutil::ReadOnce(t);
-  EXPECT_FALSE(after);
-  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
-}
-
-// 我方 RequestClose → 在途 Read 以 Closed 收敛(与设备致命断开同一终止语义:调用方
-// 无须区分"谁终结了传输",只须停止读取)。
-TEST(CoroSerialTransport, RequestCloseWakesPendingReadWithClosed) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  std::error_code read_err;
-  bool read_ok = true;
-  Coro::Awaitable<void> entered;
-  auto reader = Coro::makeTask([&] {
-    entered.resolve();
-    OperationOptions opts;
-    opts.deadline = OperationOptions::Clock::now() + 3s;
-    auto r = testutil::ReadOnce(t, opts);
-    read_ok = static_cast<bool>(r);
-    if (!r) read_err = r.error();
-  });
-  ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);
-  EXPECT_TRUE(t.RequestClose());
-
-  EXPECT_TRUE(reader.get());
-  EXPECT_FALSE(read_ok);
-  EXPECT_EQ(read_err, make_error_code(TransportErrc::kClosed));
-  EXPECT_TRUE(t.WaitClosed());
-  ::close(pty.master);
-}
-
-// ADR-0007 D4:单读守卫已删除——已有在途读者时,并发第二个读者**不再被拒**
-// (此前返 kInvalidState):两者同挂在 read_queue 上,无数据则各按自己的 deadline
-// 以 kTimeout 收敛(抢占式共读,socket 的 read 本就如此)。
-TEST(CoroSerialTransport, ConcurrentSecondReadIsNotRejected) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  Coro::Awaitable<void> entered;
-  bool first_ok = true;
-  std::error_code first_err;
-  auto reader = Coro::makeTask([&] {
-    entered.resolve();
-    OperationOptions opts;
-    opts.deadline = OperationOptions::Clock::now() + 300ms;
-    auto r = testutil::ReadOnce(t, opts);
-    first_ok = static_cast<bool>(r);
-    if (!r) first_err = r.error();
-  });
-  ASSERT_TRUE(entered.await());
-  boost::this_fiber::sleep_for(30ms);  // 让第一个读者先挂到 read_queue 上。
-
-  OperationOptions opts;
-  opts.deadline = OperationOptions::Clock::now() + 200ms;
-  auto second = testutil::ReadOnce(t, opts);
-  ASSERT_FALSE(second);
-  EXPECT_NE(second.error(), make_error_code(TransportErrc::kInvalidState));
-  EXPECT_EQ(second.error(), make_error_code(TransportErrc::kTimeout));
-
-  EXPECT_TRUE(reader.get());
-  EXPECT_FALSE(first_ok);
-  EXPECT_EQ(first_err, make_error_code(TransportErrc::kTimeout));
-  ::close(pty.master);
-}
-
-// 边界守卫:可继续的瞬时读错误**不是**致命——带 deadline 的 Read 超时 → Timeout
-// (非 kClosed),且不停流:后续数据到达后再次 Read 仍拿到(SRS §3.1.2.4)。
-TEST(CoroSerialTransport, DeadlineTimeoutDoesNotStopStream) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  SerialTransport t(cfg);
-  ASSERT_TRUE(t.Start()) << t.LastError().message();
-
-  OperationOptions timeout_opts;
-  timeout_opts.deadline = OperationOptions::Clock::now() + 60ms;
-  auto timed_out = testutil::ReadOnce(t, timeout_opts);
-  ASSERT_FALSE(timed_out);
-  EXPECT_EQ(timed_out.error(), make_error_code(TransportErrc::kTimeout));
-
-  const std::vector<std::uint8_t> frame(16, 0x77);
-  ASSERT_EQ(::write(pty.master, frame.data(), frame.size()),
-            static_cast<ssize_t>(frame.size()));
-  const std::vector<std::uint8_t> got = ReadTransport(t, frame.size(), 3000);
-  EXPECT_EQ(got, frame);
-
-  ::close(pty.master);
-}
-
-namespace {
-
-Message MakeRequest(std::uint16_t message_id, std::vector<std::uint8_t> payload) {
-  Message req;
-  req.message_id = message_id;
-  req.payload = std::move(payload);
-  return req;
-}
-
-// 标准 echo 响应(与 DefaultProtocolKeyStrategy 配对规则一致):frm_type=kResponse、
-// session_id 原样、message_id = 请求码 | 0x1000、payload echo。
-Message EchoResponse(const Message& command) {
-  Message resp;
-  resp.frm_type = FrameType::kResponse;
-  resp.protocol_id = command.protocol_id;
-  resp.session_id = command.session_id;
-  resp.message_id = static_cast<std::uint16_t>(command.message_id | 0x1000);
-  resp.payload = command.payload;
-  return resp;
-}
-
-// master 侧裸 echo harness fiber:直接在 master fd 上收发原始字节 + SystemCodec 组帧
-// (SystemCodec.Decode 内部缓冲跨切片,故可逐片喂入)。收 kCommand → 回一帧标准
-// 响应。stop 置真后退出。充当串口对端(节点在 slave 侧)。
-auto SpawnMasterEcho(int master, bool& ended, const bool& stop) {
-  return Coro::makeTask([master, &ended, &stop] {
-    SystemCodec codec;
-    while (!stop) {
-      std::uint8_t buf[256];
-      const ssize_t r = ::read(master, buf, sizeof(buf));
-      if (r > 0) {
-        auto decoded = codec.Decode(buf, static_cast<std::size_t>(r));
-        if (decoded) {
-          for (const auto& command : decoded.value()) {
-            if (command.frm_type != FrameType::kCommand) {
-              continue;
-            }
-            auto encoded = codec.Encode(EchoResponse(command));
-            if (encoded) {
-              const auto& out = encoded.value();
-              ssize_t off = 0;
-              while (off < static_cast<ssize_t>(out.size())) {
-                const ssize_t w = ::write(master, out.data() + off,
-                                          out.size() - off);
-                if (w > 0) {
-                  off += w;
-                } else {
-                  boost::this_fiber::sleep_for(1ms);
-                }
-              }
-            }
-          }
+  ASSERT_TRUE(pumpFiberUntil(
+      [&] {
+        for (auto& chunk : DrainRead(rx, 20ms)) {
+          got.insert(got.end(), chunk.value().bytes.begin(),
+                     chunk.value().bytes.end());
         }
-      } else {
-        boost::this_fiber::sleep_for(1ms);  // EAGAIN → 让出推进调度器。
-      }
-    }
-    ended = true;
-  });
+        return got.size() >= payload.size();
+      },
+      3000))
+      << "重开后数据未从同一个 AsyncRead 句柄取到(重开未对调用方透明)";
+  EXPECT_EQ(got, Bytes("post-reopen"));
+  EXPECT_EQ(t.CurrentLinkState(), LinkState::kUp);
+
+  // ③ 拔线:设备消失。**没有泵的主动 close(),链路永远不会变 kDown**(拔线后
+  //    readAll() 不终止、isOpen() 仍为 true——ADR-0012 背景 ①)。故 kDown 就是
+  //    "静默超时 → 关设备 → 重开"这一整圈的决定性证据。
+  ::close(pty.detach_master());
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kDown; }, 3000))
+      << "设备已消失而链路仍报 kUp:泵没有在静默超时后主动关闭设备(D4)";
+  EXPECT_TRUE(t.IsRunning()) << "串口自终了(D1 要求不自终)";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
 }
 
-}  // namespace
+// —— 6. 不自终(D1,TBD-005 关闭的行为证据)——————————————————————————
 
-// (可选)端到端:真 ProtocolNode(SerialTransport + 流式 SystemCodec)经 PTY 回环向
-// master 侧裸 echo 对端发一次请求-应答,Request 恰好一次完成、payload 与 echo 一致。
-// 证实串口传输可无改动组合进节点栈(RT_NODE_006 / D12 复用实证)。
-TEST(CoroSerialTransport, NodeRequestResponseEndToEnd) {
-  PtyPair pty = MakePty();
-  ASSERT_TRUE(pty.ok);
-  bool echo_ended = false;
-  bool stop = false;
-  auto echo = SpawnMasterEcho(pty.master, echo_ended, stop);
+// AC(**D1**):设备根本不存在 → `Start()` **成功**(打开失败不算启动失败),泵无限退避
+// 重试;数个 `silence_timeout` 后仍 Running、`LastError()` 有值、**读队列未被终结**。
+// 这正是 RT_LIFECYCLE_008 的串口一支被推翻后的行为:**只有我方 Close 才终止**。
+TEST(CoroSerialTransport, NeverSelfTerminatesWhileDeviceIsMissing) {
+  SerialTransport t(ConfigFor(kMissingDevice, 200ms));
+  ASSERT_TRUE(t.Start()) << "打开失败被当成了启动失败(D1)";
+  auto rx = t.AsyncRead();
+  ASSERT_TRUE(pumpFiberUntil([&t] { return static_cast<bool>(t.LastError()); },
+                             1000))
+      << "打不开设备却没留下诊断事实";
 
-  SerialConfig cfg;
-  cfg.device = pty.slave_name;
-  auto node = std::make_unique<ProtocolNode>(
-      std::make_unique<SerialTransport>(cfg), std::make_unique<SystemCodec>());
-  ASSERT_TRUE(node->Start());
+  boost::this_fiber::sleep_for(1000ms);  // 数个 silence_timeout(≈5 轮退避重试)。
 
-  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto request = Coro::makeTask([&] {
-    OperationOptions options;
-    options.deadline = OperationOptions::Clock::now() + 3s;
-    outcome = node->Request(MakeRequest(0x0002, {0x11, 0x22, 0x33}), options);
-    done = true;
-  });
+  EXPECT_TRUE(t.IsRunning()) << "串口自终了(D1 要求不自终)";
+  EXPECT_EQ(t.LastError(), make_error_code(TransportErrc::kConnection));
+  EXPECT_EQ(t.CurrentLinkState(), LinkState::kDown);
+  auto got = AwaitRead(rx, 50ms);
+  ASSERT_FALSE(got);
+  EXPECT_EQ(got.error(), make_error_code(TransportErrc::kTimeout))
+      << "读队列被提前终结(应只有我方 Close 才终止)";
 
-  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return done; }, 4000));
-  ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(outcome.value().message_id, 0x1002);
-  EXPECT_EQ(outcome.value().payload,
-            (std::vector<std::uint8_t>{0x11, 0x22, 0x33}));
-
-  stop = true;
-  ASSERT_TRUE(node->Close());
-  EXPECT_TRUE(testutil::pumpFiberUntil([&] { return echo_ended; }, 2000));
-  EXPECT_TRUE(request.get());
-  EXPECT_TRUE(echo.get());
-  ::close(pty.master);
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
 }
 
-// 生命周期:Start 前 Read/Write → InvalidState。
-TEST(CoroSerialTransport, OperationsBeforeStartAreInvalidState) {
-  SerialConfig cfg;
-  cfg.device = "/dev/null";
-  SerialTransport t(cfg);
-  auto r = testutil::ReadOnce(t);
-  EXPECT_FALSE(r);
-  EXPECT_EQ(r.error(), make_error_code(TransportErrc::kInvalidState));
-  auto w = t.Write(Frame({1, 2, 3}));
-  EXPECT_FALSE(w);
-  EXPECT_EQ(w.error(), make_error_code(TransportErrc::kInvalidState));
+// —— 7. `Close()` 的四处打断(D6 的回归证据)————————————————————————————
+
+// 【打断之一:管理泵停在**退避**】设备不存在,`open()` 恒失败,泵钉在
+// `await_for(close_signal_, 3s)` 上。AC:`close_signal_->close()` 即刻唤醒。
+TEST(CoroSerialTransport, CloseDuringBackoffConvergesPromptly) {
+  SerialTransport t(ConfigFor(kMissingDevice, 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(pumpFiberUntil([&t] { return static_cast<bool>(t.LastError()); },
+                             500))
+      << "未进入'打不开'的状态,后续断言无意义";
+  ASSERT_EQ(t.CurrentLinkState(), LinkState::kDown);
+  // 让泵**真的**跑进退避里:`Start()` 就地试开过一次(故 LastError 立刻有值),但泵
+  // fiber 此刻可能一步都还没跑——不让出的话本用例测的是"泵还没起就 Close",不是打断。
+  boost::this_fiber::sleep_for(100ms);
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断重开退避";
+}
+
+// 【打断之二:管理泵停在**读等待**】设备打开、对端一字节不发,泵钉在
+// `await_for(read_stream_, 3s)` 上。AC:`read_stream_->close()`(以及 `port_->close()`
+// 这条串口独有的有效路径,D6)即刻唤醒。
+TEST(CoroSerialTransport, CloseDuringReadWaitConvergesPromptly) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }, 500));
+  boost::this_fiber::sleep_for(50ms);  // 泵已建流并进入读等待(对端一字节未发)。
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断读等待";
+}
+
+// 【打断之三:写泵停在**等数据**】设备打开、一字节不写,写泵钉在 `await(write_queue_)`
+// 上——那是**无限期**等待(不是 await_for),漏了 `write_queue_->close()` 就是**永久
+// 挂死**,而不只是挂满一个 silence_timeout。AC:关写队列即刻唤醒。
+//
+// 注:此刻管理泵同时钉在读等待上,故本用例的收敛同样依赖打断之二;两者的区分靠**负向
+// 对照**(逐个去掉打断重跑)完成,见文件头的表。
+TEST(CoroSerialTransport, CloseWhileWritePumpWaitsForDataConvergesPromptly) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(pumpFiberUntil(
+      [&t] { return t.CurrentLinkState() == LinkState::kUp; }, 500));
+  boost::this_fiber::sleep_for(50ms);  // 写泵已进到"等数据"里(队列始终为空)。
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断写泵的'等数据'";
+}
+
+// 【打断之四:写泵停在**等设备就绪**】设备不存在且**有待发数据**:写泵取到数据后判设备
+// 未打开,钉在 `await(device_ready_)` 上——同样是无限期等待。AC:`device_ready_->close()`
+// 即刻唤醒(注意管理泵此刻钉在退避上,靠打断之一收敛)。
+TEST(CoroSerialTransport, CloseWhileWritePumpWaitsForDeviceConvergesPromptly) {
+  SerialTransport t(ConfigFor(kMissingDevice, 3000ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(t.AsyncWrite(Unit("never-sent")))
+      << "设备不可用时 AsyncWrite 应照常入队即返";
+  boost::this_fiber::sleep_for(100ms);  // 写泵已进到"等设备就绪"里。
+  ASSERT_EQ(t.CurrentLinkState(), LinkState::kDown);
+
+  const auto began = std::chrono::steady_clock::now();
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_LT(Since(began), 500ms) << "Close 未打断写泵的'等设备就绪'";
+}
+
+// —— 8. `CurrentLinkState()` 只有两值(D10)————————————————————————————
+
+// AC(**D10**):串口只给 `kDown` / `kUp`,**永不出现 `kEstablishing`**——退避重开期间
+// 报 kDown 更诚实(此刻确实收发不了字节);且退避是连接管理策略,不经本查询暴露。
+// 这一点与 `UdpTransport` 一致、与 `TcpTransport` 分歧(后者退避重连期间报
+// kEstablishing)。
+TEST(CoroSerialTransport, LinkStateHasOnlyTwoValues) {
+  SerialTransport t(ConfigFor(kMissingDevice, 200ms));
+  ASSERT_TRUE(t.Start());
+  ASSERT_TRUE(pumpFiberUntil([&t] { return static_cast<bool>(t.LastError()); },
+                             1000));
+
+  // 整个退避重开期间**逐次**采样:恒为 kDown,一次 kEstablishing 都不许出现。
+  int samples = 0;
+  pumpFiberUntil(
+      [&] {
+        EXPECT_NE(t.CurrentLinkState(), LinkState::kEstablishing)
+            << "串口给出了 kEstablishing(D10 只许两值)";
+        EXPECT_EQ(t.CurrentLinkState(), LinkState::kDown);
+        return ++samples > 600;  // ≈600ms,跨过数轮退避。
+      },
+      1500);
+  EXPECT_GT(samples, 100) << "采样太少,断言不充分";
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+  EXPECT_EQ(t.CurrentLinkState(), LinkState::kDown);
+
+  // 设备打开时的另一支:kUp。
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport up(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(up.Start());
+  EXPECT_EQ(up.CurrentLinkState(), LinkState::kUp);
+  ASSERT_TRUE(up.Close());
+  up.WaitClosed();
+}
+
+// —— 9. 生命周期 ——————————————————————————————————————————————————
+
+// AC(ADR-0007 D4):未 Start 时读句柄以 kInvalidState 关闭、写返 kInvalidState;
+// `Close()` / `WaitClosed()` 幂等;从未 Start 也能干净收敛。
+TEST(CoroSerialTransport, LifecycleBeforeStartAndIdempotentClose) {
+  SerialTransport t(ConfigFor(kMissingDevice, 1000ms));
+  auto handle = t.AsyncRead();
+  auto got = AwaitRead(handle, 0ms);
+  ASSERT_FALSE(got);
+  EXPECT_EQ(got.error(), make_error_code(TransportErrc::kInvalidState));
+  auto written = t.AsyncWrite(Unit("too-early"));
+  ASSERT_FALSE(written);
+  EXPECT_EQ(written.error(), make_error_code(TransportErrc::kInvalidState));
+
+  ASSERT_TRUE(t.Close());  // 从未 Start:无泵可停。
+  ASSERT_TRUE(t.Close());  // 幂等。
+  t.WaitClosed();
+  t.WaitClosed();  // 不得挂死。
+}
+
+// AC:`Close()` 关 read_queue 并携带终止原因,在途的读随即得到 kClosed;`WaitClosed()`
+// 返回后 Start 不再受理、写返 kClosed,且析构安全。
+TEST(CoroSerialTransport, CloseTerminatesQueuesAndBlocksRestart) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(t.Start());
+  auto rx = t.AsyncRead();
+
+  ASSERT_TRUE(t.Close());
+  auto closing = t.AsyncWrite(Unit("too-late"));  // Closing。
+  ASSERT_FALSE(closing);
+  EXPECT_EQ(closing.error(), make_error_code(TransportErrc::kClosed));
+  auto got = AwaitRead(rx, 1000ms);
+  ASSERT_FALSE(got);
+  EXPECT_EQ(got.error(), make_error_code(TransportErrc::kClosed));
+
+  t.WaitClosed();
+  EXPECT_FALSE(t.IsRunning());
+  EXPECT_EQ(t.CurrentLinkState(), LinkState::kDown);
+  auto restarted = t.Start();
+  ASSERT_FALSE(restarted);
+  EXPECT_EQ(restarted.error(), make_error_code(TransportErrc::kInvalidState));
+  // 析构在此处发生:`WaitClosed()` 已 join 两条泵,故可安全释放。
 }
