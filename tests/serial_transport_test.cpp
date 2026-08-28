@@ -49,12 +49,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <boost/fiber/operations.hpp>
@@ -62,19 +65,28 @@
 
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
+#include "task/fibertask.h"
+#include "transport/codec/SystemCodec.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
+#include "transport/core/Message.hpp"
 #include "transport/io/serial/SerialConfig.hpp"
 #include "transport/io/serial/SerialTransport.hpp"
+#include "transport/node/ProtocolNode.hpp"
 
 using namespace std::chrono_literals;
 using testutil::AwaitRead;
 using testutil::pumpFiberUntil;
 using transport::Datagram;
 using transport::Endpoint;
+using transport::FrameType;
 using transport::LinkState;
+using transport::Message;
+using transport::ProtocolNode;
+using transport::ProtocolNodeConfig;
 using transport::SerialConfig;
 using transport::SerialTransport;
+using transport::SystemCodec;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -610,4 +622,255 @@ TEST(CoroSerialTransport, CloseTerminatesQueuesAndBlocksRestart) {
   ASSERT_FALSE(restarted);
   EXPECT_EQ(restarted.error(), make_error_code(TransportErrc::kInvalidState));
   // 析构在此处发生:`WaitClosed()` 已 join 两条泵,故可安全释放。
+}
+
+// =============================================================================
+// —— 10. #194 迁移件:旧 `serial_transport_test.cpp` 的三条幸存用例 ——————————
+//
+// #193 用上面九组整体替换了旧文件(11 条)。#194 逐条判定去留后,只有三条断言的行为在
+// 新形态下**仍然成立且未被上面任何一条覆盖**,改写到新接口面后追加于此:
+//
+//   ① `NonDefaultBaudConfigApplied` —— 配置里的波特率是否**真的落到设备上**;
+//   ② `ConcurrentSecondReadIsNotRejected` —— 并发第二个读者**不被拒**(ADR-0007 D4
+//      删单读守卫后的回归);
+//   ③ `NodeRequestResponseEndToEnd` —— `ProtocolNode` × 串口的端到端(RT_NODE_006)。
+//
+// 其余八条的判定与依据见 #194 的判定表(六条已被上面的用例等价或更强地覆盖,两条的行为
+// 已被 ADR-0012 **D1** 撤销)。
+// =============================================================================
+
+namespace {
+
+// 从 PTY **master** 侧读出这一对伪终端当前的线路参数。
+//
+// Linux 上 master 与 slave 共享同一份 termios(实测:在 slave 上 `tcsetattr` 到 B9600 后,
+// 从 master `tcgetattr` 读到的 ispeed/ospeed 同为 B9600,而未设置前是 pty 缺省的 B38400)。
+// 故"波特率有没有真的落到设备上"在**对端侧直接可观测**,不必靠"回环还通"来间接推断。
+speed_t PeerOutputSpeed(int master) {
+  struct termios attrs = {};
+  EXPECT_EQ(::tcgetattr(master, &attrs), 0);
+  return ::cfgetospeed(&attrs);
+}
+
+speed_t PeerInputSpeed(int master) {
+  struct termios attrs = {};
+  EXPECT_EQ(::tcgetattr(master, &attrs), 0);
+  return ::cfgetispeed(&attrs);
+}
+
+}  // namespace
+
+// —— ① 波特率真的落到设备上 ————————————————————————————————————————————
+//
+// AC(旧 `NonDefaultBaudConfigApplied` 的迁移件,断言**加强**):`SerialConfig::baud_rate`
+// 经 `Open()` 的 `setBaudRate()` 落到设备上,**从对端侧可直接读出**——配 9600 得 B9600,
+// 配 115200(缺省)得 B115200,两者都不是 pty 的缺省 B38400。旧用例只断言"配了 9600 之后
+// 回环仍通",那连"参数被整个忽略"都测不出来(忽略了也照样通)。
+//
+// **只断言波特率**:实测 Linux pty 会**吞掉** CSIZE / PARENB 的修改(设 CS7+PARENB 后从
+// 两侧读回来仍是 CS8 / 无校验),故数据位与校验位在 PTY 上**无法**这样验证——断言它们会
+// 是一条恒假的断言,不是更强的断言。这落在 ADR-0012 已登记的代价③(全部实测建立在 PTY
+// 上,真实硬件未验)之内,本票不改变。
+TEST(CoroSerialTransport, ConfiguredBaudRateReachesDevice) {
+  PtyPair fresh;
+  ASSERT_TRUE(fresh.ok());
+  ASSERT_EQ(PeerOutputSpeed(fresh.master()), B38400)
+      << "pty 缺省速率不是 B38400,本用例的对照前提不成立";
+
+  // 非默认波特率 9600。
+  PtyPair slow_pty;
+  ASSERT_TRUE(slow_pty.ok());
+  SerialConfig slow_config = ConfigFor(slow_pty.slave(), 3000ms);
+  slow_config.baud_rate = 9600;
+  SerialTransport slow(slow_config);
+  ASSERT_TRUE(slow.Start());
+  ASSERT_EQ(slow.CurrentLinkState(), LinkState::kUp);
+  EXPECT_EQ(PeerOutputSpeed(slow_pty.master()), B9600)
+      << "配置的 9600 没有落到设备上(参数被忽略或应用失败)";
+  EXPECT_EQ(PeerInputSpeed(slow_pty.master()), B9600);
+
+  // 对照:缺省波特率 115200 —— 证明上面读到的 B9600 来自**配置值**,不是某个固定常量。
+  PtyPair fast_pty;
+  ASSERT_TRUE(fast_pty.ok());
+  SerialConfig fast_config = ConfigFor(fast_pty.slave(), 3000ms);
+  ASSERT_EQ(fast_config.baud_rate, 115200u);
+  SerialTransport fast(fast_config);
+  ASSERT_TRUE(fast.Start());
+  EXPECT_EQ(PeerOutputSpeed(fast_pty.master()), B115200)
+      << "缺省波特率没有落到设备上";
+
+  // 参数应用之后设备照常双向工作(旧用例那条断言,一并保留)。
+  ASSERT_TRUE(slow.AsyncWrite(Unit("baud")));
+  EXPECT_EQ(RecvAtLeast(slow_pty.master(), 4), Bytes("baud"));
+
+  ASSERT_TRUE(slow.Close());
+  slow.WaitClosed();
+  ASSERT_TRUE(fast.Close());
+  fast.WaitClosed();
+}
+
+// —— ② 并发第二个读者不被拒(ADR-0007 D4)————————————————————————————————
+//
+// AC(旧 `ConcurrentSecondReadIsNotRejected` 的迁移件):单读守卫已删除——已有在途读者时,
+// **并发的第二个读者不被拒**(此前返 kInvalidState)。两者同挂在 read_queue 上,无数据则
+// 各按自己的时限以 kTimeout 收敛;此后**流未被终结**,新到的字节照常取到。
+//
+// 新接口面下 `AsyncRead()` 交出的是**同一个** read_queue 句柄(节点要独立一路才调
+// `shared()`),故这里是名副其实的抢占式共读:一条切片只会落到其中一个读者手里。
+TEST(CoroSerialTransport, ConcurrentSecondReaderIsNotRejected) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport t(ConfigFor(pty.slave(), 3000ms));  // 长静默:全程不触发重开。
+  ASSERT_TRUE(t.Start());
+  auto first_handle = t.AsyncRead();
+  auto second_handle = t.AsyncRead();
+  EXPECT_EQ(first_handle, second_handle)
+      << "AsyncRead 给出了两个不同的队列,本用例测不到'共读'";
+
+  // 第一个读者在自己的 fiber 里挂到队列上。
+  Coro::Awaitable<void> entered;
+  Coro::Result<Datagram> first_result{make_error_code(TransportErrc::kInternal)};
+  bool first_done = false;
+  auto reader = Coro::makeTask([&] {
+    entered.resolve();
+    first_result = AwaitRead(first_handle, 400ms);
+    first_done = true;
+  });
+  ASSERT_TRUE(entered.await());
+  // 构造前提:让第一个读者**真的**挂到队列上(resolve 之后它才走到 await)。
+  boost::this_fiber::sleep_for(30ms);
+
+  // 第二个读者:**不被拒**。无数据 → 按自己的时限以 kTimeout 收敛,而非 kInvalidState。
+  auto second_result = AwaitRead(second_handle, 200ms);
+  ASSERT_FALSE(second_result);
+  EXPECT_NE(second_result.error(), make_error_code(TransportErrc::kInvalidState))
+      << "并发第二个读者被拒了(单读守卫已随 ADR-0007 D4 删除)";
+  EXPECT_EQ(second_result.error(), make_error_code(TransportErrc::kTimeout));
+
+  ASSERT_TRUE(pumpFiberUntil([&] { return first_done; }, 2000));
+  EXPECT_TRUE(reader.get());
+  ASSERT_FALSE(first_result);
+  EXPECT_EQ(first_result.error(), make_error_code(TransportErrc::kTimeout))
+      << "第一个读者没有按自己的时限收敛";
+
+  // 两次超时都没有终结流:新到的字节照常取到。
+  const std::string payload = "still-open";
+  ASSERT_EQ(::write(pty.master(), payload.data(), payload.size()),
+            static_cast<ssize_t>(payload.size()));
+  std::vector<std::uint8_t> got;
+  ASSERT_TRUE(pumpFiberUntil(
+      [&] {
+        for (auto& chunk : DrainRead(first_handle, 20ms)) {
+          got.insert(got.end(), chunk.value().bytes.begin(),
+                     chunk.value().bytes.end());
+        }
+        return got.size() >= payload.size();
+      },
+      3000))
+      << "读者超时把流停了";
+  EXPECT_EQ(got, Bytes("still-open"));
+
+  ASSERT_TRUE(t.Close());
+  t.WaitClosed();
+}
+
+// —— ③ ProtocolNode × 串口端到端(RT_NODE_006)——————————————————————————
+//
+// AC(旧 `NodeRequestResponseEndToEnd` 的迁移件):真 `ProtocolNode`(借用
+// `SerialTransport` + 流式 `SystemCodec`)经 PTY 向对端发一次 needresponse 交互,恰好一次
+// 完成、payload 与 echo 一致。证实串口传输**可无改动组合进节点栈**——上面九组只测到
+// 传输这一层为止。
+//
+// 与 TCP 侧 `protocol_node_tcp_e2e_test.cpp` 的两处形态差异:
+//   · 对端是 **PTY master 的裸 fd**,不是 `QTcpSocket`,故没有 `coroiodevice` 可挂——对端
+//     的收发就地做在 `pumpFiberUntil` 的判据里(**没有额外的对端 fiber、没有轮询 sleep**);
+//   · 传输由**宿主**(本用例)启停,节点只借用——`ProtocolNode` 不管传输的生命周期。
+//
+// 【与旧用例的一处实质差异】旧对端回的是 `message_id | 0x1000`,因为旧节点对响应命令码
+// 做过归一化。重设计后配对键是 `(session_id, message_id, frm_type)` 的直接比对
+// (`ResponseTo`),**响应帧须与请求帧同码**。故此处照新规则回帧,不是放松断言。
+namespace {
+
+Message SerialEchoResponse(const Message& command) {
+  Message resp;
+  resp.frm_type = FrameType::kResponse;
+  resp.protocol_id = command.protocol_id;
+  resp.session_id = command.session_id;
+  resp.message_id = command.message_id;
+  resp.payload = command.payload;
+  return resp;
+}
+
+// 对端一拍:从 master 排空一次 → 喂给 codec(内部缓冲跨切片)→ 每条 kCommand 回一帧标准
+// 响应。**非阻塞、不 sleep**,由 `pumpFiberUntil` 反复调用推进。
+void ServePeerEchoOnce(int master, SystemCodec* codec, int* served) {
+  std::uint8_t buf[512];
+  const ssize_t n = ::read(master, buf, sizeof(buf));
+  if (n <= 0) {
+    return;  // EAGAIN / EIO:本拍无事可做。
+  }
+  auto decoded = codec->Decode(buf, static_cast<std::size_t>(n));
+  if (!decoded) {
+    return;  // 坏帧:codec 自行重同步,对端不做别的。
+  }
+  for (const Message& command : decoded.value()) {
+    if (command.frm_type != FrameType::kCommand) {
+      continue;
+    }
+    auto encoded = codec->Encode(SerialEchoResponse(command));
+    ASSERT_TRUE(encoded);
+    const auto& out = encoded.value();
+    ASSERT_EQ(::write(master, out.data(), out.size()),
+              static_cast<ssize_t>(out.size()));
+    ++*served;
+  }
+}
+
+}  // namespace
+
+TEST(CoroSerialTransport, NodeRequestResponseEndToEndOverSerial) {
+  PtyPair pty;
+  ASSERT_TRUE(pty.ok());
+  SerialTransport transport(ConfigFor(pty.slave(), 3000ms));
+  ASSERT_TRUE(transport.Start());
+  ASSERT_EQ(transport.CurrentLinkState(), LinkState::kUp);
+
+  ProtocolNodeConfig node_config;
+  node_config.protocol_id = 0x2A;
+  ProtocolNode node(transport, std::make_unique<SystemCodec>(), node_config);
+  ASSERT_TRUE(node.Start());
+
+  Message request;
+  request.message_id = 0x0002;
+  request.payload = {0x11, 0x22, 0x33};
+  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
+  bool done = false;
+  auto caller = Coro::makeTask([&] {
+    // 单次尝试:本用例要的是"恰好一次完成",重发会掩盖丢字节。
+    outcome = node.RequestForResponse(std::move(request), {2000ms, 1});
+    done = true;
+  });
+
+  SystemCodec peer_codec;
+  int served = 0;
+  ASSERT_TRUE(pumpFiberUntil(
+      [&] {
+        ServePeerEchoOnce(pty.master(), &peer_codec, &served);
+        return done;
+      },
+      4000))
+      << "交互未在预算内完成";
+  EXPECT_TRUE(caller.get());
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
+  EXPECT_EQ(outcome.value().protocol_id, 0x2A);
+  EXPECT_EQ(outcome.value().message_id, 0x0002);
+  EXPECT_EQ(outcome.value().payload,
+            (std::vector<std::uint8_t>{0x11, 0x22, 0x33}));
+  EXPECT_EQ(served, 1) << "对端收到的命令帧不是恰好一条";
+
+  ASSERT_TRUE(node.Close());
+  node.WaitClosed();
+  ASSERT_TRUE(transport.Close());  // 传输由**宿主**关(节点不管它的生命周期)。
+  transport.WaitClosed();
 }
