@@ -61,6 +61,7 @@ add_library(transport STATIC
   src/node/ProtocolNode.cpp
   src/io/udp/UdpTransport.cpp
   src/io/tcp/TcpTransport.cpp
+  src/io/serial/SerialTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
 )
@@ -105,6 +106,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/tcp_transport_test.cpp
     tests/tcp_transport_read_test.cpp
     tests/tcp_transport_reconnect_test.cpp
+    tests/serial_transport_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_tcp_e2e_test.cpp
     # —— 以下两个 TCP 用例继续停摆，各有明确的待决依据（#181 的判定）——
