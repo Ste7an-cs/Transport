@@ -41,7 +41,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **由此写侧的阻塞对调用方完全不可见**：阻塞发生在专属线程上，业务 fiber 早已返回。写出的一切结果（含 `RETCODE_TIMEOUT`）**不回传，只落 `LastError()`**——与三介质逐字相同。
 
-- **D4（QoS 统一一套，不按模式分）：** `DdsConfig::qos` 保持**单一** `DdsQos`，对所有 topic 一视同仁。`DeclareTopic(topic)` 只管建端点，**不带 QoS 参数**。
+- **D4（QoS 统一一套，不按模式分）：** `DdsConfig::qos` 保持**单一** `DdsQos`，对所有 topic 一视同仁。`DeclareWriter` / `DeclareReader`（**D15**）只管建端点，**不带 QoS 参数**。
 
   2026-08-28 裁决："qos 都使用一样的"。
 
@@ -78,12 +78,14 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   ```cpp
   // DdsNodeConfig：请求 topic ──► 该服务的应答 topic，【一服务一条】
-  std::map<std::string, std::string> reply_topics;
+  //   客户端填 request_topics，服务端填 serve_topics，【内容相同、端点方向相反】（D16）
   //   "cfg.get"  -> "cfg.get.reply"
   //   "log.tail" -> "log.tail.reply"
+  std::map<std::string, std::string> request_topics;   // 客户端
+  std::map<std::string, std::string> serve_topics;     // 服务端
   ```
 
-  `RequestForResultDirect(topic, ...)` 按 `topic` 查表取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
+  `RequestForResultDirect(topic, ...)` 按 `topic` 查 `request_topics` 取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
 
   **故一个客户端同时调多个服务时，各服务的应答落在各自的 topic 上，互不相扰**——这正是"每服务一个"要保证的。若把它做成节点级的单一字段，多个服务的应答会挤在一起、读入放大从 `N` 倍恶化为 `N×M` 倍（`M` 为服务数），**那不是本裁决的意思**。
 
@@ -220,10 +222,11 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
-  | `DdsNodeConfig::topics` | 元素**均非空**；**可为空表**（纯客户端节点不必订阅任何 topic） |
-  | **`DdsNodeConfig::reply_topics`** | 键值**均非空**；**不要求唯一**——同一服务的应答 topic 本就由其全体客户端共用（**D6**） |
+  | `publish_topics` / `subscribe_topics` | 元素**均非空**；**均可为空表**（纯请求-响应节点不发布也不订阅） |
+  | `request_topics` / `serve_topics` | 键值**均非空**；**不要求唯一**——同一服务的应答 topic 本就由其全体客户端共用（**D6**） |
+  | **四项全空** | **返 `kConfiguration`**——一个什么都不收不发的节点必是配置写漏了 |
 
-  **另一处校验在调用时、不在 `Start()` 时**：`RequestForResultDirect(topic, ...)` 若在 `reply_topics` 里查不到 `topic`，返 `kConfiguration`。放在调用时是因为**客户端未必要为它不调的服务配表项**，启动时全量要求反而是过度约束。
+  **另一组校验在调用时、不在 `Start()` 时**：`Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 须命中对应配置项，否则返 `kConfiguration`（对应关系见 **D16**）。
 
   **这里没有"topic 须唯一"这类部署约束**（2026-08-31 裁决取消了先前的 per-client inbox 方案）：应答 topic **本就由一个服务的全体客户端共用**，唯一性的担子**整个移到了 `correlation_id` 的 uuid 半段**上——那是节点**自己**用 `QUuid::createUuid()` 生成的，无需部署方协调，也不会因配置写错而静默误配。**这是共用方案相对 per-client inbox 的主要收益。**
 
@@ -249,35 +252,43 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 - **D15（topic 端点的声明：显式 + 幂等 + 应答目的地懒声明）：** DDS 的每个 topic 需要建 `DataReader`（决定**什么会到达**）与 `DataWriter`（决定**能发往哪里**）。本设计的处置：
 
   ```cpp
-  // DdsTransport 公开面（幂等：同 topic 重复调用直接成功）
-  Coro::Result<void> DeclareTopic(const std::string& topic);
+  // DdsTransport 公开面（均幂等：同 topic 同方向重复调用直接成功）
+  Coro::Result<void> DeclareWriter(const std::string& topic);
+  Coro::Result<void> DeclareReader(const std::string& topic);
   ```
+
+  **两个方法而非一个**：一个 topic 上本节点通常**只需要一侧**——客户端在请求 topic 上只发不收、在应答 topic 上只收不发，服务端反之。**建成对是浪费，还会招来自收**（代价 9）。
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | 启动时一次性 | `config_.topics` 全部 + `config_.reply_topics` 的**键与值**（见 **D16**） |
-  | **`DdsNode::Reply()`** | **每次回应前** | **`request.reply_to`** —— 见下 |
+  | `DdsNode::DoStart()` | 启动时一次性 | 按 **D16** 的四个配置项逐项建**对应方向**的端点 |
+  | **`DdsNode::Reply()`** | **每次回应前** | **`DeclareWriter(request.reply_to)`** —— 见下 |
 
   **为什么 `Reply` 仍要懒声明**：服务端的应答目的地是**从请求里读出来的**（`request.reply_to`），而不是自己配置的，故仍不能保证启动时已声明。懒声明**让服务端无需为"我服务的每个客户端群用哪个应答 topic"另加配置**。
 
-  **`DeclareTopic` 因此必须幂等**：同一个 `reply_to` 会被反复声明（每来一个请求就触发一次）。
+  **`DeclareWriter` 因此必须幂等**：同一个 `reply_to` 会被反复声明（每来一个请求就触发一次）。**服务端把 `serve_topics` 配全后，这里每次都是幂等空操作**——留着只为兜住"`reply_to` 不在配置里"这一情形（**D16**）。
 
   > **本条是第一版发现、第二版重写时丢失、复核时重新发现的缺口。** 记此以免第三次丢。
 
   **`DataWriter` 累积的代价随共用应答 topic 大幅缩小**（2026-08-31 裁决的**连带收益**）：`reply_to` 的取值域从 **O(客户端数)** 降为 **O(服务数)**——先前每接入一个客户端就永久多一个 `DataWriter`，现在**一个服务只对应一个**。故本设计**不做回收**，且不再需要"客户端数量有限"那条部署假设。
 
-  **QoS 统一之后（D4），`DeclareTopic` 不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
+  **QoS 统一之后（D4），两个声明方法都不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
 
-- **D16（`DdsNodeConfig` 定型；topic 一律在 `DoStart()` 声明，不懒声明）：**
+- **D16（`DdsNodeConfig` 定型：topic 按【角色与方向】分列；一律在 `DoStart()` 声明）：**
 
   ```cpp
   struct DdsNodeConfig {
-    /// 发布与订阅用到的全部 topic。DoStart() 逐个 DeclareTopic。
-    std::vector<std::string> topics;
+    // —— 发布-订阅 ——
+    std::vector<std::string> publish_topics;    // 【只建 DataWriter】
+    std::vector<std::string> subscribe_topics;  // 【只建 DataReader】
 
-    /// 请求-响应（客户端）：请求 topic ──► 该服务的应答 topic（D6）。
-    /// DoStart() 把【键与值】都声明。
-    std::map<std::string, std::string> reply_topics;
+    // —— 请求-响应 · 客户端：请求 topic ──► 该服务的应答 topic ——
+    //    键 → DataWriter（发请求）　值 → DataReader（收应答）
+    std::map<std::string, std::string> request_topics;
+
+    // —— 请求-响应 · 服务端：请求 topic ──► 该服务的应答 topic ——
+    //    键 → DataReader（收请求）　值 → DataWriter（发应答）
+    std::map<std::string, std::string> serve_topics;
 
     /// 节点 uuid：非空则用它，为空才 QUuid::createUuid()（D6）。测试注入用。
     std::string uuid_override;
@@ -288,18 +299,39 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **删除四项**：`inbox_topic`（per-client inbox 方案已取消，**D6**）、`node_id`（由 uuid 取代，**D6**）、`handler` 与 `business_queue_max_*`（**D8** 的公开面无处理器回调——宿主自己起消费 fiber，与 ADR-0009 **D1** 移除 `ProtocolNode` handler 通道同向）。
 
-  **`topics` 是一个扁平列表，不按方向分**：`DeclareTopic` 本就同时建 `DataReader` 与 `DataWriter`（**D15**），故无须区分"我发布的"与"我订阅的"。**代价**：只订阅的 topic 上也会建一个用不到的 `DataWriter`（反之亦然）。这点浪费换掉三个列表和"方向写错了但要到运行期才发现"的一类配置错误。**另一项更实质的代价见「代价 9」（自收）。**
+  ### 角色由配置项本身表达，不设 `role` 枚举
 
-  ### 两侧的典型配置（非对称，须写进使用文档）
+  | 填了哪项 | 该节点就是 |
+  |---|---|
+  | `publish_topics` | 发布者 |
+  | `subscribe_topics` | 订阅者 |
+  | `request_topics` | 请求-响应的**客户端** |
+  | `serve_topics` | 请求-响应的**服务端** |
 
-  | | `topics` | `reply_topics` |
-  |---|---|---|
-  | **服务端**（服务 `cfg.get`） | `["cfg.get", "cfg.get.reply"]` | **空** |
-  | **客户端**（调 `cfg.get`） | 空 | `{"cfg.get": "cfg.get.reply"}` |
+  **四者可任意并存**——一个节点常常兼任（既是服务 A 的服务端，又是服务 B 的客户端，同时还发布心跳）。**若另设一个 `role` 枚举，就会出现"`role` 说是服务端、却填了 `request_topics`"这类自相矛盾的配置，还得再定优先级规则。** 让配置项自己表达角色，矛盾无从产生。
 
-  **服务端不需要 `reply_topics`**：它回哪儿由 `request.reply_to` 给出，不自己查表。
+  ### 请求-响应两侧是同一张表、相反的方向
 
-  **但服务端宜把应答 topic 也列进自己的 `topics`**：否则该 topic 的 `DataWriter` 要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——**该服务的第一次应答会丢**，靠 **D7** 重发才补回来。列进 `topics` 后启动时就建好，`Reply()` 里的懒声明退化为幂等空操作。**懒声明仍保留**，它兜的是"`reply_to` 不在配置里"这种情形。
+  ```
+             客户端                                    服务端
+    request_topics                              serve_topics
+      "cfg.get" ──► "cfg.get.reply"               "cfg.get" ──► "cfg.get.reply"
+         │              │                             │              │
+      DataWriter    DataReader                    DataReader     DataWriter
+      （发请求）    （收应答）                     （收请求）     （发应答）
+  ```
+
+  **表的形状相同、端点方向相反。** 部署时两侧填**同样的内容**，各自按角色建各自那一侧——不会填错方向，也不必协调。
+
+  ### 由此 `DeclareTopic` 须带方向
+
+  ```cpp
+  // DdsTransport 公开面（均幂等：同 topic 同方向重复调用直接成功）
+  Coro::Result<void> DeclareWriter(const std::string& topic);
+  Coro::Result<void> DeclareReader(const std::string& topic);
+  ```
+
+  取代原先"一个 `DeclareTopic` 同时建两端"的做法。`DdsNode::DoStart()` 按上表逐项调用；`DdsNode::Reply()` 的懒声明只需 **`DeclareWriter(request.reply_to)`**。
 
   ### 为什么必须在 `DoStart()` 声明，不能懒声明
 
@@ -309,15 +341,27 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   |---|---|
   | **应答 topic 的 `DataReader`**（客户端等应答的那一层） | 在 `RequestForResultDirect` 里才建 → 服务端的应答 writer 与它**尚未 match** → 应答**在 DDS 层就落空**，连 `read_queue_` 都进不来。**首次请求几乎必然超时、白吃一次重试；`max_attempts == 1` 时直接失败。** |
   | **订阅 topic 的 `DataReader`** | `Subscribe` 之后立刻到达的消息因未 match 而丢 |
+  | **应答 topic 的 `DataWriter`**（服务端回送的那一层） | 第一次 `Reply()` 才建 → 与客户端的 reader 尚未 match → **该服务的第一次应答会丢**，靠 **D7** 重发才补回来 |
   | 发布 topic 的 `DataWriter` | **可以懒**——顶多这一条发不出去，不影响正确性语义 |
 
-  **三者里有两者不能懒，故一律提前**，不为发布单开一条路径。
+  **四者里三者不能懒，故一律提前**，不为发布单开一条路径。**`serve_topics` 的值在启动时就建好 `DataWriter`，正是为了消掉上表第三行那次丢失**；`Reply()` 里的懒声明随之退化为幂等空操作，**保留它只为兜住"`reply_to` 不在配置里"这一情形**（**D15**）。
 
-  > **唯一的例外仍是 `Reply()` 对 `request.reply_to` 的懒声明**（**D15**）：那个 topic 是**从请求里读出来的**，服务端事先无从配置，**没有提前的可能**。其发现窗口的代价由 **D7** 的重发吸收。
+  ### 配置项与调用的对应校验
+
+  `Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 若不在对应配置项里，返 **`kConfiguration`**：
+
+  | 调用 | 须命中 |
+  |---|---|
+  | `Publish(topic, …)` | `publish_topics` |
+  | `Subscribe(topic, kNotify)` | `subscribe_topics` |
+  | `Subscribe(topic, kRequest)` | `serve_topics` 的键 |
+  | `RequestForResultDirect(topic, …)` | `request_topics` 的键 |
+
+  **不猜、不回落、不懒补**。这让"忘了配"从一个**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成一个**启动即报的显式错误**。
 
   ### 一处必须写进接口文档的限制
 
-  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**"本 domain 上的全部"——未列进 `config_.topics` 的 topic，其消息**根本不会到达本进程**，`kAny` 也通配不出来。
+  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已声明为 reader 的 topic 的全部**」——即 `subscribe_topics` ∪ `serve_topics` 的键 ∪ `request_topics` 的值，**不是**"本 domain 上的全部"。未列进配置的 topic，其消息**根本不会到达本进程**。
 
   **这是确定会被理解反的一处**，接口文档须明写。
 
@@ -347,11 +391,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
    **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 
-9. **自收：节点会收到自己发出去的样本。** `DeclareTopic` 同时建 reader 与 writer（**D15/D16**），而 Fast DDS 默认**不屏蔽同一 participant 内的收发匹配**——已核 3.6.1 头文件，`DomainParticipant` 只提供 `ignore_participant(GUID)`（屏蔽**别的** participant，`DomainParticipant.hpp:703`），**没有 `ignore_local_endpoints` 这类自环开关**。
+9. **自收只在【同一 topic 既发布又订阅】时发生，且那是配置方显式写出来的。** Fast DDS 默认**不屏蔽同一 participant 内的收发匹配**——已核 3.6.1 头文件：`DomainParticipant` 只提供 `ignore_participant(GUID)`（屏蔽**别的** participant，`DomainParticipant.hpp:703`），**没有 `ignore_local_endpoints` 这类自环开关**。
 
-   后果：`Publish` 出去的通知、发出去的请求，都会**原样回到自己的 `read_queue_`**，解码后在 `Dispatcher` 处因无匹配订阅而落空。**功能上无害**（不会误配——自己的请求键为 `kRequest`，客户端没登记；自己的应答键上 `corr` 对不上），但**白占队列与解码开销，并与代价 8 的读入放大叠加**。
+   **但 D16 按方向分列之后，这在正常配置下不会触发**：节点在一个 topic 上**只建它实际需要的那一侧端点**。客户端在 `cfg.get` 上只有 writer、在 `cfg.get.reply` 上只有 reader；服务端反之。**没有任何 topic 同时挂着本节点的 writer 与 reader，自收无从谈起。**
 
-   **实现票的处置方向（可行性已核）**：在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），**前缀相同即丢弃、不入队**。两个符号在 3.6.1 均存在。**是否要做由实现票按实测开销定**，但本 ADR 明确记下这一自收行为，避免实现时被当成 bug 反复排查。
+   **唯一会触发的情形**：同一个 topic 同时出现在 `publish_topics` 与 `subscribe_topics` 里。那是配置方**显式写下的**（例如有意做本地回环自测），**不是框架强加的**。
+
+   **实现票的处置方向（可行性已核）**：若确需屏蔽，在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），前缀相同即丢弃、不入队。两个符号在 3.6.1 均存在。**本设计不默认屏蔽**——既然只有显式配置才会触发，替配置方决定"你不想收到自己"是越权。
 
 ## 影响（Consequences）
 

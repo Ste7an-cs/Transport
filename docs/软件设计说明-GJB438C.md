@@ -392,15 +392,23 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **代价——读入放大**：同一服务的每个客户端都会收到该服务的**全部**应答，`N` 个并发客户端即约 `N` 倍读入量；多余样本一路进 `read_queue_` 并被解码后才落空，故**别人的应答可能把自己的挤掉**（队列有界 1024、静默丢最旧），这加强了 **D7** 重发的必要性。**放大只限于同一服务内**，调多个服务不叠乘。缓解手段 `ContentFilteredTopic` 本轮不采用。
 
-**`DdsNodeConfig` 定型**（**D16**）：`topics`（发布与订阅用到的全部 topic，扁平列表不按方向分——`DeclareTopic` 本就同时建 reader 与 writer）+ `reply_topics`（请求 topic → 应答 topic）+ `uuid_override`（为空才 `QUuid::createUuid()`，测试注入用）+ `trace_sink`。**删除** `inbox_topic` / `node_id` / `handler` / `business_queue_max_*` 四项。
+**`DdsNodeConfig` 定型：topic 按【角色与方向】分列**（**D16**）——`publish_topics`（只建 `DataWriter`）、`subscribe_topics`（只建 `DataReader`）、`request_topics`（客户端：键建 writer 发请求、值建 reader 收应答）、`serve_topics`（服务端：键建 reader 收请求、值建 writer 发应答），另加 `uuid_override`（为空才 `QUuid::createUuid()`，测试注入用）与 `trace_sink`。**删除** `inbox_topic` / `node_id` / `handler` / `business_queue_max_*` 四项。
+
+**角色由配置项本身表达，不设 `role` 枚举**：填了哪项就是哪个角色，四者可任意并存（一个节点常兼任服务 A 的服务端与服务 B 的客户端）。另设枚举会招来"`role` 说是服务端却填了 `request_topics`"这类自相矛盾的配置，还得再定优先级规则。
+
+**请求-响应两侧是同一张表、相反的方向**：客户端 `request_topics` 与服务端 `serve_topics` **内容相同**，各自按角色建各自那一侧端点——部署时两侧填一样的东西，不会填错方向。
+
+**`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。
+
+**配置项与调用一一对应校验**：`Publish` 须命中 `publish_topics`、`Subscribe(topic, kNotify)` 命中 `subscribe_topics`、`Subscribe(topic, kRequest)` 命中 `serve_topics` 的键、`RequestForResultDirect` 命中 `request_topics` 的键，否则返 `kConfiguration`。这让"忘了配"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。
 
 **topic 一律在 `DoStart()` 声明，不懒声明**（**D16**）：决定性约束是 DDS 的发现窗口 **~240ms**（DD-17 的 `kEstablishing`）。若把**应答 topic 的 DataReader** 拖到 `RequestForResultDirect` 里才建，服务端的应答 writer 与它尚未 match，应答**在 DDS 层就落空**——首次请求几乎必然超时、白吃一次重试，`max_attempts == 1` 时直接失败；**订阅 topic 的 DataReader** 同理会丢掉订阅后立刻到达的消息。只有发布方向可以懒，故不为它单开路径，一律提前。
 
 **`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
 
-**两侧配置非对称**（**D16**）：服务端 `topics = {请求 topic, 应答 topic}`、`reply_topics` 为空（回哪儿由 `request.reply_to` 给出，不查表）；客户端 `topics` 可空、`reply_topics = {请求 topic → 应答 topic}`。**服务端宜把应答 topic 也列进 `topics`**，否则其 `DataWriter` 要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——该服务的**第一次应答会丢**，靠重发才补回来。
+**服务端的应答 `DataWriter` 由 `serve_topics` 的值在启动时建好**（**D16**）：否则要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——该服务的**第一次应答会丢**，靠重发才补回来。配全后 `Reply()` 里的懒声明退化为幂等空操作，保留它只为兜住"`reply_to` 不在配置里"这一情形。
 
-**自收行为须记明**（代价 9）：`DeclareTopic` 同时建 reader 与 writer，而 Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关）。故节点**会收到自己发出的样本**，解码后在 `Dispatcher` 处落空——功能无害，但白占队列并与读入放大叠加。可在 listener 内比对 `SampleInfo::sample_identity` 的 writer GUID 前缀与本 participant `guid()` 后丢弃，**是否实施由实现票按实测开销定**。
+**自收在正常配置下不发生**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关），但按方向分列后**节点在一个 topic 上只建它实际需要的那一侧端点**——没有任何 topic 同时挂着本节点的 writer 与 reader。唯一会触发的情形是同一 topic 同时出现在 `publish_topics` 与 `subscribe_topics` 里，那是配置方**显式写下的**（如本地回环自测），**框架不默认屏蔽**。
 
 **topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `reply_topics` 的全部值与配置里的全部 topic；服务端的 `Reply()` 对 `request.reply_to` **懒声明**——应答目的地是从请求里读出来的，不能保证启动时已声明。`DeclareTopic` 因此**必须幂等**。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
 
