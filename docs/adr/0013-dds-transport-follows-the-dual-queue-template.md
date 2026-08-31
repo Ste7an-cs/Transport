@@ -109,6 +109,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **uuid 用 `QUuid::createUuid()`**（2026-08-31 裁决）。`Qt5::Core` 已 `PUBLIC` 链进 `transport` 目标（`CMakeLists.txt:71`），**不引入新依赖**；取字符串用 `toString(QUuid::WithoutBraces)`（36 字符）。
   **不自搓**（`random_device` 在 WSL 下质量存疑，且要自行论证碰撞率），**不引第三方 uuid 库**（为一个字段引依赖不划算）。
 
+  **配 `uuid_override` 保住确定性可测**：`QUuid` 是随机的，而被本设计取代的 `DdsNodeConfig::node_id` 其注释明写「**不用随机数（确定性可测，RT_REQUEST）**」——旧设计特意让 corr 前缀确定，好让测试断言具体值。故 `DdsNodeConfig` 留一个 `uuid_override`：**非空则用它，为空才 `QUuid::createUuid()`**。测试注入固定值，生产留空。一行的事，不该把可测性丢掉。
+
   `Message::correlation_id` 本就是 `std::string`（`Message.hpp:49`），`36 + 1 + ≤10 = ≤47` 字节，**装得下，不需要改结构**；线缆上 `corr_len` 为 2 字节 BE（**D5**），余量充足。
 
   **"客户端要过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成**，不需要应用层写过滤代码：共用 topic 上别人的应答携带别人的 `corr`，与本机登记的 `{该服务的应答 topic, 我的 corr, kReply}` **不匹配**，落到"无订阅者"而被丢弃。**uuid 那一半正是这一步安全的根据**——若只有自增计数，两个节点会各自从 0 开始，**必然互相误配**。
@@ -218,6 +220,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
+  | `DdsNodeConfig::topics` | 元素**均非空**；**可为空表**（纯客户端节点不必订阅任何 topic） |
   | **`DdsNodeConfig::reply_topics`** | 键值**均非空**；**不要求唯一**——同一服务的应答 topic 本就由其全体客户端共用（**D6**） |
 
   **另一处校验在调用时、不在 `Start()` 时**：`RequestForResultDirect(topic, ...)` 若在 `reply_topics` 里查不到 `topic`，返 `kConfiguration`。放在调用时是因为**客户端未必要为它不调的服务配表项**，启动时全量要求反而是过度约束。
@@ -252,7 +255,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | 启动时一次性 | `config_.reply_topics` 的**全部值** + `config_.topics` 里列出的全部 topic |
+  | `DdsNode::DoStart()` | 启动时一次性 | `config_.topics` 全部 + `config_.reply_topics` 的**键与值**（见 **D16**） |
   | **`DdsNode::Reply()`** | **每次回应前** | **`request.reply_to`** —— 见下 |
 
   **为什么 `Reply` 仍要懒声明**：服务端的应答目的地是**从请求里读出来的**（`request.reply_to`），而不是自己配置的，故仍不能保证启动时已声明。懒声明**让服务端无需为"我服务的每个客户端群用哪个应答 topic"另加配置**。
@@ -264,6 +267,48 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **`DataWriter` 累积的代价随共用应答 topic 大幅缩小**（2026-08-31 裁决的**连带收益**）：`reply_to` 的取值域从 **O(客户端数)** 降为 **O(服务数)**——先前每接入一个客户端就永久多一个 `DataWriter`，现在**一个服务只对应一个**。故本设计**不做回收**，且不再需要"客户端数量有限"那条部署假设。
 
   **QoS 统一之后（D4），`DeclareTopic` 不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
+
+- **D16（`DdsNodeConfig` 定型；topic 一律在 `DoStart()` 声明，不懒声明）：**
+
+  ```cpp
+  struct DdsNodeConfig {
+    /// 发布与订阅用到的全部 topic。DoStart() 逐个 DeclareTopic。
+    std::vector<std::string> topics;
+
+    /// 请求-响应（客户端）：请求 topic ──► 该服务的应答 topic（D6）。
+    /// DoStart() 把【键与值】都声明。
+    std::map<std::string, std::string> reply_topics;
+
+    /// 节点 uuid：非空则用它，为空才 QUuid::createUuid()（D6）。测试注入用。
+    std::string uuid_override;
+
+    ITraceSink* trace_sink = nullptr;
+  };
+  ```
+
+  **删除四项**：`inbox_topic`（per-client inbox 方案已取消，**D6**）、`node_id`（由 uuid 取代，**D6**）、`handler` 与 `business_queue_max_*`（**D8** 的公开面无处理器回调——宿主自己起消费 fiber，与 ADR-0009 **D1** 移除 `ProtocolNode` handler 通道同向）。
+
+  **`topics` 是一个扁平列表，不按方向分**：`DeclareTopic` 本就同时建 `DataReader` 与 `DataWriter`（**D15**），故无须区分"我发布的"与"我订阅的"。**代价**：只订阅的 topic 上也会建一个用不到的 `DataWriter`（反之亦然）。这点浪费换掉三个列表和"方向写错了但要到运行期才发现"的一类配置错误。
+
+  ### 为什么必须在 `DoStart()` 声明，不能懒声明
+
+  **决定性约束是 DDS 的发现窗口 ~240ms**（**D9** 的 `kEstablishing`，实测）。端点建起来到 `matched > 0` 之间有一段真空，这段时间里：
+
+  | 若懒声明 | 后果 |
+  |---|---|
+  | **应答 topic 的 `DataReader`**（客户端等应答的那一层） | 在 `RequestForResultDirect` 里才建 → 服务端的应答 writer 与它**尚未 match** → 应答**在 DDS 层就落空**，连 `read_queue_` 都进不来。**首次请求几乎必然超时、白吃一次重试；`max_attempts == 1` 时直接失败。** |
+  | **订阅 topic 的 `DataReader`** | `Subscribe` 之后立刻到达的消息因未 match 而丢 |
+  | 发布 topic 的 `DataWriter` | **可以懒**——顶多这一条发不出去，不影响正确性语义 |
+
+  **三者里有两者不能懒，故一律提前**，不为发布单开一条路径。
+
+  > **唯一的例外仍是 `Reply()` 对 `request.reply_to` 的懒声明**（**D15**）：那个 topic 是**从请求里读出来的**，服务端事先无从配置，**没有提前的可能**。其发现窗口的代价由 **D7** 的重发吸收。
+
+  ### 一处必须写进接口文档的限制
+
+  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**"本 domain 上的全部"——未列进 `config_.topics` 的 topic，其消息**根本不会到达本进程**，`kAny` 也通配不出来。
+
+  **这是确定会被理解反的一处**，接口文档须明写。
 
 ## 明确接受的代价
 

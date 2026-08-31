@@ -392,6 +392,12 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **代价——读入放大**：同一服务的每个客户端都会收到该服务的**全部**应答，`N` 个并发客户端即约 `N` 倍读入量；多余样本一路进 `read_queue_` 并被解码后才落空，故**别人的应答可能把自己的挤掉**（队列有界 1024、静默丢最旧），这加强了 **D7** 重发的必要性。**放大只限于同一服务内**，调多个服务不叠乘。缓解手段 `ContentFilteredTopic` 本轮不采用。
 
+**`DdsNodeConfig` 定型**（**D16**）：`topics`（发布与订阅用到的全部 topic，扁平列表不按方向分——`DeclareTopic` 本就同时建 reader 与 writer）+ `reply_topics`（请求 topic → 应答 topic）+ `uuid_override`（为空才 `QUuid::createUuid()`，测试注入用）+ `trace_sink`。**删除** `inbox_topic` / `node_id` / `handler` / `business_queue_max_*` 四项。
+
+**topic 一律在 `DoStart()` 声明，不懒声明**（**D16**）：决定性约束是 DDS 的发现窗口 **~240ms**（DD-17 的 `kEstablishing`）。若把**应答 topic 的 DataReader** 拖到 `RequestForResultDirect` 里才建，服务端的应答 writer 与它尚未 match，应答**在 DDS 层就落空**——首次请求几乎必然超时、白吃一次重试，`max_attempts == 1` 时直接失败；**订阅 topic 的 DataReader** 同理会丢掉订阅后立刻到达的消息。只有发布方向可以懒，故不为它单开路径，一律提前。
+
+**`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
+
 **topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `reply_topics` 的全部值与配置里的全部 topic；服务端的 `Reply()` 对 `request.reply_to` **懒声明**——应答目的地是从请求里读出来的，不能保证启动时已声明。`DeclareTopic` 因此**必须幂等**。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
 
 **没有"topic 须唯一"这类部署约束**（**D12**）：`reply_topics` 只校验键值非空。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
