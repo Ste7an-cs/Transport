@@ -384,7 +384,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **四条纪律里三条不适用**（这正是它与 `RequestForResult` 的分界）：只登记一个订阅（无受理）、无 `ack.Reset()`、**等结果阶段恰恰要重发**、不回应。**仍沿用两条**：先登记再发出（`Dispatcher` 用法的固有要求）、重发沿用同一 `correlation_id` 且以首帧为准。
 
-**应答 topic 每服务一个、由该服务的全体客户端共用**（**D6**）：它**绑在服务上、不绑在节点上**——`DdsNodeConfig::reply_topics` 是一张 `请求 topic → 应答 topic` 的表，`RequestForResultDirect` 按目标 topic 查表，**查不到即 `kConfiguration`**。故一个客户端同时调多个服务时，各服务的应答落在各自 topic 上互不相扰。
+**应答 topic 每服务一个、由该服务的全体客户端共用**（**D6**）：它**绑在服务上、不绑在节点上**——客户端的 `request_topics` 与服务端的 `serve_topics` 都是 `请求 topic → 应答 topic` 的表（**内容相同、端点方向相反**，见 **D16**）；`RequestForResultDirect` 按目标 topic 查 `request_topics`，**查不到即 `kConfiguration`**。故一个客户端同时调多个服务时，各服务的应答落在各自 topic 上互不相扰。
 
 区分**同一服务的不同客户端**全靠 `correlation_id`，故它定为两段式 `"<uuid>#<request_seq>"`——uuid 在**节点初始化时生成一次**（`QUuid::createUuid()`，`Qt5::Core` 已 PUBLIC 链入，不引入新依赖）保证跨节点不撞；`request_seq`（`uint32`）**从 0 自增**保证节点内不撞，**回绕明确接受**（届时旧订阅早已注销）。自增半段**不叫 `session_id`**——那是外部协议的匹配键，DDS 路径留缺省 `0`，同名会造成阅读陷阱。`Message::correlation_id` 本是 `std::string`，`≤47` 字节装得下，无需改结构。
 
@@ -410,9 +410,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **自收在正常配置下不发生**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关），但按方向分列后**节点在一个 topic 上只建它实际需要的那一侧端点**——没有任何 topic 同时挂着本节点的 writer 与 reader。唯一会触发的情形是同一 topic 同时出现在 `publish_topics` 与 `subscribe_topics` 里，那是配置方**显式写下的**（如本地回环自测），**框架不默认屏蔽**。
 
-**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `reply_topics` 的全部值与配置里的全部 topic；服务端的 `Reply()` 对 `request.reply_to` **懒声明**——应答目的地是从请求里读出来的，不能保证启动时已声明。`DeclareTopic` 因此**必须幂等**。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
+**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 按 **D16** 的四个配置项逐项建**对应方向**的端点；服务端的 `Reply()` 对 `request.reply_to` 只需 `DeclareWriter` **懒声明**——兜住 `reply_to` 不在 `serve_topics` 里的情形。`DeclareWriter` 因此**必须幂等**（配全后即幂等空操作）。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
 
-**没有"topic 须唯一"这类部署约束**（**D12**）：`reply_topics` 只校验键值非空。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
+**没有"topic 须唯一"这类部署约束**（**D12**）：`request_topics` / `serve_topics` 只校验键值非空（四项全空则返 `kConfiguration`）。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
 
 > **重发的依据与 ADR-0010 不同，须写明**：ADR-0010 那边是"命令帧丢包即彻底失败"，而 **DDS 是 `RELIABLE` 的、网络层不会丢**。**这里丢的是我方的队列**——`read_queue` 有界 1024 静默丢最旧（**DD-15**），且 listener 一搬走样本 DDS 即认为已交付、背压解除。**`RELIABLE` 覆盖不到这一段，重发正是对它的补救。** 代价：**对端须能容忍重复请求**（幂等或自行去重），框架不校验。
 
