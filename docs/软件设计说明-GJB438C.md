@@ -384,9 +384,13 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **四条纪律里三条不适用**（这正是它与 `RequestForResult` 的分界）：只登记一个订阅（无受理）、无 `ack.Reset()`、**等结果阶段恰恰要重发**、不回应。**仍沿用两条**：先登记再发出（`Dispatcher` 用法的固有要求）、重发沿用同一 `correlation_id` 且以首帧为准。
 
-**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `inbox_topic` 与配置里的全部 topic；而**服务端的 `Reply()` 必须对 `request.reply_to` 懒声明**——那是**某个客户端的 inbox**，服务端事先不可能知道，不懒声明则**每一次 `Reply` 都会因目标 topic 无 `DataWriter` 而失败**。`DeclareTopic` 因此**必须幂等**。代价：每个出现过的 `reply_to` 留下一个 `DataWriter`，**不自动回收**。
+**应答 topic 每服务一个、全体客户端共用**（**D6**）：区分客户端全靠 `correlation_id`，故它定为两段式 `"<uuid>#<session_id>"`——uuid 在**节点初始化时生成一次**保证跨节点不撞，`session_id`（`uint32`）**从 0 自增**保证节点内不撞。`Message::correlation_id` 本是 `std::string`，装得下，无需改结构。"客户端过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成，应用层不写过滤代码。
 
-**`inbox_topic` 须节点唯一**（**D12**）：`correlation_id` 是节点内自增，两个节点共用同一 inbox 会互相收到对方的应答并按 `corr` 误配。框架无法跨进程校验全局唯一，只校验非空，唯一性列为**部署约束**。
+**代价——读入放大**：每个客户端都会收到该服务的**全部**应答，`N` 个并发客户端即约 `N` 倍读入量；多余样本一路进 `read_queue_` 并被解码后才落空，故**别人的应答可能把自己的挤掉**（队列有界 1024、静默丢最旧），这加强了 **D7** 重发的必要性。缓解手段 `ContentFilteredTopic` 本轮不采用。
+
+**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `reply_topic` 与配置里的全部 topic；服务端的 `Reply()` 对 `request.reply_to` **懒声明**——应答目的地是从请求里读出来的，不能保证启动时已声明。`DeclareTopic` 因此**必须幂等**。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
+
+**没有"topic 须唯一"这类部署约束**（**D12**）：`reply_topic` 只校验非空。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
 
 > **重发的依据与 ADR-0010 不同，须写明**：ADR-0010 那边是"命令帧丢包即彻底失败"，而 **DDS 是 `RELIABLE` 的、网络层不会丢**。**这里丢的是我方的队列**——`read_queue` 有界 1024 静默丢最旧（**DD-15**），且 listener 一搬走样本 DDS 即认为已交付、背压解除。**`RELIABLE` 覆盖不到这一段，重发正是对它的补救。** 代价：**对端须能容忍重复请求**（幂等或自行去重），框架不校验。
 
@@ -590,7 +594,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
 - **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8；ADR-0009 D1 后仅存 DDS 侧）**：`HandlerContext` 已随 `ProtocolNode` 的 handler 通道一并移除；`DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
 
-**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。
+**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。**以上为未编译历史代码的 as-built，非现行设计**——其中 `reply_to=inbox`（每客户端一个信箱 topic）已由 ADR-0013 **D6** 取代为**每服务一个、全体客户端共用**的应答 topic。
 
 **执行时序/数据流**：见 §4.2.3/§4.2.4/§4.2.6。
 

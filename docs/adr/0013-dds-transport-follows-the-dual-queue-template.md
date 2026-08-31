@@ -72,7 +72,24 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | 订阅某 topic 的通知 | `Subscribe(topic, kNotify)` | `{topic, kAny, kNotify}` |
   | 收某 topic 的请求 | `Subscribe(topic, kRequest)` | `{topic, kAny, kRequest}` |
   | 收全部 topic 的通知 | `Subscribe(kAny, kNotify)` | `{kAny, kAny, kNotify}` |
-  | `RequestForResultDirect` **内部**登记（结果，**只有一条**） | — | `{inbox_topic, corr, kReply}` |
+  | `RequestForResultDirect` **内部**登记（结果，**只有一条**） | — | `{reply_topic, corr, kReply}` |
+
+  **应答 topic 是【每服务一个、全体客户端共用】的，不是每客户端一个**（2026-08-31 裁决）。区分客户端**全靠 `correlation_id`**，故它必须**全局唯一**，为此定死两段式构成：
+
+  ```
+  correlation_id = "<uuid>#<session_id>"
+                     ↑         ↑
+       节点初始化时生成一次   uint32，从 0 开始自增，每请求一个
+  ```
+
+  | 半段 | 谁生成 | 何时 | 保证什么 |
+  |---|---|---|---|
+  | **uuid** | 节点自身 | **初始化时一次**，此后不变 | **跨节点**不撞——这是共用 topic 得以成立的全部根据 |
+  | **session_id**（`uint32`） | 节点内自增计数器 | 每次 `RequestForResultDirect` | **节点内**不撞 |
+
+  `Message::correlation_id` 本就是 `std::string`（`Message.hpp:49`），**装得下，不需要改结构**。
+
+  **"客户端要过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成**，不需要应用层写过滤代码：共用 topic 上别人的应答携带别人的 `corr`，与本机登记的 `{reply_topic, 我的 corr, kReply}` **不匹配**，落到"无订阅者"而被丢弃。**uuid 那一半正是这一步安全的根据**——若只有自增计数，两个节点会各自从 0 开始，**必然互相误配**。
 
   **不提供"订阅一个"与"订阅所有"两种固定变体**（2026-08-28 裁决）——"所有"由调用方传 `kAny` 表达。**`ServeRequests` 这个名字随之取消**：两个键全开放后它与 `Subscribe(topic, kRequest)` **完全等价**，留两个签名相同的方法只会让人以为有语义差别。
 
@@ -175,10 +192,9 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
-  | **`DdsNodeConfig::inbox_topic`** | **非空，且须节点唯一**（见 **D15**） |
+  | **`DdsNodeConfig::reply_topic`** | **非空**（**不要求唯一——本就是共用的**，见 **D6**） |
 
-  **`inbox_topic` 的唯一性是硬约束，不是建议**：`correlation_id` 由节点内自增生成，故**不同节点会生成相同的值**。这本不成问题——客户端登记的键是 `{自己的 inbox, corr, kReply}`，`corr` 只需**在自己 inbox 内唯一**。**但前提是 inbox 每个节点独占**；两个节点共用同一 inbox 会互相收到对方的应答并按 `corr` 误配。
-  框架**无法自行校验全局唯一**（跨进程），故只校验非空，并**在使用文档中列为部署约束**；建议取值内含节点标识。
+  **这里没有"topic 须唯一"这类部署约束**（2026-08-31 裁决取消了先前的 per-client inbox 方案）：应答 topic **本就是一个服务的全体客户端共用**的，唯一性的担子**整个移到了 `correlation_id` 的 uuid 半段**上——那是节点**自己**生成的，无需部署方协调，也不会因配置写错而静默误配。**这是共用方案相对 per-client inbox 的主要收益。**
 
 - **D13（`IDdsProvider` 接口增删）：**
 
@@ -208,16 +224,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | 启动时一次性 | `config_.inbox_topic` + `config_.topics` 里列出的全部 topic |
+  | `DdsNode::DoStart()` | 启动时一次性 | `config_.reply_topic` + `config_.topics` 里列出的全部 topic |
   | **`DdsNode::Reply()`** | **每次回应前** | **`request.reply_to`** —— 见下 |
 
-  **⚠ 为什么 `Reply` 必须懒声明**：`request.reply_to` 是**某个客户端的 inbox**，服务端**事先不可能知道**（客户端是动态接入的），因而不可能预先声明。**若不懒声明，服务端的每一次 `Reply` 都会因目标 topic 无 `DataWriter` 而失败。**
+  **为什么 `Reply` 仍要懒声明**：服务端的应答目的地是**从请求里读出来的**（`request.reply_to`），而不是自己配置的，故仍不能保证启动时已声明。懒声明**让服务端无需为"我服务的每个客户端群用哪个应答 topic"另加配置**。
 
-  **`DeclareTopic` 因此必须幂等**：同一个 `reply_to` 会被反复声明（该客户端每发一次请求就触发一次）。
+  **`DeclareTopic` 因此必须幂等**：同一个 `reply_to` 会被反复声明（每来一个请求就触发一次）。
 
   > **本条是第一版发现、第二版重写时丢失、复核时重新发现的缺口。** 记此以免第三次丢。
 
-  **明确接受的代价——`DataWriter` 只增不减**：每个出现过的 `reply_to` 会留下一个 `DataWriter`，**本设计不自动回收**。回收策略（LRU？`matched` 归零即拆？）留待实现票评估，届时须给出上界，或明确"服务端的客户端数量有限"这一部署假设。
+  **`DataWriter` 累积的代价随共用应答 topic 大幅缩小**（2026-08-31 裁决的**连带收益**）：`reply_to` 的取值域从 **O(客户端数)** 降为 **O(服务数)**——先前每接入一个客户端就永久多一个 `DataWriter`，现在**一个服务只对应一个**。故本设计**不做回收**，且不再需要"客户端数量有限"那条部署假设。
 
   **QoS 统一之后（D4），`DeclareTopic` 不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
 
@@ -236,6 +252,14 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 6. **全部实测为单机 loopback、单次实跑**；跨主机时延/丢失率未测。
 
 7. **`Shutdown()` 能否打断在途阻塞的 `Publish` —— 未实测**（#191 标注）。若不能，`Close()` 落在一次阻塞的写上时，`WaitClosed()` 最坏要等**一个 `max_blocking_time`**。**实现票须先补测**。
+
+8. **共用应答 topic 带来读入放大。** 一个服务的应答 topic 由**全体客户端共用**（**D6**），故**每个客户端都会收到该服务的全部应答**，自己那份只是其中之一——`N` 个并发客户端 ⇒ 每客户端约 `N` 倍读入量。这些多余样本会**一路进到 `read_queue_` 并被解码**，然后才在 `Dispatcher` 处因 `corr` 不匹配而落空。
+
+   **后果不只是白干**：`read_queue_` 有界 1024、满时静默丢最旧（**D11**），故**别人的应答有可能把自己的挤掉**。这恰好**加强**了 **D7** 重发的必要性——重发本就是对"丢在我方队列这一段"的补救，而共用 topic 把这一段的压力放大了 `N` 倍。
+
+   **未采用的缓解手段**：DDS 的 `ContentFilteredTopic` 能把按 `corr` 前缀的过滤下推到 DDS 侧、使多余样本根本不进我方队列。**本轮不采用**，因 2026-08-28 裁决"不需要考虑优先使用 DDS 自己的机制"；若实测中放大成为瓶颈，这是**第一顺位**的优化入口。
+
+   **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 
 ## 影响（Consequences）
 
