@@ -1,7 +1,7 @@
 # ADR-0013：DDS 按双队列样板跟进，请求-响应用 `correlation_id` 走单阶段 `Direct`
 
 **状态：** Proposed（**第二版**，2026-08-28 裁决后整体改写；第一版"优先用 DDS 自身机制"已作废，见文末「被推翻的第一版」）
-**日期：** 2026-08-28（2026-08-31 就应答 topic 与 `correlation_id` 构成再次裁决，见 **D6**）
+**日期：** 2026-08-28。**2026-08-31 三轮增补**：① 应答 topic 改为每服务共用、`correlation_id` 定为两段式（**D6**）；② 端点声明去掉懒声明、全部前置（**D15**）；③ topic 由**注册接口**给出、不进配置（**D16**）。
 **关联：** ADR-0007（泵 + 读写双队列——本 ADR **沿用**其形态）；ADR-0011（TCP）、ADR-0012（串口）（同一形态的前两次跟进）；ADR-0008 **D1**（`ITransport` 七方法——**本 ADR 完整实现，不分叉**）、**D6**（`Dispatcher` 协议无关模板——复用）；ADR-0010 **D13**（`RequestForResultDirect` 的**单阶段**模型——**本 ADR 的请求-响应照此实现**；同 ADR 的两阶段 `RequestForResult` **本 ADR 不用**）；SRS **RT_NODE_007**（本 ADR 修订其丢弃策略）。
 **实施范围：** `DdsTransport` 与 `DdsNode`。调研见 **#190**，Fast DDS 3.6.1 实测见 **#191**。
 
@@ -25,7 +25,9 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 ## 决策（Decision）
 
-- **D1（形态照双队列样板，`DdsTransport` 完整实现 `ITransport`）：** 读写各一条内部队列，公开面即 `ITransport` 七方法，**签名不变、语义不变**。
+- **D1（形态照双队列样板，`DdsTransport` 完整实现 `ITransport`）：** 读写各一条内部队列，`ITransport` 七方法**签名不变、语义不变、不分叉**。
+
+  公开面**在七方法之外另有两个 DDS 专有的声明方法**（`DeclareWriter` / `DeclareReader`，**D15**）——它们是 DDS 端点模型的必需品，三介质没有对应物；**但它们不改动 `ITransport` 本身**，故"换传输即可运行"的调用方仍不受影响。
 
   **与三介质的唯一形态差异是"谁在推读队列"**：UDP/TCP/串口是**泵 fiber** 从 socket/device 读流取数后推；DDS 是 **provider 的 listener 在外来线程**上取样本后推。**故 DDS 读侧没有泵 fiber。**
 
@@ -64,7 +66,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
                                             std::string /*correlation_id*/,
                                             MessageKind /*kind*/>;
 
-  Ticket Subscribe(TopicKey topic, KindKey kind);   // 【一个方法】，两个键均可传 kAny
+  // 【一个方法】，两个键均可传 kAny。返 Result 而非裸 Ticket —— 见 D8
+  Coro::Result<Ticket> Subscribe(TopicKey topic, KindKey kind);
   ```
 
   | 用途 | 调用 | 实际键 |
@@ -178,7 +181,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   ```cpp
   // —— 订阅：一个方法，覆盖发布-订阅与服务端收请求两种用途 ——
-  Ticket Subscribe(TopicKey topic, KindKey kind);        // 两键均可 kAny，见 D6
+  //    【返 Coro::Result<Ticket>，不是裸 Ticket】——见下
+  Coro::Result<Ticket> Subscribe(TopicKey topic, KindKey kind);   // 两键均可 kAny，见 D6
 
   // —— 发布-订阅 ——
   Coro::Result<void> Publish(const std::string& topic, Message msg);
@@ -191,6 +195,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   // —— 请求-响应（服务端）：【只有一个方法】——
   Coro::Result<void> Reply(const Message& request, Message result);  // 回结果 kReply
   ```
+
+  **`Subscribe` 必须返 `Coro::Result<Ticket>`，不能返裸 `Ticket`**：**D16** 规定"topic 未注册为对应角色即返 `kConfiguration`"，而 `Ticket` **装不下错误码**。若返裸 `Ticket`，"忘了注册"只能交出一个空 `Ticket`——其 `Wait` 返的是 **`kInvalidState`**（`Dispatcher.hpp:203`），**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
 
   **服务端没有 `Accept()`**：本模型无受理阶段（**D7**）。**`MessageKind::kFeedback` 在本设计中不使用**——它是 `Message` 为别的路径预留的值。
 
@@ -214,12 +220,12 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 - **D12（配置校验，`Start()` 时一次性）：** 非法返 `kConfiguration`、**停在 `Created`**。
 
-  | 字段 | 约束 |
+  | 检查项 | 约束 |
   |---|---|
-  | `domain_id` | `[0, 232]` |
-  | `provider` | 非空且已注册 |
-  | `max_blocking_time` / `liveliness_lease` | **须为正** |
-  | **四组注册全空** | **返 `kConfiguration`**——一个什么都不收不发的节点必是漏了注册 |
+  | `DdsConfig::domain_id` | `[0, 232]` |
+  | `DdsConfig::provider` | 非空且已注册 |
+  | `DdsQos::max_blocking_time` / `liveliness_lease` | **须为正** |
+  | **四组注册全空**（非配置字段，见 **D16**） | **返 `kConfiguration`**——一个什么都不收不发的节点必是漏了注册 |
 
   **配置里已无 topic**（**D16**）：topic 的合法性（非空、键值不同、方向不冲突）在**注册那一刻**就判完了，`Start()` 只补判"四组全空"这一条——它要等注册全部结束才知道。
 
@@ -231,10 +237,26 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 变化 | 用途 |
   |---|---|
-  | **新增** `SetDataObserver(std::function<void(Message)>)` | listener 在外来线程上回调，`DdsTransport` 据此 push 进 `read_queue_`（**D2**） |
   | **新增** `MatchedCount() → {matched, alive}` | **D9** 的判活 |
   | **改语义** `Publish` | 由"必成功"改为**可阻塞**（在专属线程上调用，**D3**） |
-  | `Subscribe` / `Unsubscribe` / `Init` / `Shutdown` / `Name` | 不变（QoS 统一，无须增参） |
+  | `Subscribe` / `Unsubscribe` / `Init` / `Shutdown` / `Name` | **不变**（QoS 统一，无须增参） |
+
+  **不新增数据观察者接口**——既有的 `IDdsProvider::Subscribe` 已经是所需的那个钩子：
+
+  ```cpp
+  // IDdsProvider.hpp:28（现状，不改）
+  virtual Coro::Result<void> Subscribe(
+      const std::string& topic,
+      std::function<void(const std::vector<uint8_t>&)> cb) = 0;
+  ```
+
+  `DeclareReader(topic)`（**D15**）落到 provider 就是调它，**闭包捕获 `topic`** 即可填 `Datagram.peer`（**D6**：topic 不上线缆，入站由 `peer` 带出）。
+
+  > **曾拟新增 `SetDataObserver(std::function<void(Message)>)`，已否决**，两个理由：
+  > ① **跨层**——`Message` 是 codec **之后**的产物，而 provider 在 codec **之下**；`read_queue_` 装的是 `Datagram`（字节），provider 不该认识 `Message`。
+  > ② **重复**——它与既有的 `Subscribe(topic, cb)` 是同一个钩子的两种写法，留两个只会让人猜哪个才是真入口。
+  >
+  > 若将来确需**单一全局**观察者取代按 topic 回调，其签名**必须带 topic**（`void(const std::string&, const std::vector<uint8_t>&)`），且 `Subscribe` 的 `cb` 参数须同时去掉——**两者只能留一个**。
 
 - **D14（`FastDdsProvider` 与 `FastDdsRawType` 按 Fast DDS 3.x 重写）：** 本机为 **3.6.1**，与代码假定的 2.13.x 是**大版本断裂**：包名 `fastrtps` → **`fastdds`**、命名空间 `eprosima::fastrtps::rtps` → **`eprosima::fastdds::rtps`**、`TopicDataType` 的 `serialize`/`deserialize` 由指针改引用并增 `DataRepresentationId_t`、`getSerializedSizeProvider` → **`calculate_serialized_size`**、`getKey` → **`compute_key`**、`fastrtps/types/TypesBase.h` **已不存在**。
 
@@ -273,11 +295,11 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`reply_to` 仍留在线缆上，但降为【一致性交叉校验】**：若 `request.reply_to` 非空且与查出的 `reply_topic` **不等**，返 `kInvalidArgument`。
 
-  > **保留它是有价值的，不是冗余**：两侧配置写歪时（客户端在 `cfg.get.reply` 上等、服务端配成 `cfg.reply` 往外发），**若不带 `reply_to`，这种偏差完全不可见**——客户端只会一路超时到 `kTimeout`，看起来像对端没响应。带上它，服务端**当场就能报出**"你等的地方和我发的地方不一样"。这 20 来个字节买的是一类部署错误的可诊断性。
+  > **保留它是有价值的，不是冗余**：两侧注册实参写歪时（客户端在 `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发），**若不带 `reply_to`，这种偏差完全不可见**——客户端只会一路超时到 `kTimeout`，看起来像对端没响应。带上它，服务端**当场就能报出**"你等的地方和我发的地方不一样"。这 20 来个字节买的是一类部署错误的可诊断性。
 
   ### 三处连带收益
 
-  1. **`DataWriter` 不再累积。** 先前"每个出现过的 `reply_to` 永久留一个 writer、不做回收"那条代价**整条消失**——端点集合现在**完全由配置决定、启动即定型、运行期恒定**。
+  1. **`DataWriter` 不再累积。** 先前"每个出现过的 `reply_to` 永久留一个 writer、不做回收"那条代价**整条消失**——端点集合现在**完全由启动前的注册决定、启动即定型、运行期恒定**。
   2. **运行期无 DDS 端点创建**，故也没有"回应路径上突然吃一个 ~240ms 发现窗口"的问题（**D16**）。
   3. **服务端不再受客户端摆布**：`reply_to` 曾是**客户端说了算**的目的地，服务端照着发。现在它只是个待校验的声明。
 
@@ -331,6 +353,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **注册发生在 `Created`**，故它**不是**"启动后动态增删 topic"的能力；要那个能力得另行裁决。
 
+  **`Start()` 失败不清空已注册的内容**：校验失败停在 `Created`（**D12**），此时**注册表原样保留**，调用方补上漏的那几项再 `Start()` 一次即可。否则"四组全空返 `kConfiguration`"之后还得把全部注册重做一遍，无谓。
+
   ### 批量、可多次调用、整批生效
 
   - **批量**：一次给一组，`{"a","b","c"}` 一次调完。
@@ -345,7 +369,9 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | 不在 `Created` 阶段 | `kInvalidState` |
   | topic 为空串 | `kInvalidArgument` |
   | `Clients` / `Services` 某条的键与值相同 | `kInvalidArgument`（请求与应答同 topic 必然自收自答） |
-  | 同一 topic 被注册为**方向冲突**的两个角色（如既是 `Clients` 的键又是 `Services` 的键） | `kInvalidArgument`——那是自己请求自己 |
+  | 同一 topic 既是 `Clients` 的键、又是 `Services` 的键 | `kInvalidArgument`——**自己请求自己**，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答 |
+
+  **只拦这一种组合。** 其余"同一 topic 上既有 writer 又有 reader"的组合（判据见「代价 9」）**只造成自收白干、不会误配**，且可能是调用方有意为之（本地回环自测），故**不拦、只在文档记明**。
 
   **四组全空**：`Start()` 返 `kConfiguration`（**D12**）——一个什么都不收不发的节点必是漏了注册。**这一条仍在 `Start()` 判**，因为"全空"要等注册全部结束才知道。
 
@@ -383,6 +409,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `Subscribe(topic, kRequest)` | `Services` 的键 |
   | `RequestForResultDirect(topic, …)` | `Clients` 的键 |
 
+  **`Subscribe` 的 topic 键传 `kAny` 时【跳过该校验】**：`kAny` 不对应任何一个具体 topic，拿它去查注册表必然落空。这不是网开一面——`kAny` 本来**就只在已注册范围内起作用**（见下节），它的作用域已由注册天然限定。
+
   **不猜、不回落、不懒补**。这让"忘了注册"从一个**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成一个**显式错误**。
 
   ### 一处必须写进接口文档的限制
@@ -390,6 +418,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader 的 topic 的全部**」——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值，**不是**"本 domain 上的全部"。未注册的 topic，其消息**根本不会到达本进程**。
 
   **这是确定会被理解反的一处**，接口文档须明写。
+
 ## 明确接受的代价
 
 1. **`RELIABLE` QoS 被本地队列架空。** listener 一搬走样本，DDS 即认为已交付、背压解除；我方 `read_queue_` 满时静默丢最旧（#190 实测丢 3976/5000 而 `push_fail=0`）。**这是 2026-08-28 裁决"不需要优先使用 DDS 自己的机制"的直接后果，明确接受。**
@@ -412,15 +441,28 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
    **未采用的缓解手段**：DDS 的 `ContentFilteredTopic` 能把按 `corr` 前缀的过滤下推到 DDS 侧、使多余样本根本不进我方队列。**本轮不采用**，因 2026-08-28 裁决"不需要考虑优先使用 DDS 自己的机制"；若实测中放大成为瓶颈，这是**第一顺位**的优化入口。
 
-   **放大只限于同一服务内**（**D6**：应答 topic 每服务一个）：调多个服务**不会**叠成 `N×M`。
+   **只要不同服务用不同的应答 topic，放大就只限于同一服务内**（**D6**），调多个服务不叠成 `N×M`。
+   **但这一点靠调用方保证，框架不强制**：`RegisterClients` 的 map 只排除了"同一请求 topic 配两个应答 topic"，**不排除两个请求 topic 共用一个应答 topic**（`{"a":"r","b":"r"}`）——那样写就**会**叠。
 
    **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 
 9. **自收只在【同一 topic 既发布又订阅】时发生，且那是配置方显式写出来的。** Fast DDS 默认**不屏蔽同一 participant 内的收发匹配**——已核 3.6.1 头文件：`DomainParticipant` 只提供 `ignore_participant(GUID)`（屏蔽**别的** participant，`DomainParticipant.hpp:703`），**没有 `ignore_local_endpoints` 这类自环开关**。
 
-   **但按角色注册之后（D16），这在正常用法下不会触发**：每个角色在一个 topic 上**只建它实际需要的那一侧端点**。客户端在 `cfg.get` 上只有 writer、在 `cfg.get.reply` 上只有 reader；服务端反之。**没有任何 topic 同时挂着本节点的 writer 与 reader，自收无从谈起。**
+   **但按角色注册之后（D16），典型用法下不会触发**：每个角色在一个 topic 上**只建它实际需要的那一侧端点**。客户端在 `cfg.get` 上只有 writer、在 `cfg.get.reply` 上只有 reader；服务端反之。
 
-   **唯一会触发的情形**：同一个 topic 同时注册为 `Publishers` 与 `Subscribers`。那是调用方**显式写下的**（例如有意做本地回环自测），**不是框架强加的**。
+   **精确判据是两个方向集合相交**（**不是**"同时注册为 `Publishers` 与 `Subscribers`"那一种）：
+
+   ```
+   writer 侧 = Publishers ∪ Clients 的键 ∪ Services 的值
+   reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
+   自收 ⟺ writer 侧 ∩ reader 侧 ≠ ∅
+   ```
+
+   交集里的每个 topic 都会自收。举两例：`Publishers` ∩ `Subscribers`（本地回环自测）；`Publishers` ∩ `Clients` 的值（往某应答 topic 发布、同时又是该服务的客户端）。
+
+   **其中最危险的一种已被 D16 的方向冲突校验拦下**：`Clients` 的键 ∩ `Services` 的键——自己请求自己，且 `corr` 是自己生成的，`Dispatcher` **会真的匹配上**，形成自问自答而调用方毫无察觉。**其余交集只是白干**（`kind` / `corr` 对不上，落到无订阅者）。
+
+   **落到交集里但未被校验拦下的组合，是调用方显式写下的**，**不是框架强加的**。
 
    **实现票的处置方向（可行性已核）**：若确需屏蔽，在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），前缀相同即丢弃、不入队。两个符号在 3.6.1 均存在。**本设计不默认屏蔽**——既然只有显式注册两个相反角色才会触发，替调用方决定"你不想收到自己"是越权。
 

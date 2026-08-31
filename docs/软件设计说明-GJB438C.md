@@ -412,9 +412,15 @@ Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics); 
 
 **请求-响应两侧实参一模一样、端点方向相反**：客户端 `RegisterClients` 与服务端 `RegisterServices` 传相同内容，各自按角色建各自那一侧——不会填错方向，也不必协调。
 
-**`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。
+**`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。**这两个方法在 `ITransport` 七方法【之外】**——它们是 DDS 端点模型的必需品、三介质没有对应物，但**不改动 `ITransport` 本身**，故"换传输即可运行"的调用方不受影响（**D1**）。
 
-**注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`、`Subscribe(topic, kRequest)` 为 `Services` 的键、`RequestForResultDirect` 为 `Clients` 的键，否则返 `kConfiguration`。这让"忘了注册"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。
+**不新增 provider 侧的数据观察者接口**（**D13**）：既有的 `IDdsProvider::Subscribe(topic, cb)`（`IDdsProvider.hpp:28`，`cb` 收 `std::vector<uint8_t>`）已经是所需的钩子，`DeclareReader` 落到 provider 就是调它，闭包捕获 `topic` 即可填 `Datagram.peer`。**曾拟新增的 `SetDataObserver(std::function<void(Message)>)` 已否决**——`Message` 是 codec **之后**的产物而 provider 在 codec **之下**（跨层），且它与既有 `Subscribe` 是同一钩子的两种写法（重复）。
+
+**注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`、`Subscribe(topic, kRequest)` 为 `Services` 的键、`RequestForResultDirect` 为 `Clients` 的键，否则返 `kConfiguration`。这让"忘了注册"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。**`Subscribe` 的 topic 键传 `kAny` 时跳过该校验**——`kAny` 不对应任何具体 topic，且它本就只在已注册范围内起作用。
+
+**`Subscribe` 因此必须返 `Coro::Result<Ticket>`、不能返裸 `Ticket`**（**D8**）：`Ticket` 装不下 `kConfiguration`；返裸 `Ticket` 只能交出一个空凭据，其 `Wait` 返的是 `kInvalidState`（`Dispatcher.hpp:203`）——**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
+
+**`Start()` 失败不清空已注册的内容**（**D16**）：校验失败停在 `Created`，注册表**原样保留**，调用方补上漏项再 `Start()` 一次即可。
 
 **`DdsNodeConfig` 只剩两项**：`uuid_override`（为空才 `QUuid::createUuid()`，测试注入用）与 `trace_sink`。历史遗留的 `inbox_topic` / `node_id` / `handler` / `business_queue_max_*` 一并删除。`DdsConfig`（传输层）保持 `domain_id` / `provider` / `qos`，**不含任何 topic**。
 
@@ -430,7 +436,15 @@ Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics); 
 
 **代价：两侧注册实参歪了只能运行期发现**。跨进程无从静态校验，表现为服务端返 `kInvalidArgument` / `kConfiguration`、客户端重发耗尽后返 `kTimeout`——**两侧各有明确错误码，不是静默失败**。
 
-**自收在正常用法下不发生**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关），但按角色注册后**节点在一个 topic 上只建它实际需要的那一侧端点**——没有任何 topic 同时挂着本节点的 writer 与 reader。唯一会触发的情形是同一 topic 同时注册为 `Publishers` 与 `Subscribers`，那是调用方**显式写下的**（如本地回环自测），**框架不默认屏蔽**。
+**自收的精确判据是两个方向集合相交**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关）。按角色注册后，
+
+```
+writer 侧 = Publishers ∪ Clients 的键 ∪ Services 的值
+reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
+自收 ⟺ writer 侧 ∩ reader 侧 ≠ ∅
+```
+
+典型用法下交集为空。**最危险的一种已被 D16 的注册校验拦下**——`Clients` 的键 ∩ `Services` 的键（自己请求自己，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答）。**其余交集只造成自收白干、不会误配**（`kind`/`corr` 对不上，落到无订阅者），且可能是调用方有意为之（本地回环自测），故**不拦、只记明，框架不默认屏蔽**。
 
 **topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 按 **D16** 的四组注册项逐项建**对应方向**的端点；**且仅此一处**——运行期无建端点路径。`DeclareWriter` / `DeclareReader` 仍要求**幂等**，但理由是**注册里可能重复**（同一 topic 既注册为 `Subscribers`、又是某条 `Clients` 的值），幂等让 `DoStart()` 不必先去重。
 
