@@ -65,7 +65,9 @@ classDiagram
         <<编译面内 · ADR-0007 样板>>
     }
     class SerialTransport {
-        <<待按新形态跟进 · 排除于编译面>>
+        <<编译面内 · ADR-0012 重构完毕>>
+        +设备管理泵 + 读写双队列
+        +静默超时唯一判活 · 自动重开、不自终
     }
     class DdsTransport {
         <<待按新形态跟进 · 排除于编译面>>

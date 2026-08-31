@@ -106,7 +106,7 @@
 
 **图例说明**：实线箭头读作"A 使用/组合 B"，虚线为可选依赖。`CSC_NODE` 组合 `CSC_CODEC`+`CSC_IO`、依赖 `CSC_CORE`；`CSC_CODEC`/`CSC_IO` 各依赖 `CSC_CORE`；全体运行于 `AsyncTask`；`CSC_IO` 的 Qt socket/串口依赖在宿主未启用 Qt 时不编译。整体单向依赖、上层不被下层反向引用。总体类关系见附图 `arch-class.svg`（`ITransport`/`ICodec`/node/core 的组合 ▷ 与实现 △）。
 
-框内标注了**当前编译面**：`CSC_IO` 有 **`UdpTransport` 与 `TcpTransport`** 两个实现在编译面内——TCP 已按 **ADR-0011** 重构完毕（#179 读侧 / #180 写侧 / #181 用例判定）。**串口 / DDS 与 `TcpServer` 待按同一形态跟进**；`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
+框内标注了**当前编译面**：`CSC_IO` 有 **`UdpTransport` / `TcpTransport` / `SerialTransport`** 三个实现在编译面内——TCP 依 **ADR-0011**（#179 读侧 / #180 写侧 / #181 用例判定）、串口依 **ADR-0012**（#193 重写 / #194 旧用例判定）。**`DdsTransport` 与 `TcpServer` 仍在外**：前者设计见 **ADR-0013**（尚未实现），后者本轮不做（ADR-0011 **D10**）。`DdsNode`/`DdsHandlerContext`/`DdsCodec` 是重设计之前的历史代码。
 
 > **变更（ADR-0006/0008/0009）**：`CSC_CORE` 框原列 `Result/Status`、`Cancellation`、`SharedCompletion` 三项——`Result`/`Status` 本就只是别名、已随 `core/Result.hpp` 删除（改用 `Coro::Result`），`SharedCompletion` 已删除（改用 `Awaitable::close()` 广播 + `FiberTask::get()` 汇合）。`Cancellation` **文件仍在且随库编译、亦有自己的测试**，但 ADR-0006 D3 取消令牌退化为时限之后，**库的活代码里已无使用者**，故在框内标注其性质而非直接抹去。`Dispatcher` 原被同时画进 `CSC_NODE`——它实际位于 `core/`，已归入 `CSC_CORE` 一处。
 
@@ -328,7 +328,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 #### 4.2.14 串口传输泵与设备重开（MS_SERIAL_PUMP）
 
-**图 4-16（`seq-serial-pump`）** —— ADR-0012 定稿的**目标形态**，尚未实现。
+**图 4-16（`seq-serial-pump`）** —— ADR-0012 定稿的形态，**已实现**（#193 重写 / #194 旧用例判定）。
 
 ![串口传输泵与设备重开时序图](diagrams/seq-serial-pump.svg)
 
@@ -552,14 +552,14 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ### 5.6 传输层详细设计（CSU_IO）
 
-**单元设计决策（ADR-0007 D1，UDP 先行；TCP 已于 ADR-0011 跟进，串口设计见 ADR-0012）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**本轮仅 `UdpTransport` 落地该形态**，`TcpClientTransport` 已是其前身（#109 的连接泵 + 对外通道），`TcpTransport`/`SerialTransport` 待跟进（队列策略差异见 TBD-009）。
+**单元设计决策（ADR-0007 D1，UDP 先行；TCP 已于 ADR-0011、串口已于 ADR-0012 跟进；DDS 设计见 ADR-0013，尚未实现）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**本轮仅 `UdpTransport` 落地该形态**，`TcpClientTransport` 已是其前身（#109 的连接泵 + 对外通道），`TcpTransport`/`SerialTransport` 待跟进（队列策略差异见 TBD-009）。
 连接管理（TCP 客户端）与纯管道分离并**维持两层**（ADR-0004 D8：合并只会复制收发语义）；TCP 客户端内部改为**连接泵 + 对外通道**（ADR-0004 D6）；DDS 跨线程有界交接闭合 ADR-0001 未决项。
 
 **设计约束**：并发写串行化保留（RT_TRANSPORT_004；其"单读"约束已随 ADR-0007 D4 删除，`AsyncRead()` 交出等待器句柄、是否共享由调用方 `shared()` 决定）、**发送完成语义与背压已撤销**（DD-6）；UDP/DDS 单次一报文/样本，过大发送前失败；**读取终止语义**（DD-11）：不可重连介质致命错误返 `kClosed`，可重连介质链路中断**对调用方透明**（`Read` 挂起至新链路就绪，不返回任何断链错误）；socket/串口在节点执行域 fiber 内创建（亲和纪律）。
 
 **软件逻辑**：见 `src/io/*`。
 
-> **实况标注（2026-08-28 核对）**：下表中 **`UdpTransport` 与 `TcpTransport` 已按新形态实现并参与编译**（后者依 ADR-0011，#179/#180/#181）。**`SerialTransport` 一行是 ADR-0012 定稿的目标形态，尚未实现**——其源文件当前有 13 处不可编译引用。`SerialTransport` / `DdsTransport` / `TcpServer` 三行描述的是**重设计之前的形态**，其源文件当前**不在 `CMakeLists.txt` 的库源清单内**（编译面收窄至 UDP + ProtocolNode），行内提及的 `Read()`、`BoundedQueue` 等已是历史 API。这些单元的复活与改写属"编译面恢复"。
+> **实况标注（2026-08-28 核对）**：下表中 **`UdpTransport` / `TcpTransport` / `SerialTransport` 三者已按新形态实现并参与编译**（TCP 依 ADR-0011 #179/#180/#181，串口依 ADR-0012 #193/#194）。**`DdsTransport` 与 `TcpServer` 仍排除于编译面**——前者设计见 ADR-0013（尚未实现），后者本轮不做（ADR-0011 D10）。
 >
 > **`TcpTransport` 一行是例外**：它描述的是 **ADR-0011 定稿的目标形态**（尚未实现），不是历史代码。当前 `src/io/tcp/` 下的三个 .cpp 仍是重设计之前的实现，且 `TcpClientTransport.hpp:126` 引用着已删除的 `OperationOptions`、**头文件本身无法编译**。
 
@@ -568,7 +568,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | **TcpTransport**（ADR-0011 重构后） | **socket 管理泵 + 读写双队列**，与 `UdpTransport` 同构。外层泵：`connectToHost` + 等 `connected`（**用那唯一的 `silence_timeout`**，D5）→ 成功则建 `readAll` 流、`await_for(stream, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal, silence_timeout)` 退避。**每轮末尾无条件 `abort()`**，socket 回 `UnconnectedState`，下轮在**同一对象**上重连（**D3**，与 UDP 的 bind→close→再 bind 同模式）。写泵两个阻塞点（等数据 / 等连接就绪），短写循环刷缓冲；**不做代际号校验**——断链时半条即半条，由对端重同步（**D7**）。判活以**断开事件为主**、静默超时为辅（半开检测，**D4**）。**不自终**，唯一退出条件是我方 `Close`。 |
 | ~~TcpClientTransport~~ | **已并入 `TcpTransport`**（ADR-0011 **D1**）：重连是 TCP 客户端的固定语义（RT_TCP_RECONNECT_001 不设开关），做成外层泵的一部分即可，无需单设包装类。原分层的理由是"`TcpServer` 复用裸管道"，但服务端连接**不重连**、外层泵形态本就不同，复用的是数据面而非泵形态。 |
 | UdpTransport | **socket 管理泵 + 读写双队列**（ADR-0007，样板实现）。外层循环：按配置 bind → 失败**按 `silence_timeout` 所定间隔（默认 5 s）重试、无限重试**，唯一退出条件是我方 `Close`（**不自终**，RT_LIFECYCLE_008 的介质清单已去掉 UDP）。内层循环：`await` 报文流（带**静默超时**，可配、`0` 禁用、默认禁用）→ 投入 `read_queue`；流终止或静默超时 → 退出内层回外层重建。`Read()` 交出 `read_queue` 句柄;`Write()` 投入 `write_queue` 即返（fire-and-forget，链路不可用时排队等待恢复，恢复后按序全部发出）。寻址 kDefault→config 默认 / kNet→ip:port |
-| **SerialTransport**（ADR-0012 重构后，**目标形态、尚未实现**） | **设备管理泵 + 读写双队列**，与 `Udp`/`TcpTransport` 同构。外层泵：`open()`（**同步**，故无"等连上"这一处）→ 成功则建 `readAll` 流、`await_for(read_stream_, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal_, silence_timeout)` 退避。每轮末尾 `port->close()`，下轮在**同一对象**上重开。**唯一时间量** `silence_timeout` 两处共用（读静默 / 退避），比 TCP 少一处。**静默超时是唯一主动判据**（**D4 反转**：串口无断开事件）。**读泵须显式跳过空切片**（**D5**，串口独有）。**不自终**——TBD-005 已关闭，串口自动重开、与 TCP 同构。 |
+| **SerialTransport**（ADR-0012 重构后，**已实现**，#193/#194） | **设备管理泵 + 读写双队列**，与 `Udp`/`TcpTransport` 同构。外层泵：`open()`（**同步**，故无"等连上"这一处）→ 成功则建 `readAll` 流、`await_for(read_stream_, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal_, silence_timeout)` 退避。每轮末尾 `port->close()`，下轮在**同一对象**上重开。**唯一时间量** `silence_timeout` 两处共用（读静默 / 退避），比 TCP 少一处。**静默超时是唯一主动判据**（**D4 反转**：串口无断开事件）。**读泵须显式跳过空切片**（**D5**，串口独有）。**不自终**——TBD-005 已关闭，串口自动重开、与 TCP 同构。 |
 
 > **三处"照抄样板就会漏"的串口独有点**（ADR-0012）：
 > 1. **跳空切片**（**D5**）——`coroiodevice::readAll()` 的 `readyRead` 处理器是 `ch->push(dev->readAll())`，**无 `bytesAvailable()` 判断、无 `isEmpty()` 守卫**；其初次 drain 处**有**该检查，`corosocket::readAll()` 两处都有。**这是 `coroiodevice` 独有的结构性缺口**，UDP/TCP 都不需要这一行。
@@ -1024,7 +1024,7 @@ done
 | 图 4-13 | 时序 | MS_TRANSPORT_PUMP | `seq-transport-pump.mmd`（ADR-0007 引入） |
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
 | 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**已实现**，#179/#180） |
-| 图 4-16 | 时序 | MS_SERIAL_PUMP | `seq-serial-pump.mmd`（ADR-0012 引入；**目标形态，尚未实现**） |
+| 图 4-16 | 时序 | MS_SERIAL_PUMP | `seq-serial-pump.mmd`（ADR-0012 引入；**已实现**，#193/#194） |
 | 附图 | 类图 | 总体 | `arch-class.mmd` |
 
 ---

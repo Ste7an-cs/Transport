@@ -20,7 +20,7 @@ classDiagram
         +silence_timeout：读超时兼重试间隔
     }
     class SerialTransport {
-        <<排除于编译面>>
+        <<编译面内 · ADR-0012 重构完毕>>
         +串口字节流
     }
     class DdsTransport {
