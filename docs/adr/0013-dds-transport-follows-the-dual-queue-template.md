@@ -1,8 +1,8 @@
-# ADR-0013：DDS 按双队列样板跟进，请求-响应用 `correlation_id` 走两阶段
+# ADR-0013：DDS 按双队列样板跟进，请求-响应用 `correlation_id` 走单阶段 `Direct`
 
 **状态：** Proposed（**第二版**，2026-08-28 裁决后整体改写；第一版"优先用 DDS 自身机制"已作废，见文末「被推翻的第一版」）
-**日期：** 2026-08-28
-**关联：** ADR-0007（泵 + 读写双队列——本 ADR **沿用**其形态）；ADR-0011（TCP）、ADR-0012（串口）（同一形态的前两次跟进）；ADR-0008 **D1**（`ITransport` 七方法——**本 ADR 完整实现，不分叉**）、**D6**（`Dispatcher` 协议无关模板——复用）；ADR-0010（`RequestForResult` 的两阶段模型——**本 ADR 的请求-响应照此实现**）；SRS **RT_NODE_007**（本 ADR 修订其丢弃策略）。
+**日期：** 2026-08-28（2026-08-31 就应答 topic 与 `correlation_id` 构成再次裁决，见 **D6**）
+**关联：** ADR-0007（泵 + 读写双队列——本 ADR **沿用**其形态）；ADR-0011（TCP）、ADR-0012（串口）（同一形态的前两次跟进）；ADR-0008 **D1**（`ITransport` 七方法——**本 ADR 完整实现，不分叉**）、**D6**（`Dispatcher` 协议无关模板——复用）；ADR-0010 **D13**（`RequestForResultDirect` 的**单阶段**模型——**本 ADR 的请求-响应照此实现**；同 ADR 的两阶段 `RequestForResult` **本 ADR 不用**）；SRS **RT_NODE_007**（本 ADR 修订其丢弃策略）。
 **实施范围：** `DdsTransport` 与 `DdsNode`。调研见 **#190**，Fast DDS 3.6.1 实测见 **#191**。
 
 ## 背景（Context）
@@ -72,30 +72,56 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | 订阅某 topic 的通知 | `Subscribe(topic, kNotify)` | `{topic, kAny, kNotify}` |
   | 收某 topic 的请求 | `Subscribe(topic, kRequest)` | `{topic, kAny, kRequest}` |
   | 收全部 topic 的通知 | `Subscribe(kAny, kNotify)` | `{kAny, kAny, kNotify}` |
-  | `RequestForResultDirect` **内部**登记（结果，**只有一条**） | — | `{reply_topic, corr, kReply}` |
+  | `RequestForResultDirect` **内部**登记（结果，**只有一条**） | — | `{该服务的应答 topic, corr, kReply}` |
 
-  **应答 topic 是【每服务一个、全体客户端共用】的，不是每客户端一个**（2026-08-31 裁决）。区分客户端**全靠 `correlation_id`**，故它必须**全局唯一**，为此定死两段式构成：
+  **应答 topic 是【每服务一个、该服务的全体客户端共用】的**（2026-08-31 裁决）。**"每服务一个"是字面意思——它绑在【服务】上，不是绑在【节点】上**：
+
+  ```cpp
+  // DdsNodeConfig：请求 topic ──► 该服务的应答 topic，【一服务一条】
+  std::map<std::string, std::string> reply_topics;
+  //   "cfg.get"  -> "cfg.get.reply"
+  //   "log.tail" -> "log.tail.reply"
+  ```
+
+  `RequestForResultDirect(topic, ...)` 按 `topic` 查表取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
+
+  **故一个客户端同时调多个服务时，各服务的应答落在各自的 topic 上，互不相扰**——这正是"每服务一个"要保证的。若把它做成节点级的单一字段，多个服务的应答会挤在一起、读入放大从 `N` 倍恶化为 `N×M` 倍（`M` 为服务数），**那不是本裁决的意思**。
+
+  **不用约定式派生**（如 `<topic>/reply`）：省下的是一行配置，代价是 topic 命名空间被框架侵占，且与既有 topic 命名冲突时无从规避。显式表更笨但可控。
+
+  区分**同一服务的不同客户端**则**全靠 `correlation_id`**，故它必须**全局唯一**，为此定死两段式构成：
 
   ```
-  correlation_id = "<uuid>#<session_id>"
-                     ↑         ↑
-       节点初始化时生成一次   uint32，从 0 开始自增，每请求一个
+  correlation_id = "<uuid>#<request_seq>"
+                      ↑          ↑
+        节点初始化时生成一次    uint32，从 0 开始自增，每请求一个
   ```
 
   | 半段 | 谁生成 | 何时 | 保证什么 |
   |---|---|---|---|
   | **uuid** | 节点自身 | **初始化时一次**，此后不变 | **跨节点**不撞——这是共用 topic 得以成立的全部根据 |
-  | **session_id**（`uint32`） | 节点内自增计数器 | 每次 `RequestForResultDirect` | **节点内**不撞 |
+  | **`request_seq`**（`uint32`） | 节点内自增计数器 | 每次 `RequestForResultDirect` | **节点内**不撞 |
 
-  `Message::correlation_id` 本就是 `std::string`（`Message.hpp:49`），**装得下，不需要改结构**。
+  **自增半段叫 `request_seq`，【不叫 `session_id`】**：`Message::session_id` 是**外部协议**的匹配键，**D5** 刚明确 DDS 路径把它留缺省 `0`。同一份代码里出现两个语义无关的 `session_id` 是确定的阅读陷阱，故改名。
 
-  **"客户端要过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成**，不需要应用层写过滤代码：共用 topic 上别人的应答携带别人的 `corr`，与本机登记的 `{reply_topic, 我的 corr, kReply}` **不匹配**，落到"无订阅者"而被丢弃。**uuid 那一半正是这一步安全的根据**——若只有自增计数，两个节点会各自从 0 开始，**必然互相误配**。
+  **`uint32` 回绕（约 42.9 亿次请求后）明确接受，不加防回绕逻辑**：回绕后重复的是**本节点很久以前**用过的值，而那一条订阅早已注销——`Dispatcher` 里已无对应登记，不会误配。
+
+  **uuid 用 `QUuid::createUuid()`**（2026-08-31 裁决）。`Qt5::Core` 已 `PUBLIC` 链进 `transport` 目标（`CMakeLists.txt:71`），**不引入新依赖**；取字符串用 `toString(QUuid::WithoutBraces)`（36 字符）。
+  **不自搓**（`random_device` 在 WSL 下质量存疑，且要自行论证碰撞率），**不引第三方 uuid 库**（为一个字段引依赖不划算）。
+
+  `Message::correlation_id` 本就是 `std::string`（`Message.hpp:49`），`36 + 1 + ≤10 = ≤47` 字节，**装得下，不需要改结构**；线缆上 `corr_len` 为 2 字节 BE（**D5**），余量充足。
+
+  **"客户端要过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成**，不需要应用层写过滤代码：共用 topic 上别人的应答携带别人的 `corr`，与本机登记的 `{该服务的应答 topic, 我的 corr, kReply}` **不匹配**，落到"无订阅者"而被丢弃。**uuid 那一半正是这一步安全的根据**——若只有自增计数，两个节点会各自从 0 开始，**必然互相误配**。
 
   **不提供"订阅一个"与"订阅所有"两种固定变体**（2026-08-28 裁决）——"所有"由调用方传 `kAny` 表达。**`ServeRequests` 这个名字随之取消**：两个键全开放后它与 `Subscribe(topic, kRequest)` **完全等价**，留两个签名相同的方法只会让人以为有语义差别。
 
-  **`correlation_id` 不进公开接口，内部恒 `kAny`。** 理由：
+  **`correlation_id` 不进公开接口。** 精确地说：**`Subscribe` 交出去的订阅其 `corr` 位恒为 `kAny`**，而 `RequestForResultDirect` **内部**登记的那一条**用具体值**（见上表末行）。
 
-  - **请求-响应侧**：`corr` 由框架在 `RequestForResult` 内生成。**服务端事先不可能知道客户端会生成什么值**，客户端等应答用的具体值又是内部登记的——故公开出去只有 `kAny` 一个可用值，**那是陷阱不是灵活性**。
+  > **这个区别是承重的，不是措辞**：共用应答 topic 之所以能区分客户端，**全靠内部登记的 corr 是具体值**。若内部也用 `kAny`，客户端会匹配上该 topic 上**所有人**的应答。
+
+  公开面不暴露 `corr` 的理由：
+
+  - **请求-响应侧**：`corr` 由框架在 `RequestForResultDirect` 内生成。**服务端事先不可能知道客户端会生成什么值**，客户端等应答用的具体值又是内部登记的——故公开出去只有 `kAny` 一个可用值，**那是陷阱不是灵活性**。
   - **发布-订阅侧**：`corr` 本可当"应用自定义子通道标识"（发布时填、订阅时按它过滤），但 **2026-08-28 裁决"发布订阅不需要这个能力"**。
 
   **连带**：`correlation_id` 自此**只有框架生成的关联符一个来源**，先前"同一字段服务两个目的、`kind` 传 `kAny` 时可能串"的隐患**一并消失**。
@@ -192,9 +218,11 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
-  | **`DdsNodeConfig::reply_topic`** | **非空**（**不要求唯一——本就是共用的**，见 **D6**） |
+  | **`DdsNodeConfig::reply_topics`** | 键值**均非空**；**不要求唯一**——同一服务的应答 topic 本就由其全体客户端共用（**D6**） |
 
-  **这里没有"topic 须唯一"这类部署约束**（2026-08-31 裁决取消了先前的 per-client inbox 方案）：应答 topic **本就是一个服务的全体客户端共用**的，唯一性的担子**整个移到了 `correlation_id` 的 uuid 半段**上——那是节点**自己**生成的，无需部署方协调，也不会因配置写错而静默误配。**这是共用方案相对 per-client inbox 的主要收益。**
+  **另一处校验在调用时、不在 `Start()` 时**：`RequestForResultDirect(topic, ...)` 若在 `reply_topics` 里查不到 `topic`，返 `kConfiguration`。放在调用时是因为**客户端未必要为它不调的服务配表项**，启动时全量要求反而是过度约束。
+
+  **这里没有"topic 须唯一"这类部署约束**（2026-08-31 裁决取消了先前的 per-client inbox 方案）：应答 topic **本就由一个服务的全体客户端共用**，唯一性的担子**整个移到了 `correlation_id` 的 uuid 半段**上——那是节点**自己**用 `QUuid::createUuid()` 生成的，无需部署方协调，也不会因配置写错而静默误配。**这是共用方案相对 per-client inbox 的主要收益。**
 
 - **D13（`IDdsProvider` 接口增删）：**
 
@@ -224,7 +252,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | 启动时一次性 | `config_.reply_topic` + `config_.topics` 里列出的全部 topic |
+  | `DdsNode::DoStart()` | 启动时一次性 | `config_.reply_topics` 的**全部值** + `config_.topics` 里列出的全部 topic |
   | **`DdsNode::Reply()`** | **每次回应前** | **`request.reply_to`** —— 见下 |
 
   **为什么 `Reply` 仍要懒声明**：服务端的应答目的地是**从请求里读出来的**（`request.reply_to`），而不是自己配置的，故仍不能保证启动时已声明。懒声明**让服务端无需为"我服务的每个客户端群用哪个应答 topic"另加配置**。
@@ -259,11 +287,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
    **未采用的缓解手段**：DDS 的 `ContentFilteredTopic` 能把按 `corr` 前缀的过滤下推到 DDS 侧、使多余样本根本不进我方队列。**本轮不采用**，因 2026-08-28 裁决"不需要考虑优先使用 DDS 自己的机制"；若实测中放大成为瓶颈，这是**第一顺位**的优化入口。
 
+   **放大只限于同一服务内**（**D6**：应答 topic 每服务一个）：调多个服务**不会**叠成 `N×M`。
+
    **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 
 ## 影响（Consequences）
 
-- **正面：** ① 四个介质形态统一，`ITransport` 仍是**全介质**的内部缝；② `AsyncRead`/`AsyncWrite` 契约不分叉，"换传输即可运行"的调用方**含 DDS**；③ 请求-响应复用 ADR-0010 已验证的两阶段模型与四条纪律；④ 恢复 DDS 进入编译面。
+- **正面：** ① 四个介质形态统一，`ITransport` 仍是**全介质**的内部缝；② `AsyncRead`/`AsyncWrite` 契约不分叉，"换传输即可运行"的调用方**含 DDS**；③ 请求-响应复用 ADR-0010 **D13** 已验证的**单阶段** `Direct` 模型（其四条纪律**只余两条适用**，见 **D7**）；④ 恢复 DDS 进入编译面。
 - **负面（明确接受）：** 见上七条。
 - **对 SRS：** **RT_NODE_007** 的丢弃策略修订为"丢最旧 + 静默"（与 DD-15 一致）；`DropReason` 五项减为**四项**；`RT_IF_DDS` 与 `DdsConfig` 登记同步；**RT_IN_INTERFACE_003** 的"非阻塞交接"仍成立（listener 侧 `push` 不阻塞）。
 - **对 ADR-0002：** **D4**（交接边界有界 + tail-drop）的"tail-drop"部分**被修订**为丢最旧；有界部分沿用。

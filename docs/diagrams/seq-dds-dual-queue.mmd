@@ -40,8 +40,8 @@ sequenceDiagram
 
     Note over T,RQ: ⚠ read_queue 沿用默认【有界 1024 + 静默丢最旧】，与三介质逐字相同（DD-15）。<br/>kDdsHandoffOverflow 删除（五项→四项）：它与三介质的接收队列同类，三者都不单设归因项。
 
-    Note over N,PEER: 应答 topic【每服务一个、全体客户端共用】(D6)：区分客户端全靠 correlation_id，<br/>故定为两段式 uuid#session_id —— uuid 节点初始化时生成一次(跨节点不撞)，<br/>session_id 为 uint32 从 0 自增(节点内不撞)。"过滤是不是给自己的"由 Dispatcher 的 corr 键天然完成。<br/>代价：每客户端都会收到该服务的【全部】应答，N 个客户端即约 N 倍读入量，<br/>多余样本进 read_queue_ 解码后才落空 —— 别人的应答可能把自己的挤掉，这加强了 D7 重发的必要性。
+    Note over N,PEER: 应答 topic【每服务一个】(D6)：绑在服务上、不绑在节点上 —— reply_topics 是一张<br/>「请求 topic → 应答 topic」的表，按目标 topic 查，查不到即 kConfiguration。<br/>故同时调多个服务时各服务应答落在各自 topic 上，互不相扰。<br/>区分同一服务的不同客户端全靠 correlation_id，定为两段式 uuid#request_seq ——<br/>uuid 由 QUuid::createUuid() 在节点初始化时生成一次(跨节点不撞)，request_seq 为 uint32 从 0 自增(节点内不撞)。<br/>"过滤是不是给自己的"由 Dispatcher 的 corr 键天然完成：内部登记用具体 corr、公开面登记恒 kAny。<br/>代价：同一服务的每客户端都会收到该服务【全部】应答，约 N 倍读入量，多余样本进 read_queue_ 解码后才落空 ——<br/>别人的应答可能把自己的挤掉，这加强了 D7 重发的必要性；放大只限同一服务内，不叠乘。
 
-    Note over N,PEER: topic 端点须【显式声明】(D15)：DoStart() 一次性声明 reply_topic 与配置里的全部 topic；<br/>服务端 Reply() 对 request.reply_to【懒声明】——应答目的地是从请求里读出来的，<br/>不能保证启动时已声明，故 DeclareTopic 必须幂等。<br/>reply_to 取值域为 O(服务数) 而非 O(客户端数)，故 DataWriter 不做回收。
+    Note over N,PEER: topic 端点须【显式声明】(D15)：DoStart() 一次性声明 reply_topics 的全部值与配置里的全部 topic；<br/>服务端 Reply() 对 request.reply_to【懒声明】——应答目的地是从请求里读出来的，<br/>不能保证启动时已声明，故 DeclareTopic 必须幂等。<br/>reply_to 取值域为 O(服务数) 而非 O(客户端数)，故 DataWriter 不做回收。
 
     Note over T,P: Close()：关 read_queue（携终止原因）、置 wq_stopping 并 notify 专属线程、<br/>provider->Shutdown()。WaitClosed()：join 专属线程。<br/>⚠ Shutdown() 能否打断在途阻塞的 Publish【未实测】——若不能，Close 最坏等一个 max_blocking_time。
