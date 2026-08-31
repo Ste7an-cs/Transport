@@ -175,6 +175,10 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
+  | **`DdsNodeConfig::inbox_topic`** | **非空，且须节点唯一**（见 **D15**） |
+
+  **`inbox_topic` 的唯一性是硬约束，不是建议**：`correlation_id` 由节点内自增生成，故**不同节点会生成相同的值**。这本不成问题——客户端登记的键是 `{自己的 inbox, corr, kReply}`，`corr` 只需**在自己 inbox 内唯一**。**但前提是 inbox 每个节点独占**；两个节点共用同一 inbox 会互相收到对方的应答并按 `corr` 误配。
+  框架**无法自行校验全局唯一**（跨进程），故只校验非空，并**在使用文档中列为部署约束**；建议取值内含节点标识。
 
 - **D13（`IDdsProvider` 接口增删）：**
 
@@ -194,6 +198,28 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   > if (!writer->write(&copy)) return make_error_code(TransportErrc::kIo);
   > ```
   > 在 3.x 下**语义完全反转**——已复核 `DDSReturnCode.hpp`：`typedef int32_t ReturnCode_t; const ReturnCode_t RETCODE_OK = 0;`，而 `write()` 返回的正是 `ReturnCode_t`。**成功返 0 → `!0` 为真 → 返 `kIo`；失败返非 0 → 返成功。且零警告照常编译。**
+
+- **D15（topic 端点的声明：显式 + 幂等 + 应答目的地懒声明）：** DDS 的每个 topic 需要建 `DataReader`（决定**什么会到达**）与 `DataWriter`（决定**能发往哪里**）。本设计的处置：
+
+  ```cpp
+  // DdsTransport 公开面（幂等：同 topic 重复调用直接成功）
+  Coro::Result<void> DeclareTopic(const std::string& topic);
+  ```
+
+  | 谁声明 | 何时 | 声明什么 |
+  |---|---|---|
+  | `DdsNode::DoStart()` | 启动时一次性 | `config_.inbox_topic` + `config_.topics` 里列出的全部 topic |
+  | **`DdsNode::Reply()`** | **每次回应前** | **`request.reply_to`** —— 见下 |
+
+  **⚠ 为什么 `Reply` 必须懒声明**：`request.reply_to` 是**某个客户端的 inbox**，服务端**事先不可能知道**（客户端是动态接入的），因而不可能预先声明。**若不懒声明，服务端的每一次 `Reply` 都会因目标 topic 无 `DataWriter` 而失败。**
+
+  **`DeclareTopic` 因此必须幂等**：同一个 `reply_to` 会被反复声明（该客户端每发一次请求就触发一次）。
+
+  > **本条是第一版发现、第二版重写时丢失、复核时重新发现的缺口。** 记此以免第三次丢。
+
+  **明确接受的代价——`DataWriter` 只增不减**：每个出现过的 `reply_to` 会留下一个 `DataWriter`，**本设计不自动回收**。回收策略（LRU？`matched` 归零即拆？）留待实现票评估，届时须给出上界，或明确"服务端的客户端数量有限"这一部署假设。
+
+  **QoS 统一之后（D4），`DeclareTopic` 不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
 
 ## 明确接受的代价
 
