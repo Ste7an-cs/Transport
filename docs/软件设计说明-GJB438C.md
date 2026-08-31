@@ -398,6 +398,10 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
 
+**两侧配置非对称**（**D16**）：服务端 `topics = {请求 topic, 应答 topic}`、`reply_topics` 为空（回哪儿由 `request.reply_to` 给出，不查表）；客户端 `topics` 可空、`reply_topics = {请求 topic → 应答 topic}`。**服务端宜把应答 topic 也列进 `topics`**，否则其 `DataWriter` 要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——该服务的**第一次应答会丢**，靠重发才补回来。
+
+**自收行为须记明**（代价 9）：`DeclareTopic` 同时建 reader 与 writer，而 Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关）。故节点**会收到自己发出的样本**，解码后在 `Dispatcher` 处落空——功能无害，但白占队列并与读入放大叠加。可在 listener 内比对 `SampleInfo::sample_identity` 的 writer GUID 前缀与本 participant `guid()` 后丢弃，**是否实施由实现票按实测开销定**。
+
 **topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 一次性声明 `reply_topics` 的全部值与配置里的全部 topic；服务端的 `Reply()` 对 `request.reply_to` **懒声明**——应答目的地是从请求里读出来的，不能保证启动时已声明。`DeclareTopic` 因此**必须幂等**。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
 
 **没有"topic 须唯一"这类部署约束**（**D12**）：`reply_topics` 只校验键值非空。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。

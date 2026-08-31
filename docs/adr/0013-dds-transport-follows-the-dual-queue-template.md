@@ -288,7 +288,18 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **删除四项**：`inbox_topic`（per-client inbox 方案已取消，**D6**）、`node_id`（由 uuid 取代，**D6**）、`handler` 与 `business_queue_max_*`（**D8** 的公开面无处理器回调——宿主自己起消费 fiber，与 ADR-0009 **D1** 移除 `ProtocolNode` handler 通道同向）。
 
-  **`topics` 是一个扁平列表，不按方向分**：`DeclareTopic` 本就同时建 `DataReader` 与 `DataWriter`（**D15**），故无须区分"我发布的"与"我订阅的"。**代价**：只订阅的 topic 上也会建一个用不到的 `DataWriter`（反之亦然）。这点浪费换掉三个列表和"方向写错了但要到运行期才发现"的一类配置错误。
+  **`topics` 是一个扁平列表，不按方向分**：`DeclareTopic` 本就同时建 `DataReader` 与 `DataWriter`（**D15**），故无须区分"我发布的"与"我订阅的"。**代价**：只订阅的 topic 上也会建一个用不到的 `DataWriter`（反之亦然）。这点浪费换掉三个列表和"方向写错了但要到运行期才发现"的一类配置错误。**另一项更实质的代价见「代价 9」（自收）。**
+
+  ### 两侧的典型配置（非对称，须写进使用文档）
+
+  | | `topics` | `reply_topics` |
+  |---|---|---|
+  | **服务端**（服务 `cfg.get`） | `["cfg.get", "cfg.get.reply"]` | **空** |
+  | **客户端**（调 `cfg.get`） | 空 | `{"cfg.get": "cfg.get.reply"}` |
+
+  **服务端不需要 `reply_topics`**：它回哪儿由 `request.reply_to` 给出，不自己查表。
+
+  **但服务端宜把应答 topic 也列进自己的 `topics`**：否则该 topic 的 `DataWriter` 要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——**该服务的第一次应答会丢**，靠 **D7** 重发才补回来。列进 `topics` 后启动时就建好，`Reply()` 里的懒声明退化为幂等空操作。**懒声明仍保留**，它兜的是"`reply_to` 不在配置里"这种情形。
 
   ### 为什么必须在 `DoStart()` 声明，不能懒声明
 
@@ -336,10 +347,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
    **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 
+9. **自收：节点会收到自己发出去的样本。** `DeclareTopic` 同时建 reader 与 writer（**D15/D16**），而 Fast DDS 默认**不屏蔽同一 participant 内的收发匹配**——已核 3.6.1 头文件，`DomainParticipant` 只提供 `ignore_participant(GUID)`（屏蔽**别的** participant，`DomainParticipant.hpp:703`），**没有 `ignore_local_endpoints` 这类自环开关**。
+
+   后果：`Publish` 出去的通知、发出去的请求，都会**原样回到自己的 `read_queue_`**，解码后在 `Dispatcher` 处因无匹配订阅而落空。**功能上无害**（不会误配——自己的请求键为 `kRequest`，客户端没登记；自己的应答键上 `corr` 对不上），但**白占队列与解码开销，并与代价 8 的读入放大叠加**。
+
+   **实现票的处置方向（可行性已核）**：在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），**前缀相同即丢弃、不入队**。两个符号在 3.6.1 均存在。**是否要做由实现票按实测开销定**，但本 ADR 明确记下这一自收行为，避免实现时被当成 bug 反复排查。
+
 ## 影响（Consequences）
 
 - **正面：** ① 四个介质形态统一，`ITransport` 仍是**全介质**的内部缝；② `AsyncRead`/`AsyncWrite` 契约不分叉，"换传输即可运行"的调用方**含 DDS**；③ 请求-响应复用 ADR-0010 **D13** 已验证的**单阶段** `Direct` 模型（其四条纪律**只余两条适用**，见 **D7**）；④ 恢复 DDS 进入编译面。
-- **负面（明确接受）：** 见上七条。
+- **负面（明确接受）：** 见上九条。
 - **对 SRS：** **RT_NODE_007** 的丢弃策略修订为"丢最旧 + 静默"（与 DD-15 一致）；`DropReason` 五项减为**四项**；`RT_IF_DDS` 与 `DdsConfig` 登记同步；**RT_IN_INTERFACE_003** 的"非阻塞交接"仍成立（listener 侧 `push` 不阻塞）。
 - **对 ADR-0002：** **D4**（交接边界有界 + tail-drop）的"tail-drop"部分**被修订**为丢最旧；有界部分沿用。
 
