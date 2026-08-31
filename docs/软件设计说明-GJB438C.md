@@ -406,11 +406,17 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
 
-**服务端的应答 `DataWriter` 由 `serve_topics` 的值在启动时建好**（**D16**）：否则要等第一次 `Reply()` 懒声明才建，随之吃一个 ~240ms 发现窗口——该服务的**第一次应答会丢**，靠重发才补回来。配全后 `Reply()` 里的懒声明退化为幂等空操作，保留它只为兜住"`reply_to` 不在配置里"这一情形。
+**`Reply()` 不做懒声明，运行期没有任何建端点的路径**（**D15**）：`DeclareWriter` / `DeclareReader` 只由 `DoStart()` 调用，端点集合**完全由配置决定、启动即定型、运行期恒定**。服务端的应答目的地随之改由**自己的 `serve_topics` 查出**（`serve_topics[request.topic]`），**不再取信于线缆**；查不到返 `kConfiguration`。
+
+**`reply_to` 仍上线缆，但降为一致性交叉校验**：与查出的应答 topic 不等即返 `kInvalidArgument`。保留它不是冗余——两侧配置写歪时（客户端在 `cfg.get.reply` 上等、服务端配成 `cfg.reply` 往外发），**若不带 `reply_to` 这种偏差完全不可见**，客户端只会一路超时，看起来像对端没响应；带上它服务端当场就能报出偏差。
+
+**连带三处收益**：① `DataWriter` 不再累积——原先"每个出现过的 `reply_to` 永久留一个 writer、不回收"那条代价整条消失；② 运行期无 DDS 端点创建，回应路径不会突然吃一个 ~240ms 发现窗口；③ 服务端不再受客户端摆布——`reply_to` 曾是客户端说了算的目的地。
+
+**代价：配置歪了只能运行期发现**。两侧的 `request_topics` / `serve_topics` 不一致时 `Start()` 无从跨进程校验，表现为服务端返 `kInvalidArgument` / `kConfiguration`、客户端重发耗尽后返 `kTimeout`——**两侧各有明确错误码，不是静默失败**。
 
 **自收在正常配置下不发生**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关），但按方向分列后**节点在一个 topic 上只建它实际需要的那一侧端点**——没有任何 topic 同时挂着本节点的 writer 与 reader。唯一会触发的情形是同一 topic 同时出现在 `publish_topics` 与 `subscribe_topics` 里，那是配置方**显式写下的**（如本地回环自测），**框架不默认屏蔽**。
 
-**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 按 **D16** 的四个配置项逐项建**对应方向**的端点；服务端的 `Reply()` 对 `request.reply_to` 只需 `DeclareWriter` **懒声明**——兜住 `reply_to` 不在 `serve_topics` 里的情形。`DeclareWriter` 因此**必须幂等**（配全后即幂等空操作）。`reply_to` 取值域为 **O(服务数)** 而非 O(客户端数)，故 `DataWriter` 不做回收。
+**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 按 **D16** 的四个配置项逐项建**对应方向**的端点；**且仅此一处**——运行期无建端点路径。`DeclareWriter` / `DeclareReader` 仍要求**幂等**，但理由是**配置里可能重复**（同一 topic 既在 `subscribe_topics`、又是某条 `request_topics` 的值），幂等让 `DoStart()` 不必先去重。
 
 **没有"topic 须唯一"这类部署约束**（**D12**）：`request_topics` / `serve_topics` 只校验键值非空（四项全空则返 `kConfiguration`）。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
 

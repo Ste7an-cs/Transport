@@ -249,7 +249,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   > ```
   > 在 3.x 下**语义完全反转**——已复核 `DDSReturnCode.hpp`：`typedef int32_t ReturnCode_t; const ReturnCode_t RETCODE_OK = 0;`，而 `write()` 返回的正是 `ReturnCode_t`。**成功返 0 → `!0` 为真 → 返 `kIo`；失败返非 0 → 返成功。且零警告照常编译。**
 
-- **D15（topic 端点的声明：显式 + 幂等 + 应答目的地懒声明）：** DDS 的每个 topic 需要建 `DataReader`（决定**什么会到达**）与 `DataWriter`（决定**能发往哪里**）。本设计的处置：
+- **D15（topic 端点的声明：全部在 `DoStart()`，【没有懒声明】）：** DDS 的每个 topic 需要建 `DataReader`（决定**什么会到达**）与 `DataWriter`（决定**能发往哪里**）。本设计的处置：
 
   ```cpp
   // DdsTransport 公开面（均幂等：同 topic 同方向重复调用直接成功）
@@ -261,18 +261,34 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | 启动时一次性 | 按 **D16** 的四个配置项逐项建**对应方向**的端点 |
-  | **`DdsNode::Reply()`** | **每次回应前** | **`DeclareWriter(request.reply_to)`** —— 见下 |
+  | `DdsNode::DoStart()` | **启动时一次性，且仅此一处** | 按 **D16** 的四个配置项逐项建**对应方向**的端点 |
 
-  **为什么 `Reply` 仍要懒声明**：服务端的应答目的地是**从请求里读出来的**（`request.reply_to`），而不是自己配置的，故仍不能保证启动时已声明。懒声明**让服务端无需为"我服务的每个客户端群用哪个应答 topic"另加配置**。
+  **`Reply()` 不做懒声明**（2026-08-31 裁决）。**运行期不再有任何建端点的路径**——`DeclareWriter` / `DeclareReader` 只由 `DoStart()` 调用。
 
-  **`DeclareWriter` 因此必须幂等**：同一个 `reply_to` 会被反复声明（每来一个请求就触发一次）。**服务端把 `serve_topics` 配全后，这里每次都是幂等空操作**——留着只为兜住"`reply_to` 不在配置里"这一情形（**D16**）。
+  **由此服务端的应答目的地改由自己的配置决定，不再取信于线缆**：
 
-  > **本条是第一版发现、第二版重写时丢失、复核时重新发现的缺口。** 记此以免第三次丢。
+  ```cpp
+  // Reply()：应答 topic 从【自己的 serve_topics】查，不是从请求里读
+  auto it = config_.serve_topics.find(request.topic);
+  if (it == config_.serve_topics.end()) return kConfiguration;   // 我根本不服务这个 topic
+  const std::string& reply_topic = it->second;                   // 【已在 DoStart() 建好 writer】
+  ```
 
-  **`DataWriter` 累积的代价随共用应答 topic 大幅缩小**（2026-08-31 裁决的**连带收益**）：`reply_to` 的取值域从 **O(客户端数)** 降为 **O(服务数)**——先前每接入一个客户端就永久多一个 `DataWriter`，现在**一个服务只对应一个**。故本设计**不做回收**，且不再需要"客户端数量有限"那条部署假设。
+  **`reply_to` 仍留在线缆上，但降为【一致性交叉校验】**：若 `request.reply_to` 非空且与查出的 `reply_topic` **不等**，返 `kInvalidArgument`。
 
-  **QoS 统一之后（D4），两个声明方法都不带 QoS 参数**——第一版它兼作按模式分 QoS 的挂载点，那个理由已不存在；但**端点本身仍须建**，故本决策保留而非删除。
+  > **保留它是有价值的，不是冗余**：两侧配置写歪时（客户端在 `cfg.get.reply` 上等、服务端配成 `cfg.reply` 往外发），**若不带 `reply_to`，这种偏差完全不可见**——客户端只会一路超时到 `kTimeout`，看起来像对端没响应。带上它，服务端**当场就能报出**"你等的地方和我发的地方不一样"。这 20 来个字节买的是一类部署错误的可诊断性。
+
+  ### 三处连带收益
+
+  1. **`DataWriter` 不再累积。** 先前"每个出现过的 `reply_to` 永久留一个 writer、不做回收"那条代价**整条消失**——端点集合现在**完全由配置决定、启动即定型、运行期恒定**。
+  2. **运行期无 DDS 端点创建**，故也没有"回应路径上突然吃一个 ~240ms 发现窗口"的问题（**D16**）。
+  3. **服务端不再受客户端摆布**：`reply_to` 曾是**客户端说了算**的目的地，服务端照着发。现在它只是个待校验的声明。
+
+  **`DeclareWriter` / `DeclareReader` 仍要求幂等**，但理由变了：不再是"同一 `reply_to` 反复声明"，而是**配置里可能重复**（例如同一 topic 既在 `subscribe_topics`、又是某条 `request_topics` 的值）。幂等让 `DoStart()` 不必先去重。
+
+  **QoS 统一之后（D4），两个声明方法都不带 QoS 参数。**
+
+  **明确接受的代价——配置歪了只能在运行期发现**：客户端与服务端的 `request_topics` / `serve_topics` 若不一致，`Start()` **无从校验**（跨进程）。表现为：服务端 `Reply()` 返 `kInvalidArgument`（若客户端带了 `reply_to`）或 `kConfiguration`（若服务端根本没配那个请求 topic），客户端则重发至耗尽后返 `kTimeout`。**两侧各自都有明确错误码，不是静默失败**——这已是不引入配置中心的前提下能做到的最好程度。
 
 - **D16（`DdsNodeConfig` 定型：topic 按【角色与方向】分列；一律在 `DoStart()` 声明）：**
 
@@ -331,7 +347,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   Coro::Result<void> DeclareReader(const std::string& topic);
   ```
 
-  取代原先"一个 `DeclareTopic` 同时建两端"的做法。`DdsNode::DoStart()` 按上表逐项调用；`DdsNode::Reply()` 的懒声明只需 **`DeclareWriter(request.reply_to)`**。
+  取代原先"一个 `DeclareTopic` 同时建两端"的做法。**两者都只由 `DdsNode::DoStart()` 调用**——运行期没有第二个调用点（**D15**）。
 
   ### 为什么必须在 `DoStart()` 声明，不能懒声明
 
@@ -344,7 +360,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | **应答 topic 的 `DataWriter`**（服务端回送的那一层） | 第一次 `Reply()` 才建 → 与客户端的 reader 尚未 match → **该服务的第一次应答会丢**，靠 **D7** 重发才补回来 |
   | 发布 topic 的 `DataWriter` | **可以懒**——顶多这一条发不出去，不影响正确性语义 |
 
-  **四者里三者不能懒，故一律提前**，不为发布单开一条路径。**`serve_topics` 的值在启动时就建好 `DataWriter`，正是为了消掉上表第三行那次丢失**；`Reply()` 里的懒声明随之退化为幂等空操作，**保留它只为兜住"`reply_to` 不在配置里"这一情形**（**D15**）。
+  **四者里三者不能懒，故一律提前——且【一处懒的都不留】**（**D15**，2026-08-31 裁决）：`serve_topics` 的值在启动时建好 `DataWriter`，`Reply()` 直接用，**运行期没有任何建端点的路径**。为发布单开一条懒路径既无收益，又会让"端点集合何时定型"这件事失去单一答案。
 
   ### 配置项与调用的对应校验
 

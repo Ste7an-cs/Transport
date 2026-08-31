@@ -46,6 +46,6 @@ sequenceDiagram
 
     Note over N,PEER: 配置按【角色与方向】分列(D16)：publish_topics 只建 Writer、subscribe_topics 只建 Reader、<br/>request_topics(客户端：键建 Writer 发请求、值建 Reader 收应答)、serve_topics(服务端：方向相反)。<br/>角色由配置项本身表达，不设 role 枚举，四者可并存。请求响应两侧【同一张表、相反方向】，部署时填一样的内容。<br/>由此 DeclareTopic 拆为 DeclareWriter / DeclareReader —— 一个 topic 上通常只需一侧，<br/>建成对是浪费且会招来自收；按方向分列后正常配置【不会自收】。
 
-    Note over N,PEER: topic 端点须【显式声明】(D15)：DoStart() 按四个配置项逐项建【对应方向】的端点；<br/>服务端 Reply() 对 request.reply_to【懒声明】——应答目的地是从请求里读出来的，<br/>兜住 reply_to 不在 serve_topics 里的情形，故 DeclareWriter 必须幂等(配全后即空操作)。<br/>reply_to 取值域为 O(服务数) 而非 O(客户端数)，故 DataWriter 不做回收。
+    Note over N,PEER: topic 端点须【显式声明】(D15)：DoStart() 按四个配置项逐项建【对应方向】的端点；【且仅此一处】——运行期没有任何建端点的路径，端点集合启动即定型。<br/>Reply() 的应答目的地改由【自己的 serve_topics 查出】，不再取信于线缆；查不到返 kConfiguration。<br/>reply_to 仍上线缆但降为一致性交叉校验(不等即 kInvalidArgument)——两侧配置写歪时，<br/>不带它则偏差完全不可见(客户端只会一路超时、像对端没响应)，带上它服务端当场能报出。<br/>连带：DataWriter 不再累积；回应路径不会突然吃 ~240ms 发现窗口；服务端不再受客户端摆布。
 
     Note over T,P: Close()：关 read_queue（携终止原因）、置 wq_stopping 并 notify 专属线程、<br/>provider->Shutdown()。WaitClosed()：join 专属线程。<br/>⚠ Shutdown() 能否打断在途阻塞的 Publish【未实测】——若不能，Close 最坏等一个 max_blocking_time。
