@@ -77,15 +77,12 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **应答 topic 是【每服务一个、该服务的全体客户端共用】的**（2026-08-31 裁决）。**"每服务一个"是字面意思——它绑在【服务】上，不是绑在【节点】上**：
 
   ```cpp
-  // DdsNodeConfig：请求 topic ──► 该服务的应答 topic，【一服务一条】
-  //   客户端填 request_topics，服务端填 serve_topics，【内容相同、端点方向相反】（D16）
-  //   "cfg.get"  -> "cfg.get.reply"
-  //   "log.tail" -> "log.tail.reply"
-  std::map<std::string, std::string> request_topics;   // 客户端
-  std::map<std::string, std::string> serve_topics;     // 服务端
+  // 请求 topic ──► 该服务的应答 topic，【一服务一条】。两侧【实参一模一样、端点方向相反】（D16）
+  RegisterClients ({{"cfg.get", "cfg.get.reply"}, {"log.tail", "log.tail.reply"}});  // 客户端
+  RegisterServices({{"cfg.get", "cfg.get.reply"}, {"log.tail", "log.tail.reply"}});  // 服务端
   ```
 
-  `RequestForResultDirect(topic, ...)` 按 `topic` 查 `request_topics` 取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
+  `RequestForResultDirect(topic, ...)` 按 `topic` 查已注册的 `Clients` 表取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
 
   **故一个客户端同时调多个服务时，各服务的应答落在各自的 topic 上，互不相扰**——这正是"每服务一个"要保证的。若把它做成节点级的单一字段，多个服务的应答会挤在一起、读入放大从 `N` 倍恶化为 `N×M` 倍（`M` 为服务数），**那不是本裁决的意思**。
 
@@ -222,13 +219,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `domain_id` | `[0, 232]` |
   | `provider` | 非空且已注册 |
   | `max_blocking_time` / `liveliness_lease` | **须为正** |
-  | `publish_topics` / `subscribe_topics` | 元素**均非空**；**均可为空表**（纯请求-响应节点不发布也不订阅） |
-  | `request_topics` / `serve_topics` | 键值**均非空**；**不要求唯一**——同一服务的应答 topic 本就由其全体客户端共用（**D6**） |
-  | **四项全空** | **返 `kConfiguration`**——一个什么都不收不发的节点必是配置写漏了 |
+  | **四组注册全空** | **返 `kConfiguration`**——一个什么都不收不发的节点必是漏了注册 |
 
-  **另一组校验在调用时、不在 `Start()` 时**：`Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 须命中对应配置项，否则返 `kConfiguration`（对应关系见 **D16**）。
+  **配置里已无 topic**（**D16**）：topic 的合法性（非空、键值不同、方向不冲突）在**注册那一刻**就判完了，`Start()` 只补判"四组全空"这一条——它要等注册全部结束才知道。
 
-  **这里没有"topic 须唯一"这类部署约束**（2026-08-31 裁决取消了先前的 per-client inbox 方案）：应答 topic **本就由一个服务的全体客户端共用**，唯一性的担子**整个移到了 `correlation_id` 的 uuid 半段**上——那是节点**自己**用 `QUuid::createUuid()` 生成的，无需部署方协调，也不会因配置写错而静默误配。**这是共用方案相对 per-client inbox 的主要收益。**
+  **另一组校验在调用时**：`Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 须已注册为对应角色，否则返 `kConfiguration`（对应关系见 **D16**）。
+
+  **没有"topic 须唯一"这类部署约束**：应答 topic **本就由一个服务的全体客户端共用**，唯一性的担子**整个落在 `correlation_id` 的 uuid 半段**上——那是节点**自己**用 `QUuid::createUuid()` 生成的，无需部署方协调，也不会因写错而静默误配。
 
 - **D13（`IDdsProvider` 接口增删）：**
 
@@ -261,16 +258,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
-  | `DdsNode::DoStart()` | **启动时一次性，且仅此一处** | 按 **D16** 的四个配置项逐项建**对应方向**的端点 |
+  | `DdsNode::DoStart()` | **启动时一次性，且仅此一处** | 按 **D16** 的四组注册项逐项建**对应方向**的端点 |
 
   **`Reply()` 不做懒声明**（2026-08-31 裁决）。**运行期不再有任何建端点的路径**——`DeclareWriter` / `DeclareReader` 只由 `DoStart()` 调用。
 
-  **由此服务端的应答目的地改由自己的配置决定，不再取信于线缆**：
+  **由此服务端的应答目的地改由自己注册的内容决定，不再取信于线缆**：
 
   ```cpp
-  // Reply()：应答 topic 从【自己的 serve_topics】查，不是从请求里读
-  auto it = config_.serve_topics.find(request.topic);
-  if (it == config_.serve_topics.end()) return kConfiguration;   // 我根本不服务这个 topic
+  // Reply()：应答 topic 从【自己注册的 Services 表】查，不是从请求里读
+  auto it = services_.find(request.topic);
+  if (it == services_.end()) return kConfiguration;              // 我根本不服务这个 topic
   const std::string& reply_topic = it->second;                   // 【已在 DoStart() 建好 writer】
   ```
 
@@ -284,103 +281,115 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   2. **运行期无 DDS 端点创建**，故也没有"回应路径上突然吃一个 ~240ms 发现窗口"的问题（**D16**）。
   3. **服务端不再受客户端摆布**：`reply_to` 曾是**客户端说了算**的目的地，服务端照着发。现在它只是个待校验的声明。
 
-  **`DeclareWriter` / `DeclareReader` 仍要求幂等**，但理由变了：不再是"同一 `reply_to` 反复声明"，而是**配置里可能重复**（例如同一 topic 既在 `subscribe_topics`、又是某条 `request_topics` 的值）。幂等让 `DoStart()` 不必先去重。
+  **`DeclareWriter` / `DeclareReader` 仍要求幂等**，但理由变了：不再是"同一 `reply_to` 反复声明"，而是**注册里可能重复**（例如同一 topic 既注册为 `Subscribers`、又是某条 `Clients` 的值）。幂等让 `DoStart()` 不必先去重。
 
   **QoS 统一之后（D4），两个声明方法都不带 QoS 参数。**
 
-  **明确接受的代价——配置歪了只能在运行期发现**：客户端与服务端的 `request_topics` / `serve_topics` 若不一致，`Start()` **无从校验**（跨进程）。表现为：服务端 `Reply()` 返 `kInvalidArgument`（若客户端带了 `reply_to`）或 `kConfiguration`（若服务端根本没配那个请求 topic），客户端则重发至耗尽后返 `kTimeout`。**两侧各自都有明确错误码，不是静默失败**——这已是不引入配置中心的前提下能做到的最好程度。
+  **明确接受的代价——两侧注册实参歪了只能在运行期发现**：客户端 `RegisterClients` 与服务端 `RegisterServices` 的实参若不一致，`Start()` **无从校验**（跨进程）。表现为：服务端 `Reply()` 返 `kInvalidArgument`（若客户端带了 `reply_to`）或 `kConfiguration`（若服务端根本没注册那个请求 topic），客户端则重发至耗尽后返 `kTimeout`。**两侧各自都有明确错误码，不是静默失败**——这已是不引入配置中心的前提下能做到的最好程度。
 
-- **D16（`DdsNodeConfig` 定型：topic 按【角色与方向】分列；一律在 `DoStart()` 声明）：**
+- **D16（topic 由【注册接口】给出，不进配置；仍一律在 `DoStart()` 建端点）：** 2026-08-31 裁决——把原先的四个 topic 配置字段换成四个注册方法。**`DdsNode` 的用法不变**：`Publish` / `Subscribe` / `RequestForResultDirect` / `Reply` 的签名与语义**一个字不动**（**D8**），换掉的只是"这些 topic 从哪来"。
 
   ```cpp
-  struct DdsNodeConfig {
-    // —— 发布-订阅 ——
-    std::vector<std::string> publish_topics;    // 【只建 DataWriter】
-    std::vector<std::string> subscribe_topics;  // 【只建 DataReader】
+  // DdsNode 注册接口 —— 【须在 Start() 之前调用】
+  //   Running / Closing / Closed 一律返 kInvalidState
+  //   【批量】：一次给一组，不必一个 topic 调一次
+  Coro::Result<void> RegisterPublishers (std::vector<std::string> topics);
+  Coro::Result<void> RegisterSubscribers(std::vector<std::string> topics);
+  Coro::Result<void> RegisterClients (std::map<std::string, std::string> topics);  // 请求 → 应答
+  Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics);  // 请求 → 应答
+  ```
 
-    // —— 请求-响应 · 客户端：请求 topic ──► 该服务的应答 topic ——
-    //    键 → DataWriter（发请求）　值 → DataReader（收应答）
-    std::map<std::string, std::string> request_topics;
+  **与原配置项一一对应，方向与端点全不变：**
 
-    // —— 请求-响应 · 服务端：请求 topic ──► 该服务的应答 topic ——
-    //    键 → DataReader（收请求）　值 → DataWriter（发应答）
-    std::map<std::string, std::string> serve_topics;
+  | 注册方法 | 角色 | 建的端点 |
+  |---|---|---|
+  | `RegisterPublishers` | 发布者 | 每个 topic 的 **Writer** |
+  | `RegisterSubscribers` | 订阅者 | 每个 topic 的 **Reader** |
+  | `RegisterClients` | 请求-响应**客户端** | 键 → **Writer**（发请求）　值 → **Reader**（收应答） |
+  | `RegisterServices` | 请求-响应**服务端** | 键 → **Reader**（收请求）　值 → **Writer**（发应答） |
 
+  **方法名用复数**——名字直接说明是批量，免得读者以为要一个 topic 调一次。
+  **两个 pair 型用 `std::map` 而非 `vector<pair>`**：天然去重，且**从类型上排除"同一请求 topic 配了两个不同应答 topic"**这种自相矛盾的输入。
+
+  ```cpp
+  struct DdsNodeConfig {   // 【只剩两项】
     /// 节点 uuid：非空则用它，为空才 QUuid::createUuid()（D6）。测试注入用。
     std::string uuid_override;
-
     ITraceSink* trace_sink = nullptr;
   };
   ```
 
-  **删除四项**：`inbox_topic`（per-client inbox 方案已取消，**D6**）、`node_id`（由 uuid 取代，**D6**）、`handler` 与 `business_queue_max_*`（**D8** 的公开面无处理器回调——宿主自己起消费 fiber，与 ADR-0009 **D1** 移除 `ProtocolNode` handler 通道同向）。
+  全部 topic 字段移出配置；历史遗留的 `inbox_topic`、`node_id`、`handler`、`business_queue_max_*` 一并删除。`DdsConfig`（传输层）保持 `domain_id` / `provider` / `qos`，**不含任何 topic**。
 
-  ### 角色由配置项本身表达，不设 `role` 枚举
+  ### 只允许 `Start()` 之前注册
 
-  | 填了哪项 | 该节点就是 |
+  **端点集合仍然"启动即定型、运行期恒定"**——这一步只把"填结构体"换成"调四个函数"，**没有引入运行期动态端点**。由此：
+
+  - 回应路径、发布路径、订阅路径上**都不会突然冒出一个 ~240ms 的发现窗口**（**D9**）
+  - `DoStart()` 仍是**唯一**建端点的地方（**D15**），运行期没有第二个调用点
+  - 诊断"我建了哪些端点"仍然只看**启动前那几次注册调用**，不必查运行期状态
+
+  **注册发生在 `Created`**，故它**不是**"启动后动态增删 topic"的能力；要那个能力得另行裁决。
+
+  ### 批量、可多次调用、整批生效
+
+  - **批量**：一次给一组，`{"a","b","c"}` 一次调完。
+  - **可多次调用**：同一方法调多次**累加**（便于按模块分别注册）。
+  - **重复项幂等**：同一 topic 同一角色重复出现（无论同批还是跨批）**去重**，不报错。
+  - **整批生效或整批不生效**：一批里只要有一项非法，**整批回滚、一项都不落**，返对应错误。半生效的注册会让调用方难以判断该重试哪些。
+
+  ### 校验落在注册这一步
+
+  | 检查 | 返回 |
   |---|---|
-  | `publish_topics` | 发布者 |
-  | `subscribe_topics` | 订阅者 |
-  | `request_topics` | 请求-响应的**客户端** |
-  | `serve_topics` | 请求-响应的**服务端** |
+  | 不在 `Created` 阶段 | `kInvalidState` |
+  | topic 为空串 | `kInvalidArgument` |
+  | `Clients` / `Services` 某条的键与值相同 | `kInvalidArgument`（请求与应答同 topic 必然自收自答） |
+  | 同一 topic 被注册为**方向冲突**的两个角色（如既是 `Clients` 的键又是 `Services` 的键） | `kInvalidArgument`——那是自己请求自己 |
 
-  **四者可任意并存**——一个节点常常兼任（既是服务 A 的服务端，又是服务 B 的客户端，同时还发布心跳）。**若另设一个 `role` 枚举，就会出现"`role` 说是服务端、却填了 `request_topics`"这类自相矛盾的配置，还得再定优先级规则。** 让配置项自己表达角色，矛盾无从产生。
+  **四组全空**：`Start()` 返 `kConfiguration`（**D12**）——一个什么都不收不发的节点必是漏了注册。**这一条仍在 `Start()` 判**，因为"全空"要等注册全部结束才知道。
+
+  ### 角色由"注册了什么"表达，不设 `role` 枚举
+
+  | 调了哪个 | 该节点就是 |
+  |---|---|
+  | `RegisterPublishers` | 发布者 |
+  | `RegisterSubscribers` | 订阅者 |
+  | `RegisterClients` | 请求-响应的**客户端** |
+  | `RegisterServices` | 请求-响应的**服务端** |
+
+  **四者可任意并存**——一个节点常常兼任（既是服务 A 的服务端，又是服务 B 的客户端，同时还发布心跳）。若另设一个 `role` 枚举，就会出现"`role` 说是服务端、却注册了 `Clients`"这类**自相矛盾的输入**，还得再定优先级规则。让注册本身表达角色，矛盾无从产生。
 
   ### 请求-响应两侧是同一张表、相反的方向
 
   ```
-             客户端                                    服务端
-    request_topics                              serve_topics
-      "cfg.get" ──► "cfg.get.reply"               "cfg.get" ──► "cfg.get.reply"
-         │              │                             │              │
-      DataWriter    DataReader                    DataReader     DataWriter
-      （发请求）    （收应答）                     （收请求）     （发应答）
+    客户端                                              服务端
+    RegisterClients({{"cfg.get", "cfg.get.reply"}})     RegisterServices({{"cfg.get", "cfg.get.reply"}})
+         │              │                                    │              │
+      DataWriter    DataReader                           DataReader     DataWriter
+      （发请求）    （收应答）                            （收请求）     （发应答）
   ```
 
-  **表的形状相同、端点方向相反。** 部署时两侧填**同样的内容**，各自按角色建各自那一侧——不会填错方向，也不必协调。
+  **两侧传【一模一样的实参】**，各自按角色建各自那一侧——不会填错方向，也不必协调。
 
-  ### 由此 `DeclareTopic` 须带方向
+  ### 调用与注册的对应校验
 
-  ```cpp
-  // DdsTransport 公开面（均幂等：同 topic 同方向重复调用直接成功）
-  Coro::Result<void> DeclareWriter(const std::string& topic);
-  Coro::Result<void> DeclareReader(const std::string& topic);
-  ```
+  `Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 若未注册为对应角色，返 **`kConfiguration`**：
 
-  取代原先"一个 `DeclareTopic` 同时建两端"的做法。**两者都只由 `DdsNode::DoStart()` 调用**——运行期没有第二个调用点（**D15**）。
-
-  ### 为什么必须在 `DoStart()` 声明，不能懒声明
-
-  **决定性约束是 DDS 的发现窗口 ~240ms**（**D9** 的 `kEstablishing`，实测）。端点建起来到 `matched > 0` 之间有一段真空，这段时间里：
-
-  | 若懒声明 | 后果 |
+  | 调用 | 须已注册为 |
   |---|---|
-  | **应答 topic 的 `DataReader`**（客户端等应答的那一层） | 在 `RequestForResultDirect` 里才建 → 服务端的应答 writer 与它**尚未 match** → 应答**在 DDS 层就落空**，连 `read_queue_` 都进不来。**首次请求几乎必然超时、白吃一次重试；`max_attempts == 1` 时直接失败。** |
-  | **订阅 topic 的 `DataReader`** | `Subscribe` 之后立刻到达的消息因未 match 而丢 |
-  | **应答 topic 的 `DataWriter`**（服务端回送的那一层） | 第一次 `Reply()` 才建 → 与客户端的 reader 尚未 match → **该服务的第一次应答会丢**，靠 **D7** 重发才补回来 |
-  | 发布 topic 的 `DataWriter` | **可以懒**——顶多这一条发不出去，不影响正确性语义 |
+  | `Publish(topic, …)` | `Publishers` |
+  | `Subscribe(topic, kNotify)` | `Subscribers` |
+  | `Subscribe(topic, kRequest)` | `Services` 的键 |
+  | `RequestForResultDirect(topic, …)` | `Clients` 的键 |
 
-  **四者里三者不能懒，故一律提前——且【一处懒的都不留】**（**D15**，2026-08-31 裁决）：`serve_topics` 的值在启动时建好 `DataWriter`，`Reply()` 直接用，**运行期没有任何建端点的路径**。为发布单开一条懒路径既无收益，又会让"端点集合何时定型"这件事失去单一答案。
-
-  ### 配置项与调用的对应校验
-
-  `Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 若不在对应配置项里，返 **`kConfiguration`**：
-
-  | 调用 | 须命中 |
-  |---|---|
-  | `Publish(topic, …)` | `publish_topics` |
-  | `Subscribe(topic, kNotify)` | `subscribe_topics` |
-  | `Subscribe(topic, kRequest)` | `serve_topics` 的键 |
-  | `RequestForResultDirect(topic, …)` | `request_topics` 的键 |
-
-  **不猜、不回落、不懒补**。这让"忘了配"从一个**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成一个**启动即报的显式错误**。
+  **不猜、不回落、不懒补**。这让"忘了注册"从一个**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成一个**显式错误**。
 
   ### 一处必须写进接口文档的限制
 
-  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已声明为 reader 的 topic 的全部**」——即 `subscribe_topics` ∪ `serve_topics` 的键 ∪ `request_topics` 的值，**不是**"本 domain 上的全部"。未列进配置的 topic，其消息**根本不会到达本进程**。
+  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader 的 topic 的全部**」——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值，**不是**"本 domain 上的全部"。未注册的 topic，其消息**根本不会到达本进程**。
 
   **这是确定会被理解反的一处**，接口文档须明写。
-
 ## 明确接受的代价
 
 1. **`RELIABLE` QoS 被本地队列架空。** listener 一搬走样本，DDS 即认为已交付、背压解除；我方 `read_queue_` 满时静默丢最旧（#190 实测丢 3976/5000 而 `push_fail=0`）。**这是 2026-08-28 裁决"不需要优先使用 DDS 自己的机制"的直接后果，明确接受。**
@@ -409,11 +418,11 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 9. **自收只在【同一 topic 既发布又订阅】时发生，且那是配置方显式写出来的。** Fast DDS 默认**不屏蔽同一 participant 内的收发匹配**——已核 3.6.1 头文件：`DomainParticipant` 只提供 `ignore_participant(GUID)`（屏蔽**别的** participant，`DomainParticipant.hpp:703`），**没有 `ignore_local_endpoints` 这类自环开关**。
 
-   **但 D16 按方向分列之后，这在正常配置下不会触发**：节点在一个 topic 上**只建它实际需要的那一侧端点**。客户端在 `cfg.get` 上只有 writer、在 `cfg.get.reply` 上只有 reader；服务端反之。**没有任何 topic 同时挂着本节点的 writer 与 reader，自收无从谈起。**
+   **但按角色注册之后（D16），这在正常用法下不会触发**：每个角色在一个 topic 上**只建它实际需要的那一侧端点**。客户端在 `cfg.get` 上只有 writer、在 `cfg.get.reply` 上只有 reader；服务端反之。**没有任何 topic 同时挂着本节点的 writer 与 reader，自收无从谈起。**
 
-   **唯一会触发的情形**：同一个 topic 同时出现在 `publish_topics` 与 `subscribe_topics` 里。那是配置方**显式写下的**（例如有意做本地回环自测），**不是框架强加的**。
+   **唯一会触发的情形**：同一个 topic 同时注册为 `Publishers` 与 `Subscribers`。那是调用方**显式写下的**（例如有意做本地回环自测），**不是框架强加的**。
 
-   **实现票的处置方向（可行性已核）**：若确需屏蔽，在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），前缀相同即丢弃、不入队。两个符号在 3.6.1 均存在。**本设计不默认屏蔽**——既然只有显式配置才会触发，替配置方决定"你不想收到自己"是越权。
+   **实现票的处置方向（可行性已核）**：若确需屏蔽，在 listener 里比对 `SampleInfo::sample_identity`（`SampleInfo.hpp:89`）的 writer GUID 前缀与本 participant 的 `guid()`（`DomainParticipant.hpp:1371`），前缀相同即丢弃、不入队。两个符号在 3.6.1 均存在。**本设计不默认屏蔽**——既然只有显式注册两个相反角色才会触发，替调用方决定"你不想收到自己"是越权。
 
 ## 影响（Consequences）
 
