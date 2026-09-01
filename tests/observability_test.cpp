@@ -3,7 +3,7 @@
 // (ADR-0003 D13 Q2/Q3、RT_TRACE_001/002、RT_DATA_BUFFER)
 //
 // 覆盖:
-//  - DropReason 五项枚举值完整可用,DropReasonName 稳定可辨识、互不相同。
+//  - DropReason 四项枚举值完整可用,DropReasonName 稳定可辨识、互不相同。
 //  - RecordDrop:计数器恰好 +1;配 sink 收到一条可辨识出 reason 的 TraceEvent;
 //    sink == nullptr 时无副作用(仅计数)。
 //  - RecordEvent:配 sink 收到对应事件;sink == nullptr 时是空操作。
@@ -37,12 +37,15 @@ using transport::TraceLevel;
 
 namespace {
 
-// 五项 DropReason,与 ADR-0003 D13 Q2 taxonomy 一一对应(「连接代际隔离丢弃」随
+// 四项 DropReason,与 ADR-0003 D13 Q2 taxonomy 一一对应(「连接代际隔离丢弃」随
 // ADR-0004 D3 撤销代际隔离而移除;`kNoHandlerConfigured` 随 ADR-0009 废止内建
-// handler 通道而移除——入站业务改由订阅承载,"未设 handler"的产生时刻已不存在)。
+// handler 通道而移除——入站业务改由订阅承载,"未设 handler"的产生时刻已不存在;
+// `kDdsHandoffOverflow` 随 ADR-0013 D11 移除——DDS 的接收队列与三介质的同性质,
+// 三介质都不为它单设归因项)。
 constexpr DropReason kAllReasons[] = {
-    DropReason::kBusinessQueueOverflow, DropReason::kDdsHandoffOverflow,
-    DropReason::kBadFrame,              DropReason::kUnmatchedOrLateResponse,
+    DropReason::kBusinessQueueOverflow,
+    DropReason::kBadFrame,
+    DropReason::kUnmatchedOrLateResponse,
     DropReason::kCloseDrop,
 };
 
@@ -56,7 +59,7 @@ std::string ReadFile(const std::string& path) {
 
 }  // namespace
 
-TEST(DropReasonTest, FiveValuesAreDistinctAndUsable) {
+TEST(DropReasonTest, FourValuesAreDistinctAndUsable) {
   std::set<std::string_view> names;
   for (DropReason reason : kAllReasons) {
     // 每项都可构造、可比较、可转成稳定短名。
@@ -65,7 +68,7 @@ TEST(DropReasonTest, FiveValuesAreDistinctAndUsable) {
     EXPECT_NE(name, "unknown");
     names.insert(name);
   }
-  EXPECT_EQ(names.size(), 5u) << "五项 DropReasonName 应互不相同";
+  EXPECT_EQ(names.size(), 4u) << "四项 DropReasonName 应互不相同";
 }
 
 TEST(RecordDropTest, IncrementsCounterExactlyOnceWithoutSink) {
