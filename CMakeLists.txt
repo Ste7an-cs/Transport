@@ -140,7 +140,9 @@ if(TRANSPORT_BUILD_TESTS)
   )
   # 真实 provider 的用例只在装了 Fast DDS 时编入(缺席时非 DDS 部分照常可测)。
   if(TRANSPORT_HAS_FASTDDS)
-    target_sources(transport_tests PRIVATE tests/dds/fast_dds_provider_test.cpp)
+    target_sources(transport_tests PRIVATE
+      tests/dds/fast_dds_provider_test.cpp
+      tests/dds/dds_node_fastdds_e2e_test.cpp)
     # FastDdsProvider.hpp 不是公共头(在 src/ 下),用例须直接见到它。
     target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   endif()
