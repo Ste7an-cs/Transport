@@ -1,287 +1,308 @@
 #include "transport/io/dds/DdsTransport.hpp"
 
-#include <mutex>
+#include <chrono>
+#include <cstdint>
+#include <system_error>
 #include <utility>
+#include <vector>
 
-#include <boost/fiber/channel_op_status.hpp>
-
-#include "await/awaitable.hpp"
-#include "task/fibertask.h"  // Coro::makeTask —— 转发泵 fiber。
-#include "transport/node/BoundedQueue.hpp"
-#include "transport/core/DropReason.hpp"
+#include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/SharedCompletion.hpp"
+#include "transport/io/dds/DdsProviderRegistry.hpp"
+
+// DdsTransport.cpp — 见 .hpp。双队列样板的第四次跟进(ADR-0013),两处与三介质不同:
+//   ① 读侧**没有泵 fiber**——provider 的 listener 在外来线程上直推 read_queue_(D2);
+//   ② 写侧是**一条专属 OS 线程**而不是写泵 fiber——`Publish` park 的是线程(D3)。
+//
+// 全文只有一处允许阻塞:写线程里的 `provider_->Publish()`。其余每一处(尤其 listener)
+// 都必须是"拿锁—动一下—放锁"的。
 
 namespace transport {
 
-// 交接边界的实现状态。交接队列 handoff_ 与 provider 同置于一个 shared_ptr<State>,
-// 但 provider 的订阅回调**只捕获 handoff_ 的共享句柄(BoundedQueue 内部 shared_ptr),
-// 不捕获 State**——这样回调与 provider 之间无引用环(State→provider→回调→State),
-// 且迟到回调在 State 销毁后仍只触碰存活的交接队列共享状态,不碰已销毁对象。
-struct DdsTransport::State {
-  explicit State(std::unique_ptr<IDdsProvider> p, DdsConfig cfg,
-                 std::vector<std::string> topics, std::size_t max_samples,
-                 std::size_t max_bytes, ITraceSink* trace_sink)
-      : provider(std::move(p)),
-        config(std::move(cfg)),
-        subscribe_topics(std::move(topics)),
-        // 归因(P5-3):交接边界满 tail-drop 命名 kDdsHandoffOverflow,trace_sink 透传。
-        handoff([](const Sample& s) { return s.bytes.size(); }, max_samples,
-                max_bytes, DropReason::kDdsHandoffOverflow, trace_sink) {}
-
-  mutable std::mutex mutex;
-  std::unique_ptr<IDdsProvider> provider;
-  DdsConfig config;
-  std::vector<std::string> subscribe_topics;
-  // 跨线程有界交接边界:listener 线程 Push、转发泵 fiber Pop(BoundedQueue 内部
-  // std::mutex 守表 + Awaitable 唤醒,底层 boost.fiber channel 跨线程安全)。
-  BoundedQueue<Sample> handoff;
-  // 对外 read_queue(ADR-0007 D1/D4):转发泵是唯一生产者,`Read()` 只交出本句柄。
-  // 交接边界(有界 + kDdsHandoffOverflow 归因)仍在其上游不变;本队列容量策略未定
-  // (TBD-009),沿用 AsyncTask 默认,本轮不处置(#152)。
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue{
-      std::make_shared<Coro::Awaitable<Datagram>>()};
-  LifecycleState lifecycle{LifecycleState::kCreated};
-  SharedCompletion<void> closed;
-
-  // I/O 事实(ADR-0003 D13):Publish 成功记 last_send;出队样本记 last_recv;
-  // Publish/Pop 操作失败记 last_error(RT_NODE_006「所有介质如实报」)。
-  std::optional<Clock::time_point> last_send;
-  std::optional<Clock::time_point> last_recv;
-  std::error_code last_error;
-};
-
 namespace {
 
-// 关闭一次(幂等):进入 Closing → 先 Unsubscribe 停投递 → Shutdown 释放 provider 侧
-// 回调(连带释放其持有的交接队列共享句柄)→ 交接边界 Close(令转发泵退出)→ read_queue
-// 以 kClosed 关闭唤醒全部读者 → 落 Closed 并完成 closed。迟到的在途回调(Dispatch 已取
-// 快照)仍只对交接队列 Push,返 kClosed 丢弃,不触碰 State(RT_NODE_005 防碰已销毁对象)。
-void BeginClose(const std::shared_ptr<DdsTransport::State>& state) {
-  std::vector<std::string> topics;
-  IDdsProvider* provider = nullptr;
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kClosing ||
-        state->lifecycle == LifecycleState::kClosed) {
-      return;  // 已在关闭:幂等。
-    }
-    state->lifecycle = LifecycleState::kClosing;
-    topics = state->subscribe_topics;
-    provider = state->provider.get();
-    read_queue = state->read_queue;
-  }
-  if (provider) {
-    for (const auto& topic : topics) {
-      (void)provider->Unsubscribe(topic);  // 先停投递。
-    }
-    provider->Shutdown();  // 释放回调(连带其交接队列共享句柄)。
-  }
-  state->handoff.Close();  // 令转发泵退出。
-  // 终止表达(ADR-0007 D4):read_queue 被 close 并携带终止原因,调用方 await 得到它;
-  // 同时丢弃残留——与改造前 BoundedQueue「Close 先于取元素、残留不再经 Read 交付」
-  // 逐字对齐(残留样本的归因口径亦不变:本就不计入任何丢弃计数)。
-  CloseDatagramQueue(read_queue, make_error_code(TransportErrc::kClosed));
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->lifecycle = LifecycleState::kClosed;
-  }
-  state->closed.Complete(Coro::Result<void>{});
-}
-
-// 转发泵(ADR-0007 D1 的 DDS 形态):反复从交接边界 Pop 一条 Sample,转成 Datagram 投入
-// read_queue,直至交接边界 Close。DDS 无 socket,故只有内层数据泵、无外层管理循环。
-//
-// 错误处置与改造前 `Read` 逐字对齐:kClosed = 我方关闭 → 关 read_queue 并退出;其余
-// (kInternal 等)是可继续的瞬时错误 → 记 LastError 后继续下一轮(改造前由调用方的读
-// 循环 `continue`,现由泵就地消化,不外泄到 read_queue)。kTimeout/kCancelled 不会出现
-// ——泵不带 deadline、不接令牌(它们是调用方在句柄上自理的事,ADR-0007 D4)。
-void RunReadPump(const std::shared_ptr<DdsTransport::State>& state,
-                 const std::shared_ptr<Coro::Awaitable<Datagram>>& read_queue) {
-  const auto channel = read_queue->channel();
-  for (;;) {
-    Coro::Result<Sample> sample = state->handoff.Pop();
-    if (!sample) {
-      const auto error = sample.error();
-      if (error == make_error_code(TransportErrc::kClosed)) {
-        read_queue->close(make_error_code(TransportErrc::kClosed));
-        return;
-      }
-      // 非终止失败:记为故障事实(kTimeout/kClosed/kCancelled 才是正常控制流结果,
-      // 不稀释 LastError——同改造前 Read 的口径,ADR-0003 D13、RT_NODE_006)。
-      if (error != make_error_code(TransportErrc::kTimeout) &&
-          error != make_error_code(TransportErrc::kCancelled)) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->last_error = error;
-      }
-      continue;
-    }
-    Datagram datagram;
-    datagram.bytes = std::move(sample.value().bytes);
-    datagram.peer = Endpoint::Topic(std::move(sample.value().topic));
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->last_recv = OperationOptions::Clock::now();
-    }
-    if (channel->push(std::move(datagram)) !=
-        boost::fibers::channel_op_status::success) {
-      return;  // read_queue 已关闭(我方 Close)→ 停止投递。
-    }
-  }
-}
+/// `domain_id` 的合法上界(**D12**)。DDS 规范下 domain 编号 0..232。
+constexpr int kMaxDomainId = 232;
 
 }  // namespace
 
-DdsTransport::DdsTransport(std::unique_ptr<IDdsProvider> provider,
-                           DdsConfig config, std::vector<std::string> topics,
-                           std::size_t max_samples, std::size_t max_bytes,
-                           ITraceSink* trace_sink)
-    : state_(std::make_shared<State>(std::move(provider), std::move(config),
-                                     std::move(topics), max_samples,
-                                     max_bytes, trace_sink)) {}
+DdsTransport::DdsTransport(DdsConfig config) : config_(std::move(config)) {}
 
-DdsTransport::~DdsTransport() { BeginClose(state_); }
+DdsTransport::~DdsTransport() {
+  (void)Close();
+  WaitClosed();  // join 写线程 + Shutdown provider:返回即无人再触碰本对象。
+}
+
+// 配置校验(D12):**在 `Start()` 里一次性做**,非法一律 kConfiguration 并停在 Created。
+// topic 不在这里判——配置里根本没有 topic(D16),端点合法性落在 `Declare*` 上。
+Coro::Result<void> DdsTransport::ValidateConfig() const {
+  if (config_.domain_id < 0 || config_.domain_id > kMaxDomainId) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (config_.provider.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  // 两项都是**转达给 DDS 的 QoS 参数**(D10),但零值/负值在 DDS 侧无意义:
+  // `max_blocking_time` 为零 = `RELIABLE` 准入满时立刻失败,`liveliness_lease` 为零则
+  // 判活恒判死。故**须为正**(D12),不设"0 = 禁用"这一档。
+  if (config_.qos.max_blocking_time <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (config_.qos.liveliness_lease <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  return Coro::Result<void>{};
+}
 
 Coro::Result<void> DdsTransport::Start() {
-  const auto state = state_;
-  IDdsProvider* provider = nullptr;
-  DdsConfig config;
-  std::vector<std::string> topics;
-  BoundedQueue<Sample> handoff = state->handoff;  // 共享句柄:供回调捕获(不捕获 State)。
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kRunning) {
-      return Coro::Result<void>{};  // 幂等。
-    }
-    if (state->lifecycle != LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (!state->provider) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    provider = state->provider.get();
-    config = state->config;
-    topics = state->subscribe_topics;
+  if (lifecycle_ == LifecycleState::kRunning) {
+    return Coro::Result<void>{};  // 幂等 no-op,同三介质。
   }
-
-  if (Coro::Result<void> init = provider->Init(config); !init) {
-    return init;
-  }
-  // 逐 topic 订阅:回调在 listener 线程构造 Sample 并**非阻塞** Push 交接边界。回调只
-  // 捕获 handoff(BoundedQueue 共享句柄)与 topic,不引用 State——无引用环、迟到安全。
-  for (const auto& topic : topics) {
-    Coro::Result<void> sub = provider->Subscribe(
-        topic, [handoff, topic](const std::vector<std::uint8_t>& bytes) mutable {
-          // 满即 tail-drop(BoundedQueue 内部计数 dds_handoff_overflow),不阻塞 listener。
-          (void)handoff.Push(Sample{bytes, topic});
-        });
-    if (!sub) {
-      return sub;  // 订阅失败:上层可 RequestClose 收敛已订阅的 topic。
-    }
-  }
-
-  std::shared_ptr<Coro::Awaitable<Datagram>> read_queue;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->lifecycle = LifecycleState::kRunning;
-    read_queue = state->read_queue;
-  }
-  // 起转发泵(ADR-0007 D1):把交接边界的样本转成 Datagram 投 read_queue。句柄不留存:
-  // 泵只触碰以 shared_ptr 持有的 State 与队列,故本类析构后仍安全收敛。
-  Coro::makeTask([state, read_queue] { RunReadPump(state, read_queue); });
-  return Coro::Result<void>{};
-}
-
-// 交出 read_queue 句柄(ADR-0007 D4):不返回数据,deadline/取消/扇出由调用方在句柄上
-// 自理。未 Start 时给一个以 kInvalidState 关闭的句柄;关闭后 read_queue 已被以 kClosed
-// 关闭,await 即得终止原因。
-std::shared_ptr<Coro::Awaitable<Datagram>> DdsTransport::Read() {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  if (state_->lifecycle == LifecycleState::kCreated) {
-    return ClosedDatagramQueue(make_error_code(TransportErrc::kInvalidState));
-  }
-  return state_->read_queue;
-}
-
-Coro::Result<void> DdsTransport::Write(SendUnit unit) {
-  const auto state = state_;
-  IDdsProvider* provider = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
-    }
-    if (state->lifecycle != LifecycleState::kRunning) {
-      return make_error_code(TransportErrc::kClosed);
-    }
-    provider = state->provider.get();
-  }
-  // 统一寻址:DDS 每条消息经 destination.topic 发往不同 topic;非 topic 目的地
-  // (kDefault/kNet)对 DDS 无意义 → kInvalidArgument(调用契约错误,不算一次
-  // Publish 尝试,不计入 LastError,同 UdpTransport 对早期寻址校验的处理)。
-  if (unit.destination.kind != Endpoint::Kind::kTopic) {
-    return make_error_code(TransportErrc::kInvalidArgument);
-  }
-  if (!provider) {
+  if (lifecycle_ != LifecycleState::kCreated) {
     return make_error_code(TransportErrc::kInvalidState);
   }
-  Coro::Result<void> result = provider->Publish(unit.destination.topic, unit.bytes);
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (result) {
-      state->last_send = Clock::now();
-    } else {
-      state->last_error = result.error();
-    }
+  if (auto valid = ValidateConfig(); !valid) {
+    SetLastError(valid.error());
+    return valid.error();  // **停在 Created**:可改配后重试(RT_LIFECYCLE_007)。
   }
-  return result;
-}
+  // provider **按名从注册表取**(D12 的"已注册"就是这一步)。未注册即 kConfiguration:
+  // 这不是 I/O 故障,是配置里写了个不存在的实现名。
+  auto provider = DdsProviderRegistry::Create(config_.provider);
+  if (!provider) {
+    const std::error_code error = make_error_code(TransportErrc::kConfiguration);
+    SetLastError(error);
+    return error;
+  }
+  if (auto inited = provider->Init(config_); !inited) {
+    // Init 失败同样**停在 Created**,且**不留半个 provider**——DDS 没有重连相位
+    // (与三介质的"首次链路就绪失败不算启动失败"分歧:那三个有泵可以无限重试,
+    // 而 participant 建不出来多半是配置问题,留着只会让后续每次 Publish 都失败)。
+    SetLastError(inited.error());
+    return inited.error();
+  }
+  provider_ = std::move(provider);
+  lifecycle_ = LifecycleState::kRunning;
 
-Coro::Result<void> DdsTransport::RequestClose() {
-  BeginClose(state_);
+  // **端点一个都不建**:topic 由调用方在启动时逐项 Declare*(D15/D16)。
+  write_thread_ = std::thread([this] { RunWriteThread(); });
   return Coro::Result<void>{};
 }
 
-Coro::Result<void> DdsTransport::WaitClosed(OperationOptions options) {
-  {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->lifecycle == LifecycleState::kCreated) {
-      return make_error_code(TransportErrc::kInvalidState);
+// 专属写线程(D3)。**这是全文唯一允许阻塞的地方**:`Publish` 会 park 本线程,且**没有
+// 上界**——Fast DDS 默认 `INTRAPROCESS_FULL`,同进程订阅方的 `on_data_available` 就跑在
+// 本线程上,`max_blocking_time` 根本不参与。
+//
+// 由此本线程实际**兼跑同进程内所有对端的交付回调**;我方 listener 只做一次 push 故满足
+// "快且不阻塞",但同进程内非本框架的慢订阅方会卡住整条写队列——那是部署面的约束。
+void DdsTransport::RunWriteThread() {
+  for (;;) {
+    Datagram item;
+    {
+      std::unique_lock<std::mutex> lock(write_mutex_);
+      write_cv_.wait(lock,
+                     [this] { return write_stop_ || !write_queue_.empty(); });
+      if (write_stop_) {
+        return;  // Close 已置位并清空残留(不等刷出,同三介质)。
+      }
+      item = std::move(write_queue_.front());
+      write_queue_.pop_front();
+    }
+    // 目的地只能是 topic:DDS 的寻址维度就是它,而配置里**没有默认 topic**(D16),
+    // 故 `Endpoint::Default()` / `kNet` 在本介质上无从解析。**丢该条并只落 LastError**
+    // ——与 UDP 解析不出目的地时的处置同形,不回传调用方(写是 fire-and-forget)。
+    if (item.peer.kind != Endpoint::Kind::kTopic || item.peer.topic.empty()) {
+      SetLastError(make_error_code(TransportErrc::kInvalidArgument));
+      continue;
+    }
+    // 写出的一切结果(含 `RETCODE_TIMEOUT`)**不回传,只落 LastError()**——与三介质
+    // 逐字相同。代价:背压信号被丢弃,调用方无从知道"这条因对端消费不过来而没发出去"。
+    if (auto published = provider_->Publish(item.peer.topic, item.bytes);
+        !published) {
+      SetLastError(published.error());
     }
   }
-  return state_->closed.Wait(std::move(options));
 }
 
-std::size_t DdsTransport::DdsHandoffOverflowCount() const {
-  return state_->handoff.DroppedCount();
+// 交出 read_queue_ 句柄(ADR-0007 D4),与三介质完全一致。
+std::shared_ptr<Coro::Awaitable<Datagram>> DdsTransport::AsyncRead() {
+  if (lifecycle_ == LifecycleState::kCreated) {
+    return ClosedQueue<Datagram>(make_error_code(TransportErrc::kInvalidState));
+  }
+  return read_queue_;
 }
 
-std::optional<DdsTransport::Clock::time_point> DdsTransport::LastSendTime()
-    const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_send;
+// 入队即返(ADR-0007 D3):**只判生命周期与入队**。目的地是否可解析由写线程判——契约只
+// 允许本方法判这两件事,提前判会让"传输无关的调用方"拿到一个三介质都不会给的错误码。
+//
+// 队列**有界 1024 且满时静默丢最旧**(与三介质的 `write_queue_` 逐字相同)。写侧尤其需要
+// 这个界:在途 `Publish` 的阻塞无上界,不设界则积压无上界。
+Coro::Result<void> DdsTransport::AsyncWrite(Datagram datagram) {
+  if (lifecycle_ == LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kClosed);
+  }
+  {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (write_stop_) {
+      return make_error_code(TransportErrc::kClosed);
+    }
+    write_queue_.push_back(std::move(datagram));
+    while (write_queue_.size() > kWriteQueueCapacity) {
+      write_queue_.pop_front();  // 丢最旧,静默(DD-15):不计数、不归因。
+    }
+  }
+  write_cv_.notify_one();
+  return Coro::Result<void>{};
 }
 
-std::optional<DdsTransport::Clock::time_point>
-DdsTransport::LastReceiveTime() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_recv;
+// 请求关闭(幂等,只发信号不等收敛):两处。
+//
+// | # | 停止的东西                    | 手段                                   |
+// |---|-------------------------------|----------------------------------------|
+// | ① | 交付(listener → read_queue_) | `CloseQueue` —— 此后 push 返 closed    |
+// | ② | 写线程(停在 cv 上等数据)      | `write_stop_ = true` + `notify_all`     |
+//
+// **不在这里 `Shutdown()` provider**:它要等在途 `Publish` 跑完(无上界),而本方法契约是
+// 受理即返。收敛整个落在 `WaitClosed()`。
+Coro::Result<void> DdsTransport::Close() {
+  if (lifecycle_ >= LifecycleState::kClosing) {
+    return Coro::Result<void>{};  // 幂等。
+  }
+  const std::error_code closed = make_error_code(TransportErrc::kClosed);
+  if (lifecycle_ == LifecycleState::kCreated) {
+    lifecycle_ = LifecycleState::kClosed;  // 从未 Start:无线程可停、无 provider 可关。
+    CloseQueue(read_queue_, closed);
+    return Coro::Result<void>{};
+  }
+  lifecycle_ = LifecycleState::kClosing;
+
+  // ① 停止交付。迟到的 listener 回调只会 push 进一条已关闭的队列(返 closed),它捕获的
+  //    是分发端而**不是 `this`**,故不触碰已销毁的对象。
+  CloseQueue(read_queue_, closed);
+  {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    write_stop_ = true;    // ② 唤醒写线程的唯一阻塞点(等数据)。
+    write_queue_.clear();  // 未发出的残留随之丢弃——同三介质,不等刷出。
+  }
+  write_cv_.notify_all();
+  return Coro::Result<void>{};
+}
+
+// join 写线程,再 Shutdown provider。
+//
+// **最坏等待没有上界**(ADR-0013「明确接受的代价」7):`Close()` 落在一次在途 `Publish`
+// 上时,那次写**打不断**——Fast DDS 3.6.1 的 `DataWriter` 上没有任何中止 `write()` 的
+// 入口(实测 5 轮,`Shutdown()` 一次也没截断过它)。故等待时长 = 那次 `Publish` 自己跑完
+// 所需的时间,而它由**同进程内最慢的那个订阅回调**决定,**不是**一个 `max_blocking_time`
+// (实测 `max_blocking_time` 设 300ms 而 `Publish` 跑满 2000ms)。
+//
+// **顺序不能反**:先 join 才 `Shutdown()`。provider 内部已按在途计数守着 writer 的删除
+// (`write()` 在锁外跑,直接删 writer 就是 use-after-free),我方 join 在前是同一条纪律的
+// 外层保证——两道闩都要,不绕开任何一道。
+void DdsTransport::WaitClosed() {
+  if (joined_ || lifecycle_ == LifecycleState::kCreated) {
+    return;  // 已汇合过,或从未 Start:无可汇合者。
+  }
+  joined_ = true;
+  if (write_thread_.joinable()) {
+    write_thread_.join();  // ← 无上界的那一等就在这里。
+  }
+  if (provider_) {
+    provider_->Shutdown();  // 摘 reader/writer、销 participant;此刻已无在途写。
+  }
+  lifecycle_ = LifecycleState::kClosed;
+}
+
+// 端点声明(D15)。两个方法**都幂等**:注册里可能重复(同一 topic 既是订阅项、又是某条
+// client 的应答 topic),幂等让调用方不必先去重。
+//
+// **一处已知缺口**:`IDdsProvider` 上没有与 `Subscribe` 对称的 writer 声明钩子(D13 明确
+// 不增删该接口),故 `DeclareWriter` 只登记意图,真正的 `DataWriter` 仍由 provider 在首次
+// `Publish` 时惰性建——D15「运行期无 DDS 端点创建」在**写侧尚未真正兑现**。
+Coro::Result<void> DdsTransport::DeclareWriter(const std::string& topic) {
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (topic.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  declared_writers_.insert(topic);
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsTransport::DeclareReader(const std::string& topic) {
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (topic.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (declared_readers_.count(topic) != 0) {
+    return Coro::Result<void>{};  // 幂等:同 topic 重复声明直接成功。
+  }
+  // ★★ listener:**跑在 provider 的外来线程上,且可能就是别人的发布线程**(默认
+  // `INTRAPROCESS_FULL`)。故这里**只做一次 push**——`lock` + `push_back` + `notify_all`,
+  // 无等待路径,满时丢最旧也不阻塞。
+  //
+  // **不要在这里加任何东西**:不解码(`Message` 是 codec 之后的产物,而这里在 codec 之下)、
+  // 不加锁等待、不打日志到慢 sink。任何一处阻塞都会当场卡住对端的整条写队列。
+  //
+  // 捕获的是**读队列的分发端**与 **topic 的副本**,**不捕获 `this`**:前者让迟到回调不触碰
+  // 已销毁的对象,后者用来填 `Datagram.peer`——topic 不上线缆(D5),入站只能靠它带出。
+  auto subscribed = provider_->Subscribe(
+      topic, [channel = read_queue_->channel(), topic](
+                 const std::vector<std::uint8_t>& bytes) {
+        (void)channel->push(Datagram{bytes, Endpoint::Topic(topic)});
+      });
+  if (!subscribed) {
+    SetLastError(subscribed.error());
+    return subscribed.error();
+  }
+  declared_readers_.insert(topic);
+  return Coro::Result<void>{};
+}
+
+bool DdsTransport::IsRunning() const {
+  return lifecycle_ == LifecycleState::kRunning;
+}
+
+void DdsTransport::SetLastError(std::error_code error) {
+  std::lock_guard<std::mutex> lock(error_mutex_);
+  last_error_ = error;
 }
 
 std::error_code DdsTransport::LastError() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return state_->last_error;
+  std::lock_guard<std::mutex> lock(error_mutex_);
+  return last_error_;
 }
 
-// DDS 的"链路可用"即 provider 已初始化且订阅全部完成:Start 只在 Init 与逐 topic
-// Subscribe 全部成功后才落 Running(任一失败中途返回、不进 Running),故 Running +
-// provider 存活是充要判据。
+// 判活(D9)。**无状态成员,当场向 provider 取数算出**——与串口/TCP 的 `CurrentLinkState()`
+// 同定位:统一的 I/O 事实查询,不面向业务调用方。
+//
+// `kEstablishing` 那约 240ms 的发现窗口**没有 DDS 原生事件**,是由我方状态(端点已声明 +
+// matched 尚未 > 0)推出来的,这是 ADR-0013 已登记的代价 5。
 LinkState DdsTransport::CurrentLinkState() const {
-  std::lock_guard<std::mutex> lock(state_->mutex);
-  return (state_->lifecycle == LifecycleState::kRunning && state_->provider)
-             ? LinkState::kUp
-             : LinkState::kDown;
+  if (lifecycle_ != LifecycleState::kRunning || !provider_) {
+    return LinkState::kDown;  // 未 Start / 关闭中 / 已关闭。
+  }
+  if (declared_writers_.empty() && declared_readers_.empty()) {
+    // 一个端点都没声明:此刻**确实收发不了任何字节**,报 kDown 比 kEstablishing 诚实
+    // ——没有任何东西"正在建立"。
+    return LinkState::kDown;
+  }
+  const DdsMatchedCount count = provider_->MatchedCount();
+  if (count.matched > 0 && count.alive > 0) {
+    return LinkState::kUp;
+  }
+  if (count.matched == 0) {
+    return LinkState::kEstablishing;  // 端点已建,还没发现对端。
+  }
+  // matched > 0 但 alive == 0:对端端点还在,但已被 `AUTOMATIC_LIVELINESS` 判死。
+  // **必须配 liveliness**——只靠 matched 时对端被硬杀要等 participant lease(默认 20s)
+  // 才检出,期间谎报 kUp;配 2s 后 2.0s 检出(D9)。
+  return LinkState::kDown;
 }
 
 }  // namespace transport

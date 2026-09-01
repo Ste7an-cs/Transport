@@ -1,13 +1,28 @@
-// 协程原生 DdsTransport 契约与**跨线程交接边界**测试(ADR-0003 D12 Q1 /
-// RT_NODE_004/005/007)。在 fiber 调度器(coro_test_main)内跑:
-//   * 收侧:FakeDdsProvider Publish → DdsTransport.Read 收 Datagram{bytes, kTopic(topic)}。
-//   * 多 topic 各自到达、同 topic 保接受顺序(FIFO)。
-//   * 交接满 → tail-drop 丢最新 + dds_handoff_overflow 计数,listener 不阻塞。
-//   * 发侧:Write → provider.Publish 到 destination.topic;非 topic → kInvalidArgument。
-//   * Unsubscribe/Close 后迟到样本丢弃、不碰已销毁对象。
-//   * ★ 跨线程确证:listener(std::thread)Push、fiber Pop,压测无崩溃/无丢唤醒/无死锁。
-//   * I/O 观测面(ADR-0003 D13/RT_NODE_006):Publish 成功记 LastSendTime;出队样本记
-//     LastReceiveTime;Publish/Read 操作失败记 LastError。
+// -----------------------------------------------------------------------------
+// dds_transport_test.cpp — 协程原生 DdsTransport 双队列样板测试(ADR-0013
+// D1/D2/D3/D9/D11/D12/D15)。在 fiber 调度器(coro_test_main)内跑。
+//
+// 确定化手段:被测传输的 provider 由**每个用例自己注册的一条独立 Fake 总线**给出——
+// `DdsProviderRegistry` 是进程级的静态表,故每个 fixture 生成一个唯一名字并绑一条新
+// `Bus`,`--gtest_repeat` 多轮之间不串。对端用一个直接挂在同一条总线上的裸
+// `FakeDdsProvider`,它的 `Publish` 是**同步分发**的,故"发布方线程 = 订阅回调线程"这一
+// 条与 Fast DDS 默认 `INTRAPROCESS_FULL` 的实测形态一致,写侧的两个契约(入队即返 /
+// 关闭要等在途写)可以在 Fake 上如实复现。
+//
+// 覆盖九组事实:
+//   1. 配置校验(**D12**):五类非法配置 → kConfiguration 且**停在 Created**,改配可再 Start;
+//   2. 读侧(**D2**):listener 直推,`peer` = `Endpoint::Topic(来源 topic)`,多 topic 各自带出;
+//   3. ⭐ `read_queue_` 溢出(**D11**):有界 1024 + **静默丢最旧**,且 listener **从不阻塞**;
+//   4. 写侧(**D3**):`AsyncWrite` **入队即返**——provider 阻塞 400ms 也不拖住调用方;
+//   5. 写侧目的地:非 `kTopic` 的 `peer` **不回传错误**,只落 `LastError()`(kInvalidArgument);
+//   6. `Declare*` **幂等**(**D15**):重复声明 reader 不会重复投递;
+//   7. `CurrentLinkState()` **三态**(**D9**):kDown / kEstablishing / kUp 逐条;
+//   8. ⭐ 关闭路径(「明确接受的代价」7):`Close()` **打不断**在途 `Publish`,
+//      `WaitClosed()` 得等它自己跑完——最坏等待由**那次回调多慢**决定,不是 max_blocking_time;
+//   9. 生命周期:未 Start / 已 Close 的读写、`Close()` 与 `WaitClosed()` 幂等。
+//
+// 第 3 与第 8 组是本文件的核心。
+// -----------------------------------------------------------------------------
 #include "transport/io/dds/DdsTransport.hpp"
 
 #include <atomic>
@@ -15,377 +30,606 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <boost/fiber/operations.hpp>
 #include <gtest/gtest.h>
 
 #include "coro_test_util.hpp"
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/ITraceSink.hpp"
+#include "transport/io/dds/DdsConfig.hpp"
+#include "transport/io/dds/DdsProviderRegistry.hpp"
 #include "transport/io/dds/FakeDdsProvider.hpp"
 #include "transport/io/dds/IDdsProvider.hpp"
 
 using namespace std::chrono_literals;
-using transport::CapturingTraceSink;
+using testutil::pumpFiberUntil;
 using transport::Datagram;
 using transport::DdsConfig;
+using transport::DdsMatchedCount;
+using transport::DdsProviderRegistry;
 using transport::DdsTransport;
-using transport::DropReason;
-using transport::DropReasonName;
 using transport::Endpoint;
 using transport::FakeDdsProvider;
-using transport::OperationOptions;
-using transport::SendUnit;
+using transport::IDdsProvider;
+using transport::LinkState;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 namespace {
 
-DdsConfig Cfg() { DdsConfig c; c.domain_id = 0; return c; }
+using Bytes = std::vector<std::uint8_t>;
+using Clock = std::chrono::steady_clock;
 
-std::vector<std::uint8_t> Enc(int i) {
-  return {static_cast<std::uint8_t>(i & 0xFF),
-          static_cast<std::uint8_t>((i >> 8) & 0xFF)};
-}
-int Dec(const std::vector<std::uint8_t>& b) {
-  return static_cast<int>(b[0]) | (static_cast<int>(b[1]) << 8);
+int NextFixtureId() {
+  static std::atomic<int> counter{0};
+  return ++counter;
 }
 
-// 以共享 Bus 造被测 DdsTransport(rx)与一个独立发布方 provider(tx)。
+std::chrono::milliseconds ElapsedSince(Clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                               start);
+}
+
+Bytes Enc(int value) {
+  return {static_cast<std::uint8_t>(value & 0xFF),
+          static_cast<std::uint8_t>((value >> 8) & 0xFF)};
+}
+int Dec(const Bytes& bytes) {
+  return static_cast<int>(bytes[0]) | (static_cast<int>(bytes[1]) << 8);
+}
+
+// 一条独立的 Fake 总线 + 一个只属于本用例的 provider 注册名。
 struct Fixture {
-  std::shared_ptr<FakeDdsProvider::Bus> bus = std::make_shared<FakeDdsProvider::Bus>();
-  FakeDdsProvider tx{bus};
+  std::shared_ptr<FakeDdsProvider::Bus> bus =
+      std::make_shared<FakeDdsProvider::Bus>();
+  std::string provider_name = "fake-bus-" + std::to_string(NextFixtureId());
 
-  std::unique_ptr<DdsTransport> MakeRx(std::vector<std::string> topics,
-                                       std::size_t max_samples = DdsTransport::kDefaultMaxSamples,
-                                       std::size_t max_bytes = DdsTransport::kDefaultMaxBytes,
-                                       transport::ITraceSink* trace_sink = nullptr) {
-    return std::make_unique<DdsTransport>(std::make_unique<FakeDdsProvider>(bus),
-                                          Cfg(), std::move(topics), max_samples,
-                                          max_bytes, trace_sink);
+  Fixture() {
+    DdsProviderRegistry::RegisterProvider(provider_name, [bus = bus] {
+      return std::unique_ptr<IDdsProvider>(new FakeDdsProvider(bus));
+    });
   }
-  Fixture() { (void)tx.Init(Cfg()); }
+
+  DdsConfig Cfg() const {
+    DdsConfig config;
+    config.provider = provider_name;
+    return config;
+  }
+
+  std::unique_ptr<DdsTransport> MakeTransport() const {
+    return std::make_unique<DdsTransport>(Cfg());
+  }
 };
 
-OperationOptions Deadline(std::chrono::milliseconds d) {
-  OperationOptions o;
-  o.deadline = OperationOptions::Clock::now() + d;
-  return o;
-}
-
-// 最小 IDdsProvider 替身,专供 LastError 测试:Init/Subscribe/Unsubscribe/Shutdown
-// 恒成功(不驱动任何真实收发),Publish 恒失败(模拟 provider 侧发布故障)。
-using transport::IDdsProvider;
-class FailingPublishProvider : public IDdsProvider {
+// 挂在同一条总线上的对端:发样本给被测传输,或收被测传输发出的样本。
+// 回调可能跑在**被测传输的写线程**上(Fake 同步分发),故收到的东西一律加锁存。
+class Peer {
  public:
-  Coro::Result<void> Init(const DdsConfig&) override { return Coro::Result<void>{}; }
-  void Shutdown() override {}
-  Coro::Result<void> Publish(const std::string&, const std::vector<uint8_t>&) override {
-    return make_error_code(TransportErrc::kIo);
+  Peer(const Fixture& fixture) : provider_(fixture.bus) {
+    (void)provider_.Init(fixture.Cfg());
   }
-  Coro::Result<void> Subscribe(const std::string&,
-                   std::function<void(const std::vector<uint8_t>&)>) override {
+  ~Peer() { provider_.Shutdown(); }
+
+  Peer(const Peer&) = delete;
+  Peer& operator=(const Peer&) = delete;
+
+  void Publish(const std::string& topic, const Bytes& bytes) {
+    EXPECT_TRUE(static_cast<bool>(provider_.Publish(topic, bytes)));
+  }
+
+  void Watch(const std::string& topic) {
+    EXPECT_TRUE(static_cast<bool>(
+        provider_.Subscribe(topic, [this](const Bytes& bytes) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          received_.push_back(bytes);
+        })));
+  }
+
+  std::size_t Count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return received_.size();
+  }
+  std::vector<Bytes> Received() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return received_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<Bytes> received_;
+  FakeDdsProvider provider_;
+};
+
+// 会把发布线程 park 住的 provider——复现「`Publish` 的阻塞是线程级、且没有上界」这一
+// 实测事实(ADR-0013 背景:同进程订阅回调跑在发布线程上,`max_blocking_time` 不参与)。
+// 状态放在共享块里,使工厂造出的实例与用例共用同一份计数。
+struct BlockingState {
+  std::atomic<int> entered{0};    ///< 已进入 Publish 的次数。
+  std::atomic<int> completed{0};  ///< **跑完**的次数(用来证明它没被截断)。
+  std::chrono::milliseconds delay{400};
+};
+
+class BlockingPublishProvider : public IDdsProvider {
+ public:
+  explicit BlockingPublishProvider(std::shared_ptr<BlockingState> state)
+      : state_(std::move(state)) {}
+
+  Coro::Result<void> Init(const DdsConfig&) override {
     return Coro::Result<void>{};
   }
-  Coro::Result<void> Unsubscribe(const std::string&) override { return Coro::Result<void>{}; }
-  std::string Name() const override { return "failing-publish"; }
+  void Shutdown() override {}
+  Coro::Result<void> Publish(const std::string&, const Bytes&) override {
+    state_->entered.fetch_add(1);
+    std::this_thread::sleep_for(state_->delay);  // 打不断的一段(同真实 write())。
+    state_->completed.fetch_add(1);
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> Subscribe(const std::string&,
+                               std::function<void(const Bytes&)>) override {
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> Unsubscribe(const std::string&) override {
+    return Coro::Result<void>{};
+  }
+  [[nodiscard]] DdsMatchedCount MatchedCount() const override { return {}; }
+  std::string Name() const override { return "blocking-publish"; }
+
+ private:
+  std::shared_ptr<BlockingState> state_;
 };
+
+// 注册一个 BlockingPublishProvider 工厂,返回配置 + 共享状态。
+std::pair<DdsConfig, std::shared_ptr<BlockingState>> MakeBlockingConfig() {
+  auto state = std::make_shared<BlockingState>();
+  DdsConfig config;
+  config.provider = "blocking-publish-" + std::to_string(NextFixtureId());
+  DdsProviderRegistry::RegisterProvider(config.provider, [state] {
+    return std::unique_ptr<IDdsProvider>(new BlockingPublishProvider(state));
+  });
+  return {config, state};
+}
 
 }  // namespace
 
-TEST(DdsTransport, PublishToTopicDeliversDatagramWithTopicSource) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+// ── 1. 配置校验(D12):非法 → kConfiguration 且停在 Created ──────────────
 
-  ASSERT_TRUE(static_cast<bool>(f.tx.Publish("t", {1, 2, 3})));
+TEST(DdsTransport, InvalidConfigIsConfigurationAndStaysCreated) {
+  Fixture fixture;
 
-  auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
-  ASSERT_TRUE(static_cast<bool>(dg));
-  EXPECT_EQ(dg.value().bytes, (std::vector<std::uint8_t>{1, 2, 3}));
-  EXPECT_EQ(dg.value().peer.kind, Endpoint::Kind::kTopic);
-  EXPECT_EQ(dg.value().peer.topic, "t");
+  const auto expect_rejected = [&fixture](DdsConfig config) {
+    DdsTransport transport(std::move(config));
+    auto started = transport.Start();
+    ASSERT_FALSE(static_cast<bool>(started));
+    EXPECT_EQ(started.error(), make_error_code(TransportErrc::kConfiguration));
+    // **停在 Created**:读句柄仍报 kInvalidState(而不是 kClosed),写同理。
+    EXPECT_FALSE(transport.IsRunning());
+    EXPECT_EQ(testutil::ReadOnce(transport, 50ms).error(),
+              make_error_code(TransportErrc::kInvalidState));
+    EXPECT_EQ(transport.AsyncWrite(Datagram{}).error(),
+              make_error_code(TransportErrc::kInvalidState));
+    EXPECT_EQ(transport.CurrentLinkState(), LinkState::kDown);
+  };
+
+  DdsConfig below = fixture.Cfg();
+  below.domain_id = -1;
+  expect_rejected(below);
+
+  DdsConfig above = fixture.Cfg();
+  above.domain_id = 233;  // 合法区间是 [0, 232]。
+  expect_rejected(above);
+
+  DdsConfig no_provider = fixture.Cfg();
+  no_provider.provider.clear();
+  expect_rejected(no_provider);
+
+  DdsConfig unregistered = fixture.Cfg();
+  unregistered.provider = "no-such-provider";  // 非空但未注册。
+  expect_rejected(unregistered);
+
+  DdsConfig zero_blocking = fixture.Cfg();
+  zero_blocking.qos.max_blocking_time = 0ms;  // 须为正,没有"0 = 禁用"这一档。
+  expect_rejected(zero_blocking);
+
+  DdsConfig negative_lease = fixture.Cfg();
+  negative_lease.qos.liveliness_lease = -1ms;
+  expect_rejected(negative_lease);
 }
 
-TEST(DdsTransport, MultiTopicEachArrivesAndSameTopicKeepsOrder) {
-  Fixture f;
-  auto rx = f.MakeRx({"a", "b"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+TEST(DdsTransport, StartAfterFixingConfigSucceeds) {
+  Fixture fixture;
+  DdsConfig bad = fixture.Cfg();
+  bad.domain_id = 999;
+  DdsTransport transport(bad);
+  ASSERT_FALSE(static_cast<bool>(transport.Start()));
+  // 停在 Created 的意义就在这里:同一个对象改不了配,但同一份配置改好后可再建再起。
+  DdsTransport fixed(fixture.Cfg());
+  ASSERT_TRUE(static_cast<bool>(fixed.Start()));
+  EXPECT_TRUE(fixed.IsRunning());
+  ASSERT_TRUE(static_cast<bool>(fixed.Close()));
+  fixed.WaitClosed();
+}
 
-  // 交替发布两 topic,验证各自都到达且同 topic 保接受顺序。
+TEST(DdsTransport, StartIsIdempotentAndRejectedAfterClose) {
+  Fixture fixture;
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  EXPECT_TRUE(static_cast<bool>(transport->Start()));  // Running 时是成功 no-op。
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));
+  EXPECT_EQ(transport->Start().error(),
+            make_error_code(TransportErrc::kInvalidState));
+  transport->WaitClosed();
+}
+
+// ── 2. 读侧(D2):listener 直推,peer 带出来源 topic ──────────────────────
+
+TEST(DdsTransport, DeclaredReaderDeliversDatagramCarryingSourceTopic) {
+  Fixture fixture;
+  Peer peer(fixture);
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+
+  peer.Publish("t", {1, 2, 3});
+
+  auto datagram = testutil::ReadOnce(*transport, 2000ms);
+  ASSERT_TRUE(static_cast<bool>(datagram));
+  EXPECT_EQ(datagram.value().bytes, (Bytes{1, 2, 3}));
+  // topic **不上线缆**(D5):入站只能靠 listener 闭包捕获的 topic 带出。
+  EXPECT_EQ(datagram.value().peer.kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ(datagram.value().peer.topic, "t");
+}
+
+TEST(DdsTransport, MultipleReadersEachCarryOwnTopicAndKeepOrder) {
+  Fixture fixture;
+  Peer peer(fixture);
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("a")));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("b")));
+
   for (int i = 0; i < 5; ++i) {
-    ASSERT_TRUE(static_cast<bool>(f.tx.Publish("a", Enc(i))));
-    ASSERT_TRUE(static_cast<bool>(f.tx.Publish("b", Enc(100 + i))));
+    peer.Publish("a", Enc(i));
+    peer.Publish("b", Enc(100 + i));
   }
 
-  std::vector<int> a_seq, b_seq;
-  for (int k = 0; k < 10; ++k) {
-    auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
-    ASSERT_TRUE(static_cast<bool>(dg));
-    if (dg.value().peer.topic == "a")
-      a_seq.push_back(Dec(dg.value().bytes));
-    else
-      b_seq.push_back(Dec(dg.value().bytes));
-  }
-  EXPECT_EQ(a_seq, (std::vector<int>{0, 1, 2, 3, 4}));
-  EXPECT_EQ(b_seq, (std::vector<int>{100, 101, 102, 103, 104}));
-}
-
-TEST(DdsTransport, HandoffFullTailDropsAndCountsWithoutBlockingListener) {
-  Fixture f;
-  // 极小交接容量:3 样本(字节上界给足,只让样本数触顶)。
-  auto rx = f.MakeRx({"t"}, /*max_samples=*/3, /*max_bytes=*/DdsTransport::kDefaultMaxBytes);
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-
-  // 不读的情况下连发 10 条:满即 tail-drop 丢最新,listener(Publish)不阻塞、始终成功。
+  std::vector<int> from_a;
+  std::vector<int> from_b;
+  auto queue = transport->AsyncRead();
   for (int i = 0; i < 10; ++i) {
-    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", Enc(i))));  // 不阻塞。
+    auto datagram = testutil::AwaitRead(queue, 2000ms);
+    ASSERT_TRUE(static_cast<bool>(datagram));
+    if (datagram.value().peer.topic == "a") {
+      from_a.push_back(Dec(datagram.value().bytes));
+    } else {
+      from_b.push_back(Dec(datagram.value().bytes));
+    }
   }
-  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 7u);  // 收下前 3,丢后 7。
-
-  // 保留的是最早的 3 条(FIFO,tail-drop 丢新不丢旧)。
-  for (int i = 0; i < 3; ++i) {
-    auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
-    ASSERT_TRUE(static_cast<bool>(dg));
-    EXPECT_EQ(Dec(dg.value().bytes), i);
-  }
+  EXPECT_EQ(from_a, (std::vector<int>{0, 1, 2, 3, 4}));
+  EXPECT_EQ(from_b, (std::vector<int>{100, 101, 102, 103, 104}));
 }
 
-// P5-3(issue #88):kDdsHandoffOverflow 定义点在 BoundedQueue::Push 内(交接边界经
-// DdsTransport 构造函数透传可选 trace_sink)——配置 trace_sink 时,交接满 tail-drop
-// 应逐条产生可辨识的 TraceEvent,且 DdsHandoffOverflowCount()(代理
-// BoundedQueue::DroppedCount())不变。
-TEST(DdsTransport, HandoffOverflowWithSinkEmitsDropTraceForEachDrop) {
-  Fixture f;
-  CapturingTraceSink sink;
-  auto rx = f.MakeRx({"t"}, /*max_samples=*/3,
-                     /*max_bytes=*/DdsTransport::kDefaultMaxBytes, &sink);
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+TEST(DdsTransport, ReaderPushFromForeignThreadIsSafeUnderLoad) {
+  // 跨线程确证(#190 Q1 的回归):listener 在**非 fiber 线程**上 push,fiber 侧 pop。
+  Fixture fixture;
+  Peer peer(fixture);
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
 
-  for (int i = 0; i < 10; ++i) {
-    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", Enc(i))));
-  }
-  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 7u);
-
-  const auto records = sink.Records();
-  ASSERT_EQ(records.size(), 7u);  // 逐条归因:7 次 tail-drop → 7 条 TraceEvent。
-  for (const auto& rec : records) {
-    EXPECT_EQ(rec.category, "drop");
-    EXPECT_EQ(rec.message, DropReasonName(DropReason::kDdsHandoffOverflow));
-  }
-}
-
-// RT_TRACE_002:未配置 trace_sink(默认 nullptr)时,交接满 tail-drop 计数不受影响
-// (行为与既有 HandoffFullTailDropsAndCountsWithoutBlockingListener 一致,不重复断言细节)。
-TEST(DdsTransport, HandoffOverflowNoSinkConfiguredCountUnaffected) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"}, /*max_samples=*/3);  // trace_sink 缺省 nullptr。
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-
-  for (int i = 0; i < 5; ++i) {
-    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", Enc(i))));
-  }
-  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 2u);
-}
-
-TEST(DdsTransport, WritePublishesToDestinationTopic) {
-  Fixture f;
-  auto rx = f.MakeRx({"in"});  // 被测对象只订阅 "in"
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-
-  // 独立订阅方监听 "out",验证 Write 发到 destination.topic。
-  std::vector<std::uint8_t> got;
-  FakeDdsProvider sink{f.bus};
-  (void)sink.Init(Cfg());
-  ASSERT_TRUE(static_cast<bool>(
-      sink.Subscribe("out", [&](const std::vector<std::uint8_t>& b) { got = b; })));
-
-  SendUnit unit;
-  unit.bytes = {9, 8, 7};
-  unit.destination = Endpoint::Topic("out");
-  ASSERT_TRUE(static_cast<bool>(rx->Write(std::move(unit))));
-  EXPECT_EQ(got, (std::vector<std::uint8_t>{9, 8, 7}));
-}
-
-TEST(DdsTransport, WriteNonTopicDestinationIsInvalidArgument) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-
-  SendUnit def;
-  def.bytes = {1};
-  def.destination = Endpoint::Default();
-  auto r1 = rx->Write(std::move(def));
-  EXPECT_EQ(r1.error(), make_error_code(TransportErrc::kInvalidArgument));
-
-  SendUnit net;
-  net.bytes = {1};
-  net.destination = Endpoint::Net("127.0.0.1", 5000);
-  auto r2 = rx->Write(std::move(net));
-  EXPECT_EQ(r2.error(), make_error_code(TransportErrc::kInvalidArgument));
-}
-
-TEST(DdsTransport, ReadBeforeStartIsInvalidStateAndAfterCloseIsClosed) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  auto before = testutil::ReadOnce(*rx, Deadline(200ms));
-  EXPECT_EQ(before.error(), make_error_code(TransportErrc::kInvalidState));
-
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-  ASSERT_TRUE(static_cast<bool>(rx->RequestClose()));
-  auto after = testutil::ReadOnce(*rx, Deadline(200ms));
-  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
-  // WaitClosed 立即完成。
-  EXPECT_TRUE(static_cast<bool>(rx->WaitClosed(Deadline(2000ms))));
-}
-
-TEST(DdsTransport, LateSampleAfterCloseIsDiscardedAndNoUseAfterFree) {
-  Fixture f;
-  {
-    auto rx = f.MakeRx({"t"});
-    ASSERT_TRUE(static_cast<bool>(rx->Start()));
-    ASSERT_TRUE(static_cast<bool>(rx->RequestClose()));
-    // 关闭后再发:回调已被 Shutdown 摘除;即便迟到回调只 Push 存活的交接队列(返 kClosed)。
-    EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", {1})));
-    EXPECT_EQ(rx->DdsHandoffOverflowCount(), 0u);  // 关闭队列 Push 记 kClosed 而非 overflow。
-  }
-  // 析构后再发:总线上已无该 provider 的订阅,不触碰已销毁对象(无崩溃)。
-  EXPECT_TRUE(static_cast<bool>(f.tx.Publish("t", {2})));
-}
-
-// —— ★ 跨线程交接确证:listener(std::thread)Push、fiber Pop ——
-// FakeDdsProvider.Publish 同步 Dispatch → 订阅回调在**调用线程**触发,故在独立
-// std::thread 上 Publish 即在非 fiber 线程上 Push 交接边界。fiber 侧 Pop 等待被
-// 该线程唤醒。压测确认无崩溃、无丢唤醒(每次 Read 有界 deadline,丢唤醒会转成
-// kTimeout 失败而非无限挂起)、无死锁。--gtest_repeat 多轮加压。
-TEST(DdsTransport, CrossThreadListenerPushFiberPopStress) {
-  Fixture f;
-  constexpr int kN = 800;  // < 默认 1024 交接容量:fiber 跟得上则无丢弃。
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-
+  constexpr int kCount = 800;  // < 1024,fiber 跟得上则无丢弃。
   std::atomic<bool> go{false};
-  std::thread listener([&] {
-    while (!go.load()) { /* 等 fiber 就绪再开压 */ }
-    for (int i = 0; i < kN; ++i) {
-      (void)f.tx.Publish("t", Enc(i));  // 非 fiber 线程上触发回调 → Push。
+  std::thread publisher([&] {
+    while (!go.load()) {
+    }
+    for (int i = 0; i < kCount; ++i) {
+      peer.Publish("t", Enc(i));
     }
   });
 
   go.store(true);
-  std::vector<int> seq;
-  seq.reserve(kN);
-  for (int i = 0; i < kN; ++i) {
-    auto dg = testutil::ReadOnce(*rx, Deadline(5000ms));
-    ASSERT_TRUE(static_cast<bool>(dg))  // 丢唤醒会在此转成 kTimeout。
-        << "Read #" << i << " failed: " << dg.error().message();
-    seq.push_back(Dec(dg.value().bytes));
+  std::vector<int> sequence;
+  sequence.reserve(kCount);
+  auto queue = transport->AsyncRead();
+  for (int i = 0; i < kCount; ++i) {
+    auto datagram = testutil::AwaitRead(queue, 5000ms);
+    ASSERT_TRUE(static_cast<bool>(datagram))
+        << "read #" << i << ": " << datagram.error().message();
+    sequence.push_back(Dec(datagram.value().bytes));
   }
-  listener.join();
+  publisher.join();
 
-  // 无丢弃(容量足)、严格 FIFO 保接受顺序。
-  EXPECT_EQ(rx->DdsHandoffOverflowCount(), 0u);
-  ASSERT_EQ(seq.size(), static_cast<std::size_t>(kN));
-  for (int i = 0; i < kN; ++i) EXPECT_EQ(seq[i], i);
+  ASSERT_EQ(sequence.size(), static_cast<std::size_t>(kCount));
+  for (int i = 0; i < kCount; ++i) {
+    EXPECT_EQ(sequence[i], i);  // 严格 FIFO,无空洞。
+  }
 }
 
-// 跨线程并发 Push 与 Close 竞争:一个 std::thread 持续 Push,fiber 侧 RequestClose,
-// 在途 Read 被唤醒返 kClosed,无崩溃/无死锁(确证唤醒原语两路唤醒安全)。
-TEST(DdsTransport, CrossThreadCloseRacesWithListenerPush) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"}, /*max_samples=*/8);
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+// ── 3. ⭐ read_queue_ 溢出(D11):有界 1024 + 静默丢最旧,listener 不阻塞 ──
 
-  std::atomic<bool> stop{false};
-  std::thread listener([&] {
-    for (int i = 0; !stop.load(); ++i) {
-      (void)f.tx.Publish("t", Enc(i & 0xFFFF));
+TEST(DdsTransport, ReadQueueOverflowSilentlyDropsOldestAndNeverBlocksListener) {
+  Fixture fixture;
+  Peer peer(fixture);
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+
+  // 一条都不读,连发 1200 条(> 1024)。`Peer::Publish` 内已断言每一条都成功——
+  // 队列满**不会**把失败回传给 listener,这正是「`RELIABLE` 被本地队列架空」的形态。
+  constexpr int kSent = 1200;
+  const auto start = Clock::now();
+  for (int i = 0; i < kSent; ++i) {
+    peer.Publish("t", Enc(i));
+  }
+  const auto elapsed = ElapsedSince(start);
+  // listener 只做 lock + push_back + notify_all,**无等待路径**:1200 条必须瞬时跑完。
+  EXPECT_LT(elapsed.count(), 1000) << "listener 被阻塞了:" << elapsed.count() << "ms";
+
+  // 丢的是**最旧**的那批(不是三介质之外的 tail-drop),且**静默**——没有计数器、
+  // 没有归因,唯一可观测的证据就是"取出来的第一条不是 0 号"。
+  auto queue = transport->AsyncRead();
+  std::vector<int> drained;
+  for (;;) {
+    auto datagram = testutil::AwaitRead(queue, 200ms);
+    if (!datagram) {
+      break;  // 取空 → kTimeout。
     }
-  });
-
-  // 先取几条(fiber 与 listener 真并发),再关闭,验证 Read 收敛到 kClosed。
-  for (int k = 0; k < 5; ++k) {
-    auto dg = testutil::ReadOnce(*rx, Deadline(5000ms));
-    ASSERT_TRUE(static_cast<bool>(dg)) << "drain read failed: " << dg.error().message();
+    drained.push_back(Dec(datagram.value().bytes));
   }
-  ASSERT_TRUE(static_cast<bool>(rx->RequestClose()));
-  stop.store(true);
-  listener.join();
-
-  // 关闭后 Read 返 kClosed(不挂起)。
-  auto after = testutil::ReadOnce(*rx, Deadline(2000ms));
-  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+  ASSERT_FALSE(drained.empty());
+  EXPECT_EQ(drained.size(), 1024u) << "read_queue_ 的界不是 1024";
+  EXPECT_EQ(drained.front(), kSent - 1024);  // 保留最新的 1024 条 ⇒ 首条是 176 号。
+  EXPECT_EQ(drained.back(), kSent - 1);
+  for (std::size_t i = 1; i < drained.size(); ++i) {
+    EXPECT_EQ(drained[i], drained[i - 1] + 1);  // 保留段内部严格连续。
+  }
+  EXPECT_FALSE(transport->LastError());  // 丢弃**不落 LastError**,与三介质逐字相同。
 }
 
-// —— I/O 观测面(ADR-0003 D13/RT_NODE_006「所有介质如实报」)——
+// ── 4/5. 写侧(D3):入队即返;非 topic 目的地只落 LastError ────────────────
 
-TEST(DdsTransport, PublishSuccessUpdatesLastSendTime) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-  EXPECT_FALSE(rx->LastSendTime().has_value());  // 未发送前为空。
+TEST(DdsTransport, AsyncWritePublishesToPeerTopic) {
+  Fixture fixture;
+  Peer peer(fixture);
+  peer.Watch("out");
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("out")));
 
-  const auto before = OperationOptions::Clock::now();
-  SendUnit unit;
-  unit.bytes = {1, 2, 3};
-  unit.destination = Endpoint::Topic("out");
-  ASSERT_TRUE(static_cast<bool>(rx->Write(std::move(unit))));
-  const auto after = OperationOptions::Clock::now();
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{9, 8, 7}, Endpoint::Topic("out")})));
 
-  ASSERT_TRUE(rx->LastSendTime().has_value());
-  EXPECT_GE(*rx->LastSendTime(), before);
-  EXPECT_LE(*rx->LastSendTime(), after);
+  ASSERT_TRUE(pumpFiberUntil([&] { return peer.Count() == 1; }));
+  EXPECT_EQ(peer.Received().front(), (Bytes{9, 8, 7}));
+  EXPECT_FALSE(transport->LastError());
 }
 
-TEST(DdsTransport, HandoffSampleUpdatesLastReceiveTime) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-  EXPECT_FALSE(rx->LastReceiveTime().has_value());  // 未收到前为空。
+TEST(DdsTransport, AsyncWriteReturnsImmediatelyWhilePublishBlocks) {
+  // **写侧的核心契约**(D3):`Publish` park 的是那条专属 OS 线程,业务侧早已返回。
+  auto [config, state] = MakeBlockingConfig();
+  DdsTransport transport(config);
+  ASSERT_TRUE(static_cast<bool>(transport.Start()));
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
 
-  const auto before = OperationOptions::Clock::now();
-  ASSERT_TRUE(static_cast<bool>(f.tx.Publish("t", {1, 2, 3})));
-  auto dg = testutil::ReadOnce(*rx, Deadline(2000ms));
-  const auto after = OperationOptions::Clock::now();
-  ASSERT_TRUE(static_cast<bool>(dg));
+  const auto start = Clock::now();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(static_cast<bool>(
+        transport.AsyncWrite(Datagram{Enc(i), Endpoint::Topic("t")})));
+  }
+  const auto elapsed = ElapsedSince(start);
+  // 三次入队 + 一次 notify,远小于一次 Publish 的 400ms。
+  EXPECT_LT(elapsed.count(), 100) << "AsyncWrite 被写侧阻塞拖住了";
+  EXPECT_TRUE(pumpFiberUntil([&s = *state] { return s.entered.load() >= 1; }));
 
-  ASSERT_TRUE(rx->LastReceiveTime().has_value());
-  EXPECT_GE(*rx->LastReceiveTime(), before);
-  EXPECT_LE(*rx->LastReceiveTime(), after);
+  (void)transport.Close();
+  transport.WaitClosed();
 }
 
-TEST(DdsTransport, PublishFailureUpdatesLastErrorWithoutTouchingLastSendTime) {
-  auto rx = std::make_unique<DdsTransport>(
-      std::make_unique<FailingPublishProvider>(), Cfg(),
-      std::vector<std::string>{});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
-  EXPECT_FALSE(rx->LastError());  // 初始无错误。
+TEST(DdsTransport, NonTopicDestinationIsDroppedIntoLastErrorNotReturned) {
+  Fixture fixture;
+  Peer peer(fixture);
+  peer.Watch("out");
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("out")));
 
-  SendUnit unit;
-  unit.bytes = {9};
-  unit.destination = Endpoint::Topic("t");
-  auto written = rx->Write(std::move(unit));
+  // 写是 fire-and-forget:`AsyncWrite` 只判生命周期与入队,故这两条**都返回成功**。
+  // DDS 没有"默认对端"(配置里没有 topic,D16),故它们在写线程上被丢弃。
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{1}, Endpoint::Default()})));
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{2}, Endpoint::Net("127.0.0.1", 5000)})));
 
-  ASSERT_FALSE(static_cast<bool>(written));
-  EXPECT_EQ(written.error(), make_error_code(TransportErrc::kIo));
-  EXPECT_EQ(rx->LastError(), make_error_code(TransportErrc::kIo));
-  EXPECT_FALSE(rx->LastSendTime().has_value());  // 失败不应记为一次成功发送。
+  ASSERT_TRUE(pumpFiberUntil([&] {
+    return transport->LastError() ==
+           make_error_code(TransportErrc::kInvalidArgument);
+  }));
+  // 一条都没发出去,且随后的合法目的地照常发得出(丢的是那一条,不是整条链路)。
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{3}, Endpoint::Topic("out")})));
+  ASSERT_TRUE(pumpFiberUntil([&] { return peer.Count() == 1; }));
+  EXPECT_EQ(peer.Received().front(), (Bytes{3}));
 }
 
-TEST(DdsTransport, ReadTimeoutDoesNotUpdateLastError) {
-  Fixture f;
-  auto rx = f.MakeRx({"t"});
-  ASSERT_TRUE(static_cast<bool>(rx->Start()));
+// ── 6. Declare* 幂等(D15)────────────────────────────────────────────────
 
-  // 空队列、短 deadline:handoff.Pop 必然超时。kTimeout 是正常操作结果(无数据
-  // 到达),不是故障事实——同 TCP/UDP/Serial 惯例,不计入 LastError,保持它作为
-  // "真故障"信号不被正常控制流结果稀释(ADR-0003 D13、RT_NODE_006)。
-  auto dg = testutil::ReadOnce(*rx, Deadline(20ms));
-  ASSERT_FALSE(static_cast<bool>(dg));
-  EXPECT_EQ(dg.error(), make_error_code(TransportErrc::kTimeout));
-  EXPECT_FALSE(rx->LastError());
+TEST(DdsTransport, DeclareIsIdempotentAndValidatesTopicAndLifecycle) {
+  Fixture fixture;
+  Peer peer(fixture);
+  auto transport = fixture.MakeTransport();
+
+  // 未 Start:两个方法都 kInvalidState(端点只能在 provider 已 Init 之后建)。
+  EXPECT_EQ(transport->DeclareReader("t").error(),
+            make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(transport->DeclareWriter("t").error(),
+            make_error_code(TransportErrc::kInvalidState));
+
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  EXPECT_EQ(transport->DeclareReader("").error(),
+            make_error_code(TransportErrc::kConfiguration));
+  EXPECT_EQ(transport->DeclareWriter("").error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  // 幂等:注册里可能重复(同一 topic 既是订阅项、又是某条 client 的应答 topic)。
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("t")));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("t")));
+
+  // 重复声明**不能**变成两个 reader,否则一条样本会被投递两次。
+  peer.Publish("t", {7});
+  auto queue = transport->AsyncRead();
+  auto first = testutil::AwaitRead(queue, 2000ms);
+  ASSERT_TRUE(static_cast<bool>(first));
+  EXPECT_EQ(first.value().bytes, (Bytes{7}));
+  EXPECT_EQ(testutil::AwaitRead(queue, 200ms).error(),
+            make_error_code(TransportErrc::kTimeout));  // 没有第二份。
+
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));
+  EXPECT_EQ(transport->DeclareReader("t").error(),
+            make_error_code(TransportErrc::kInvalidState));
+  transport->WaitClosed();
+}
+
+// ── 7. CurrentLinkState 三态(D9)────────────────────────────────────────
+
+TEST(DdsTransport, LinkStateIsDownEstablishingUpByMatchedAndAlive) {
+  Fixture fixture;
+  auto transport = fixture.MakeTransport();
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kDown);  // 未 Start。
+
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  // 已 Running 但一个端点都没声明:此刻确实收发不了字节,报 kDown 更诚实。
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kDown);
+
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+  // 端点已建、还没发现对端 —— 约 240ms 的发现窗口,**无 DDS 原生事件**,由我方推出。
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kEstablishing);
+
+  {
+    Peer peer(fixture);
+    peer.Watch("t");  // 总线上多了一个别人的 sink ⇒ matched/alive 均 > 0。
+    EXPECT_EQ(transport->CurrentLinkState(), LinkState::kUp);
+  }
+  // 对端退出 ⇒ 回到 kEstablishing(端点还在,只是又没有对端了)。
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kEstablishing);
+
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kDown);  // 关闭中/已关闭。
+  transport->WaitClosed();
+  EXPECT_EQ(transport->CurrentLinkState(), LinkState::kDown);
+}
+
+// ── 8. ⭐ 关闭路径:Close() 打不断在途 Publish ──────────────────────────
+
+TEST(DdsTransport, CloseReturnsAtOnceAndWaitClosedOutlastsInFlightPublish) {
+  auto [config, state] = MakeBlockingConfig();
+  auto* raw_state = state.get();
+  DdsTransport transport(config);
+  ASSERT_TRUE(static_cast<bool>(transport.Start()));
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
+
+  // 三条:第一条会把写线程 park 住,后两条留在队列里。
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(static_cast<bool>(
+        transport.AsyncWrite(Datagram{Enc(i), Endpoint::Topic("t")})));
+  }
+  ASSERT_TRUE(pumpFiberUntil([raw_state] { return raw_state->entered.load() >= 1; }));
+  EXPECT_EQ(raw_state->completed.load(), 0);  // 确认此刻确实卡在途中。
+
+  // `Close()` **只发信号**:落在一次阻塞写上也必须当场返回。
+  const auto close_start = Clock::now();
+  ASSERT_TRUE(static_cast<bool>(transport.Close()));
+  const auto close_elapsed = ElapsedSince(close_start);
+  EXPECT_LT(close_elapsed.count(), 50) << "Close() 等收敛了:" << close_elapsed.count() << "ms";
+
+  // `WaitClosed()` 才是收敛点,而在途的那次 `Publish` **打不断**——只能等它自己跑完。
+  const auto wait_start = Clock::now();
+  transport.WaitClosed();
+  const auto wait_elapsed = ElapsedSince(wait_start);
+
+  // 它**跑完了**,不是被截断:这正是「最坏等待没有上界」的机理——界由那次调用自己
+  // 多久返回决定(真实 DDS 上则由同进程内最慢的那个订阅回调决定)。
+  EXPECT_EQ(raw_state->completed.load(), 1);
+  // 队列里剩下的两条**随 Close 丢弃**,不等刷出(同三介质)。
+  EXPECT_EQ(raw_state->entered.load(), 1);
+  // 等待时长下界:至少是这次 Publish 剩余的那一段(留足调度余量,只断言"确实等了")。
+  EXPECT_GE(wait_elapsed.count(), 100) << "WaitClosed 没有等在途写";
+}
+
+TEST(DdsTransport, CloseAndWaitClosedAreIdempotent) {
+  Fixture fixture;
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));
+  EXPECT_TRUE(static_cast<bool>(transport->Close()));  // 幂等。
+  transport->WaitClosed();
+  transport->WaitClosed();  // 幂等:join 只做一次。
+}
+
+TEST(DdsTransport, CloseBeforeStartClosesReadQueueWithoutHangingWaitClosed) {
+  Fixture fixture;
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));  // 从未 Start:无线程可停。
+  EXPECT_EQ(testutil::ReadOnce(*transport, 200ms).error(),
+            make_error_code(TransportErrc::kClosed));
+  transport->WaitClosed();  // 必须立即返回。
+}
+
+// ── 9. 生命周期:未 Start / 已 Close 的读写 ──────────────────────────────
+
+TEST(DdsTransport, ReadAndWriteBeforeStartAreInvalidStateAfterCloseAreClosed) {
+  Fixture fixture;
+  auto transport = fixture.MakeTransport();
+  EXPECT_EQ(testutil::ReadOnce(*transport, 200ms).error(),
+            make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(transport->AsyncWrite(Datagram{{1}, Endpoint::Topic("t")}).error(),
+            make_error_code(TransportErrc::kInvalidState));
+
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+  ASSERT_TRUE(static_cast<bool>(transport->Close()));
+
+  EXPECT_EQ(testutil::ReadOnce(*transport, 200ms).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(transport->AsyncWrite(Datagram{{1}, Endpoint::Topic("t")}).error(),
+            make_error_code(TransportErrc::kClosed));
+  transport->WaitClosed();
+}
+
+TEST(DdsTransport, LateSampleAfterCloseTouchesNothing) {
+  Fixture fixture;
+  Peer peer(fixture);
+  {
+    auto transport = fixture.MakeTransport();
+    ASSERT_TRUE(static_cast<bool>(transport->Start()));
+    ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+    ASSERT_TRUE(static_cast<bool>(transport->Close()));
+    // 迟到样本只会 push 进一条已关闭的队列:listener 捕获的是分发端,不是 `this`。
+    peer.Publish("t", {1});
+    transport->WaitClosed();
+    peer.Publish("t", {2});
+  }
+  peer.Publish("t", {3});  // 析构之后:provider 已 Shutdown,总线上无该订阅,不崩。
+}
+
+// 析构不经 Close/WaitClosed 也必须收敛(析构里自己补上这两步)。
+TEST(DdsTransport, DestructorClosesAndJoins) {
+  Fixture fixture;
+  Peer peer(fixture);
+  {
+    auto transport = fixture.MakeTransport();
+    ASSERT_TRUE(static_cast<bool>(transport->Start()));
+    ASSERT_TRUE(static_cast<bool>(transport->DeclareReader("t")));
+    ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("t")));
+    ASSERT_TRUE(static_cast<bool>(
+        transport->AsyncWrite(Datagram{{5}, Endpoint::Topic("t")})));
+  }
+  peer.Publish("t", {6});
 }
