@@ -279,6 +279,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   `FastDdsProvider` 把现有 `Publish` 里那段 `GetOrCreateTopic` + `create_datawriter` **抽出来**给它，`Publish` 退化为"查已建好的 writer 并 `write`"；`FakeDdsProvider` 同步实现。
 
+  **`Publish` 遇到【未声明】的 topic 返 `kConfiguration`，【不惰性建】**（#209 落地时定，追记于此）：
+
+  - **惰性建会让本钩子形同虚设**——首帧照样在 writer 刚建出、尚未 `matched` 时发出去而丢掉，等于什么都没修。
+  - **写侧端点集合"启动即定型"**（**D16**），故运行期冒出一个未声明的 topic **必然**是启动时漏了注册，不是 I/O 故障。返 `kIo` 会把"配错了"伪装成"网络抖了一下"。
+  - 已 `Shutdown` 时**优先**判 `kInvalidState`（调用序错误先于配置错误）。
+  - 这条错误在 `DdsTransport` 那一层按写侧契约**不回传，只落 `LastError()`**（**D3**）。
+
   **不设 `UndeclareWriter`**：端点集合**启动即定型、运行期恒定**（**D16**），只在 `Shutdown()` 时整体拆除，没有单独撤销一个 writer 的时机。既有的 `Unsubscribe` 是历史遗留，不为对称而新增一个无使用者的方法。
 
   **未采用的偏方**：用 `Publish(topic, {})` 发一条空样本来逼出 writer。**否决**——那会往线上真发一条帧，对端收到一条无法解码的空消息。
@@ -286,7 +293,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **不新增数据观察者接口**——既有的 `IDdsProvider::Subscribe` 已经是所需的那个钩子：
 
   ```cpp
-  // IDdsProvider.hpp:28（现状，不改）
+  // IDdsProvider::Subscribe（现状，不改）
   virtual Coro::Result<void> Subscribe(
       const std::string& topic,
       std::function<void(const std::vector<uint8_t>&)> cb) = 0;
