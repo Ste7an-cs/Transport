@@ -64,9 +64,12 @@ add_library(transport STATIC
   src/io/serial/SerialTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
-  # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内(DdsTransport / DdsNode 仍在面外,
-  # 它们的双队列重写是 #203 / #204)。
+  # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内。DdsTransport 与 provider 注册表随
+  # #203 的双队列重写回到编译面;**DdsNode 仍在面外**——它的注册接口 / Dispatcher 键 /
+  # 两段式 corr / 四个交互方法是 #204 的活。
   src/io/dds/FakeDdsProvider.cpp
+  src/io/dds/DdsProviderRegistry.cpp
+  src/io/dds/DdsTransport.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -130,8 +133,9 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp
     tests/dds/fake_dds_provider_test.cpp
-    # —— tests/dds/ 的其余三个用例仍在面外:它们测的 DdsTransport / DdsNode /
-    #    DdsProviderRegistry 是 #203 / #204 的活,本轮只到 provider 层。——
+    tests/dds/dds_registry_test.cpp
+    tests/dds/dds_transport_test.cpp
+    # —— tests/dds/dds_node_test.cpp 仍在面外:它测的 DdsNode 是 #204 的活。——
   )
   # 真实 provider 的用例只在装了 Fast DDS 时编入(缺席时非 DDS 部分照常可测)。
   if(TRANSPORT_HAS_FASTDDS)

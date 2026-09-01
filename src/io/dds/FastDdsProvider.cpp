@@ -204,8 +204,10 @@ void FastDdsProvider::Shutdown() {
   std::unique_lock<std::mutex> lk(mutex_);
   if (!participant_) return;
   // 先拦住新的 Publish,再**等**在途的写跑完——Fast DDS 3.6.1 没有中断在途 write()
-  // 的手段(DataWriter 上无 cancel/abort 之类),所以这里只能等,最坏一个
-  // max_blocking_time(ADR-0013「明确接受的代价」7)。
+  // 的手段(DataWriter 上无 cancel/abort 之类),所以这里只能等,而这一等**没有上界**:
+  // 阻塞来自同进程订阅方的交付回调在发布线程上同步执行,`max_blocking_time` 不参与
+  // (实测它设 300ms 而 Publish 跑满 2000ms)。界由同进程内最慢的那个订阅回调决定
+  // (ADR-0013「明确接受的代价」7,2026-09-01 改判)。
   closing_ = true;
   idle_cv_.wait(lk, [this] { return in_flight_ == 0; });
 
