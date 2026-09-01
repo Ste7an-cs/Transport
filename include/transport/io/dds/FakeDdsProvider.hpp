@@ -21,7 +21,7 @@ class FakeDdsProvider : public IDdsProvider {
   using Sink = std::function<void(const std::vector<uint8_t>&)>;
 
   struct Bus {
-    std::mutex m;
+    mutable std::mutex m;
     uint64_t next_id = 1;
     std::map<std::string, std::map<uint64_t, Sink>> subs;  // topic → (id → sink)
 
@@ -46,6 +46,13 @@ class FakeDdsProvider : public IDdsProvider {
       }
       for (auto& s : snapshot) s(bytes);  // 锁外同步分发
     }
+    /// 总线上现存的 sink 总数(跨全部 topic),供 `MatchedCount()` 扣掉自己后当对端数。
+    size_t TotalSinks() const {
+      std::lock_guard<std::mutex> lk(m);
+      size_t n = 0;
+      for (const auto& kv : subs) n += kv.second.size();
+      return n;
+    }
   };
 
   FakeDdsProvider() = default;                                  // 默认:Init 接入静态 domain 总线
@@ -56,13 +63,21 @@ class FakeDdsProvider : public IDdsProvider {
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
   Coro::Result<void> Subscribe(const std::string& topic, Sink cb) override;
   Coro::Result<void> Unsubscribe(const std::string& topic) override;
+
+  /// @brief 匹配数 = 总线上**别人**的 sink 数;`alive` 与之相等。
+  ///
+  /// Fake 无发现、无判活机制,只能拿"同一条总线上还有没有别的订阅者"当对端数——
+  /// 未 `Init`(无总线)或总线上只有自己时返 `{0, 0}`。**局限**:纯发布方(从不
+  /// `Subscribe`)在总线上不留痕,故对端只订阅、我方只发布时,**对方**看不到我方。
+  [[nodiscard]] DdsMatchedCount MatchedCount() const override;
+
   std::string Name() const override { return "fake"; }
 
  private:
   static std::shared_ptr<Bus> StaticBusForDomain(int domain);
 
   std::shared_ptr<Bus> bus_;
-  std::mutex mine_m_;
+  mutable std::mutex mine_m_;
   std::map<std::string, std::vector<uint64_t>> mine_;  // 本 provider 的订阅 id
 };
 

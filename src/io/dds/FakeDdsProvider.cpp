@@ -59,4 +59,17 @@ Coro::Result<void> FakeDdsProvider::Unsubscribe(const std::string& topic) {
   return Coro::Result<void>{};
 }
 
+DdsMatchedCount FakeDdsProvider::MatchedCount() const {
+  if (!bus_) return DdsMatchedCount{};  // 未 Init:没接上总线就谈不上匹配
+  size_t mine = 0;
+  {
+    std::lock_guard<std::mutex> lk(mine_m_);
+    for (const auto& kv : mine_) mine += kv.second.size();
+  }
+  const size_t total = bus_->TotalSinks();
+  // 总线上的 sink 减去自己的即为对端。两次取数之间总线可能变动,故夹到非负。
+  const auto peers = static_cast<int32_t>(total > mine ? total - mine : 0);
+  return DdsMatchedCount{peers, peers};  // Fake 无独立判活:匹配即视为存活
+}
+
 }  // namespace transport
