@@ -90,6 +90,24 @@
   **这条分歧决定了一件更大的事**——串口**不能自终**（ADR-0012 **D1**，TBD-005 关闭）。"致命错误 → 自终"要求一个"致命错误"判据，而串口在流层面拿不到；唯一可得的是静默超时，用它判自终会把"对端暂时不发数据"误判为设备死亡。故串口改为**重开、不自终**，与 UDP/TCP 同构。
 
   **写路径连判活都做不了**：实测串口设备消失后 `write()` **照样返回成功**、`bytesToWrite()` **永不下降**——判活只能落在读侧。
+- **DD-17 DDS 的两处形态差异源于"数据在谁的线程上到达"与"写会阻塞谁"（满足 RT_IF_DDS、RT_IN_INTERFACE_003；ADR-0013 D1/D2/D3）：** DDS 沿用与三介质相同的**读写双队列**与完整的 `ITransport` 契约，差异**只有两处**，且两处都不是设计偏好，而是**被实测事实逼出来的**：
+
+  | | UDP / TCP / 串口 | **DDS** | 依据 |
+  |---|---|---|---|
+  | **谁推读队列** | **泵 fiber**——从 socket/device 的读流取数后推 | **listener，在外来线程上** | DDS 的样本经 provider 回调到达，不存在"可 await 的读流" |
+  | **写侧执行体** | **写泵 fiber** | **专属 OS 线程** | `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms）；用 fiber 会卡死整条线程上的**所有** fiber |
+
+  **两处都建立在实测之上：**
+
+  1. **外来线程 → fiber 的 `FiberChannel::push` 安全**（4 线程并发 8000/8000、20000 条严格连续无空洞、唤醒时延 avg 28µs / max 70µs）。机理已核到源码——`push` 只做 `lock` + `push_back` + `notify_all`，**无等待路径**；其文档那句 crash 警告**只针对 `pop`**。故 listener 可直推，读侧**连泵 fiber 都省了**。
+  2. **反方向不能用 `FiberChannel`**——`write_queue` 的消费方是普通线程，而 `pop` 在非协程线程上会 crash。故 `write_queue` 用 `std::mutex` + `condition_variable` + `std::deque`，**不是 `Coro::Awaitable`**。
+
+  **`ASYNCHRONOUS_PUBLISH_MODE` 绕不过写阻塞**（实测 178/200 超时）：该模式挪走的是**网络发送**，而 `write()` 仍须先把样本**放进 writer 的 history**；`RELIABLE` + 满时卡住的是**准入**，与发布模式无关。故专属线程不可省。
+
+  **由此 `AsyncWrite` 的 fire-and-forget 契约完整成立**：阻塞发生在专属线程上，业务 fiber 早已返回；写出结果（含 `RETCODE_TIMEOUT`）不回传、只落 `LastError()`——与三介质逐字相同。**代价是背压信号被丢弃**：调用方无从知道"这条因对端消费不过来而没发出去"。
+
+  **一处明确接受的代价**：listener 一搬走样本，**DDS 即认为已交付、对 publisher 的背压随之解除**（实测我方队列满时静默丢 3976/5000 而 `push_fail=0`）——`RELIABLE` 在本地队列这一层被架空。这是 2026-08-28 裁决"**不优先使用 DDS 自身机制**"的直接后果。
+
 
 
 - **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**五项** `DropReason` 之一（原七项：`kGenerationIsolationDrop` 随 ADR-0004 D3 移除，`kNoHandlerConfigured` 随 ADR-0009 于 #163 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
@@ -346,6 +364,94 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **判活判据的三介质分歧见 DD-16**，队列丢弃策略见 **DD-15**。
 
+#### 4.2.15 DDS 双队列与专属写线程（MS_DDS_DUAL_QUEUE）
+
+**图 4-17（`seq-dds-dual-queue`）** —— ADR-0013 定稿的**目标形态**，尚未实现。
+
+![DDS 双队列与专属写线程](diagrams/seq-dds-dual-queue.svg)
+
+**图例说明**：DDS 沿用与三介质相同的**读写双队列**与完整的 `ITransport` 契约；**形态差异只有两处**，且两处都不是设计偏好，而是**被实测事实逼出来的**（详见 **DD-17**）：
+
+| | UDP / TCP / 串口 | **DDS** |
+|---|---|---|
+| **谁推读队列** | 泵 fiber 从读流取数后推 | **listener，在外来线程上** → **读侧无泵 fiber** |
+| **写侧执行体** | 写泵 fiber | **专属 OS 线程** —— `write()` 的阻塞是**线程级** |
+| 其余（双队列 / 七方法 / fire-and-forget 写 / 有界丢最旧） | | **逐条相同** |
+
+**两处最容易做错的**：① **`write_queue` 不能是 `FiberChannel`** —— 消费方是普通线程，而 `pop` 在非协程线程上会 crash；② **不得用写泵 fiber 代替专属线程** —— `Publish` 会 park 调用线程，fiber 会卡死整条线程上的所有 fiber，且 `ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（实测 178/200 超时，它挪走的是网络发送而非准入）。
+
+**请求-响应照 `RequestForResultDirect`**（ADR-0010 **D13**）：`kRequest` → 等 `kReply`，**超时即重发**（同 `correlation_id`、字节相同的原帧），至多 `max_attempts` 次；**收到即成功、不回应**；耗尽返 **`kTimeout`**（不是 `kNotAccepted`——本模型根本没有受理这一步）。
+
+**四条纪律里三条不适用**（这正是它与 `RequestForResult` 的分界）：只登记一个订阅（无受理）、无 `ack.Reset()`、**等结果阶段恰恰要重发**、不回应。**仍沿用两条**：先登记再发出（`Dispatcher` 用法的固有要求）、重发沿用同一 `correlation_id` 且以首帧为准。
+
+**应答 topic 每服务一个、由该服务的全体客户端共用**（**D6**）：它**绑在服务上、不绑在节点上**——`RegisterClients` 与 `RegisterServices` 都收 `请求 topic → 应答 topic` 的表（**实参相同、端点方向相反**，见 **D16**）；`RequestForResultDirect` 按目标 topic 查已注册的 `Clients` 表，**查不到即 `kConfiguration`**。故一个客户端同时调多个服务时，各服务的应答落在各自 topic 上互不相扰。
+
+区分**同一服务的不同客户端**全靠 `correlation_id`，故它定为两段式 `"<uuid>#<request_seq>"`——uuid 在**节点初始化时生成一次**（`QUuid::createUuid()`，`Qt5::Core` 已 PUBLIC 链入，不引入新依赖）保证跨节点不撞；`request_seq`（`uint32`）**从 0 自增**保证节点内不撞，**回绕明确接受**（届时旧订阅早已注销）。自增半段**不叫 `session_id`**——那是外部协议的匹配键，DDS 路径留缺省 `0`，同名会造成阅读陷阱。`Message::correlation_id` 本是 `std::string`，`≤47` 字节装得下，无需改结构。
+
+"客户端过滤是不是给自己的"由 `Dispatcher` 的 `corr` 键天然完成，应用层不写过滤代码；**内部登记用具体 `corr`、公开面登记恒 `kAny`**，这一区别是共用 topic 得以区分客户端的全部根据。
+
+**代价——读入放大**：同一服务的每个客户端都会收到该服务的**全部**应答，`N` 个并发客户端即约 `N` 倍读入量；多余样本一路进 `read_queue_` 并被解码后才落空，故**别人的应答可能把自己的挤掉**（队列有界 1024、静默丢最旧），这加强了 **D7** 重发的必要性。**放大只限于同一服务内**，调多个服务不叠乘。缓解手段 `ContentFilteredTopic` 本轮不采用。
+
+**topic 由【注册接口】给出，不进配置**（**D16**）。`DdsNode` 的用法**不变**——`Publish` / `Subscribe` / `RequestForResultDirect` / `Reply` 的签名与语义一个字不动，换掉的只是"这些 topic 从哪来"：
+
+```cpp
+// 【须在 Start() 之前调用】，Running/Closing/Closed 一律返 kInvalidState；【批量】
+Coro::Result<void> RegisterPublishers (std::vector<std::string> topics);          // 每个建 Writer
+Coro::Result<void> RegisterSubscribers(std::vector<std::string> topics);          // 每个建 Reader
+Coro::Result<void> RegisterClients (std::map<std::string, std::string> topics);   // 键 Writer、值 Reader
+Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics);   // 键 Reader、值 Writer
+```
+
+方法名用**复数**——直说是批量，免得读者以为要一个 topic 调一次。两个 pair 型用 **`std::map`** 而非 `vector<pair>`：天然去重，且从类型上排除"同一请求 topic 配了两个不同应答 topic"。
+
+**只允许 `Start()` 之前注册**：端点集合仍"启动即定型、运行期恒定"，本步只把填结构体换成调四个函数，**没有引入运行期动态端点**——故各路径上都不会突然冒出 ~240ms 发现窗口，`DoStart()` 仍是唯一建端点的地方。
+
+**批量、可多次调用（累加）、重复项幂等去重、整批生效或整批不生效**——半生效的注册会让调用方难判该重试哪些。
+
+**角色由"注册了什么"表达，不设 `role` 枚举**：四者可任意并存（一个节点常兼任服务 A 的服务端与服务 B 的客户端）。另设枚举会招来"`role` 说是服务端却注册了 `Clients`"这类自相矛盾的输入，还得再定优先级规则。
+
+**请求-响应两侧实参一模一样、端点方向相反**：客户端 `RegisterClients` 与服务端 `RegisterServices` 传相同内容，各自按角色建各自那一侧——不会填错方向，也不必协调。
+
+**`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。**这两个方法在 `ITransport` 七方法【之外】**——它们是 DDS 端点模型的必需品、三介质没有对应物，但**不改动 `ITransport` 本身**，故"换传输即可运行"的调用方不受影响（**D1**）。
+
+**不新增 provider 侧的数据观察者接口**（**D13**）：既有的 `IDdsProvider::Subscribe(topic, cb)`（`IDdsProvider.hpp:28`，`cb` 收 `std::vector<uint8_t>`）已经是所需的钩子，`DeclareReader` 落到 provider 就是调它，闭包捕获 `topic` 即可填 `Datagram.peer`。**曾拟新增的 `SetDataObserver(std::function<void(Message)>)` 已否决**——`Message` 是 codec **之后**的产物而 provider 在 codec **之下**（跨层），且它与既有 `Subscribe` 是同一钩子的两种写法（重复）。
+
+**注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`、`Subscribe(topic, kRequest)` 为 `Services` 的键、`RequestForResultDirect` 为 `Clients` 的键，否则返 `kConfiguration`。这让"忘了注册"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。**`Subscribe` 的 topic 键传 `kAny` 时跳过该校验**——`kAny` 不对应任何具体 topic，且它本就只在已注册范围内起作用。
+
+**`Subscribe` 因此必须返 `Coro::Result<Ticket>`、不能返裸 `Ticket`**（**D8**）：`Ticket` 装不下 `kConfiguration`；返裸 `Ticket` 只能交出一个空凭据，其 `Wait` 返的是 `kInvalidState`（`Dispatcher.hpp:203`）——**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
+
+**`Start()` 失败不清空已注册的内容**（**D16**）：校验失败停在 `Created`，注册表**原样保留**，调用方补上漏项再 `Start()` 一次即可。
+
+**`DdsNodeConfig` 只剩两项**：`uuid_override`（为空才 `QUuid::createUuid()`，测试注入用）与 `trace_sink`。历史遗留的 `inbox_topic` / `node_id` / `handler` / `business_queue_max_*` 一并删除。`DdsConfig`（传输层）保持 `domain_id` / `provider` / `qos`，**不含任何 topic**。
+
+**topic 一律在 `DoStart()` 声明，不懒声明**（**D15/D16**）：决定性约束是 DDS 的发现窗口 **~240ms**（DD-17 的 `kEstablishing`）。若把**应答 topic 的 DataReader** 拖到 `RequestForResultDirect` 里才建，服务端的应答 writer 与它尚未 match，应答**在 DDS 层就落空**——首次请求几乎必然超时、白吃一次重试，`max_attempts == 1` 时直接失败；**订阅 topic 的 DataReader** 同理会丢掉订阅后立刻到达的消息。只有发布方向可以懒，故不为它单开路径，一律提前。
+
+**`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
+
+**`Reply()` 不做懒声明，运行期没有任何建端点的路径**（**D15**）：`DeclareWriter` / `DeclareReader` 只由 `DoStart()` 调用，端点集合**完全由启动前的注册决定、启动即定型、运行期恒定**。服务端的应答目的地随之改由**自己注册的 `Services` 表查出**，**不再取信于线缆**；查不到返 `kConfiguration`。
+
+**`reply_to` 仍上线缆，但降为一致性交叉校验**：与查出的应答 topic 不等即返 `kInvalidArgument`。保留它不是冗余——两侧注册实参写歪时（客户端在 `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发），**若不带 `reply_to` 这种偏差完全不可见**，客户端只会一路超时，看起来像对端没响应；带上它服务端当场就能报出偏差。
+
+**连带三处收益**：① `DataWriter` 不再累积——原先"每个出现过的 `reply_to` 永久留一个 writer、不回收"那条代价整条消失；② 运行期无 DDS 端点创建，回应路径不会突然吃一个 ~240ms 发现窗口；③ 服务端不再受客户端摆布——`reply_to` 曾是客户端说了算的目的地。
+
+**代价：两侧注册实参歪了只能运行期发现**。跨进程无从静态校验，表现为服务端返 `kInvalidArgument` / `kConfiguration`、客户端重发耗尽后返 `kTimeout`——**两侧各有明确错误码，不是静默失败**。
+
+**自收的精确判据是两个方向集合相交**（代价 9）：Fast DDS 默认不屏蔽同一 participant 内的收发匹配（3.6.1 只提供 `ignore_participant(GUID)`，无自环开关）。按角色注册后，
+
+```
+writer 侧 = Publishers ∪ Clients 的键 ∪ Services 的值
+reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
+自收 ⟺ writer 侧 ∩ reader 侧 ≠ ∅
+```
+
+典型用法下交集为空。**最危险的一种已被 D16 的注册校验拦下**——`Clients` 的键 ∩ `Services` 的键（自己请求自己，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答）。**其余交集只造成自收白干、不会误配**（`kind`/`corr` 对不上，落到无订阅者），且可能是调用方有意为之（本地回环自测），故**不拦、只记明，框架不默认屏蔽**。
+
+**topic 端点须显式声明**（**D15**）：`DdsNode::DoStart()` 按 **D16** 的四组注册项逐项建**对应方向**的端点；**且仅此一处**——运行期无建端点路径。`DeclareWriter` / `DeclareReader` 仍要求**幂等**，但理由是**注册里可能重复**（同一 topic 既注册为 `Subscribers`、又是某条 `Clients` 的值），幂等让 `DoStart()` 不必先去重。
+
+**没有"topic 须唯一"这类部署约束**（**D12**）：topic 的合法性在**注册那一刻**判完（非空、键值不同、方向不冲突），`Start()` 只补判"四组注册全空"这一条，返 `kConfiguration`。唯一性的担子整个落在 `correlation_id` 的 uuid 半段上——那是节点自己生成的，无需部署方协调，也不会因配置写错而静默误配。
+
+> **重发的依据与 ADR-0010 不同，须写明**：ADR-0010 那边是"命令帧丢包即彻底失败"，而 **DDS 是 `RELIABLE` 的、网络层不会丢**。**这里丢的是我方的队列**——`read_queue` 有界 1024 静默丢最旧（**DD-15**），且 listener 一搬走样本 DDS 即认为已交付、背压解除。**`RELIABLE` 覆盖不到这一段，重发正是对它的补救。** 代价：**对端须能容忍重复请求**（幂等或自行去重），框架不校验。
+
 ### 4.3 接口设计
 
 #### 4.3.1 接口标识和接口图
@@ -546,7 +652,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 - **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
 - **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8；ADR-0009 D1 后仅存 DDS 侧）**：`HandlerContext` 已随 `ProtocolNode` 的 handler 通道一并移除；`DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
 
-**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。
+**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。**以上为未编译历史代码的 as-built，非现行设计**——其中 `reply_to=inbox`（每客户端一个信箱 topic）已由 ADR-0013 **D6** 取代为**每服务一个、全体客户端共用**的应答 topic。
 
 **执行时序/数据流**：见 §4.2.3/§4.2.4/§4.2.6。
 
@@ -575,7 +681,9 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 >    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
 > 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
-| DdsTransport | 组合 IDdsProvider + `BoundedQueue<Sample>` 跨线程交接；listener 线程非阻塞 Push（满归因 kDdsHandoffOverflow）；`Read` 出队 fiber |
+| **DdsTransport**（ADR-0013 重构后，**目标形态、尚未实现**） | **读写双队列，完整实现 `ITransport`**，与三介质同形。**读侧无泵 fiber**——provider 的 listener 在**外来线程**上 `take()` 后直接 `push` 进 `read_queue`（跨线程 `push` 已实测安全）；`AsyncRead()` 交出该句柄。**写侧 `AsyncWrite` 入队即返**（fire-and-forget 照旧），由**一条专属 OS 线程**从 `write_queue` 取出并 `Publish`——因 `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms），用 fiber 会卡死整条线程上的所有 fiber。**QoS 统一一套**（**D4**）。链路可用性由 `matched` + `Liveliness` 提供（**D9**）。 |
+
+> **DDS 与三介质的形态差异只有两处**（ADR-0013）：① **谁在推读队列**——三介质是泵 fiber 从读流取数后推，DDS 是 listener 在外来线程上推，**故 DDS 读侧没有泵 fiber**；② **写侧是 OS 线程而非 fiber 写泵**——`Publish` 的阻塞是线程级，这是四个介质里**唯一需要额外线程**的一处。其余（双队列、`ITransport` 七方法、fire-and-forget 写、有界丢最旧）**逐条相同**。
 | TcpServer | corotcpserver accept 循环 fiber；每连接经 NodeFactory 派生 ProtocolNode + supervisor fiber |
 
 **执行时序/状态**：见 §4.2.13（TCP 传输泵与重连，图 4-15）、§4.2.10（传输层泵与双队列）、§4.2.11（动态生命周期）。
@@ -921,7 +1029,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 
 | 设计单元 | 类型 | 对应 SRS 需求 | 章节 |
 |---|---|---|---|
-| DD-1..DD-16 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
+| DD-1..DD-17 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
 | CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | §4.1.1、§5.1 |
 | CSC_IO | 部件 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 | §4.1.2、§5.6 |
 | CSC_CODEC | 部件 | RT_CODEC、RT_IF_SYSFRAME | §4.1.3、§5.7 |
@@ -935,6 +1043,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | MS_INTERACTION_MODES | 执行方案 | RT_NODE_002_a..g | §4.2.12 |
 | MS_TCP_PUMP | 执行方案 | RT_TCP_RECONNECT_001..005、RT_TRANSPORT_003/004/010 | §4.2.13 |
 | MS_SERIAL_PUMP | 执行方案 | RT_IF_SERIAL、RT_TRANSPORT_003/009/010、RT_NODE_006 | §4.2.14 |
+| MS_DDS_DUAL_QUEUE | 执行方案 | RT_IF_DDS、RT_IN_INTERFACE_003、RT_NODE_007、RT_TRANSPORT_010 | §4.2.15 |
 | MS_TICKET | 执行方案 | RT_REQUEST_003/004 | §4.2.9 |
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.11 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
@@ -971,7 +1080,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | RT_DATA_MESSAGE/STATE/CONFIG/BUFFER | CSC_CORE、CSC_NODE / CSU_CORE、CSU_DISPATCHER（**RT_DATA_BUFFER 的队列上界与观测计数已随 ADR-0008 D8/D10 回退**） |
 | RT_IN_INTERFACE_001..005 | DD-1 / JK_TRANSPORT、JK_CODEC、JK_PROVIDER、JK_NODE_API |
 | RT_IF_API/SYSFRAME/TCP/UDP/SERIAL/DDS | JK_NODE_API、JK_CODEC、JK_TRANSPORT / CSU_IO、CSU_CODEC |
-| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-16 / 全体单元 |
+| RT_DESIGN_001..008 | §3 CSCI 级设计决策 DD-1..DD-17 / 全体单元 |
 | RT_PERFORMANCE/TESTABILITY/SECURITY | 留 P6（不在本设计说明范围） |
 
 ---
@@ -1025,6 +1134,7 @@ done
 | 图 4-14 | 时序 | MS_INTERACTION_MODES | `seq-interaction-modes.mmd`（ADR-0010 引入；四种交互模式的状态机与失败码） |
 | 图 4-15 | 时序 | MS_TCP_PUMP | `seq-tcp-pump.mmd`（ADR-0011 引入；**已实现**，#179/#180） |
 | 图 4-16 | 时序 | MS_SERIAL_PUMP | `seq-serial-pump.mmd`（ADR-0012 引入；**已实现**，#193/#194） |
+| 图 4-17 | 时序 | MS_DDS_DUAL_QUEUE | `seq-dds-dual-queue.mmd`（ADR-0013 引入；**目标形态，尚未实现**） |
 | 附图 | 类图 | 总体 | `arch-class.mmd` |
 
 ---
