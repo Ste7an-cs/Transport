@@ -218,21 +218,48 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`Subscribe` 必须返 `Coro::Result<Ticket>`，不能返裸 `Ticket`**：**D16** 规定"topic 未注册为对应角色即返 `kConfiguration`"，而 `Ticket` **装不下错误码**。若返裸 `Ticket`，"忘了注册"只能交出一个空 `Ticket`——其 `Wait` 返的是 **`kInvalidState`**（`Dispatcher.hpp:203`），**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
 
-  ### `Subscribe` 的生命周期相位：`Created` 放行，`Closing` / `Closed` 返 `kClosed`（#214，2026-09-01）
+  ### `Subscribe` 的生命周期相位：**只许 `Running`**（#214 定，2026-09-01 改判）
 
   | 相位 | `Subscribe` |
   |---|---|
-  | `Created`（尚未 `Start()`） | **放行** |
+  | **`Created`（尚未 `Start()`）** | **`kInvalidState`——不允许** |
   | `Running` | 放行 |
-  | `Closing` / `Closed` | **`kClosed`** |
+  | `Closing` / `Closed` | `kClosed` |
 
-  判据用 `NodeBase::CurrentLifecycle()`（**不能用 `IsRunning()`**——它分不出 `Created` 与 `Closed`）；相位判定放在注册校验**之前**，与另外三个方法同序。
+  判据用 `NodeBase::CurrentLifecycle()`（**不能用 `IsRunning()`**——它分不出 `Created` 与 `Closed`，而这两段要返不同的错误码）；相位判定放在注册校验**之前**，与另外三个方法同序。
 
-  **本决策的由来**：初版实现里 `Subscribe` 是四个方法中**唯一不判相位**的，关闭后照常交出一张信箱已关的 `Ticket`，`kClosed` 要等**第一次 `Wait`** 才浮出来。这与 **D8** 自己立的规矩抵触——`Subscribe` 的返回类型正是为"错误码不对、且推迟到首次 `Wait` 才暴露"才从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的，**同一论证原样适用于相位**。
+  **`Created` 返 `kInvalidState` 而非 `kClosed`**：那是**调用序错误**（还没启动就订阅），与四个注册方法在非 `Created` 相位返 `kInvalidState` 恰成对称——**注册只在 `Created`、订阅只在 `Running`，两段互不重叠**，各自用 `kInvalidState` 表达"相位不对"。
 
-  **`Created` 为什么放行**（这是本决策真正的取舍）：DDS 的 `DataReader` 建于 `DoStart()`（**D15**），`Start()` 之前一条消息也到不了本进程——故「**注册 → 订阅 → `Start()`**」是唯一**结构性**零丢失的次序。若只许 `Running` 订阅，零丢失就只剩一条**隐式调度约定**撑着（读循环与调用方同线程亲和、调用方让出才跑），中间一有挂起点，启动初期的消息就被静默丢弃——**正是 D16 要消灭的那类失败**。且拒绝换不来任何东西：`Dispatcher` 从构造起就可用，`Dispatch` 不看相位。
+  ### 为什么"`Start()` 之后再订阅"是安全的
 
-  > **⚠ 连带暴露一处既有缺口，见 #217**：`NodeBase::Close()` 从 `Created` 走时**直接落 `kClosed`、不调 `DoClose()`**，于是 `Dispatcher::CloseAll` 在这条路径上**从不执行**。宿主若在 `Created` 期订阅并已 spawn 消费 fiber、随后放弃启动，那条 fiber 的信箱**永远等不到关闭信号**。本决策把 `Created` 期订阅从"没人管"变成"**明确推荐**"，故该缺口须尽快处置。
+  **`DataReader` 建于 `DoStart()`（D15），而 DDS 发现要 ~240ms（D9）** —— `Start()` 返回之后的头 ~240ms，对端根本还没 `matched`，**一条样本都到不了**：
+
+  ```
+  Start() 返回 ──────── ~240ms 发现窗口 ────────► 样本开始到达
+       │                                              │
+       └─ 宿主在这段里随便什么时候 Subscribe 都不丢 ──┘
+  ```
+
+  宿主须在 `Start()` 与 `Subscribe()` 之间**干超过 240 毫秒的事**才谈得上丢；推荐写法
+
+  ```cpp
+  node.Start();
+  auto ticket = node.Subscribe(...);   // 中间连让出都没有
+  ```
+
+  离那个边界差好几个数量级。**唯一要避免的是**：`Start()` 之后先去做慢活（读配置、等别的组件就绪）再订阅——那段流量会被 `Dispatch` 因无订阅者而静默丢弃。
+
+  ### 本条曾允许 `Created`，2026-09-01 改判，记此以免反复
+
+  初版（#214）定的是「`Created` / `Running` 放行」，理由是「注册 → 订阅 → `Start()`」为**结构性**零丢失次序，而只许 `Running` 则零丢失靠一条**隐式调度约定**（读循环与调用方同线程亲和、调用方让出才跑）撑着。
+
+  **该论证本身成立，但把风险说大了**：它没算上上面那 ~240ms 的发现窗口——真实余量不是"几条指令"，而是数百毫秒。
+
+  **而 `Created` 放行带来了一处真实危害**（**#217**）：`NodeBase::Close()` 从 `Created` 走时**直接落 `kClosed`、不调 `DoClose()`**，`Dispatcher::CloseAll` 因此**从不执行**。宿主若在 `Created` 期订阅并已 spawn 消费 fiber、随后放弃启动（`Start()` 失败或直接 `Close()`），那条 fiber 的信箱**永远等不到关闭信号**——`Ticket` 持 `weak_ptr`、没有悬垂，纯粹是**唤醒不会来**，表现为静默挂起。
+
+  **收益远小于代价，故退回，并把 `Created` 期订阅明确定为【禁用法】。**
+
+  > **⚠ 本次改判【不能】替代 #217。** `ProtocolNode::Subscribe` 返的是**裸 `Ticket`**（`ProtocolNode.hpp:310`）、**没有错误通道**，拦不住 `Created` 期订阅——那条挂起路径在 `ProtocolNode` 上依然敞着，**#217 仍须独立处置**。
 
   ### 传输的所有权：节点【借用】，启停归宿主（#204 落地时定，追记于此）
 
