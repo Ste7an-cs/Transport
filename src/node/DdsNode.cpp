@@ -307,6 +307,24 @@ void DdsNode::Dispatch(const Message& msg) {
 // ── 公开面:两种交互模式(D8)──────────────────────────────────────────
 
 Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
+  // **相位判定先于配置校验**,与另外三个交互方法同序(调用序错误先于配置错误)。
+  //
+  // 但判据不是 `IsRunning()`:它把 `Created` 与 `Closed` 一并判否,而这两个相位在本方法上
+  // 的答案相反——
+  //
+  // - **`Created` 放行**:DDS 的 `DataReader` 是在 `DoStart()` 里建的,`Start()` 之前**没有
+  //   任何一条消息能到达本进程**。故"先登记订阅、再 `Start()`"是唯一在**结构上**零丢失的
+  //   次序;反之若逼宿主先 `Start()` 再订阅,不丢消息就只能靠"两句之间不让出"这条隐式的
+  //   调度约定——一旦中间有挂起点,启动初期的消息就被**静默丢弃**(ADR-0009 D5),正是
+  //   D16 要消灭的那种失败。登记面(四个 `Register*`)本就只在 `Created` 可用,订阅在此
+  //   相位可用与之同调:注册 → 订阅 → 启动。
+  // - **`Closing` / `Closed` 返 `kClosed`**:此时 `DoClose()` 已 `CloseAll`,再登记只能得到
+  //   一张信箱已关闭的凭据。让它**在返回处**就说清楚,而不是推迟到第一次 `Wait`——D8 把
+  //   本方法从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的理由原样适用于相位。
+  if (const LifecycleState phase = CurrentLifecycle();
+      phase == LifecycleState::kClosing || phase == LifecycleState::kClosed) {
+    return make_error_code(TransportErrc::kClosed);
+  }
   // **topic 传 `kAny` 时跳过校验**(D16):`kAny` 不对应任何一个具体 topic,拿它去查注册表
   // 必然落空。这不是网开一面——它的作用域本就已由注册天然限定("已注册为 reader 的
   // topic 的全部",而不是"本 domain 上的全部")。
