@@ -694,26 +694,44 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   ASSERT_TRUE(static_cast<bool>(client_a.node().Start()));
   ASSERT_TRUE(static_cast<bool>(client_b.node().Start()));
   ASSERT_TRUE(static_cast<bool>(server.node().Start()));
-  Service service(server.node(), "svc");
 
-  // 两个客户端并发发请求,各自 payload 不同;应答把 payload 原样带回。
+  // 服务端收满两条请求后**按到达的反序**回应:先回后到的 B、再回先到的 A。
+  //
+  // ★ **这个排序是本用例的全部要害**:它使 B 的应答**先**落到共用的 `svc.reply` 上。
+  //   客户端 A 此刻正等在那条 topic 上——若它内部登记的 corr 是 `kAny`,先到的那份
+  //   (**别人的**)就会当场把它的等待终结掉,A 拿到的将是 "from-b"。唯有内部登记用
+  //   **具体 corr**,B 的那份才会在 A 的 `Dispatcher` 处落空,A 继续等到自己的那份。
+  auto pending = std::make_shared<std::vector<Message>>();
+  Subscriber svc(
+      MustSubscribe(server.node(), std::string("svc"), MessageKind::kRequest),
+      [&server, pending](const Message& request) {
+        pending->push_back(request);
+        if (pending->size() < 2) {
+          return;
+        }
+        for (auto it = pending->rbegin(); it != pending->rend(); ++it) {
+          (void)server.node().Reply(*it, Payload(Text(*it)));
+        }
+      });
+
   Coro::Result<Message> reply_a = make_error_code(TransportErrc::kInternal);
   Coro::Result<Message> reply_b = make_error_code(TransportErrc::kInternal);
   auto task_a = Coro::makeTask([&] {
     reply_a = client_a.node().RequestForResultDirect("svc", Payload("from-a"),
-                                                     RetryPolicy{1000ms, 1});
+                                                     RetryPolicy{2000ms, 1});
   });
+  // 等 A 的请求确实到了服务端,再让 B 发——这样"后到的先回"才是确定的,不靠调度巧合。
+  ASSERT_TRUE(pumpFiberUntil([pending] { return pending->size() == 1; }));
   auto task_b = Coro::makeTask([&] {
     reply_b = client_b.node().RequestForResultDirect("svc", Payload("from-b"),
-                                                     RetryPolicy{1000ms, 1});
+                                                     RetryPolicy{2000ms, 1});
   });
   (void)task_a.get();
   (void)task_b.get();
 
   ASSERT_TRUE(static_cast<bool>(reply_a)) << reply_a.error().message();
   ASSERT_TRUE(static_cast<bool>(reply_b)) << reply_b.error().message();
-  // ★ 各拿各的。若内部登记的 corr 也用 kAny,这里就会串——A 会匹配上该 topic 上**所有人**
-  //   的应答,谁先到就是谁。
+  // ★ 各拿各的:A 先等、B 的应答先到,A 仍然拿到 "from-a"。
   EXPECT_EQ(Text(reply_a.value()), "from-a");
   EXPECT_EQ(Text(reply_b.value()), "from-b");
 
@@ -724,7 +742,7 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   }));
   EXPECT_GE(sink_a.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
   EXPECT_GE(sink_b.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
-  service.Join();
+  svc.Join();
 }
 
 // ── 7. Reply:查自己的 Services 表 + reply_to 交叉校验(D15)──────────────
