@@ -420,6 +420,8 @@ Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics); 
 
 **`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。**这两个方法在 `ITransport` 七方法【之外】**——它们是 DDS 端点模型的必需品、三介质没有对应物，但**不改动 `ITransport` 本身**，故"换传输即可运行"的调用方不受影响（**D1**）。
 
+**`IDdsProvider` 增两项**（**D13**）：`MatchedCount()`（判活）与 **`DeclareWriter(topic)`**（写侧端点声明钩子）。后者是 2026-09-01 的补正——初稿只增了 `MatchedCount`，读侧因 `Subscribe(topic, cb)` 碰巧已存在而成立，**写侧则无对应物**，`DeclareWriter` 只能登记意图、`DataWriter` 仍在首次 `Publish` 时惰性建，等于把「首次应答会丢」原样放回。补上后两侧对称：`DeclareReader` → `Subscribe`，`DeclareWriter` → `DeclareWriter`。**不设 `UndeclareWriter`**（端点启动即定型、只在 `Shutdown()` 整体拆除）。
+
 **不新增 provider 侧的数据观察者接口**（**D13**）：既有的 `IDdsProvider::Subscribe(topic, cb)`（`IDdsProvider.hpp:28`，`cb` 收 `std::vector<uint8_t>`）已经是所需的钩子，`DeclareReader` 落到 provider 就是调它，闭包捕获 `topic` 即可填 `Datagram.peer`。**曾拟新增的 `SetDataObserver(std::function<void(Message)>)` 已否决**——`Message` 是 codec **之后**的产物而 provider 在 codec **之下**（跨层），且它与既有 `Subscribe` 是同一钩子的两种写法（重复）。
 
 **注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`、`Subscribe(topic, kRequest)` 为 `Services` 的键、`RequestForResultDirect` 为 `Clients` 的键，否则返 `kConfiguration`。这让"忘了注册"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。**`Subscribe` 的 topic 键传 `kAny` 时跳过该校验**——`kAny` 不对应任何具体 topic，且它本就只在已注册范围内起作用。

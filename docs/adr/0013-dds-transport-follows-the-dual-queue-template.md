@@ -258,8 +258,30 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | 变化 | 用途 |
   |---|---|
   | **新增** `MatchedCount() → {matched, alive}` | **D9** 的判活 |
+  | **新增** `DeclareWriter(topic)` | **写侧的端点声明钩子**（**D15**）——见下「补正」 |
   | **改语义** `Publish` | 由"必成功"改为**可阻塞**（在专属线程上调用，**D3**） |
   | `Subscribe` / `Unsubscribe` / `Init` / `Shutdown` / `Name` | **不变**（QoS 统一，无须增参） |
+
+  ### 补正（2026-09-01，#203 落地时发现）
+
+  **本决策初稿只增了 `MatchedCount`，写侧没有声明钩子——这是一处遗漏，不是有意的取舍。**
+
+  读侧之所以成立，是因为 `IDdsProvider::Subscribe(topic, cb)` **碰巧已经存在**，`DeclareReader` 落到它身上即可**真正建出 `DataReader`**。写侧则无对应物：`DdsTransport::DeclareWriter` 只能把 topic 记进一个集合，**真正的 `DataWriter` 仍由 provider 在首次 `Publish` 时惰性建**。
+
+  **后果是把 D15/D16 要消灭的那件事原样放了回来**：**D16** §「为什么必须提前声明」那张表的第三行写的正是"应答 topic 的 `DataWriter` 若第一次 `Reply()` 才建 → 与客户端的 reader 尚未 match → **该服务的第一次应答会丢**"。惰性建只是把它从"`Reply()` 懒声明"挪成"provider 首次 `Publish` 惰性建"，**后果一模一样**。
+
+  **故本决策补一个与 `Subscribe` 对称的写侧钩子：**
+
+  ```cpp
+  // IDdsProvider 新增（幂等：同 topic 重复调用直接成功）
+  virtual Coro::Result<void> DeclareWriter(const std::string& topic) = 0;
+  ```
+
+  `FastDdsProvider` 把现有 `Publish` 里那段 `GetOrCreateTopic` + `create_datawriter` **抽出来**给它，`Publish` 退化为"查已建好的 writer 并 `write`"；`FakeDdsProvider` 同步实现。
+
+  **不设 `UndeclareWriter`**：端点集合**启动即定型、运行期恒定**（**D16**），只在 `Shutdown()` 时整体拆除，没有单独撤销一个 writer 的时机。既有的 `Unsubscribe` 是历史遗留，不为对称而新增一个无使用者的方法。
+
+  **未采用的偏方**：用 `Publish(topic, {})` 发一条空样本来逼出 writer。**否决**——那会往线上真发一条帧，对端收到一条无法解码的空消息。
 
   **不新增数据观察者接口**——既有的 `IDdsProvider::Subscribe` 已经是所需的那个钩子：
 
@@ -298,6 +320,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **两个方法而非一个**：一个 topic 上本节点通常**只需要一侧**——客户端在请求 topic 上只发不收、在应答 topic 上只收不发，服务端反之。**建成对是浪费，还会招来自收**（代价 9）。
 
+  **两者都须落到 provider 上真正建出端点**，不能只在传输层登记意图：`DeclareReader` → `IDdsProvider::Subscribe(topic, cb)`；`DeclareWriter` → `IDdsProvider::DeclareWriter(topic)`（**D13** 补正）。
+
   | 谁声明 | 何时 | 声明什么 |
   |---|---|---|
   | `DdsNode::DoStart()` | **启动时一次性，且仅此一处** | 按 **D16** 的四组注册项逐项建**对应方向**的端点 |
@@ -321,6 +345,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   1. **`DataWriter` 不再累积。** 先前"每个出现过的 `reply_to` 永久留一个 writer、不做回收"那条代价**整条消失**——端点集合现在**完全由启动前的注册决定、启动即定型、运行期恒定**。
   2. **运行期无 DDS 端点创建**，故也没有"回应路径上突然吃一个 ~240ms 发现窗口"的问题（**D16**）。
+     > **此条需 `IDdsProvider::DeclareWriter` 才真正成立**（**D13** 补正，2026-09-01）：初稿的 provider 接口没有写侧声明钩子，`DeclareWriter` 只能登记意图、`DataWriter` 仍在首次 `Publish` 时惰性建——**读侧成立、写侧不成立**。补上该钩子后两侧对称。
   3. **服务端不再受客户端摆布**：`reply_to` 曾是**客户端说了算**的目的地，服务端照着发。现在它只是个待校验的声明。
 
   **`DeclareWriter` / `DeclareReader` 仍要求幂等**，但理由变了：不再是"同一 `reply_to` 反复声明"，而是**注册里可能重复**（例如同一 topic 既注册为 `Subscribers`、又是某条 `Clients` 的值）。幂等让 `DoStart()` 不必先去重。
