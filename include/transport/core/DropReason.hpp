@@ -16,13 +16,11 @@
 
 namespace transport {
 
-/// @brief 框架本地丢弃/重复抑制的命名归因原因(四项,穷尽 CONTEXT.md「丢弃归因」)。
+/// @brief 框架本地丢弃/重复抑制的命名归因原因(两项,穷尽 CONTEXT.md「丢弃归因」)。
 ///
 /// 每项恰好一个归属组件 + 一个定义时刻(ADR-0003 D13 Q3 可审计表):
-/// - `kBusinessQueueOverflow`   -> `BoundedQueue::Push` 满
 /// - `kBadFrame`                -> 各 node 读循环 `codec.Decode` 失败
-/// - `kUnmatchedOrLateResponse` -> 各 node `Dispatch` 的 `PendingTable::Resolve` 返回 false
-/// - `kCloseDrop`               -> `NodeBase` 收敛 drain
+/// - `kUnmatchedOrLateResponse` -> 各 node `Dispatch` 键匹配无收件人(终结帧无人认领)
 ///
 /// 原「连接代际隔离丢弃」(`ProtocolNode` reactor 断连收敛)随 ADR-0004 D3
 /// **撤销连接代际隔离**而移除:交互层不再于断链时清空旧链路排队业务,该归因项的产生
@@ -36,13 +34,24 @@ namespace transport {
 /// DD-15),三介质都不为它单设归因项,DDS 亦不例外;其唯一产生点——那条独立的跨线程
 /// 交接队列——已随 ADR-0008 **D8** 一并消失。
 ///
+/// 原 `kBusinessQueueOverflow`(`BoundedQueue::Push` 满)随 ADR-0008 **D8** 与 ADR-0009
+/// **D1/D3** 移除:框架侧的「业务队列」这一层整个不存在了——`BoundedQueue` 已换成
+/// `Coro::Awaitable`,入站业务改由订阅承载,串行/异常隔离/队列容量三项一并降为宿主契约
+/// (ADR-0009 D3)。余下的订阅信箱与传输双队列同属「有界 1024 + 静默丢最旧」,
+/// **2026-08-28 裁决**(#152 / #176 关闭,SRS TBD-009)已定案**不归因、不计数**,故本项
+/// 不只是暂时无产生点,而是**没有可复活的定义时刻**。
+///
+/// 原 `kCloseDrop`(`NodeBase` 收敛 drain)随 ADR-0008 **D2/D10** 移除:`Close()` 收为
+/// 只发信号,`DrainUnstartedBusiness()` 与 close_drop 计数一并删除。当前关闭路径上没有
+/// 逐条可归因的丢弃——残留字节由 `discard_pending()` 整队清空(返回 `void`,无逐条可见
+/// 性,亦属上述「不归因」裁决的适用面),在途请求经 `Dispatcher::CloseAll(kClosed)`
+/// **恰好一次**返终结错误,那是**错误终结**而非丢弃。
+///
 /// `HandlerExceptionCount`(处理器执行失败)**不进本口径**——RT_HANDLER_006 是隔离当前
 /// 事件语义,不是帧/响应未投递。
 enum class DropReason {
-  kBusinessQueueOverflow,
   kBadFrame,
   kUnmatchedOrLateResponse,
-  kCloseDrop,
 };
 
 /// @brief 返回 `DropReason` 的稳定短名,供 Trace `message`/日志复用。
@@ -52,14 +61,10 @@ enum class DropReason {
 /// @return 该原因的稳定短名(kebab-case);未识别的枚举值返回 "unknown"。
 [[nodiscard]] constexpr std::string_view DropReasonName(DropReason reason) noexcept {
   switch (reason) {
-    case DropReason::kBusinessQueueOverflow:
-      return "business-queue-overflow";
     case DropReason::kBadFrame:
       return "bad-frame";
     case DropReason::kUnmatchedOrLateResponse:
       return "unmatched-or-late-response";
-    case DropReason::kCloseDrop:
-      return "close-drop";
   }
   return "unknown";
 }
