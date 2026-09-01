@@ -247,10 +247,21 @@ class DdsNode : public NodeBase {
    * **返 `Coro::Result<Ticket>` 而不是裸 `Ticket`**(**D8**):"topic 未注册为对应角色"要返
    * `kConfiguration`,而 `Ticket` **装不下错误码**——返裸 `Ticket` 时"忘了注册"只能交出一个
    * 空凭据,其 `Wait` 返的是 `kInvalidState`,**错误码不对,且推迟到第一次 `Wait` 才暴露**。
+   * **相位同理**:关闭之后订阅要返 `kClosed`,也要在**返回处**返,而不是交出一张信箱已经
+   * 关闭的凭据、把 `kClosed` 推给第一次 `Wait`。
+   *
+   * **相位规则**:`Created` / `Running` 放行,`Closing` / `Closed` 返 `kClosed`。
+   * 与另外三个交互方法(一律 `!IsRunning()` 即 `kClosed`)**有意不同**——`Created` 在本方法
+   * 上是**合法且被推荐的**订阅时机:`DataReader` 建于 `Start()`,故 `Start()` 之前一条消息
+   * 也到不了本进程,「注册 → 订阅 → `Start()`」是唯一在结构上不漏收启动初期消息的次序。
+   * 反过来若只许 `Running` 订阅,零丢失就得靠"`Start()` 与 `Subscribe` 之间不让出"这条隐式
+   * 调度约定,中间一有挂起点消息就被静默丢弃。
    *
    * @param topic 具体 topic,或 `kAny`。
    * @param kind  具体 `MessageKind`,或 `kAny`。
-   * @return 订阅凭据(析构时自动注销);topic 未注册为对应角色返 `kConfiguration`:
+   * @return 订阅凭据(析构时自动注销);节点处于 `Closing` / `Closed` 返 `kClosed`
+   *         (**先于**下面的注册校验,故已关闭的节点上订阅未注册的 topic 报 `kClosed`,
+   *         不报 `kConfiguration`);topic 未注册为对应角色返 `kConfiguration`:
    *         `kNotify` 须已注册为 `Subscribers`,`kRequest` 须是 `Services` 的键,其余
    *         `kind` 须至少在读侧集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值)
    *         ——不在读侧的 topic 其消息根本不会到达本进程,订阅它必然是**静默无效**。

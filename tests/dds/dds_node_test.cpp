@@ -16,12 +16,14 @@
 //      **服务的第一次应答不会丢**;
 //   4. 发布-订阅:`Publish` / `Subscribe(topic, kNotify)` 端到端;调用与注册的对应校验;
 //   5. `Subscribe` 返 **`Coro::Result<Ticket>`**(**D8**),topic 传 `kAny` 时**跳过**校验;
+//      相位:`Created` **放行**(注册 → 订阅 → 启动,不漏收启动初期消息),`Closing` /
+//      `Closed` 返 `kClosed`;
 //   6. ⭐ 请求-响应(**D7**):单阶段、等结果时重发(**线缆上字节完全相同**)、耗尽返
 //      **kTimeout**、首个到达即成功且**不回任何帧**、策略非法返 kInvalidArgument;
 //   7. ⭐ corr 两段式(**D6**):`uuid_override` 可注入;**两个节点各自的 corr 不撞**;
 //      共用应答 topic 靠**内部登记的具体 corr** 区分客户端(那处承重的区别);
 //      `Reply` 查自己的 `Services` 表、`reply_to` 作一致性交叉校验(**D15**);
-//   8. 生命周期:关闭令在途请求恰好终结一次,关闭之后四个交互方法一律终结于 `kClosed`。
+//   8. 生命周期:关闭令在途请求恰好终结一次,关闭之后四个交互方法一律**返** `kClosed`。
 //
 // 第 6、7 组是本文件的核心。
 // -----------------------------------------------------------------------------
@@ -1076,13 +1078,12 @@ TEST(DdsNode, CloseTerminatesInFlightRequestExactlyOnce) {
   service.Join();
 }
 
-// 关闭之后四个交互方法**一律终结于 kClosed**,且不因 topic 有没有注册而改口:调用序错误
-// 先于配置错误。
+// 关闭之后四个交互方法**一律在返回值上给出 kClosed**,且不因 topic 有没有注册而改口:
+// 调用序错误先于配置错误。
 //
-// ⚠ 四个方法里 `Subscribe` 的形态与另外三个不同:它**不判相位**,而是交出一张**信箱已经
-// 关闭**的凭据(`Dispatcher::CloseAll` 之后的既定语义,Dispatcher.hpp:262),`kClosed` 由
-// 第一次 `Wait` 给出而不是由 `Subscribe` 返回。故"关闭后一律 kClosed"这句话对它成立于
-// **等待处**,不成立于**返回值处**——本例把这一点如实钉住。
+// `Subscribe` 的判据与另外三个不同(它放行 `Created`,见下一例),但**关闭一侧的答案相同**:
+// `kClosed` 由 `Subscribe` **返回**给出,不再推迟到第一次 `Wait`——`Dispatcher::CloseAll`
+// 之后"交出一张信箱已关闭的凭据"那条既定语义(Dispatcher.hpp)在本节点的公开面上够不着了。
 TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
   Fixture fixture;
   Host host(fixture, "node-a");
@@ -1108,14 +1109,61 @@ TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
             make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Reply(request, Payload("r")).error(),
             make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.Subscribe(std::string("sub"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kClosed));
   // 未注册的 topic 也一样报 kClosed,不报 kConfiguration。
   EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
             make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.Subscribe(std::string("nope"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kClosed));
+  // `kAny` 也不例外:相位判定在 `kAny` 的跳过校验**之前**。
+  EXPECT_EQ(node.Subscribe(kAny, kAny).error(),
+            make_error_code(TransportErrc::kClosed));
+}
 
-  auto ticket = node.Subscribe(std::string("sub"), MessageKind::kNotify);
-  ASSERT_TRUE(static_cast<bool>(ticket)) << ticket.error().message();
-  DdsNode::Ticket closed = std::move(ticket).value();
-  EXPECT_EQ(closed.Wait(kCaseTimeout).error(),
+// `Subscribe` 放行 `Created`——**这是与另外三个交互方法有意分歧的那一点**。
+//
+// 依据:DDS 的 `DataReader` 建于 `DoStart()`,`Start()` 之前一条消息也到不了本进程,故
+// 「注册 → 订阅 → `Start()`」是唯一在**结构上**不漏收启动初期消息的次序。本例走完这条
+// 次序并断言启动后的第一条消息确实收到了。
+TEST(DdsNode, SubscribeIsAcceptedBeforeStartAndReceivesEarlyMessages) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
+
+  // ★ 尚未 Start():订阅在此相位受理,注册校验照常生效。
+  auto early = node.Subscribe(std::string("loop"), MessageKind::kNotify);
+  ASSERT_TRUE(static_cast<bool>(early)) << early.error().message();
+  EXPECT_EQ(node.Subscribe(std::string("unknown"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  auto seen = std::make_shared<std::vector<std::string>>();
+  Subscriber sub(std::move(early).value(),
+                 [seen](const Message& msg) { seen->push_back(Text(msg)); });
+  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("first"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
+  ASSERT_EQ(seen->size(), 1u);
+  EXPECT_EQ(seen->front(), "first");
+
+  ASSERT_TRUE(static_cast<bool>(node.Close()));
+  node.WaitClosed();
+  sub.Join();
+}
+
+// 从未 `Start()` 就 `Close()`:相位直落 `Closed`(NodeBase),`Subscribe` 随即返 `kClosed`。
+TEST(DdsNode, SubscribeReturnsClosedAfterCloseFromCreated) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"sub"})));
+
+  ASSERT_TRUE(static_cast<bool>(node.Close()));
+  EXPECT_EQ(node.Subscribe(std::string("sub"), MessageKind::kNotify).error(),
             make_error_code(TransportErrc::kClosed));
 }
 
