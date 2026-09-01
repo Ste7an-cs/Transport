@@ -13,9 +13,19 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 ### 一处实测事实，决定了写侧的形状
 
-**`DataWriter::write()` 的阻塞是线程级，不是 fiber 级**（#191 M2）：它是纯同步接口、无 continuation，在内部条件变量上 park **调用线程**——实测同一线程连续 **100.05ms**（默认 `max_blocking_time`）。`ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（#191 G 组同样 178/200 超时）——该模式挪走的是**网络发送**，而 `write()` 仍须先把样本**放进 writer 的 history**，`RELIABLE` + 满时卡住的是**准入**。
+**`DataWriter::write()` 的阻塞是线程级，不是 fiber 级**：它是纯同步接口、无 continuation，直接 park **调用线程**。在协程模型里这会**卡死整条线程上的所有 fiber**。故写侧必须有一条**专属 OS 线程**。
 
-在协程模型里这会**卡死整条线程上的所有 fiber**。故写侧必须有一条**专属 OS 线程**。
+**阻塞的真实机理是【同进程交付在发布线程上同步执行】**（2026-09-01 实测，#202 复核）。Fast DDS 默认 `INTRAPROCESS_FULL`，**同进程订阅方的 `on_data_available` 直接跑在发布线程上**，`Publish` 被它完整拖住：
+
+| 设置 | `Publish` 耗时 | 回调线程 |
+|---|---|---|
+| 默认 `INTRAPROCESS_FULL` | **2000–2009ms**（= 订阅回调的睡眠时长） | **与发布线程同一条** |
+| `set_library_settings(INTRAPROCESS_OFF)` | **1–2ms** | 不同线程 |
+
+**`max_blocking_time` 根本不参与**——上表第一行里它设为 300ms，`Publish` 照样跑满 2000ms。**这段阻塞没有上界，界由对端回调决定。**
+
+> **⚠ 本 ADR 初稿的归因已被证伪，记此以免再被引用。** 初稿写的是「`RELIABLE` + history 满时卡住的是**准入**，实测同线程连续 park 100.05ms（#191 M2）」。**该归因不成立**：已核 3.6.1 的 `DataWriterHistory::prepare_change`——history 满时**只有 `KEEP_ALL` 才等**，`KEEP_LAST` 直接丢最旧、不等；而 `DdsQos` 铺的正是 `KEEP_LAST` 且不暴露 `KEEP_ALL`。向卡死不 take 的 `RELIABLE` reader 连发 3000 条 60KB（`history_depth` 取 1 与 400），总耗时 56ms/79ms、单次最长 **0ms**、零阻塞。
+> **结论方向不变（写侧仍须专属 OS 线程），换的是依据。** 原先那条 `ASYNCHRONOUS_PUBLISH_MODE` 的否决（#191 G 组 178/200 超时）**仍然成立**——它挪走的是网络发送，挡不住同进程同步交付。
 
 ### 另一处实测事实，决定了读侧可以极简
 
@@ -42,6 +52,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   **为什么是"专属线程"而不是三介质的"写泵 fiber"**：见背景——`Publish` 会 park 调用线程，用 fiber 会卡死整条线程上的所有 fiber。**这是 DDS 与三介质唯一的实质结构差异**。
 
   **由此写侧的阻塞对调用方完全不可见**：阻塞发生在专属线程上，业务 fiber 早已返回。写出的一切结果（含 `RETCODE_TIMEOUT`）**不回传，只落 `LastError()`**——与三介质逐字相同。
+
+  ### ⚠ 专属写线程会顺带跑掉同进程对端的交付回调
+
+  见背景：Fast DDS 默认 `INTRAPROCESS_FULL`，**同进程订阅方的 `on_data_available` 在发布线程上同步执行**。故这条专属写线程实际上**兼跑同进程内所有对端的交付回调**，且**没有上界**。
+
+  由此，「**读侧 listener 必须快且不阻塞**」从建议变成**硬约束**：
+
+  - **我方的 listener 满足**（**D2**）：它只做 `push` 进 `read_queue_`——`lock` + `push_back` + `notify_all`，**无等待路径**，队列满时丢最旧也不阻塞。
+  - **同进程内的【非本框架】订阅方不受我方约束**：任何一个慢回调都会**卡住我方整条写队列**（不只是那一条消息）。这是部署面的约束，**框架无法强制**，须写进使用文档。
+  - **想彻底隔断**只有一条路：`set_library_settings(INTRAPROCESS_OFF)`（实测 `Publish` 从 2000ms 降到 1–2ms）。**本设计不默认关闭**——那会牺牲同进程通信的零拷贝路径，且属于进程级全局设置，替调用方决定是越权。
 
 - **D4（QoS 统一一套，不按模式分）：** `DdsConfig::qos` 保持**单一** `DdsQos`，对所有 topic 一视同仁。`DeclareWriter` / `DeclareReader`（**D15**）只管建端点，**不带 QoS 参数**。
 
@@ -433,7 +453,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 6. **全部实测为单机 loopback、单次实跑**；跨主机时延/丢失率未测。
 
-7. **`Shutdown()` 能否打断在途阻塞的 `Publish` —— 未实测**（#191 标注）。若不能，`Close()` 落在一次阻塞的写上时，`WaitClosed()` 最坏要等**一个 `max_blocking_time`**。**实现票须先补测**。
+7. **`Shutdown()` 打不断在途阻塞的 `Publish`，只能等；且等待【无上界】。**（2026-09-01 实测，#202）
+
+   **已补测**：5 轮（订阅方停滞 600ms，阻塞开始后 100ms 调 `Shutdown()`）——`Publish` **一次也没被截断**（600.1–600.5ms 全跑满），`Shutdown()` 耗时 501–508ms 恰好等掉剩下那段，且每轮都是 `Publish` 先返回。已核 3.6.1：`DataWriter` 上**没有任何中止 `write()` 的入口**。
+
+   **故 `Close()` 落在一次阻塞的写上时，`WaitClosed()` 就得等那次写自己结束，没有捷径。**
+
+   > **等待时长【没有上界】，不是"一个 `max_blocking_time`"**（本 ADR 初稿的说法，已证伪）：阻塞来自同进程对端的交付回调（见背景），`max_blocking_time` 不参与——实测它设 300ms 而 `Publish` 跑满 2000ms。**界由同进程内最慢的那个订阅回调决定。**
 
 8. **共用应答 topic 带来读入放大。** 一个服务的应答 topic 由**全体客户端共用**（**D6**），故**每个客户端都会收到该服务的全部应答**，自己那份只是其中之一——`N` 个并发客户端 ⇒ 每客户端约 `N` 倍读入量。这些多余样本会**一路进到 `read_queue_` 并被解码**，然后才在 `Dispatcher` 处因 `corr` 不匹配而落空。
 
@@ -488,7 +514,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
 ## 备选方案（Alternatives considered）
 
-- **写侧用 fiber 写泵（照三介质）。** **否决理由：** `Publish` 的阻塞是**线程级**，fiber 写泵会卡死整条线程上的所有 fiber。实测同一线程连续 park 100.05ms。
+- **写侧用 fiber 写泵（照三介质）。** **否决理由：** `Publish` 的阻塞是**线程级**，fiber 写泵会卡死整条线程上的所有 fiber。实测同进程订阅方回调睡 2000ms 时 `Publish` 跑满 2000ms，且**回调就在发布线程上**（见背景）。
 - **用 `ASYNCHRONOUS_PUBLISH_MODE` 免掉专属线程。** **否决理由：实测证伪**（#191 G 组 178/200 超时）——该模式挪走的是网络发送，`write()` 仍须先把样本放进 history，卡住的是准入。
 - **读侧加一条转发泵 fiber**（listener → handoff → 泵 → `read_queue_`）。**否决理由：** 跨线程 `push` 已实测安全（#190 Q1），listener 可直推；多一跳只增延迟（#191 实测一跳 27µs vs 两跳 33µs）与一条 fiber。
 - **请求-响应用 DDS 原生 `SampleIdentity` 关联。** **否决理由：** 会把 Fast DDS 的具体能力捅进 `IDdsProvider` 抽象层，`FakeDdsProvider` 还得模拟。2026-08-28 裁决为自定义 `correlation_id`。

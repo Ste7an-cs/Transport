@@ -95,7 +95,7 @@
   | | UDP / TCP / 串口 | **DDS** | 依据 |
   |---|---|---|---|
   | **谁推读队列** | **泵 fiber**——从 socket/device 的读流取数后推 | **listener，在外来线程上** | DDS 的样本经 provider 回调到达，不存在"可 await 的读流" |
-  | **写侧执行体** | **写泵 fiber** | **专属 OS 线程** | `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms）；用 fiber 会卡死整条线程上的**所有** fiber |
+  | **写侧执行体** | **写泵 fiber** | **专属 OS 线程** | `DataWriter::write()` 的阻塞是**线程级**（实测同进程订阅方回调睡 2000ms 时 `Publish` 跑满 2000ms，且回调就在发布线程上）；用 fiber 会卡死整条线程上的**所有** fiber |
 
   **两处都建立在实测之上：**
 
@@ -377,6 +377,12 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 | **谁推读队列** | 泵 fiber 从读流取数后推 | **listener，在外来线程上** → **读侧无泵 fiber** |
 | **写侧执行体** | 写泵 fiber | **专属 OS 线程** —— `write()` 的阻塞是**线程级** |
 | 其余（双队列 / 七方法 / fire-and-forget 写 / 有界丢最旧） | | **逐条相同** |
+
+**阻塞的真实机理是「同进程交付在发布线程上同步执行」**（2026-09-01 实测）：Fast DDS 默认 `INTRAPROCESS_FULL`，同进程订阅方的 `on_data_available` **直接跑在发布线程上**——回调睡 2000ms 则 `Publish` 跑满 2000ms，而 `max_blocking_time`（设 300ms）**完全不参与**；`set_library_settings(INTRAPROCESS_OFF)` 后同场景降到 1–2ms。**这段阻塞没有上界，界由对端回调决定。**
+
+> **原归因「`RELIABLE` history 满时卡住的是准入」已被证伪**：3.6.1 的 `DataWriterHistory::prepare_change` 中 history 满时**只有 `KEEP_ALL` 才等**，`KEEP_LAST` 直接丢最旧、不等，而 `DdsQos` 铺的正是 `KEEP_LAST`。**结论方向不变（写侧仍须专属 OS 线程），换的是依据。**
+
+**由此多一条硬约束**：专属写线程**会顺带跑掉同进程内所有对端的交付回调**，故「读侧 listener 必须快且不阻塞」**是硬约束不是建议**。我方 listener 满足（只做 `push`，无等待路径）；但**同进程内任何非本框架的慢订阅方都会卡住我方整条写队列**——这是部署面约束，框架无法强制，须写进使用文档。
 
 **两处最容易做错的**：① **`write_queue` 不能是 `FiberChannel`** —— 消费方是普通线程，而 `pop` 在非协程线程上会 crash；② **不得用写泵 fiber 代替专属线程** —— `Publish` 会 park 调用线程，fiber 会卡死整条线程上的所有 fiber，且 `ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（实测 178/200 超时，它挪走的是网络发送而非准入）。
 
@@ -681,7 +687,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 >    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
 > 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
-| **DdsTransport**（ADR-0013 重构后，**目标形态、尚未实现**） | **读写双队列，完整实现 `ITransport`**，与三介质同形。**读侧无泵 fiber**——provider 的 listener 在**外来线程**上 `take()` 后直接 `push` 进 `read_queue`（跨线程 `push` 已实测安全）；`AsyncRead()` 交出该句柄。**写侧 `AsyncWrite` 入队即返**（fire-and-forget 照旧），由**一条专属 OS 线程**从 `write_queue` 取出并 `Publish`——因 `DataWriter::write()` 的阻塞是**线程级**（实测同一线程连续 park 100.05ms），用 fiber 会卡死整条线程上的所有 fiber。**QoS 统一一套**（**D4**）。链路可用性由 `matched` + `Liveliness` 提供（**D9**）。 |
+| **DdsTransport**（ADR-0013 重构后，**目标形态、尚未实现**） | **读写双队列，完整实现 `ITransport`**，与三介质同形。**读侧无泵 fiber**——provider 的 listener 在**外来线程**上 `take()` 后直接 `push` 进 `read_queue`（跨线程 `push` 已实测安全）；`AsyncRead()` 交出该句柄。**写侧 `AsyncWrite` 入队即返**（fire-and-forget 照旧），由**一条专属 OS 线程**从 `write_queue` 取出并 `Publish`——因 `DataWriter::write()` 的阻塞是**线程级**（实测同进程订阅方回调睡 2000ms 时 `Publish` 跑满 2000ms，且回调就在发布线程上），用 fiber 会卡死整条线程上的所有 fiber。**QoS 统一一套**（**D4**）。链路可用性由 `matched` + `Liveliness` 提供（**D9**）。 |
 
 > **DDS 与三介质的形态差异只有两处**（ADR-0013）：① **谁在推读队列**——三介质是泵 fiber 从读流取数后推，DDS 是 listener 在外来线程上推，**故 DDS 读侧没有泵 fiber**；② **写侧是 OS 线程而非 fiber 写泵**——`Publish` 的阻塞是线程级，这是四个介质里**唯一需要额外线程**的一处。其余（双队列、`ITransport` 七方法、fire-and-forget 写、有界丢最旧）**逐条相同**。
 | TcpServer | corotcpserver accept 循环 fiber；每连接经 NodeFactory 派生 ProtocolNode + supervisor fiber |

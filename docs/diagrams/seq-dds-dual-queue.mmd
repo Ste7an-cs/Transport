@@ -31,7 +31,7 @@ sequenceDiagram
     WQ-->>W: 取出一条
     W->>P: Publish()　※ 同步，可能 park【本线程】至多 max_blocking_time
     P->>PEER: 样本发出
-    Note over W: 实测 write() 的阻塞是【线程级】（同一线程连续 park 100.05ms）；<br/>用 fiber 会卡死整条线程上的【所有】fiber。<br/>ASYNCHRONOUS_PUBLISH_MODE 绕不过去（实测 178/200 超时）——<br/>它挪走的是网络发送，而 write() 仍须先把样本放进 history，卡的是【准入】。
+    Note over W: write() 的阻塞是【线程级】，用 fiber 会卡死整条线程上的【所有】fiber。<br/>机理(2026-09-01 实测)：Fast DDS 默认 INTRAPROCESS_FULL，【同进程订阅方的 on_data_available 直接跑在发布线程上】——<br/>回调睡 2000ms 则 Publish 跑满 2000ms，max_blocking_time(设 300ms)完全不参与；INTRAPROCESS_OFF 后降到 1-2ms。<br/>【该阻塞无上界】，界由对端回调决定。原归因"RELIABLE history 准入满"已证伪(KEEP_LAST 满时丢最旧、不等)。<br/>ASYNCHRONOUS_PUBLISH_MODE 仍绕不过去(实测 178/200 超时)——它挪走的是网络发送，挡不住同进程同步交付。<br/>【连带硬约束】本线程会顺带跑掉同进程内所有对端的交付回调，故"读侧 listener 必须快且不阻塞"是硬约束；<br/>我方 listener 满足(只做 push)，但同进程内任何非本框架的慢订阅方都会卡住整条写队列。
     Note over W: 写出结果（含 RETCODE_TIMEOUT）【不回传、只落 LastError()】——与三介质逐字相同。<br/>代价：背压信号被丢弃，调用方无从知道"这条因对端消费不过来而没发出去"。
     end
 
