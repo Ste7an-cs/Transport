@@ -218,6 +218,18 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`Subscribe` 必须返 `Coro::Result<Ticket>`，不能返裸 `Ticket`**：**D16** 规定"topic 未注册为对应角色即返 `kConfiguration`"，而 `Ticket` **装不下错误码**。若返裸 `Ticket`，"忘了注册"只能交出一个空 `Ticket`——其 `Wait` 返的是 **`kInvalidState`**（`Dispatcher.hpp:203`），**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
 
+  ### 传输的所有权：节点【借用】，启停归宿主（#204 落地时定，追记于此）
+
+  ```cpp
+  DdsNode(DdsTransport& transport, ICodec& codec, DdsNodeConfig config);
+  ```
+
+  与 `ProtocolNode`（ADR-0009）一致，但本设计另有一条**独立于一致性的硬理由**：
+
+  > `DdsTransport::WaitClosed()` join 的是那条**专属 OS 线程**（**D3**），而它的最坏等待**没有上界**（「明确接受的代价」7）。节点若在 `DoJoin()` 里调它，就是**阻塞整条 fiber 线程**——与 `NodeBase::WaitClosed()` 的**让出式 join** 正相反。**传输的关闭必须留在宿主那条控制流上。**
+
+  **连带后果**：节点 `Start()` 之前宿主**必须先启传输**，否则 `Declare*` 返 `kInvalidState`。这一条须写进使用文档。
+
   **服务端没有 `Accept()`**：本模型无受理阶段（**D7**）。**`MessageKind::kFeedback` 在本设计中不使用**——它是 `Message` 为别的路径预留的值。
 
   **不提供旁路监听**（2026-08-28 裁决）。机制上 `Subscribe(kAny, kAny)` 可达，但**不作为受支持的用法写入接口文档**。
@@ -383,7 +395,10 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `RegisterServices` | 请求-响应**服务端** | 键 → **Reader**（收请求）　值 → **Writer**（发应答） |
 
   **方法名用复数**——名字直接说明是批量，免得读者以为要一个 topic 调一次。
-  **两个 pair 型用 `std::map` 而非 `vector<pair>`**：天然去重，且**从类型上排除"同一请求 topic 配了两个不同应答 topic"**这种自相矛盾的输入。
+  **两个 pair 型用 `std::map` 而非 `vector<pair>`**：天然去重，且排除"同一请求 topic 配了两个不同应答 topic"这种自相矛盾的输入。
+
+  > **⚠ 更正（#204 落地时发现）**：本 ADR 初稿写的是"**从类型上**排除"——**那句话过头了**。`std::map` 只在**单批之内**成立；**跨批次**调用时（`RegisterClients` 可多次调用、累加），`map::insert` 会**静默保留第一个值**，类型层的保证被绕过去。
+  > **故须补一条运行期校验**：同一请求 topic 在跨批次被配了**两个不同的**应答 topic → **`kInvalidArgument`**（见下「校验落在注册这一步」）。
 
   ```cpp
   struct DdsNodeConfig {   // 【只剩两项】
@@ -422,6 +437,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | topic 为空串 | `kInvalidArgument` |
   | `Clients` / `Services` 某条的键与值相同 | `kInvalidArgument`（请求与应答同 topic 必然自收自答） |
   | 同一 topic 既是 `Clients` 的键、又是 `Services` 的键 | `kInvalidArgument`——**自己请求自己**，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答 |
+  | **同一请求 topic 跨批次被配了两个不同的应答 topic** | `kInvalidArgument`——`std::map` 的去重只在单批内成立，跨批次 `insert` 会静默保留第一个值（见上「更正」） |
 
   **只拦这一种组合。** 其余"同一 topic 上既有 writer 又有 reader"的组合（判据见「代价 9」）**只造成自收白干、不会误配**，且可能是调用方有意为之（本地回环自测），故**不拦、只在文档记明**。
 
@@ -460,6 +476,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | `Subscribe(topic, kNotify)` | `Subscribers` |
   | `Subscribe(topic, kRequest)` | `Services` 的键 |
   | `RequestForResultDirect(topic, …)` | `Clients` 的键 |
+
+  **上表只列了 `kNotify` / `kRequest` 两种 `kind`。其余 `kind` 配【具体 topic】时**（#204 落地时补）：要求该 topic **至少在读侧集合内**——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值，否则返 `kConfiguration`。**不在读侧的 topic，其消息根本到不了本进程**，订阅它必然是本决策要消灭的那种"静默无效"。该规则是上表两行的**超集**，不与之冲突。
 
   **`Subscribe` 的 topic 键传 `kAny` 时【跳过该校验】**：`kAny` 不对应任何一个具体 topic，拿它去查注册表必然落空。这不是网开一面——`kAny` 本来**就只在已注册范围内起作用**（见下节），它的作用域已由注册天然限定。
 

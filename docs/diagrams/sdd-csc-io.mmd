@@ -43,4 +43,4 @@ classDiagram
     DdsTransport *-- IDdsProvider : 组合
     TcpServer ..> TcpTransport : 每连接接管
     note for ITransport "读写刻意不对称：读交出等待器句柄，\n超时/取消/扇出由调用方自理；\n写入队即返，结果只落 LastError()"
-    note for UdpTransport "ADR-0007/0008 已落地，是其余介质跟进的样板；\n【TCP 已于 ADR-0011 跟进完毕】，串口 / DDS 待跟进\n两传输的队列均为有界 1024 + 静默丢最旧，\n不归因（2026-08-28 裁决，#176/#152 已关闭）"
+    note for UdpTransport "ADR-0007/0008 已落地，是其余介质跟进的样板；\n【TCP(0011)/ 串口(0012)/ DDS(0013)均已跟进完毕】\n四者队列均为有界 1024 + 静默丢最旧，\n不归因（2026-08-28 裁决，#176/#152 已关闭）"

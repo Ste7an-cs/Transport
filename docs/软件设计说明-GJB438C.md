@@ -45,8 +45,9 @@
 > | §5.4（NodeBase） | 五个反向回调删除，公开面收为 4 方法 + 3 钩子 |
 > | 全文的 `Result`/`Status`/`OperationOptions`/`SendUnit` | 分别改为 `Coro::Result<T>` / `Coro::Result<void>` / `std::chrono::milliseconds` / 合并进 `Datagram` |
 >
-> 当前编译面收窄为 **UDP + ProtocolNode**；TCP / 串口 / DDS 及其节点按同一形态后续跟进，
-> 其相关小节暂保留原文（描述的是重设计之前的形态）。
+> **编译面已覆盖四个介质**（2026-09-01）：UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）、
+> DDS（ADR-0013）四个 `ITransport` 实现与 `ProtocolNode` / `DdsNode` **均在编译面内**。
+> 仍在面外的只剩 `TcpServer`（本轮不做）。
 
 从设计视角说明各构件如何满足需求及其设计原则；每条决策标注所满足的 SRS 需求，可回溯 ADR（REF-2 决策编号 Dn）。
 
@@ -133,7 +134,7 @@
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`IDdsProvider`；`TcpServer`（本轮不做，ADR-0011 D10）（**已合并**：`TcpClientTransport` 并入 `TcpTransport`，ADR-0011 D1） | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
-| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`；`DdsNode`、`DdsHandlerContext`（未编译的历史代码，待复活重写）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
+| **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、**`DdsNode`**（三者**均在编译面内**；`DdsNode` 已按 ADR-0013 重写，`DdsHandlerContext` **随之删除**）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
@@ -152,7 +153,8 @@
 
 ![CSC_IO 类图](diagrams/sdd-csc-io.svg)
 
-**图例说明**：各介质传输实现**唯一**的 `ITransport`（七个方法，含链路可用性；`IConnectionObservable` 已取消，交互层无 `dynamic_cast` 探测）。**读写刻意不对称**：`AsyncRead()` 交出读队列的等待器句柄，超时/取消/扇出由调用方自理；`AsyncWrite(Datagram)` 入队即返，写出结果只落 `LastError()`。`UdpTransport` 已按 ADR-0008 落地（socket 管理泵 + 读写双队列，`silence_timeout` 兼作读超时与 bind 重试间隔）；`TcpClientTransport` / `SerialTransport` / `DdsTransport` **按同一形态后续跟进，当前排除于编译面**，其内部结构仍为重设计之前的形态。
+**图例说明**：各介质传输实现**唯一**的 `ITransport`（七个方法，含链路可用性；`IConnectionObservable` 已取消，交互层无 `dynamic_cast` 探测）。**读写刻意不对称**：`AsyncRead()` 交出读队列的等待器句柄，超时/取消/扇出由调用方自理；`AsyncWrite(Datagram)` 入队即返，写出结果只落 `LastError()`。**四个介质均已按同一形态落地、且都在编译面内**（2026-09-01）：`UdpTransport`（ADR-0007，socket 管理泵 + 读写双队列，`silence_timeout` 兼作读超时与 bind 重试间隔）、`TcpTransport`（ADR-0011，连接管理内建、固定间隔重连、不自终）、`SerialTransport`（ADR-0012，静默超时为唯一判活依据）、`DdsTransport`（ADR-0013）。
+**唯 `DdsTransport` 有两处形态差异**：读侧由 provider 的 listener 在外来线程上直推读队列（**无泵 fiber**），写侧由**一条专属 OS 线程**消费写队列（`Publish` 的阻塞是线程级）；另在七方法之外有 `DeclareWriter` / `DeclareReader` 两个 DDS 专有的端点声明方法，**但不改动 `ITransport` 本身**。仍排除于编译面的只剩 `TcpServer`。
 > 注：本图 SVG 尚未随 ADR-0004 重渲染（渲染工具在当前环境不可用），`.mmd` 源以本节文字为准。
 
 #### 4.1.3 编解码层部件（CSC_CODEC）
@@ -174,7 +176,9 @@
 
 **图例说明**：`ProtocolNode`/`DdsNode` **继承 `NodeBase`**（基类管幂等与汇合，子类实现 `DoStart`/`DoClose`/`DoJoin`），并组合 `Dispatcher`（~~`HandlerLoop` 已随 ADR-0009 于 #163 删除~~）（不共享交互引擎）。`ProtocolNode` 的公开面即三个交互模式方法加 `Send`/`Subscribe`（ADR-0010；`Request` 已随 **D10** 删除），私有的 `AwaitAccept()` 是受理阶段的共用骨架。
 
-> **`DdsNode` 与 `DdsHandlerContext` 已在图中标注为「未编译的历史代码」**。二者调用着 `MarkRunning()`、`transport_->Read()/Write()`、`SignalClose()` 等**已被 ADR-0006/0008 删除**的接口，且不在库源文件清单内——是重设计**之前**的代码，**不是活着的使用者**（该核实正是 ADR-0009 D2 得以删除 `HandlerLoop` 的依据）。旧图未加此标注，易被读成当前架构的一部分。`DdsNode::Request` 签名里的 `options` 是已删除的 `OperationOptions`，随其整体复活/重写时一并处置。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。订阅信箱直接用 `Coro::Awaitable`（原 `BoundedQueue` 与 `HandlerLoop` 均已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
+> **`DdsNode` 已按 ADR-0013 整体重写并回到编译面**（2026-09-01，#204），`DdsHandlerContext` **随之删除**。
+> 重写前它调用着 `MarkRunning()`、`transport_->Read()/Write()`、`SignalClose()` 等**已被 ADR-0006/0008 删除**的接口、且不在库源文件清单内——是重设计**之前**的代码、**不是活着的使用者**（该核实正是 ADR-0009 D2 得以删除 `HandlerLoop` 的依据）。旧签名里那个 `options`（已删除的 `OperationOptions`）随重写一并消失。
+> **`DdsNode` 对 `ITransport` 同样是借用而非组合**：按引用持有、宿主负责传输启停——除与 `ProtocolNode`（ADR-0008 D5）一致外，另有一条硬理由：`DdsTransport::WaitClosed()` join 的是专属 OS 线程且**最坏等待无上界**，节点在 `DoJoin()` 里调它就是阻塞整条 fiber 线程（ADR-0013 **D8**）。注：RT_IF_API「不要求应用继承节点类型」约束的是**应用**，`NodeBase` 是库内实现基类，宿主仍按组合方式使用节点。**`ProtocolNode` 对 `ITransport` 是虚线依赖而非组合**——按引用借用，宿主负责传输的启停（ADR-0008 D5）。订阅信箱直接用 `Coro::Awaitable`（原 `BoundedQueue` 与 `HandlerLoop` 均已删除）；node 在消费者 fiber 内构造 `HandlerContext` 传入 handler。
 
 ### 4.2 执行方案
 
@@ -255,7 +259,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 > **变更（#173 / #163，2026-08-26）**：原文"在途请求由各自**总超时（缺省 30 秒）**/取消/关闭终结"两处已不成立——节点级缺省超时 `default_request_timeout` **已删除**（时限改为必填、逐次传参），取消令牌亦随 ADR-0006 D3 退化为时限。归因项数原记"七项减六项"，其后「无 handler」一项随 handler 通道废止而删除（#163），现为**五项**。
 >
-> **本图描述的 TCP 侧尚未按 ADR-0007/0008/0011 的新形态重构、当前排除于编译面**；图中保留的是断链处置**决策**（DD-11），机制名已对齐当前接口（`Read()` → `await(rx_)`、`RequestClose()` → `Close()`、`PendingTable` → `Dispatcher` 订阅索引）。TCP 重构时需连同本图一并复核。
+> **TCP 侧已按 ADR-0011 重构完毕并在编译面内**（#179/#180/#181）。本图保留的是断链处置**决策**（DD-11），机制名已对齐当前接口（`Read()` → `await(rx_)`、`RequestClose()` → `Close()`、`PendingTable` → `Dispatcher` 订阅索引）。
 
 #### 4.2.7 节点生命周期状态（MS_NODE_LIFECYCLE）
 
@@ -589,7 +593,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - **字节数上界消失**，只剩事件数；
 - 丢弃**既无计数也无归因**——AsyncTask 不提供丢弃计数，容量是唯一的调节手段。§3.6 的 loss=0 等式因此不再可直接验证。
 
-`DdsTransport` 的跨线程有界交接（原 `BoundedQueue<Sample>`）按同一形态后续跟进。
+`DdsTransport` 的跨线程有界交接（原 `BoundedQueue<Sample>`）**已按同一形态跟进完毕**（ADR-0013 **D2/D11**）：listener 在外来线程上直接 `push` 进传输的 `read_queue`，容量与丢弃策略与三介质逐字相同（**DD-15**），**不为它单设归因项**（`DropReason::kDdsHandoffOverflow` 随之删除，五项减为四项）。
 
 ### 5.4 节点基类详细设计（CSU_NODEBASE）
 
@@ -658,9 +662,17 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
   **实现注记**：重发的帧字节完全相同，可编码一次重复写出，不必每次 `Encode`。
   **接收侧不建模**（**D9**）：节点收到 `kCommand` 后如何应答由宿主 `Subscribe` 自理，框架不提供对应辅助。
 - **链路断开处置（DD-11/DD-12，取代原 reactor）**：**交互层不参与**——重连由传输内部透明完成，读循环无断链分支。不批量终结在途请求、不清空排队业务、**无 reactor 协程、无能力探测**——三介质同一段读循环（仅区分 `kClosed` 与其余）。
-- **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8；ADR-0009 D1 后仅存 DDS 侧）**：`HandlerContext` 已随 `ProtocolNode` 的 handler 通道一并移除；`DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
+- **处理器能力面（RT_LIFECYCLE_005 / ADR-0006 D8；~~ADR-0009 D1 后仅存 DDS 侧~~ **ADR-0013 后全库不存在**）**：`HandlerContext` 已随 `ProtocolNode` 的 handler 通道一并移除；**`DdsHandlerContext` 亦随 ADR-0013 的 `DdsNode` 重写删除**——新公开面无处理器回调，入站业务一律经 `Subscribe` 交出的凭据由宿主自理。以下为其历史形态留档：~~`DdsHandlerContext` **保留** `RequestClose()`，但其语义为**只发起、不等待**——内部调框架的发信号路径 `SignalCloseIfFirstCloser()` 而非会等待的 `Close()`，受理即返回,收敛由读-分发循环完成。命名与 `ITransport::RequestClose()`（发信号）/ `WaitClosed()`（等待）的既有约定一致。**返回值仅表示"已受理"，不表示"已关完"**；处理器若需确认关闭完成，只能经可观测状态,不得在处理器内等待。
 
-**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。correlation_id 生成、`kReply` 终结判别、topic 寻址、`reply_to=inbox`；`Request(Message,target)` 盖 kRequest + Register(correlation_id) + WriteFramed；`Publish` 盖 kNotify fire-and-forget；`DdsHandlerContext::Reply` 对入站 kRequest 回送 kReply。无连接（D3′），无 reactor/重连。**以上为未编译历史代码的 as-built，非现行设计**——其中 `reply_to=inbox`（每客户端一个信箱 topic）已由 ADR-0013 **D6** 取代为**每服务一个、全体客户端共用**的应答 topic。
+**软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。**本节已按 ADR-0013 整体重写**（`DdsNode` 与 `DdsTransport` 自此均在编译面内）：
+
+- **四个批量注册方法**（**D16**）：`RegisterPublishers` / `RegisterSubscribers` / `RegisterClients` / `RegisterServices`，**只在 `Created` 受理**（其后返 `kInvalidState`），累加 + 幂等去重 + **整批生效或整批不生效**；`Start()` 失败不清空注册表。
+- **四个交互方法**（**D8**）：`Subscribe`（返 `Coro::Result<Ticket>`）/ `Publish` / `RequestForResultDirect`（**单阶段**，等结果时重发，耗尽 `kTimeout`）/ `Reply`（查自己的 `Services` 表，`reply_to` 作一致性交叉校验）。
+- **关联**（**D6**）：`Dispatcher<Message, topic, correlation_id, kind>`；`correlation_id` 为两段式 `"<uuid>#<request_seq>"`。**`Subscribe` 交出的订阅其 `corr` 位恒 `kAny`，而 `RequestForResultDirect` 内部登记的那一条用【具体值】**——共用应答 topic 之所以能区分客户端全靠这一点。
+- **传输的所有权**（**D8**）：节点**借用** `DdsTransport&`，**启停归宿主**——`DdsTransport::WaitClosed()` join 的是专属 OS 线程且最坏等待无上界，节点在 `DoJoin()` 里调它就是阻塞整条 fiber 线程。故节点 `Start()` 前宿主须先启传输。
+- 无连接、无 reactor/重连——重连由传输内部透明完成（**DD-11/DD-12**）。
+
+> **已删除的历史形态**（留档以免被旧文引用）：`DdsHandlerContext` / `HandlerLoop` / `PendingTable` / `inbox_topic` / `node_id` / `Request(Message,target)` 一律不再存在。其中 `reply_to=inbox`（每客户端一个信箱 topic）已由 **D6** 取代为**每服务一个、该服务全体客户端共用**的应答 topic。
 
 **执行时序/数据流**：见 §4.2.3/§4.2.4/§4.2.6。
 
@@ -673,7 +685,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 **软件逻辑**：见 `src/io/*`。
 
-> **实况标注（2026-08-28 核对）**：下表中 **`UdpTransport` / `TcpTransport` / `SerialTransport` 三者已按新形态实现并参与编译**（TCP 依 ADR-0011 #179/#180/#181，串口依 ADR-0012 #193/#194）。**`DdsTransport` 与 `TcpServer` 仍排除于编译面**——前者设计见 ADR-0013（尚未实现），后者本轮不做（ADR-0011 D10）。
+> **实况标注（2026-09-01 核对）**：下表中 **`UdpTransport` / `TcpTransport` / `SerialTransport` / `DdsTransport` 四者均已按新形态实现并参与编译**（TCP 依 ADR-0011 #179/#180/#181，串口依 ADR-0012 #193/#194，DDS 依 ADR-0013 #201/#202/#203/#209/#204）。**仍排除于编译面的只剩 `TcpServer`**——本轮不做（ADR-0011 D10）。
 >
 > **`TcpTransport` 一行是例外**：它描述的是 **ADR-0011 定稿的目标形态**（尚未实现），不是历史代码。当前 `src/io/tcp/` 下的三个 .cpp 仍是重设计之前的实现，且 `TcpClientTransport.hpp:126` 引用着已删除的 `OperationOptions`、**头文件本身无法编译**。
 
