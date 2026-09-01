@@ -2,291 +2,400 @@
 
 /**
  * @file DdsNode.hpp
- * @brief DDS 交互节点 DdsNode(pub-sub + 多路请求-应答;RT_NODE_003 / RT_REQUEST /
- *        RT_IF_DDS / ADR-0003 D10/D12 Q2)。
+ * @brief DDS 交互节点 DdsNode——**注册接口 + 两种交互模式**(ADR-0013 D5/D6/D7/D8/D16)。
  *
- * DdsNode **继承 `NodeBase`**(生命周期模板方法:基类管幂等与收敛,本类实现
- * `DoStart`/`DoClose` 等钩子;ADR-0006 D1)并**组合**(不共享交互引擎)
- * `DdsTransport`(P4-4 纯字节管道,经 ITransport)+ `DdsCodec`(线缆格式,经 ICodec)+
- * `PendingTable<std::string, Message>`(挂起-应答薄基座)+ 可选的 `HandlerLoop`
- * (handler 消费者小件,ADR-0006 D4),**自持**一条读-分发循环(ADR-0006 D5),交付 DDS
- * 语义的多路请求-应答与单向发布订阅。
+ * `DdsNode` 继承 `NodeBase`(生命周期由基类承载幂等与汇合,本类只实现 `DoStart` /
+ * `DoClose` / `DoJoin` 三个钩子),组合 `ICodec`(线缆格式)与 `DdsDispatcher`(按键分发),
+ * 借用宿主的 `DdsTransport`,自持一条读-分发循环,交付两种交互模式:
  *
- * **D10 可复用性实证**:关联键此处是 **correlation_id 字符串**——`PendingTable<Key,T>`
- * 一行不改,只把 Key 实例化为 std::string(P1 曾实例化为 uint32);`BoundedQueue` /
- * `NodeBase` / `HandlerLoop` 零改动复用。DDS 特有语义——correlation_id 生成、`kReply`
- * 终结判别、topic 寻址、reply_to=inbox——**全部内联本类**;基座保持协议无关
- * (RT_DESIGN_008 红线)。
+ * | 模式 | 客户端/发布侧 | 服务端/订阅侧 |
+ * |---|---|---|
+ * | 发布-订阅 | `Publish(topic, msg)` | `Subscribe(topic, kNotify)` |
+ * | 请求-响应(**单阶段** `Direct`,**D7**) | `RequestForResultDirect(topic, req, retry)` | `Subscribe(topic, kRequest)` + `Reply(request, result)` |
  *
- * **无连接**(D3′):无连接状态机 / 重连;底层 provider 致命 → 传输 Read 返 kClosed
- * (ADR-0004 D1 单一终止语义)→ 读循环退出 → Closing→Closed。判活(Liveliness/
- * Deadline QoS 或心跳超时,RT_NODE_006)归协议层,P4 不强做、留占位。
+ * **公开面只有这四个交互方法**(**D8**):服务端**没有** `Accept()`(本模型无受理阶段);
+ * `MessageKind::kFeedback` **在本设计中不使用**;**不提供旁路监听**——机制上
+ * `Subscribe(kAny, kAny)` 可达,但不作为受支持的用法。
  *
- * 交互状态(correlation_id 计数器、生命周期、观测计数器)由一把 std::mutex 守(D8);单
- * fiber 调度器、无 affinity(D8/Q9)。
+ * ## topic 由注册接口给出,不进配置(**D16**)
+ *
+ * ```cpp
+ * DdsNode node(transport, std::make_unique<DdsCodec>());
+ * (void)node.RegisterPublishers({"telemetry"});                        // 发布者
+ * (void)node.RegisterServices({{"cfg.get", "cfg.get.reply"}});         // 服务端
+ * (void)node.Start();                                                  // 端点在此一次性建出
+ * ```
+ *
+ * **四个注册方法一律只在 `Created` 相位受理**,`Running` / `Closing` / `Closed` 返
+ * `kInvalidState`。端点集合"**启动即定型、运行期恒定**"——本设计**不引入运行期动态端点**,
+ * 故回应、发布、订阅路径上都不会突然冒出一个约 240ms 的发现窗口(**D9**)。
+ *
+ * ## 角色由"注册了什么"表达,不设 role 枚举(**D16**)
+ *
+ * | 注册方法 | 该节点就是 | `DoStart()` 建的端点 |
+ * |---|---|---|
+ * | `RegisterPublishers` | 发布者 | 每个 topic 的 **Writer** |
+ * | `RegisterSubscribers` | 订阅者 | 每个 topic 的 **Reader** |
+ * | `RegisterClients` | 请求-响应**客户端** | 键 → **Writer**(发请求)　值 → **Reader**(收应答) |
+ * | `RegisterServices` | 请求-响应**服务端** | 键 → **Reader**(收请求)　值 → **Writer**(发应答) |
+ *
+ * 四者可任意并存(一个节点常常兼任)。请求-响应两侧**传一模一样的实参**,各自按角色建
+ * 各自那一侧,不会填错方向、也不必协调。
+ *
+ * ## 关联键 `correlation_id` 是两段式(**D6**)
+ *
+ * ```
+ * correlation_id = "<uuid>#<request_seq>"
+ *                     ↑          ↑
+ *       节点构造时生成一次    uint32,从 0 开始自增,每请求一个
+ * ```
+ *
+ * uuid 半段保证**跨节点**不撞——这是"每服务一个应答 topic、该服务全体客户端共用"得以
+ * 成立的**全部**根据;`request_seq` 保证**节点内**不撞。`uint32` 回绕(约 42.9 亿次请求后)
+ * **明确接受、不加防回绕逻辑**:届时重复的是本节点很久以前用过的值,那条订阅早已注销。
+ *
+ * @warning **一处承重的区别**:`Subscribe` 交出去的订阅其 `corr` 位**恒为 `kAny`**,而
+ *          `RequestForResultDirect` **内部**登记的那一条**用具体值**。共用应答 topic 之所以
+ *          能区分客户端,**全靠内部登记的 corr 是具体值**;若内部也用 `kAny`,客户端会匹配
+ *          上该 topic 上**所有人**的应答。
+ *
+ * ## 一处必须先理解再用的限制(**D16**)
+ *
+ * **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的,
+ * 而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader
+ * 的 topic 的全部**」——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值,**不是**
+ * "本 domain 上的全部"。未注册的 topic,其消息**根本不会到达本进程**。
+ *
+ * ## 不管 transport 的生命周期
+ *
+ * 传输由**宿主**创建、`Start()`、`Close()`、`WaitClosed()`,本节点只按引用借用它
+ * (与 `ProtocolNode` 同,ADR-0009)。`DoStart()` 只在其上逐项 `DeclareWriter` /
+ * `DeclareReader`(**D15**:这是**唯一**建端点的地方),故**调用 `Start()` 之前宿主必须先
+ * 把传输启起来**,否则声明一律返 `kInvalidState`。
+ *
+ * **借用而非拥有,还有一条硬理由**:`DdsTransport::WaitClosed()` join 的是一条**专属 OS
+ * 线程**且**最坏等待无上界**(在途 `Publish` 打不断)。若由本节点在 `DoJoin()` 里调它,
+ * 那是**阻塞整条 fiber 线程**,与 `NodeBase::WaitClosed()`「让出式 join」的纪律正相反。
+ *
+ * @warning `close()` 是**整流传播**的(AsyncTask `417790c` 起):`DoClose()` 关闭本节点这一路
+ *          读订阅时,源读队列与同一条传输上的其它订阅者**一并终结**。与 `ProtocolNode`
+ *          同形、同为有意为之——节点关闭即读侧终结,宿主随后关传输。
+ *
+ * ## 明确接受、框架不管的两件事
+ *
+ * - **重发要求对端能容忍重复请求**(幂等,或自行按 `correlation_id` 去重)。协议层假设,
+ *   **框架不校验**(**D7**)。
+ * - **共用应答 topic 带来读入放大**:同一服务的每个客户端都会收到该服务的**全部**应答,
+ *   多余样本一路进读队列、解码后才在 `Dispatcher` 处落空(「明确接受的代价」8)。由此
+ *   `kUnmatchedOrLateResponse` 这条丢弃归因在客户端侧**本来就会很吵**,不是异常。
+ *
+ * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
+ * fiber,读-分发循环运行于自持 fiber,二者同线程且仅在挂起点交错,故普通成员不加锁。
  */
 
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "await/awaitable.hpp"
+#include "task/fibertask.h"  // Coro::FiberTask —— 读-分发循环的结构化并发句柄。
 #include "detail/result.hpp"
 
-#include <cstddef>
-#include <functional>
-#include <memory>
-#include <mutex>
-#include <string>
-
-#include "transport/node/BoundedQueue.hpp"
-#include "transport/core/Cancellation.hpp"
-#include "transport/core/Endpoint.hpp"
-#include "transport/node/HandlerLoop.hpp"
 #include "transport/codec/ICodec.hpp"
+#include "transport/core/Dispatcher.hpp"
 #include "transport/core/ITraceSink.hpp"
-#include "transport/io/ITransport.hpp"
 #include "transport/core/Message.hpp"
-#include "transport/node/NodeBase.hpp"
-#include "transport/node/PendingTable.hpp"
 #include "transport/core/TransportTypes.hpp"
+#include "transport/io/dds/DdsTransport.hpp"
+#include "transport/node/NodeBase.hpp"
+#include "transport/node/RetryPolicy.hpp"
 
 namespace transport {
 
-class DdsNode;
+/// 参与 DDS 分发的字段:**topic + correlation_id + kind**(ADR-0013 **D6**)。
+///
+/// 三者分别是 **DDS 的寻址维度**、**其关联符**、**消息类别**;部分匹配由 `Dispatcher`
+/// 实现,本类只需在键提取函数里给出各字段的具体值。**这不是照搬 `ProtocolNode`**——
+/// 它选 `(session_id, message_id, frm_type)` 是**它的协议**决定的(DD-4:协议无关基座可复用)。
+using DdsDispatcher = Dispatcher<Message, std::string /*topic*/,
+                                          std::string /*correlation_id*/,
+                                          MessageKind /*kind*/>;
 
-/**
- * @brief 入站业务处理器的能力面(RT_HANDLER_001):handler 经它与节点交互,而非裸捕获
- *        node&。只露请求-应答所需能力,协议内部状态不外泄。
- *
- * 由 DdsNode 在消费者 fiber 内构造并按引用传入 handler;handler 不得持有其地址越出单次
- * 调用(生命周期系于该次分发)。
- */
-class DdsHandlerContext {
- public:
-  /**
-   * @brief 对一条入站 `kRequest` 回送终结应答(pub-sub 上的请求-应答闭环)。
-   *
-   * 内联 DDS 应答寻址:盖 `kind=kReply`、`correlation_id=request.correlation_id`,发往
-   * `Endpoint::Topic(request.reply_to)`(请求方 inbox)。request 非 `kRequest` 或其
-   * reply_to 为空时返 kInvalidArgument(无从回送)。
-   */
-  [[nodiscard]] Coro::Result<void> Reply(const Message& request, Message reply);
-
-  /// @brief 从本节点单向发布一条 `kNotify`(fire-and-forget);委托到 DdsNode::Publish。
-  [[nodiscard]] Coro::Result<void> Publish(Message msg, Endpoint topic);
-
-  /**
-   * @brief 请求关闭本节点:**只发起、不等待**(RT_LIFECYCLE_005 / ADR-0006 D8)。
-   *
-   * 走框架的发信号路径(`NodeBase::SignalClose`):置 Closing
-   * (立即拒新交互)+ 发出全部汇合信号,随即返回;**不**调会等待的 `Close()`。节点由读循环
-   * 在汇合完成后收敛到 Closed(ADR-0005 D1)。命名与 `ITransport::RequestClose()`(发信号)
-   * / `WaitClosed()`(等待)的既有约定一致。
-   *
-   * @return 仅表示**已受理**,**不表示已关完**。处理器内不得等待本节点关闭完成(等自己
-   *         退出,静默挂死;框架不设运行时守卫,ADR-0006 D8)。
-   */
-  Coro::Result<void> RequestClose();
-
-  /// @brief 节点所属执行域的协作取消令牌(Close 时被触发);handler 可据它提前收手。
-  [[nodiscard]] const CancellationToken& cancellation() const {
-    return cancellation_;
-  }
-
- private:
-  friend class DdsNode;
-  DdsHandlerContext(DdsNode* node, CancellationToken cancellation)
-      : node_(node), cancellation_(std::move(cancellation)) {}
-
-  DdsNode* node_;
-  CancellationToken cancellation_;
-};
-
-/// 入站业务处理器(组合注入,RT_HANDLER_001):对一条入站业务消息(kRequest/kNotify/…)
-/// 返回结构化结果(仅记录,框架不据此自动应答,避 TBD-001);预期失败用 Coro::Result<void> 表达,不抛
-/// 异常(RT_HANDLER_005)。回送应答由 handler 经 DdsHandlerContext::Reply 显式发起。
-using DdsInboundHandler = std::function<Coro::Result<void>(const Message&, DdsHandlerContext&)>;
-
-/// DdsNode 配置:inbox topic(reply_to)+ 节点标识(correlation_id 前缀)+ 可选入站
-/// 业务处理器 + 业务队列上界。
+/// DdsNode 配置——**只剩两项**(ADR-0013 **D16**)。
+///
+/// 全部 topic 字段已移出配置、改由四个注册方法给出;历史遗留的 `inbox_topic` / `node_id` /
+/// `handler` / `business_queue_max_*` 一并删除(入站业务由订阅承载,ADR-0009 D1)。
 struct DdsNodeConfig {
-  /// 本节点 inbox topic:Request 盖入 reply_to,对端 kReply 回送至此。须非空且已在底层
-  /// DdsTransport 的订阅 topic 集内(否则收不到应答)。
-  std::string inbox_topic;
-  /// 节点标识:确定性 correlation_id 的前缀(`node_id:序号`),须非空且集群内唯一以免
-  /// 跨节点键碰撞。不用随机数(确定性可测,RT_REQUEST)。
-  std::string node_id;
-  /// 入站业务处理器(RT_HANDLER_001);为空 = 业务消息归因 dropped_no_handler。
-  DdsInboundHandler handler;
-  /// 业务队列事件数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
-  std::size_t business_queue_max_events = BoundedQueue<Message>::kDefaultMaxEvents;
-  /// 业务队列字节数上界(仅 handler 设时用;越界由 BoundedQueue 钳制)。
-  std::size_t business_queue_max_bytes = BoundedQueue<Message>::kDefaultMaxBytes;
-  /// 可选 Trace 出口(P5-3/P5-4,ADR-0003 D13);非拥有,可为 nullptr。传给 NodeBase
-  /// (生命周期跃迁 + close_drop 归因)、HandlerLoop 业务队列与本类各丢弃归因点
-  /// (kBadFrame/kUnmatchedOrLateResponse/kNoHandlerConfigured),
-  /// 并在 send/recv/decode/match/timeout/cancel/handler/close 等边界点上报事件。
-  /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果/计数,`RecordEvent`/`RecordDrop`
-  /// 仅一次判空。
+  /// 节点 uuid:**非空则用它,为空才 `QUuid::createUuid()`**(**D6**)。
+  ///
+  /// `QUuid` 是随机的,而 `correlation_id` 的前缀确定与否直接决定测试能不能断言具体值;
+  /// 故留这一个注入口:**测试填固定值,生产留空**。
+  std::string uuid_override;
+  /// 可选 Trace 出口(ADR-0003 D13);非拥有,可为 `nullptr`。**观测的唯一出口**——本类没有
+  /// 任何计数器与 getter。发射点:两个丢弃归因(`kBadFrame` / `kUnmatchedOrLateResponse`)
+  /// 与 send / recv / decode 三个边界。RT_TRACE_002:为空时仅一次判空,不改变任何控制流。
   ITraceSink* trace_sink = nullptr;
 };
 
 /**
- * @brief DDS 交互节点:继承 NodeBase(生命周期)+ 组合 transport + codec + PendingTable +
- *        HandlerLoop,交付 DDS pub-sub 与多路请求-应答。
+ * @brief DDS 交互节点:注册接口给出 topic,四个方法交付发布-订阅与单阶段请求-响应。
  *
- * **生命周期全部由 `NodeBase` 承载**(ADR-0006 D1/D6):`Start()` / `Close()` /
- * `WaitClosed()` / `IsRunning()` / `CloseDropCount()` / `LastCloseLatency()` 一律**继承自
- * 基类**,本类只实现 DDS 特有的钩子(`ValidateConfig` / `DoStart` / `DoClose` /
- * `JoinHandler` / `DrainUnstartedBusiness`)。Created→Running(Start)→Closing→Closed(Close)。
- * - `Close()` 只发汇合信号 + 等收敛结果;收敛由读循环兼任(ADR-0005 D1)。关闭后
- *   Request/Publish 一律 kClosed。**须由节点外部调用**(RT_LIFECYCLE_005 使用契约,
- *   ADR-0006 D8):它**会等**收敛完成,在 handler 内调用等于等自己退出 → 静默挂死;框架不设
- *   运行时重入守卫。处理器请求关闭走只发信号的 `DdsHandlerContext::RequestClose()`。
- * - **致命错误自终(ADR-0005 D5 / RT_LIFECYCLE_008)**:DDS 非重连(断开即致命,Read 返
- *   kClosed),此时读循环退出而节点仍 Running → 由读循环**自行**走同一条关闭路径,宿主
- *   无需干预;可观察结果与外部发起关闭一致。
- *
- * 不可拷贝、不可移动(读-分发循环 fiber 捕获 this)。
+ * 见文件头。不可拷贝、不可移动(读-分发循环 fiber 捕获 this)。
  */
 class DdsNode : public NodeBase {
  public:
-  using Clock = OperationOptions::Clock;
+  /// 订阅凭据(析构自动注销);`Subscribe` 交出的就是它。
+  using Ticket = DdsDispatcher::Ticket;
+  /// `Subscribe` 的 topic 键:具体 topic 名,或 `kAny`(该字段不参与匹配)。
+  using TopicKey = std::optional<std::string>;
+  /// `Subscribe` 的 kind 键:具体 `MessageKind`,或 `kAny`。
+  using KindKey = std::optional<MessageKind>;
 
-  DdsNode(std::unique_ptr<ITransport> transport, std::unique_ptr<ICodec> codec,
-          DdsNodeConfig config);
-  /// @brief 析构即关闭:在**本类**析构体内调 `Close()`——彼时动态类型仍是 DdsNode,虚钩子
-  ///        可用、成员尚存(基类析构不得收敛,见 `NodeBase::~NodeBase`)。
+  /// @brief 构造。
+  /// @param transport **借用**的 DDS 传输:宿主负责其 `Start()` / `Close()` /
+  ///                  `WaitClosed()`,且须保证其寿命长于本节点。**本节点 `Start()` 之前
+  ///                  它必须已 Running**——端点声明只能落在已 `Init` 的 provider 上。
+  /// @param codec     线缆格式(本节点独占),DDS 路径即 `DdsCodec`。
+  /// @param config    见 `DdsNodeConfig`。
+  DdsNode(DdsTransport& transport, std::unique_ptr<ICodec> codec,
+          DdsNodeConfig config = {});
+  /// @brief 析构:`Close()` + `WaitClosed()`——须在**本类**析构体内做,彼时动态类型仍是
+  ///        DdsNode、虚钩子可用、成员尚存(基类析构不得收敛,见 `NodeBase::~NodeBase`)。
   ~DdsNode() override;
 
   DdsNode(const DdsNode&) = delete;
   DdsNode& operator=(const DdsNode&) = delete;
 
-  /**
-   * @brief 交付一次请求-应答(多路并发在途,各自 correlation_id 互不串)。
-   *
-   * node 盖 `kind=kRequest`、生成确定性 correlation_id(`node_id:序号`)、`reply_to=inbox`;
-   * PendingTable.Register(correlation_id) → Encode → transport.Write(destination=@p target)
-   * → Handle::Wait 等 inbox 上匹配 correlation_id 的唯一 `kReply`。总超时经 options.deadline。
-   * 关闭后返 kClosed。
-   *
-   * @param req     请求 Message(payload 由调用方填;kind/correlation_id/reply_to 由 node 盖)。
-   * @param target  目标 topic(须为 `Endpoint::Topic`,否则传输返 kInvalidArgument)。
-   * @param options 截止时间与取消令牌。
-   * @return 匹配的 kReply Message,或机器可判别错误(kClosed / kTimeout / kCancelled / …)。
-   */
-  [[nodiscard]] Coro::Result<Message> Request(Message req, Endpoint target,
-                                        OperationOptions options = {});
+  // ── 注册接口(D16)——【须在 Start() 之前调用】 ──────────────────────────
 
   /**
-   * @brief 单向发布一条 `kNotify`(fire-and-forget,pub-sub):不登记 PendingTable、不期待应答。
+   * @brief 注册**发布者** topic:每个 topic 在 `DoStart()` 建一个 **Writer**。
    *
-   * node 盖 `kind=kNotify`、Encode、transport.Write(destination=@p topic)。关闭后返 kClosed;
-   * 非 topic 目的地由传输返 kInvalidArgument。
+   * **批量**——一次给一组,不必一个 topic 调一次;**可多次调用累加**(便于按模块分别注册);
+   * **重复项幂等去重**,不报错。
    *
-   * @param msg   出站 Message(payload 由调用方填)。
-   * @param topic 目标 topic(须为 `Endpoint::Topic`)。
+   * **整批生效或整批不生效**:一批里只要有一项非法,**整批回滚、一项都不落**,返对应错误。
+   * 半生效的注册会让调用方难以判断该重试哪些。
+   *
+   * @param topics 待注册的 topic 集合。
+   * @return 成功;不在 `Created` 相位返 `kInvalidState`;任一 topic 为空串返
+   *         `kInvalidArgument`(此时整批未落)。
    */
-  [[nodiscard]] Coro::Result<void> Publish(Message msg, Endpoint topic);
+  [[nodiscard]] Coro::Result<void> RegisterPublishers(
+      std::vector<std::string> topics);
 
-  /// @brief 观测:`kReply` 无匹配在途 Request(迟到 / 无匹配 correlation_id)而归因丢弃的累计数。
-  [[nodiscard]] std::size_t UnmatchedReplyCount() const;
+  /// @brief 注册**订阅者** topic:每个 topic 在 `DoStart()` 建一个 **Reader**。
+  ///        批量 / 累加 / 幂等去重 / 整批生效,返回值同 `RegisterPublishers`。
+  [[nodiscard]] Coro::Result<void> RegisterSubscribers(
+      std::vector<std::string> topics);
 
-  /// @brief 观测:入站业务消息因无 handler 而被丢弃的累计次数。
-  [[nodiscard]] std::size_t DroppedNoHandlerCount() const;
+  /**
+   * @brief 注册**请求-响应客户端**:`请求 topic → 应答 topic`,**一服务一条**。
+   *
+   * 键在 `DoStart()` 建 **Writer**(发请求)、值建 **Reader**(收应答)。与服务端
+   * `RegisterServices` **传一模一样的实参**,各自按角色建各自那一侧(**D16**)。
+   *
+   * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**),故一个客户端同时调
+   * 多个服务时各服务的应答落在各自 topic 上、互不相扰。用 `std::map` 而非
+   * `vector<pair>`:天然去重,且**从类型上排除"同一请求 topic 配了两个不同应答 topic"**。
+   *
+   * @param topics 请求 topic → 应答 topic。
+   * @return 成功;不在 `Created` 相位返 `kInvalidState`;下列任一非法返 `kInvalidArgument`
+   *         (整批不落):
+   *         - 键或值为空串;
+   *         - 某条的**键与值相同**(请求与应答同 topic 必然自收自答);
+   *         - 某个键**已注册为 `Services` 的键**——**自己请求自己**,且 `corr` 由自己生成、
+   *           `Dispatcher` **会真的匹配上**,形成调用方毫无察觉的自问自答。**这是唯一要拦的
+   *           方向冲突**;其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收白干、
+   *           不会误配,且可能是有意的回环自测,**不拦**;
+   *         - 某个键**此前已注册为 `Clients` 的键但应答 topic 不同**——与上面那条 map 的
+   *           类型保证同源:一个请求 topic 只能有一个应答 topic,跨批次亦然。
+   */
+  [[nodiscard]] Coro::Result<void> RegisterClients(
+      std::map<std::string, std::string> topics);
 
-  /// @brief 观测:业务队列满而 tail-drop 的累计次数(命名归因 business_queue_overflow)。
-  [[nodiscard]] std::size_t BusinessQueueOverflowCount() const;
+  /// @brief 注册**请求-响应服务端**:`请求 topic → 应答 topic`,键建 **Reader**(收请求)、
+  ///        值建 **Writer**(发应答)。校验与返回值与 `RegisterClients` 逐条对称
+  ///        (方向冲突查的是 `Clients` 的键)。
+  [[nodiscard]] Coro::Result<void> RegisterServices(
+      std::map<std::string, std::string> topics);
 
-  /// @brief 观测:handler 逃逸异常被边界兜住、转 kInternal 隔离的累计次数(RT_HANDLER_006)。
-  [[nodiscard]] std::size_t HandlerExceptionCount() const;
+  // ── 公开面:两种交互模式(D8)────────────────────────────────────────────
 
-  /// @brief 观测:当前在途(已登记未终结)Request 数;关联清理判据。
-  [[nodiscard]] std::size_t PendingCount() const;
+  /**
+   * @brief 登记一个订阅——**取用入站消息的唯一入口**(ADR-0009 D1 / **D6**)。
+   *
+   * 两个键均可传 `kAny`。**交出去的订阅其 `corr` 位恒为 `kAny`**(见文件头的承重区别):
+   * `correlation_id` 不进公开接口——请求-响应侧它由框架在 `RequestForResultDirect` 内生成、
+   * 服务端事先不可能知道客户端会生成什么值,发布-订阅侧的"应用自定义子通道"能力已裁决
+   * 为不需要。暴露一个只能填一个值的参数是陷阱,不是灵活性。
+   *
+   * | 用途 | 这样调 | 实际键 |
+   * |---|---|---|
+   * | 订阅某 topic 的通知 | `Subscribe("t", MessageKind::kNotify)` | `{"t", kAny, kNotify}` |
+   * | 收某 topic 的请求 | `Subscribe("t", MessageKind::kRequest)` | `{"t", kAny, kRequest}` |
+   * | 收全部(已注册 reader 的)topic 的通知 | `Subscribe(kAny, MessageKind::kNotify)` | `{kAny, kAny, kNotify}` |
+   *
+   * 消费在**调用方自己的 fiber** 内进行,节点不代管;串行、异常隔离与信箱容量之外的背压
+   * 一律是调用方契约(RT_INBOUND_005)。**多 topic 用多次 `Subscribe`,每 topic 一条消费
+   * fiber**——各自独立信箱,一路慢不拖累另一路。
+   *
+   * **返 `Coro::Result<Ticket>` 而不是裸 `Ticket`**(**D8**):"topic 未注册为对应角色"要返
+   * `kConfiguration`,而 `Ticket` **装不下错误码**——返裸 `Ticket` 时"忘了注册"只能交出一个
+   * 空凭据,其 `Wait` 返的是 `kInvalidState`,**错误码不对,且推迟到第一次 `Wait` 才暴露**。
+   *
+   * @param topic 具体 topic,或 `kAny`。
+   * @param kind  具体 `MessageKind`,或 `kAny`。
+   * @return 订阅凭据(析构时自动注销);topic 未注册为对应角色返 `kConfiguration`:
+   *         `kNotify` 须已注册为 `Subscribers`,`kRequest` 须是 `Services` 的键,其余
+   *         `kind` 须至少在读侧集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值)
+   *         ——不在读侧的 topic 其消息根本不会到达本进程,订阅它必然是**静默无效**。
+   *         **topic 传 `kAny` 时跳过该校验**:`kAny` 不对应任何一个具体 topic,拿它去查
+   *         注册表必然落空;它的作用域本就已由注册天然限定(见文件头的限制一节)。
+   */
+  [[nodiscard]] Coro::Result<Ticket> Subscribe(TopicKey topic, KindKey kind);
 
-  /// @brief 观测:读循环 `codec_->Decode` 失败(坏 sample / codec 语义错误)而丢弃的累计
-  ///        次数(P5-3,ADR-0003 D13;命名归因 kBadFrame)。
-  [[nodiscard]] std::size_t BadFrameCount() const;
+  /**
+   * @brief 单向发布一条 `kNotify`(fire-and-forget,发布-订阅):不登记任何订阅、不期待应答。
+   *
+   * 本节点盖 `kind = kNotify` 并**清空** `correlation_id` / `reply_to`——**D6** 之后
+   * `correlation_id` 只有框架生成的关联符一个来源,发布路径上它没有第二种用法。
+   *
+   * @param topic 目标 topic,**须已注册为 `Publishers`**。
+   * @param msg   出站 Message(`payload` 由调用方填)。
+   * @return 已入队;`kClosed`(未启动 / 关闭中 / 已关闭)、`kConfiguration`(topic 未注册为
+   *         发布者)、编码错误。**返回成功不表示已发出**——写出与其失败归因都在传输的
+   *         专属写线程里,只落 `LastError()`。
+   */
+  [[nodiscard]] Coro::Result<void> Publish(const std::string& topic, Message msg);
 
-  /// @brief 观测:最近一次 Request 从 Register 到终结的时延(P5-4,RT_DATA_BUFFER)。尚无
-  ///        已终结请求时为 0。
-  [[nodiscard]] Clock::duration LastRequestLatency() const;
+  /**
+   * @brief 交付一次请求-响应(**单阶段**,等结果时重发,不回应;**D7**)。
+   *
+   * ```
+   * → kRequest
+   * ⏱ 等 kReply ──超时──▶ 重发 ──次数耗尽──▶ kTimeout
+   * ← kReply                                ⇒ 成功(返回该帧,【不回应】)
+   * ```
+   *
+   * 步骤:按 `topic` 查已注册的 `Clients` 表取应答 topic(**查不到即 `kConfiguration`,
+   * 不猜、不回落**)→ 盖 `kind` / `corr` / `reply_to` → **先登记订阅再发出** → 编码**一次**、
+   * 重发复用同一份字节 → 首个到达即成功。
+   *
+   * **签名里没有 `result_timeout`**:本交互只有**一个**等待阶段,其时限即 `retry.timeout`。
+   * **耗尽返 `kTimeout` 而不是 `kNotAccepted`**——后者的语义是"对端没有受理",而本模型
+   * **根本不存在受理这一步**。
+   *
+   * **为什么 `RELIABLE` 的 DDS 上还要重发**:丢的不是网络,是**队列**——读队列有界 1024、
+   * 满时静默丢最旧,且共用应答 topic 把这一段的压力放大了 `N` 倍(**D11** / 代价 8)。
+   * 重发正是对这一段的补救。代价是**要求对端能容忍重复请求**,框架不校验。
+   *
+   * @param topic 请求 topic,**须已注册为 `Clients` 的键**。
+   * @param req   请求 Message(`payload` 由调用方填;`kind` / `correlation_id` /
+   *              `reply_to` 由本节点盖)。
+   * @param retry 重发策略,见 `RetryPolicy`。
+   * @return 收到的 `kReply`;或 `kTimeout`(重发次数耗尽)、`kInvalidArgument`(策略非法)、
+   *         `kConfiguration`(topic 未注册为客户端)、`kClosed`、编码错误。
+   */
+  [[nodiscard]] Coro::Result<Message> RequestForResultDirect(
+      const std::string& topic, Message req, RetryPolicy retry);
 
-  /// @brief 观测:最近一次 handler 单次调用的处理时长(P5-4,RT_DATA_BUFFER)。尚无已
-  ///        完成调用时为 0。
-  [[nodiscard]] Clock::duration LastHandlerDuration() const;
+  /**
+   * @brief 服务端回一条终结应答 `kReply`——请求-响应服务端**唯一**的方法(无受理阶段)。
+   *
+   * **应答 topic 从自己注册的 `Services` 表查**(`services_[request.topic]`),**不取信于
+   * 线缆、不建端点**(**D15**):运行期不再有任何建端点的路径,该 topic 的 writer 早在
+   * `DoStart()` 就建好了,故服务的**第一次应答也不会丢**。
+   *
+   * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的应答 topic 不等即返
+   * `kInvalidArgument`。**保留它是有价值的,不是冗余**——两侧注册实参写歪时(客户端在
+   * `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发),不带它这种偏差**完全不可见**,
+   * 客户端只会一路超时、看起来像对端没响应;带上它,服务端**当场就能报出**"你等的地方和
+   * 我发的地方不一样"。
+   *
+   * @param request 收到的请求(其 `topic` 与 `correlation_id` 是本方法的全部输入)。
+   * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` 由本节点盖)。
+   * @return 已入队;`kClosed`、`kConfiguration`(本节点根本不服务 `request.topic`)、
+   *         `kInvalidArgument`(`reply_to` 交叉校验不过)、编码错误。
+   */
+  [[nodiscard]] Coro::Result<void> Reply(const Message& request, Message result);
+
+  /// @brief 本节点的 uuid——`correlation_id` 的前缀半段(**D6**),供诊断与测试断言。
+  [[nodiscard]] const std::string& uuid() const { return uuid_; }
 
  protected:
-  // —— NodeBase 生命周期钩子(DDS 特有实事,ADR-0006 D1)——————————————————————
+  // ── NodeBase 生命周期钩子 ──────────────────────────────────────────────
 
-  /// @brief 校验 config(RT_LIFECYCLE_007):inbox_topic / node_id 非空、队列上界落法定
-  ///        区间。非法返 kConfiguration(停 Created、不 latch start_done_、可改配重试)。
-  Coro::Result<void> ValidateConfig() const override;
-
-  /// @brief 首个 Start 的实事:transport.Start(Init + 订阅 topic 集)→ `MarkRunning()` →
-  ///        spawn 读-分发循环 +(设了 handler 时)handler 消费者。**无连接**:不 spawn
-  ///        reactor(D3′)。三介质(含 DDS)共用同一段无分支读循环(ADR-0004 D1/D2)。
+  /// @brief 启动的 DDS 特有实事:**四组注册全空即 `kConfiguration`**(**D12**:一个什么都
+  ///        不收不发的节点必是漏了注册)→ 按四组注册逐项在传输上建**对应方向**的端点
+  ///        (**D15**:**唯一**建端点的地方)→ 取读订阅 → spawn 读-分发循环。
+  ///        **不启动 transport**(那是宿主的事)。任一步失败即返错,基类退回 `Created`
+  ///        且**注册表原样保留**——补上漏的那几项再 `Start()` 一次即可(**D16**)。
   Coro::Result<void> DoStart() override;
 
-  /// @brief 关闭汇合信号(首个关闭者独占执行一次,`Close` 与致命错误自终共用):按序
-  ///        transport.RequestClose → 业务队列 Close + handler 协作取消 →
-  ///        PendingTable.FailAll(kClosed)(令在途 Request 恰好一次 kClosed 收敛)。
-  ///        无 reactor(无连接),故无额外取消源。
+  /// @brief 关闭汇合信号(只发信号、不等待):close 本节点的读订阅(读循环据此退出)→
+  ///        `Dispatcher::CloseAll`(关闭全部订阅信箱:令在途请求恰好终结一次,同时即
+  ///        订阅者的协作取消信号)。**不关闭 transport**。
   Coro::Result<void> DoClose() override;
 
-  /// @brief 收敛:让出式 join handler 消费者 fiber(未设 handler 时立即返回)。
-  void JoinHandler() override;
-
-  /// @brief 收敛:Drain 业务队列内未启动的排队业务,返回条数(归因 close_drop 在基类)。
-  std::size_t DrainUnstartedBusiness() override;
+  /// @brief join 本节点 spawn 的全部 fiber——只有读-分发循环一条。订阅者的消费 fiber
+  ///        属宿主,不在此列(ADR-0009 D4)。
+  void DoJoin() override;
 
  private:
-  friend class DdsHandlerContext;
-
-  /**
-   * @brief spawn 读-分发循环 fiber(ADR-0006 D5:骨架归本类)。
-   *
-   * **三介质同一段读循环、无介质分支、无能力探测**(ADR-0004 D1 / RT_TRANSPORT_008):
-   *
-   * ```
-   * Read() → 成功    → DecodeAndDispatch(解码 + DDS 特有分类/寻址)
-   *        → kClosed → 退出读循环
-   *        → 其它     → 瞬时错误,继续
-   * ```
-   *
-   * `kClosed` 是**唯一**的传输终结信号(我方关闭,或 DDS provider 底层致命错误——DDS 无
-   * 连接、断开即致命);其余失败一律视为可继续的瞬时错误。
-   *
-   * **退出后本 fiber 兼任收敛者**(ADR-0005 D1):读循环恒是第一个退出的内部工作单元,故
-   * 它天然是收敛的正确位置。收敛本身在基类内(ADR-0006 D6),本方法只在循环出口调基类的
-   * `ConvergeAfterReadLoop()`;**不得**改调公开的 `Close()`(那会等自己退出)。
-   */
+  /// @brief spawn 读-分发循环 fiber:`await(rx_) → 成功 → DecodeAndDispatch;错误 → Close()`。
   void SpawnReadLoop();
-
-  /// @brief 读循环体内的 DDS 特有处理:Decode 一 sample → 填 source/topic → 逐条 Dispatch
-  ///        (读循环骨架本身不 decode、不分类,守 RT_NODE_003)。
-  void DecodeAndDispatch(Datagram datagram);
-  /// @brief 单条 Message 的分发(DDS 特有分类,内联):`kReply` → correlation_id 键 Resolve;
-  ///        其它(kRequest/kNotify/…)业务 → 入队 handler / 无 handler 归因丢弃。
-  void Dispatch(Message msg);
-
-  /// @brief 盖 kind、Encode、transport.Write 到 @p dest 的内部收口(Request/Publish/Reply 共用)。
-  [[nodiscard]] Coro::Result<void> WriteFramed(Message msg, MessageKind kind, Endpoint dest);
-
-  /// @brief 生成确定性 correlation_id(`node_id:序号`,单调递增)。自持锁。
+  /// @brief 读循环体内的 DDS 特有处理:Decode 一条样本 → 按来源 topic 填 `topic`/`source`
+  ///        → 逐条 Dispatch。**topic 不上线缆**(**D5**),入站只能由 `Datagram.peer` 带出。
+  void DecodeAndDispatch(const Datagram& datagram);
+  /// @brief 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时
+  ///        `kReply` 归因 `kUnmatchedOrLateResponse`、其余静默丢弃(ADR-0009 D5)。
+  void Dispatch(const Message& msg);
+  /// @brief 编码 + 交给传输的出站尾段(`Publish` / `Reply` 共用)。**不盖任何章**——盖章
+  ///        各自做完再进来,故本函数对交互模式不透明。
+  [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg,
+                                                  const std::string& topic);
+  /// @brief 把**已编码**的字节交给传输(fire-and-forget)。
+  ///        `RequestForResultDirect` 直接用它:那条路径**编码一次、重发复用同一份字节**
+  ///        (ADR-0010 D3:重发的是字节完全相同的原帧),不能每次重新 Encode。
+  [[nodiscard]] Coro::Result<void> WriteEncoded(std::vector<std::uint8_t> bytes,
+                                                const std::string& topic);
+  /// @brief 取用下一个 `correlation_id`:`"<uuid>#<request_seq>"`,`request_seq` 自增。
+  ///        **`uint32` 回绕明确接受**,不加防回绕逻辑(**D6**)。
   [[nodiscard]] std::string NextCorrelationId();
+  /// @brief 该 topic 是否在**读侧**集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的
+  ///        值)——即"它的消息有没有可能到达本进程"。
+  [[nodiscard]] bool IsReaderSideTopic(const std::string& topic) const;
 
-  std::unique_ptr<ITransport> transport_;
+  DdsTransport& transport_;  ///< **借用**:宿主拥有并启停,寿命须长于本节点。
   std::unique_ptr<ICodec> codec_;
   DdsNodeConfig config_;
-  /// 关联表:correlation_id 字符串键(D10 实证——PendingTable 一行不改,仅换 Key 类型)。
-  PendingTable<std::string, Message> pending_;
-  /// 入站业务处理器消费者小件(**可选**件,ADR-0006 D4):业务队列 + 消费者 fiber 句柄 +
-  /// 协作取消 + 异常隔离 + 时长计量。未设 `config_.handler`(即未 `Spawn`)时它只是个没人
-  /// 消费的空队列。自守其锁,不进基类(基类只装每个节点都有的东西)。
-  HandlerLoop<Message> handler_loop_;
 
-  mutable std::mutex mutex_;  ///< 守 DDS 特有交互状态(correlation 计数、观测计数,D8)。
-  std::uint64_t correlation_counter_{0};  ///< 确定性 correlation_id 单调序号。
-  std::size_t unmatched_reply_count_{0};
-  std::size_t dropped_no_handler_count_{0};
-  std::size_t bad_frame_count_{0};
+  /// 本节点 uuid,**构造时生成一次、此后不变**(**D6**):`config_.uuid_override` 非空则用
+  /// 它,为空才 `QUuid::createUuid().toString(QUuid::WithoutBraces)`。
+  std::string uuid_;
+  /// `correlation_id` 的自增半段。**不叫 `session_id`**:那是**外部协议**的匹配键
+  /// (`Message::session_id`,DDS 路径留缺省 `0`),同名是确定的阅读陷阱(**D6**)。
+  std::uint32_t request_seq_{0};
+
+  // —— 四组注册表(**D16**)。`Start()` 之前填,此后只读;`Start()` 失败**不清空**。——
+  std::set<std::string> publishers_;             ///< topic → Writer。
+  std::set<std::string> subscribers_;            ///< topic → Reader。
+  std::map<std::string, std::string> clients_;   ///< 请求 topic → 应答 topic(键 W、值 R)。
+  std::map<std::string, std::string> services_;  ///< 请求 topic → 应答 topic(键 R、值 W)。
+
+  /// 本节点在传输 `read_queue` 上的订阅(`shared()`);`DoClose` 关闭之——**关闭是整流
+  /// 传播的**,连源队列与其它订阅者一并终结(见文件头 warning)。
+  std::shared_ptr<Coro::Awaitable<Datagram>> rx_;
+  /// 读-分发循环的结构化并发句柄;`DoJoin()` 让出式 join 之。
+  std::shared_ptr<Coro::FiberTask<void>> read_task_;
+
+  /// 入站的**唯一**投递路径:`RequestForResultDirect` 与宿主的 `Subscribe` 都在此登记。
+  DdsDispatcher dispatcher_;
 };
 
 }  // namespace transport

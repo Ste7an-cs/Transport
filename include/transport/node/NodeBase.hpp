@@ -123,6 +123,19 @@ class NodeBase {
  protected:
   NodeBase() = default;
 
+  /**
+   * @brief 当前生命周期相位——**供子类判"是否仍在 `Created`"**,不进公开面。
+   *
+   * `IsRunning()` 分不出 `Created` 与 `Closed`(两者都是 false),而 `DdsNode` 的四个注册
+   * 方法要求"**只允许 `Start()` 之前注册**"(ADR-0013 **D16**),非 `Created` 一律返
+   * `kInvalidState`——这个判据只有基类给得了:注册表是子类的,但相位是基类的,且
+   * "从未 `Start()` 就 `Close()`"这条路径根本不调 `DoClose()`,子类自持一份标志必然漂移。
+   *
+   * 只读一眼当下的相位,**不构成任何同步保证**:返回后相位可能立即变化。故它只适合
+   * "拒绝非法调用序"这类用途,不适合当临界区判据。
+   */
+  [[nodiscard]] LifecycleState CurrentLifecycle() const;
+
   // —— 子类钩子(协议特有实事;一律锁外调用)————————————————————————————
 
   /// @brief 启动的协议特有实事:**配置校验** → transport.Start → spawn 读-分发循环 /

@@ -89,4 +89,11 @@ bool NodeBase::IsRunning() const {
   return lifecycle_ == LifecycleState::kRunning;
 }
 
+// 供子类判"是否仍在 Created"(见 .hpp)。与 `IsRunning()` 同形:取一眼锁内的相位就走,
+// 不构成任何同步保证。
+LifecycleState NodeBase::CurrentLifecycle() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return lifecycle_;
+}
+
 }  // namespace transport

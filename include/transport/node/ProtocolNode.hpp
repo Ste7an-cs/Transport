@@ -77,6 +77,9 @@
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/node/NodeBase.hpp"
+// RetryPolicy 已提到独立头(`DdsNode` 亦用同一类型,ADR-0013 D7);此处 include 使既有
+// 调用方"include ProtocolNode.hpp 即得 RetryPolicy"的写法继续成立。
+#include "transport/node/RetryPolicy.hpp"
 
 namespace transport {
 
@@ -98,19 +101,6 @@ using MessageDispatcher =
 
 /// @brief 任意会话、任意命令码的某类帧,用于旁路监听。
 [[nodiscard]] MessageDispatcher::Key AnyOfType(FrameType type);
-
-/**
- * @brief 一次交互中**受理阶段**的重发策略(ADR-0010 D6 / RT_NODE_002_e)。
- *
- * 逐次调用传入而**不进节点配置**:两阶段的等待是数量级不同的量(第一阶段等"对端受理",
- * 第二阶段等"对端执行完"),且同一节点上不同命令的耐受度不同,不宜由节点级配置一刀切。
- */
-struct RetryPolicy {
-  /// 单次尝试的等待时长;须为正值,否则调用返 kInvalidArgument。
-  std::chrono::milliseconds timeout{};
-  /// 总发送次数(**含首发**);须 ≥ 1,否则调用返 kInvalidArgument。
-  int max_attempts = 1;
-};
 
 /// ProtocolNode 配置:默认外部协议 id + 可选 Trace 出口。
 ///

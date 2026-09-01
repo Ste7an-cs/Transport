@@ -1,287 +1,487 @@
 #include "transport/node/DdsNode.hpp"
 
+#include <chrono>
+#include <cstdint>
+#include <map>
 #include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
+
+#include <QUuid>  // QUuid::createUuid —— correlation_id 的 uuid 半段(ADR-0013 D6)。
+
+#include "await/awaitable.hpp"
 
 #include "task/fibertask.h"  // Coro::makeTask —— 读-分发循环 fiber。
 
 #include "transport/core/DropReason.hpp"
+#include "transport/core/Endpoint.hpp"
+#include "transport/core/Error.hpp"
 #include "transport/core/Observability.hpp"
 #include "transport/core/TraceCategories.hpp"
 
-// DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):correlation_id 生成、kReply
-// 终结判别、topic 寻址、reply_to=inbox。生命周期(幂等 Start / 关闭仲裁 / 收敛)由基类
-// NodeBase 承载,本类只填 DDS 特有钩子(ADR-0006 D1);读-分发循环骨架与 handler 观测计数
-// 归本类(ADR-0006 D5,#140),handler 消费者在可选小件 HandlerLoop(D4);关联复用
-// PendingTable<std::string,Message>。
+// DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):四组注册表、两段式
+// correlation_id、Dispatcher 键 (topic, corr, kind)、单阶段请求-响应、应答寻址。生命周期
+// (幂等 Start / 关闭仲裁 / join)由基类 NodeBase 承载,本类只填三个钩子。
+//
+// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不持有业务队列与 handler
+// 消费者 fiber:入站业务由宿主 `Subscribe` 后在自己的 fiber 上消费。
+//
+// 本类**不触碰 transport 的生命周期**:不 Start、不 Close、不 WaitClosed,只在 `DoStart()`
+// 里逐项 `Declare*`(D15:唯一建端点的地方),此外只借它的两条队列。
 
 namespace transport {
+namespace {
 
-DdsNode::DdsNode(std::unique_ptr<ITransport> transport,
-                 std::unique_ptr<ICodec> codec, DdsNodeConfig config)
-    // 生命周期基类:共用同一可选 trace_sink(生命周期跃迁 + close_drop 归因)。
-    : NodeBase(config.trace_sink),
-      transport_(std::move(transport)),
-      codec_(std::move(codec)),
-      config_(std::move(config)),
-      // 关联表:correlation_id 无天然容量语义(≠ session_id 的 uint8 硬顶)→ 纯计数无限
-      // (max_pending=0)。D10:仅把 Key 实例化为 std::string,PendingTable 一行不改。
-      // P5-4:与 handler_loop_ 共用同一可选 trace_sink(未配则两处 RecordEvent 均一次判空)。
-      pending_(/*max_pending=*/0, config_.trace_sink),
-      // handler 消费者小件持有业务队列:字节计量注入 payload.size()(D10:小件不读 Message
-      // 其它字段)。trace_sink 透传(P5-3):业务队列满(business_queue_overflow)与 handler
-      // 调用起止点经它可选上报。**未设 handler 时不 Spawn**,它只是个空队列。
-      handler_loop_([](const Message& msg) { return msg.payload.size(); },
-                    config_.business_queue_max_events,
-                    config_.business_queue_max_bytes, config_.trace_sink) {}
+/// 丢弃归因:只上报,不计数(本类无观测面)。级别 kWarn——丢弃是需要关注的信号。
+void TraceDrop(ITraceSink* sink, DropReason reason) {
+  RecordEvent(kTraceCategoryDrop, sink, DropReasonName(reason), {}, {}, {},
+              kNoNum, -1, kNoTag, TraceLevel::kWarn);
+}
 
-// 析构即关闭:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚(见 NodeBase 文档)。
-DdsNode::~DdsNode() { Close(); }
-
-Coro::Result<void> DdsNode::ValidateConfig() const {
-  // inbox_topic 是 reply_to 的来源、node_id 是 correlation_id 的前缀——二者为空则请求-应答
-  // 无从成立(收不到应答 / 键无归属),停 Created 允许改配重试。
-  if (config_.inbox_topic.empty() || config_.node_id.empty()) {
-    return make_error_code(TransportErrc::kConfiguration);
+/// 节点 uuid(**D6**):`uuid_override` 非空则用它,为空才 `QUuid::createUuid()`。
+///
+/// **不自搓**(`random_device` 在 WSL 下质量存疑,且要自行论证碰撞率),**不引第三方 uuid
+/// 库**(为一个字段引依赖不划算);`Qt5::Core` 本就 `PUBLIC` 链进 `transport`,不引入新依赖。
+std::string MakeUuid(const std::string& uuid_override) {
+  if (!uuid_override.empty()) {
+    return uuid_override;  // 测试注入固定值,保住确定性可测。
   }
-  using Q = BoundedQueue<Message>;
-  if (config_.business_queue_max_events < Q::kMinEvents ||
-      config_.business_queue_max_events > Q::kMaxEvents) {
-    return make_error_code(TransportErrc::kConfiguration);
-  }
-  if (config_.business_queue_max_bytes < Q::kMinBytes ||
-      config_.business_queue_max_bytes > Q::kMaxBytes) {
-    return make_error_code(TransportErrc::kConfiguration);
+  return QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+}
+
+/// 单值型注册批(`Publishers` / `Subscribers`)的校验:**只有"topic 非空"一条**。
+///
+/// **先整批校验、再整批落地**——"整批生效或整批不生效"(**D16**)由这个顺序天然保证,
+/// 不需要回滚代码:校验没过就一个字节都没写进注册表。
+[[nodiscard]] Coro::Result<void> ValidatePlainBatch(
+    const std::vector<std::string>& batch) {
+  for (const auto& topic : batch) {
+    if (topic.empty()) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
   }
   return Coro::Result<void>{};
 }
 
+/// 成对型注册批(`Clients` / `Services`)的校验。四条,逐条都有明确依据:
+///
+/// | 检查 | 依据 |
+/// |---|---|
+/// | 键或值为空串 | 空 topic 建不出端点 |
+/// | 键 == 值 | 请求与应答同 topic,必然自收自答(**D16**) |
+/// | 键已是**反向表**的键 | **唯一要拦的方向冲突**——自己请求自己,且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**,形成毫无察觉的自问自答 |
+/// | 键在**本表**里已配了**别的**应答 topic | 与 `std::map` 的类型保证同源:一个请求 topic 只能有一个应答 topic,跨批次亦然 |
+///
+/// **只拦这一种方向冲突。** 其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收
+/// 白干、不会误配,且可能是调用方有意为之(本地回环自测),**不拦**(**D16** / 代价 9)。
+[[nodiscard]] Coro::Result<void> ValidatePairBatch(
+    const std::map<std::string, std::string>& batch,
+    const std::map<std::string, std::string>& own,
+    const std::map<std::string, std::string>& opposite) {
+  for (const auto& entry : batch) {
+    const std::string& request_topic = entry.first;
+    const std::string& reply_topic = entry.second;
+    if (request_topic.empty() || reply_topic.empty()) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+    if (request_topic == reply_topic) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+    if (opposite.count(request_topic) != 0) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+    const auto existing = own.find(request_topic);
+    if (existing != own.end() && existing->second != reply_topic) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+  }
+  return Coro::Result<void>{};
+}
+
+}  // namespace
+
+DdsNode::DdsNode(DdsTransport& transport, std::unique_ptr<ICodec> codec,
+                 DdsNodeConfig config)
+    : transport_(transport),
+      codec_(std::move(codec)),
+      config_(std::move(config)),
+      // uuid **构造时生成一次、此后不变**(D6):它是"共用应答 topic 也能区分客户端"的
+      // 全部根据,故不能每次请求重取。
+      uuid_(MakeUuid(config_.uuid_override)),
+      // 键提取函数:给出一条消息在三个匹配字段上的具体值。部分匹配(kAny)由 Dispatcher
+      // 实现,本类不需要提供通配逻辑。`topic` 由读循环按来源填(D5:topic 不上线缆)。
+      dispatcher_([](const Message& msg) {
+        return std::make_tuple(msg.topic, msg.correlation_id, msg.kind);
+      }) {}
+
+// 析构即关闭并汇合:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚。
+// Close 只发信号,WaitClosed 才 join,故两句缺一不可。
+DdsNode::~DdsNode() {
+  (void)Close();
+  WaitClosed();
+}
+
+// ── 注册接口(D16)────────────────────────────────────────────────────────
+//
+// 四个方法同一副骨架:**判相位 → 整批校验 → 整批落地**。
+//
+// - **只允许 `Start()` 之前注册**:端点集合"启动即定型、运行期恒定",本设计**不引入
+//   运行期动态端点**。故非 `Created` 一律 `kInvalidState`,不分"正在启动"与"已关闭"。
+// - **可多次调用累加、重复项幂等去重**:落地用的是 `set`/`map` 的 insert,天然如此。
+// - **整批生效或整批不生效**:校验在落地之前整批做完,故失败时一项都没落。
+
+Coro::Result<void> DdsNode::RegisterPublishers(std::vector<std::string> topics) {
+  if (CurrentLifecycle() != LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (auto valid = ValidatePlainBatch(topics); !valid) {
+    return valid;
+  }
+  publishers_.insert(topics.begin(), topics.end());
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::RegisterSubscribers(std::vector<std::string> topics) {
+  if (CurrentLifecycle() != LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (auto valid = ValidatePlainBatch(topics); !valid) {
+    return valid;
+  }
+  subscribers_.insert(topics.begin(), topics.end());
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::RegisterClients(
+    std::map<std::string, std::string> topics) {
+  if (CurrentLifecycle() != LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  // 反向表是 `services_`:同一 topic 既是 Clients 的键、又是 Services 的键 = 自己请求自己。
+  if (auto valid = ValidatePairBatch(topics, clients_, services_); !valid) {
+    return valid;
+  }
+  clients_.insert(topics.begin(), topics.end());  // 重复键幂等(值已校验过一致)。
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::RegisterServices(
+    std::map<std::string, std::string> topics) {
+  if (CurrentLifecycle() != LifecycleState::kCreated) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (auto valid = ValidatePairBatch(topics, services_, clients_); !valid) {
+    return valid;
+  }
+  services_.insert(topics.begin(), topics.end());
+  return Coro::Result<void>{};
+}
+
+// ── NodeBase 钩子 ────────────────────────────────────────────────────────
+
 Coro::Result<void> DdsNode::DoStart() {
-  // 基类已做完幂等仲裁与配置校验,这里只做 DDS 特有实事。三介质(含 DDS)共用同一段无
-  // 分支读循环(ADR-0004 D1/D2)——DdsTransport 断开即致命(Read 返 kClosed),由读循环收敛。
-  Coro::Result<void> started = transport_->Start();  // DdsTransport:Init + 订阅 topic 集。
-  if (!started) {
-    return started;  // 传输启动失败:基类退回 Created 允许重试(此时未 MarkRunning)。
+  // **四组全空由 `Start()` 判**(D12):topic 的合法性在注册那一刻就判完了,只剩这一条要
+  // 等注册全部结束才知道——一个什么都不收不发的节点必是漏了注册。
+  if (publishers_.empty() && subscribers_.empty() && clients_.empty() &&
+      services_.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
   }
-  MarkRunning();
-  // 读-分发循环(本类自持,ADR-0006 D5):Read 骨架 + 内联 decode + DDS 特有分类/寻址;
-  // 循环退出后本 fiber 兼任收敛者,走基类内部路径 ConvergeAfterReadLoop(ADR-0005 D1)。
+  // **唯一建端点的地方**(D15)。按四组注册逐项建**对应方向**的端点:一个 topic 上通常
+  // 只需要一侧,建成对是浪费、还会招来自收。`Declare*` 幂等,故这里不必先去重
+  // (同一 topic 可能既是订阅项、又是某条 client 的应答 topic)。
+  //
+  // **不启动 transport**:宿主已经启过。它若还没 Running,`Declare*` 会返 kInvalidState,
+  // 本次 Start 随之失败并停在 Created ——注册表原样保留,启好传输再来一次即可。
+  for (const auto& topic : publishers_) {
+    if (auto declared = transport_.DeclareWriter(topic); !declared) {
+      return declared;
+    }
+  }
+  for (const auto& topic : subscribers_) {
+    if (auto declared = transport_.DeclareReader(topic); !declared) {
+      return declared;
+    }
+  }
+  for (const auto& entry : clients_) {
+    if (auto declared = transport_.DeclareWriter(entry.first); !declared) {
+      return declared;  // 键 → Writer(发请求)。
+    }
+    if (auto declared = transport_.DeclareReader(entry.second); !declared) {
+      return declared;  // 值 → Reader(收应答)。
+    }
+  }
+  for (const auto& entry : services_) {
+    if (auto declared = transport_.DeclareReader(entry.first); !declared) {
+      return declared;  // 键 → Reader(收请求)。
+    }
+    if (auto declared = transport_.DeclareWriter(entry.second); !declared) {
+      return declared;  // 值 → Writer(发应答)。**服务的第一次应答不会丢**就靠这一行。
+    }
+  }
+
+  // 读侧取自己的一路订阅——各订阅者各得全量副本;写侧无句柄可取,直接调 AsyncWrite。
+  rx_ = transport_.AsyncRead()->shared();
+  // 本节点只 spawn 这一条 fiber。入站业务的消费 fiber 属宿主,由其自行 spawn 与 join。
   SpawnReadLoop();
-  // 设了 handler → spawn 单消费者 handler fiber(串行消费业务队列)。
-  if (config_.handler) {
-    handler_loop_.Spawn([this](Message&& msg) {
-      DdsHandlerContext ctx(this, handler_loop_.Token());
-      // 返回 Coro::Result<void> 仅记录:框架不据此自动应答(避 TBD-001)。逃逸异常由 HandlerLoop
-      // 边界兜住并归因 handler_exception(RT_HANDLER_006)。
-      (void)config_.handler(msg, ctx);
-    });
-  }
   return Coro::Result<void>{};
 }
 
 Coro::Result<void> DdsNode::DoClose() {
-  // 关闭汇合信号,**顺序即契约**(见 NodeBase::DoClose 文档):transport.RequestClose 一
-  // 执行读循环就可能被唤醒退出,余下信号必须在本段内发完,基类随后才放行收敛。
-  transport_->RequestClose();
-  handler_loop_.CancelAndClose();  // 业务队列 Close + handler 协作取消(同一顺序)。
-  // DDS 特有收敛信号(ADR-0005 D5):PendingTable.FailAll(kClosed) 令在途 Request 恰好一次
-  // 收敛。**外部 Close 与读循环致命错误自终共用本段**——故它是钩子而非 Close 的入参。
-  // 无 reactor(无连接),故无额外取消源。
-  pending_.FailAll(make_error_code(TransportErrc::kClosed));
+  // close 本节点这一路读订阅 → 读循环的 await 立即得到终止错误而退出。
+  // **close 是整流传播的**(AsyncTask 417790c 起):源读队列与同一条传输上的其它订阅者
+  // 一并终结。有意为之——节点关闭即读侧终结,宿主随后关传输。
+  if (rx_) {
+    rx_->close(make_error_code(TransportErrc::kClosed));
+    rx_->channel()->discard_pending();
+  }
+  // 关闭全部订阅信箱并置终止标记。一举两得:令在途 `RequestForResultDirect` 恰好终结
+  // 一次,同时**即入站订阅者的协作取消信号**(ADR-0009 D4)。
+  dispatcher_.CloseAll(make_error_code(TransportErrc::kClosed));
   return Coro::Result<void>{};
 }
 
-void DdsNode::JoinHandler() { handler_loop_.Join(); }
-
-std::size_t DdsNode::DrainUnstartedBusiness() {
-  return handler_loop_.DrainForClose();
+void DdsNode::DoJoin() {
+  // 让出式 join(FiberTask::get()):返回即意味着读循环已不再运行、不再触碰本对象。
+  // 这里 join 的是本节点**全部**的内部工作单元——只此一条。**不 join transport 的写线程**:
+  // 那是宿主的事,且它的最坏等待无上界,在 fiber 里 join 会阻塞整条线程。
+  if (read_task_) {
+    (void)read_task_->get();
+  }
 }
 
 void DdsNode::SpawnReadLoop() {
-  Coro::makeTask([this] {
-    // 取一次 read_queue 句柄,循环 await(ADR-0007 D4):不设 deadline、不接令牌
-    // ——循环级中断靠传输的 RequestClose 关队列。
-    auto rx = transport_->Read();
+  read_task_ = std::make_shared<Coro::FiberTask<void>>(Coro::makeTask([this] {
     while (true) {
-      Coro::Result<Datagram, std::error_code> datagram = Coro::await(rx);
+      Coro::Result<Datagram, std::error_code> datagram = Coro::await(rx_);
       if (!datagram) {
-        // 等待器给出终止错误 = read_queue 被 close 并携带终止原因 = 传输终结(唯一
-        // 终止语义,ADR-0004 D1 经 ADR-0007 D4 改写表达)→ 退出读循环。可继续的瞬时
-        // 错误由传输内部的泵就地消化,不出现在本句柄上。
+        // 两种成因:我方 Close 关了订阅,或传输终结关了源队列。二者都该让节点关闭。
         break;
       }
-      DecodeAndDispatch(std::move(datagram).value());  // 内联 decode + 分发。
+      DecodeAndDispatch(datagram.value());
     }
-    // 读循环兼任收敛者(ADR-0005 D1):走基类内部路径,不得调公开的 Close(会自等)。
-    ConvergeAfterReadLoop();
-  });
+    // 无条件调**公开的** Close():我方 Close 所致时是幂等空操作,传输终结所致时即自终。
+    (void)Close();
+  }));
 }
+
+void DdsNode::DecodeAndDispatch(const Datagram& datagram) {
+  const auto& bytes = datagram.bytes;
+  auto decoded = codec_->Decode(bytes.data(), bytes.size());
+  if (!decoded) {
+    // 坏样本 / codec 语义错误:丢弃,归因 kBadFrame。
+    TraceDrop(config_.trace_sink, DropReason::kBadFrame);
+    return;
+  }
+  // Decode 成功边界:一次 Decode 调用一条事件,不逐条消息重复。
+  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
+              static_cast<long>(bytes.size()));
+  for (auto& msg : decoded.value()) {
+    // **topic 不上线缆**(D5):它是 DDS 的寻址维度,入站只能由 `Datagram.peer` 带出。
+    // 这两个字段同时也是 `Dispatcher` 键的第一位,故这一行是分发能成立的前提。
+    msg.source = datagram.peer.topic;
+    msg.topic = datagram.peer.topic;
+    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, msg.source, {},
+                static_cast<long>(msg.payload.size()));
+    Dispatch(msg);
+  }
+}
+
+void DdsNode::Dispatch(const Message& msg) {
+  // **唯一投递路径**:交由 Dispatcher 按键投递,命中的订阅者各得一份副本(ADR-0009 D1)。
+  if (dispatcher_.Dispatch(msg) > 0) {
+    return;
+  }
+  // 无人认领的 `kReply`:迟到、乱序,或**别人的应答**——共用应答 topic 之下,同一服务的
+  // 每个客户端都会收到该服务的全部应答,自己那份只是其中之一(代价 8)。故这条归因在
+  // 客户端侧**本来就会很吵**,不代表异常;它仍归因,是因为"应答无人认领"在请求-响应侧
+  // 确实是需要看得见的一类事实。
+  if (msg.kind == MessageKind::kReply) {
+    TraceDrop(config_.trace_sink, DropReason::kUnmatchedOrLateResponse);
+    return;
+  }
+  // 其余为业务消息:**静默丢弃、不归因**(ADR-0009 D5)。订阅模型下"没人订阅"是宿主的
+  // 正常选择而非异常。
+}
+
+// ── 公开面:两种交互模式(D8)──────────────────────────────────────────
+
+Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
+  // **topic 传 `kAny` 时跳过校验**(D16):`kAny` 不对应任何一个具体 topic,拿它去查注册表
+  // 必然落空。这不是网开一面——它的作用域本就已由注册天然限定("已注册为 reader 的
+  // topic 的全部",而不是"本 domain 上的全部")。
+  if (topic.has_value()) {
+    const std::string& name = topic.value();
+    bool registered = false;
+    if (kind.has_value() && kind.value() == MessageKind::kNotify) {
+      registered = subscribers_.count(name) != 0;  // 发布-订阅的订阅侧。
+    } else if (kind.has_value() && kind.value() == MessageKind::kRequest) {
+      registered = services_.count(name) != 0;  // 请求-响应的服务端收请求。
+    } else {
+      // 其余 kind(含 kind 传 kAny):**至少**得在读侧集合内——不在读侧的 topic 其消息
+      // 根本不会到达本进程,订阅它必然是静默无效,正是 D16 要消灭的那种失败。
+      registered = IsReaderSideTopic(name);
+    }
+    if (!registered) {
+      return make_error_code(TransportErrc::kConfiguration);
+    }
+  }
+  // ★ **交出去的订阅其 corr 位恒为 `kAny`**(D6)——与 `RequestForResultDirect` 内部登记的
+  // 那一条(用具体 corr)恰成对照。`correlation_id` 不进公开接口。
+  return Coro::Result<Ticket>{
+      dispatcher_.Subscribe({std::move(topic), kAny, std::move(kind)})};
+}
+
+Coro::Result<void> DdsNode::Publish(const std::string& topic, Message msg) {
+  if (!IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);
+  }
+  // **调用序错误先于配置错误**:上面先判了生命周期,这里才判注册。
+  if (publishers_.count(topic) == 0) {
+    return make_error_code(TransportErrc::kConfiguration);  // 不猜、不回落、不懒补。
+  }
+  msg.kind = MessageKind::kNotify;
+  msg.topic = topic;
+  // D6 之后 `correlation_id` **只有框架生成的关联符一个来源**,发布路径上它没有第二种
+  // 用法("应用自定义子通道"已裁决为不需要);`reply_to` 同理——本调用不期待应答。
+  msg.correlation_id.clear();
+  msg.reply_to.clear();
+  return EncodeAndWrite(msg, topic);
+}
+
+Coro::Result<Message> DdsNode::RequestForResultDirect(const std::string& topic,
+                                                      Message req,
+                                                      RetryPolicy retry) {
+  if (!IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);
+  }
+  // 时限是在途交互唯一的兜底终结源(写出是 fire-and-forget),故不接受"零即永不超时";
+  // 次数含首发,少于一次意味着一帧都不发。
+  if (retry.max_attempts < 1 ||
+      retry.timeout <= std::chrono::milliseconds::zero()) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  // 应答 topic 从**已注册的 `Clients` 表**查:**查不到即 kConfiguration,不猜、不回落到
+  // 某个默认值**(D6)。这让"忘了注册"从一个静默无效变成一个显式错误。
+  const auto client = clients_.find(topic);
+  if (client == clients_.end()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  const std::string reply_topic = client->second;
+
+  const std::string correlation_id = NextCorrelationId();
+  req.kind = MessageKind::kRequest;
+  req.correlation_id = correlation_id;
+  // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15):两侧注册实参写歪时,不带它
+  // 这种偏差完全不可见,客户端只会一路超时、看起来像对端没响应。
+  req.reply_to = reply_topic;
+  req.topic = topic;
+
+  // **编码一次**,重发复用同一份字节(ADR-0010 D3:重发的是字节完全相同的原帧,
+  // `correlation_id` 不变,故订阅横跨全部重发继续有效)。
+  auto encoded = codec_->Encode(req);
+  if (!encoded) {
+    return encoded.error();
+  }
+  const std::vector<std::uint8_t> bytes = std::move(encoded).value();
+
+  // **先登记订阅、再发出**——这是 `Dispatcher` 用法的固有要求:反之则应答可能先于订阅
+  // 登记到达而被丢弃。
+  //
+  // ★ 这条登记的 corr 用的是**具体值**,不是 `kAny`。共用应答 topic 之所以能区分客户端,
+  //   全靠这一点:该 topic 上别人的应答带着别人的 corr,与本条不匹配,落到"无订阅者"
+  //   而被丢弃。若这里也用 `kAny`,本客户端会匹配上该 topic 上**所有人**的应答。
+  auto result = dispatcher_.Subscribe(
+      {reply_topic, correlation_id, MessageKind::kReply});
+
+  for (int attempt = 0; attempt < retry.max_attempts; ++attempt) {
+    if (auto queued = WriteEncoded(bytes, topic); !queued) {
+      return queued.error();  // 生命周期非法——不属超时,不重试。
+    }
+    auto got = result.Wait(retry.timeout);
+    if (got) {
+      return got;  // 首个到达者即终结本次交互,**不回应任何帧**(D7)。
+    }
+    if (got.error() != make_error_code(TransportErrc::kTimeout)) {
+      return got.error();  // kClosed 等终止原因直接透出,重试无意义。
+    }
+    // 超时 → 重发。**本模型恰恰要在等结果阶段重发**(D7):丢的不是网络(DDS 是
+    // RELIABLE 的),是我方或对端的**本地队列**——那一段 RELIABLE 覆盖不到。
+  }
+  // **耗尽返 kTimeout,不是 kNotAccepted**(D7 / ADR-0010 D12):后者的语义是"对端没有
+  // 受理",而本模型根本不存在受理这一步。
+  return make_error_code(TransportErrc::kTimeout);
+}
+
+Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
+  if (!IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);
+  }
+  // **应答 topic 从自己注册的 `Services` 表查,不取信于线缆、不建端点**(D15)。
+  const auto service = services_.find(request.topic);
+  if (service == services_.end()) {
+    return make_error_code(TransportErrc::kConfiguration);  // 我根本不服务这个 topic。
+  }
+  const std::string& reply_topic = service->second;
+  // 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的不等即报错。这 20 来个
+  // 字节买的是"两侧注册实参写歪"这一类部署错误的可诊断性。
+  if (!request.reply_to.empty() && request.reply_to != reply_topic) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  result.kind = MessageKind::kReply;
+  result.correlation_id = request.correlation_id;  // 关联符沿用请求那一份。
+  result.reply_to.clear();                         // 应答不再期待应答。
+  result.topic = reply_topic;
+  return EncodeAndWrite(result, reply_topic);
+}
+
+// ── 私有 ────────────────────────────────────────────────────────────────
 
 std::string DdsNode::NextCorrelationId() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  // 确定性可测:node_id 前缀 + 单调序号(不用随机数,RT_REQUEST)。node_id 集群内唯一
-  // 保证跨节点键不碰撞。
-  return config_.node_id + ":" + std::to_string(++correlation_counter_);
+  // 两段式(D6):uuid 保证**跨节点**不撞,自增半段保证**节点内**不撞。
+  // `uint32` 回绕(约 42.9 亿次请求后)**明确接受**——届时重复的是本节点很久以前用过的
+  // 值,那条订阅早已注销,`Dispatcher` 里已无对应登记,不会误配。
+  return uuid_ + "#" + std::to_string(request_seq_++);
 }
 
-Coro::Result<void> DdsNode::WriteFramed(Message msg, MessageKind kind, Endpoint dest) {
-  msg.kind = kind;
+bool DdsNode::IsReaderSideTopic(const std::string& topic) const {
+  // 读侧 = Subscribers ∪ Services 的键 ∪ Clients 的值(D16 的判据,与代价 9 的
+  // "reader 侧"逐字相同)。
+  if (subscribers_.count(topic) != 0 || services_.count(topic) != 0) {
+    return true;
+  }
+  for (const auto& entry : clients_) {
+    if (entry.second == topic) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Coro::Result<void> DdsNode::EncodeAndWrite(const Message& msg,
+                                            const std::string& topic) {
   auto encoded = codec_->Encode(msg);
   if (!encoded) {
     return encoded.error();
   }
-  SendUnit unit;
-  unit.bytes = std::move(encoded).value();
-  unit.destination = std::move(dest);
-  const std::size_t sent_bytes = unit.bytes.size();
-  auto written = transport_->Write(std::move(unit));
-  if (written) {
-    // Write 完成边界(P5-4):Request/Publish/Reply 共用本收口,不逐字节。
-    RecordEvent(kTraceCategorySend, config_.trace_sink, {}, {}, {}, {},
-                static_cast<long>(sent_bytes));
+  return WriteEncoded(std::move(encoded).value(), topic);
+}
+
+Coro::Result<void> DdsNode::WriteEncoded(std::vector<std::uint8_t> bytes,
+                                          const std::string& topic) {
+  const std::size_t sent_bytes = bytes.size();
+  // fire-and-forget:返回成功只表示"已入队",不表示已发出;写出的一切结果不回传,只落
+  // 传输的 `LastError()`。这里能拿到的错误只有生命周期非法一种。
+  //
+  // 目的地恒是 `Endpoint::Topic`——DDS 的寻址维度就是 topic,配置里也没有默认对端。
+  if (auto queued =
+          transport_.AsyncWrite(Datagram{std::move(bytes), Endpoint::Topic(topic)});
+      !queued) {
+    return queued;
   }
-  return written;
-}
-
-Coro::Result<Message> DdsNode::Request(Message req, Endpoint target,
-                                 OperationOptions options) {
-  if (!IsRunning()) {
-    // 未启动 / 关闭中 / 已关闭:一律 kClosed(PendingTable closed latch 亦兜底)。
-    return make_error_code(TransportErrc::kClosed);
-  }
-
-  // DDS 关联语义内联:生成 correlation_id,盖 reply_to=inbox(对端据此回送)。
-  const std::string correlation_id = NextCorrelationId();
-  req.correlation_id = correlation_id;
-  req.reply_to = config_.inbox_topic;
-
-  auto registration = pending_.Register(correlation_id);
-  if (!registration) {
-    return registration.error();  // 键重复 kInvalidState(几无) / closed kClosed 透传。
-  }
-  auto handle = std::move(registration).value();
-
-  // 盖 kind=kRequest、Encode、发往目标 topic。任一失败 handle 析构兜底摘除未终结 entry。
-  if (auto written = WriteFramed(std::move(req), MessageKind::kRequest,
-                                 std::move(target));
-      !written) {
-    return written.error();
-  }
-
-  // 等 inbox 上匹配 correlation_id 的唯一 kReply;终结(值/超时/取消/FailAll)后 handle
-  // 析构摘除 entry(关联清理)。
-  return handle.Wait(std::move(options));
-}
-
-Coro::Result<void> DdsNode::Publish(Message msg, Endpoint topic) {
-  if (!IsRunning()) {
-    return make_error_code(TransportErrc::kClosed);
-  }
-  // 单向 kNotify fire-and-forget:不登记 PendingTable。
-  return WriteFramed(std::move(msg), MessageKind::kNotify, std::move(topic));
-}
-
-void DdsNode::DecodeAndDispatch(Datagram datagram) {
-  const auto& bytes = datagram.bytes;
-  auto decoded = codec_->Decode(bytes.data(), bytes.size());
-  if (!decoded) {
-    // 坏 sample / codec 错误:丢弃。归因 kBadFrame(P5-3)。
-    std::lock_guard<std::mutex> lock(mutex_);
-    RecordDrop(DropReason::kBadFrame, bad_frame_count_, config_.trace_sink);
-    return;
-  }
-  // Decode 成功边界(P5-4):一次 Decode 调用一条事件,不逐条消息重复。
-  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
-              static_cast<long>(bytes.size()));
-  for (auto& msg : decoded.value()) {
-    // 引擎按来源 topic 填 source/topic(Message.hpp 约定:DDS 的 source 即来源 topic 名)。
-    msg.source = datagram.peer.topic;
-    msg.topic = datagram.peer.topic;
-    // Read 解出消息边界(P5-4):按解出的消息计,不逐字节。
-    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, msg.source, {},
-                static_cast<long>(msg.payload.size()));
-    Dispatch(std::move(msg));
-  }
-}
-
-void DdsNode::Dispatch(Message msg) {
-  // IsTerminal 内联锁死:kReply = 终结应答(请求-应答的应答)。
-  if (msg.kind == MessageKind::kReply) {
-    const std::string key = msg.correlation_id;
-    if (!pending_.Resolve(key, std::move(msg))) {
-      // RouteUnmatched 内联锁死:无匹配在途 Request(迟到 / 无匹配 correlation_id)→
-      // 归因丢弃,不误配。
-      std::lock_guard<std::mutex> lock(mutex_);
-      RecordDrop(DropReason::kUnmatchedOrLateResponse, unmatched_reply_count_,
-                config_.trace_sink);
-    }
-    return;
-  }
-  // 非 kReply 业务消息(kRequest/kNotify/kOneway/kFeedback 延后):设了 handler → 入有界
-  // 业务队列交单消费者串行处理;满则 tail-drop(business_queue_overflow),读循环不阻塞、
-  // 应答匹配照常。未设 handler → 归因 dropped_no_handler。
-  if (config_.handler) {
-    (void)handler_loop_.Enqueue(std::move(msg));  // 满 / 已 Close 均丢弃,不阻塞。
-    return;
-  }
-  std::lock_guard<std::mutex> lock(mutex_);
-  RecordDrop(DropReason::kNoHandlerConfigured, dropped_no_handler_count_,
-            config_.trace_sink);
-}
-
-std::size_t DdsNode::UnmatchedReplyCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return unmatched_reply_count_;
-}
-
-std::size_t DdsNode::DroppedNoHandlerCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return dropped_no_handler_count_;
-}
-
-std::size_t DdsNode::BusinessQueueOverflowCount() const {
-  return handler_loop_.BusinessQueueOverflowCount();  // HandlerLoop/队列自守其锁。
-}
-
-std::size_t DdsNode::HandlerExceptionCount() const {
-  return handler_loop_.HandlerExceptionCount();  // HandlerLoop 自守其锁。
-}
-
-std::size_t DdsNode::PendingCount() const { return pending_.Size(); }
-
-std::size_t DdsNode::BadFrameCount() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return bad_frame_count_;
-}
-
-DdsNode::Clock::duration DdsNode::LastRequestLatency() const {
-  return pending_.LastRequestLatency();
-}
-
-DdsNode::Clock::duration DdsNode::LastHandlerDuration() const {
-  return handler_loop_.LastHandlerDuration();  // HandlerLoop 自守其锁。
-}
-
-// —— DdsHandlerContext ————————————————————————————————————————————————————————
-
-Coro::Result<void> DdsHandlerContext::Reply(const Message& request, Message reply) {
-  // DDS 应答寻址内联:非请求 / 无回送 topic → 无从回送。
-  if (request.kind != MessageKind::kRequest || request.reply_to.empty()) {
-    return make_error_code(TransportErrc::kInvalidArgument);
-  }
-  reply.correlation_id = request.correlation_id;
-  return node_->WriteFramed(std::move(reply), MessageKind::kReply,
-                            Endpoint::Topic(request.reply_to));
-}
-
-Coro::Result<void> DdsHandlerContext::Publish(Message msg, Endpoint topic) {
-  return node_->Publish(std::move(msg), std::move(topic));
-}
-
-Coro::Result<void> DdsHandlerContext::RequestClose() {
-  // 只发汇合信号、不等待(ADR-0006 D8):当前即 handler 消费者 fiber,任何等待收敛的入口
-  // 都等于等自己退出。返回仅表示已受理;节点由读循环在汇合完成后收敛到 Closed(ADR-0005 D1)。
-  return node_->SignalClose();  // NodeBase 的受保护入口(本类是 DdsNode 的友元)。
+  RecordEvent(kTraceCategorySend, config_.trace_sink, {}, {}, topic, {},
+              static_cast<long>(sent_bytes));
+  return Coro::Result<void>{};
 }
 
 }  // namespace transport
