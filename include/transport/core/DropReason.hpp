@@ -16,11 +16,10 @@
 
 namespace transport {
 
-/// @brief 框架本地丢弃/重复抑制的命名归因原因(五项,穷尽 CONTEXT.md「丢弃归因」)。
+/// @brief 框架本地丢弃/重复抑制的命名归因原因(四项,穷尽 CONTEXT.md「丢弃归因」)。
 ///
 /// 每项恰好一个归属组件 + 一个定义时刻(ADR-0003 D13 Q3 可审计表):
 /// - `kBusinessQueueOverflow`   -> `BoundedQueue::Push` 满
-/// - `kDdsHandoffOverflow`      -> `DdsTransport` listener 交接满
 /// - `kBadFrame`                -> 各 node 读循环 `codec.Decode` 失败
 /// - `kUnmatchedOrLateResponse` -> 各 node `Dispatch` 的 `PendingTable::Resolve` 返回 false
 /// - `kCloseDrop`               -> `NodeBase` 收敛 drain
@@ -32,11 +31,15 @@ namespace transport {
 /// 原 `kNoHandlerConfigured`(各 node `Dispatch` 未设 handler)随 ADR-0009 **废止内建
 /// handler 通道**而移除:入站业务改由订阅承载,"未设 handler"这一产生时刻不复存在。
 ///
+/// 原 `kDdsHandoffOverflow`(`DdsTransport` listener 交接满)随 ADR-0013 **D11** 移除:
+/// DDS 的接收队列与 UDP/TCP/串口的接收队列同性质(同为「有界 + 静默丢最旧」,SDD
+/// DD-15),三介质都不为它单设归因项,DDS 亦不例外;其唯一产生点——那条独立的跨线程
+/// 交接队列——已随 ADR-0008 **D8** 一并消失。
+///
 /// `HandlerExceptionCount`(处理器执行失败)**不进本口径**——RT_HANDLER_006 是隔离当前
 /// 事件语义,不是帧/响应未投递。
 enum class DropReason {
   kBusinessQueueOverflow,
-  kDdsHandoffOverflow,
   kBadFrame,
   kUnmatchedOrLateResponse,
   kCloseDrop,
@@ -51,8 +54,6 @@ enum class DropReason {
   switch (reason) {
     case DropReason::kBusinessQueueOverflow:
       return "business-queue-overflow";
-    case DropReason::kDdsHandoffOverflow:
-      return "dds-handoff-overflow";
     case DropReason::kBadFrame:
       return "bad-frame";
     case DropReason::kUnmatchedOrLateResponse:
