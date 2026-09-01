@@ -16,8 +16,8 @@
 //      **服务的第一次应答不会丢**;
 //   4. 发布-订阅:`Publish` / `Subscribe(topic, kNotify)` 端到端;调用与注册的对应校验;
 //   5. `Subscribe` 返 **`Coro::Result<Ticket>`**(**D8**),topic 传 `kAny` 时**跳过**校验;
-//      相位:`Created` **放行**(注册 → 订阅 → 启动,不漏收启动初期消息),`Closing` /
-//      `Closed` 返 `kClosed`;
+//      相位:**只在 `Running` 放行**——`Created` 返 `kInvalidState`(与四个 `Register*` 恰
+//      成对称),`Closing` / `Closed` 返 `kClosed`;
 //   6. ⭐ 请求-响应(**D7**):单阶段、等结果时重发(**线缆上字节完全相同**)、耗尽返
 //      **kTimeout**、首个到达即成功且**不回任何帧**、策略非法返 kInvalidArgument;
 //   7. ⭐ corr 两段式(**D6**):`uuid_override` 可注入;**两个节点各自的 corr 不撞**;
@@ -1081,7 +1081,8 @@ TEST(DdsNode, CloseTerminatesInFlightRequestExactlyOnce) {
 // 关闭之后四个交互方法**一律在返回值上给出 kClosed**,且不因 topic 有没有注册而改口:
 // 调用序错误先于配置错误。
 //
-// `Subscribe` 的判据与另外三个不同(它放行 `Created`,见下一例),但**关闭一侧的答案相同**:
+// `Subscribe` 的判据与另外三个不同(未启动一侧它报 `kInvalidState`,见下一例),但**关闭
+// 一侧的答案相同**:
 // `kClosed` 由 `Subscribe` **返回**给出,不再推迟到第一次 `Wait`——`Dispatcher::CloseAll`
 // 之后"交出一张信箱已关闭的凭据"那条既定语义(Dispatcher.hpp)在本节点的公开面上够不着了。
 TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
@@ -1121,12 +1122,12 @@ TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
             make_error_code(TransportErrc::kClosed));
 }
 
-// `Subscribe` 放行 `Created`——**这是与另外三个交互方法有意分歧的那一点**。
+// `Subscribe` **只在 `Running` 受理**:`Created` 期订阅是**禁用法**,返 `kInvalidState`。
 //
-// 依据:DDS 的 `DataReader` 建于 `DoStart()`,`Start()` 之前一条消息也到不了本进程,故
-// 「注册 → 订阅 → `Start()`」是唯一在**结构上**不漏收启动初期消息的次序。本例走完这条
-// 次序并断言启动后的第一条消息确实收到了。
-TEST(DdsNode, SubscribeIsAcceptedBeforeStartAndReceivesEarlyMessages) {
+// 与四个 `Register*`(只在 `Created`)恰成对称——注册只在 `Created`、订阅只在 `Running`,
+// 两段互不重叠,各自用 `kInvalidState` 表达"相位不对"。相位判定**先于**注册校验:连
+// 已注册为 `Subscribers` 的 topic 在此相位也报 `kInvalidState`,而不是放行。
+TEST(DdsNode, SubscribeBeforeStartIsInvalidState) {
   Fixture fixture;
   Host host(fixture, "node-a");
   host.StartTransport();
@@ -1134,15 +1135,36 @@ TEST(DdsNode, SubscribeIsAcceptedBeforeStartAndReceivesEarlyMessages) {
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
 
-  // ★ 尚未 Start():订阅在此相位受理,注册校验照常生效。
-  auto early = node.Subscribe(std::string("loop"), MessageKind::kNotify);
-  ASSERT_TRUE(static_cast<bool>(early)) << early.error().message();
+  // ★ 尚未 Start():注册得再全也订阅不了。
+  EXPECT_EQ(node.Subscribe(std::string("loop"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kInvalidState));
+  // 未注册的 topic 也一样报 kInvalidState,不报 kConfiguration(相位先于配置)。
   EXPECT_EQ(node.Subscribe(std::string("unknown"), MessageKind::kNotify).error(),
-            make_error_code(TransportErrc::kConfiguration));
+            make_error_code(TransportErrc::kInvalidState));
+  // `kAny` 不例外:相位判定在 `kAny` 的跳过校验之前。
+  EXPECT_EQ(node.Subscribe(kAny, kAny).error(),
+            make_error_code(TransportErrc::kInvalidState));
+}
+
+// 推荐写法「注册 → `Start()` → 订阅」:`Start()` 之后订阅照常收得到消息。
+//
+// 这样不漏收启动初期的消息——`DataReader` 建于 `DoStart()`,而 DDS 发现约需 ~240ms,
+// `Start()` 返回后的头 ~240ms 对端还没 match,一条样本也到不了;紧挨着的两句(中间连一次
+// 让出都没有)离那个边界差着几个数量级。
+TEST(DdsNode, SubscribeRightAfterStartReceivesTheFirstMessage) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
 
   ASSERT_TRUE(static_cast<bool>(node.Start()));
+  auto ticket = node.Subscribe(std::string("loop"), MessageKind::kNotify);
+  ASSERT_TRUE(static_cast<bool>(ticket)) << ticket.error().message();
+
   auto seen = std::make_shared<std::vector<std::string>>();
-  Subscriber sub(std::move(early).value(),
+  Subscriber sub(std::move(ticket).value(),
                  [seen](const Message& msg) { seen->push_back(Text(msg)); });
   ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("first"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
@@ -1155,6 +1177,10 @@ TEST(DdsNode, SubscribeIsAcceptedBeforeStartAndReceivesEarlyMessages) {
 }
 
 // 从未 `Start()` 就 `Close()`:相位直落 `Closed`(NodeBase),`Subscribe` 随即返 `kClosed`。
+//
+// **与上面那条不重叠**:同为"没启动过"的节点,`Close()` 之前是 `Created` ⇒ `kInvalidState`
+// (调用序错误,补一句 `Start()` 就对了),之后是 `Closed` ⇒ `kClosed`(终态,再无补救)。
+// 两个错误码分别对应两件不同的事,本例钉住的是后一件。
 TEST(DdsNode, SubscribeReturnsClosedAfterCloseFromCreated) {
   Fixture fixture;
   Host host(fixture, "node-a");

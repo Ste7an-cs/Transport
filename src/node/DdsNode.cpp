@@ -309,21 +309,29 @@ void DdsNode::Dispatch(const Message& msg) {
 Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
   // **相位判定先于配置校验**,与另外三个交互方法同序(调用序错误先于配置错误)。
   //
-  // 但判据不是 `IsRunning()`:它把 `Created` 与 `Closed` 一并判否,而这两个相位在本方法上
-  // 的答案相反——
+  // 但判据不是 `IsRunning()`:它把 `Created` 与 `Closed` 一并判否,而这两个相位该报的错
+  // **不是同一个**——
   //
-  // - **`Created` 放行**:DDS 的 `DataReader` 是在 `DoStart()` 里建的,`Start()` 之前**没有
-  //   任何一条消息能到达本进程**。故"先登记订阅、再 `Start()`"是唯一在**结构上**零丢失的
-  //   次序;反之若逼宿主先 `Start()` 再订阅,不丢消息就只能靠"两句之间不让出"这条隐式的
-  //   调度约定——一旦中间有挂起点,启动初期的消息就被**静默丢弃**(ADR-0009 D5),正是
-  //   D16 要消灭的那种失败。登记面(四个 `Register*`)本就只在 `Created` 可用,订阅在此
-  //   相位可用与之同调:注册 → 订阅 → 启动。
+  // - **`Created` 返 `kInvalidState`**:还没 `Start()` 就订阅是**调用序错误**,与四个
+  //   `Register*` 在非 `Created` 相位返 `kInvalidState` 恰成对称——**注册只在 `Created`、
+  //   订阅只在 `Running`**,两段互不重叠,各自用 `kInvalidState` 表达"相位不对"。
+  //   这不是保守起见,而是因为放行 `Created` 有一处真实危害:`NodeBase::Close()` 从
+  //   `Created` 走时**不调 `DoClose()`**,`dispatcher_.CloseAll` 因此从不执行——宿主若在
+  //   此相位订阅并 spawn 了消费 fiber、随后放弃启动,那条 fiber 的信箱**永远等不到关闭
+  //   信号**,join 时挂住。
+  //   而它本要换来的"不漏收启动初期消息"是空的:`DataReader` 建于 `DoStart()`,**DDS 发现
+  //   约 240ms**,`Start()` 返回之后的头 ~240ms 对端根本还没 match,一条样本也到不了。
+  //   宿主得在 `Start()` 与 `Subscribe()` 之间干超过 240 毫秒的事才谈得上丢,而
+  //   `Start(); Subscribe();` 这样的正常写法离那个边界差着几个数量级。
   // - **`Closing` / `Closed` 返 `kClosed`**:此时 `DoClose()` 已 `CloseAll`,再登记只能得到
   //   一张信箱已关闭的凭据。让它**在返回处**就说清楚,而不是推迟到第一次 `Wait`——D8 把
   //   本方法从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的理由原样适用于相位。
-  if (const LifecycleState phase = CurrentLifecycle();
-      phase == LifecycleState::kClosing || phase == LifecycleState::kClosed) {
+  const LifecycleState phase = CurrentLifecycle();
+  if (phase == LifecycleState::kClosing || phase == LifecycleState::kClosed) {
     return make_error_code(TransportErrc::kClosed);
+  }
+  if (phase != LifecycleState::kRunning) {  // 即 `Created`:还没启动就订阅。
+    return make_error_code(TransportErrc::kInvalidState);
   }
   // **topic 传 `kAny` 时跳过校验**(D16):`kAny` 不对应任何一个具体 topic,拿它去查注册表
   // 必然落空。这不是网开一面——它的作用域本就已由注册天然限定("已注册为 reader 的
