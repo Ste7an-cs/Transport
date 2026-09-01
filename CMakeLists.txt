@@ -65,11 +65,12 @@ add_library(transport STATIC
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内。DdsTransport 与 provider 注册表随
-  # #203 的双队列重写回到编译面;**DdsNode 仍在面外**——它的注册接口 / Dispatcher 键 /
-  # 两段式 corr / 四个交互方法是 #204 的活。
+  # #203 的双队列重写回到编译面;DdsNode 随 #204 的整体重写(注册接口 / Dispatcher 键 /
+  # 两段式 corr / 四个交互方法)一并回来。DDS 至此整条链路都在面内。
   src/io/dds/FakeDdsProvider.cpp
   src/io/dds/DdsProviderRegistry.cpp
   src/io/dds/DdsTransport.cpp
+  src/node/DdsNode.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
