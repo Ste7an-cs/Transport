@@ -15,7 +15,8 @@
 //   3. ⭐ `read_queue_` 溢出(**D11**):有界 1024 + **静默丢最旧**,且 listener **从不阻塞**;
 //   4. 写侧(**D3**):`AsyncWrite` **入队即返**——provider 阻塞 400ms 也不拖住调用方;
 //   5. 写侧目的地:非 `kTopic` 的 `peer` **不回传错误**,只落 `LastError()`(kInvalidArgument);
-//   6. `Declare*` **幂等**(**D15**):重复声明 reader 不会重复投递;
+//   6. `Declare*` **幂等**(**D15**)且**都真落到 provider 上**(**D13** 补正):重复声明
+//      reader 不会重复投递、重复声明 writer 不会重复建端点,未声明的 topic 发不出去;
 //   7. `CurrentLinkState()` **三态**(**D9**):kDown / kEstablishing / kUp 逐条;
 //   8. ⭐ 关闭路径(「明确接受的代价」7):`Close()` **打不断**在途 `Publish`,
 //      `WaitClosed()` 得等它自己跑完——最坏等待由**那次回调多慢**决定,不是 max_blocking_time;
@@ -119,7 +120,10 @@ class Peer {
   Peer(const Peer&) = delete;
   Peer& operator=(const Peer&) = delete;
 
+  // 对端也是个守规矩的节点:先声明写侧端点再发(D13 补正后 provider 不再惰性建 writer,
+  // 未声明即发布返 kConfiguration)。`DeclareWriter` 幂等,故每次都调无妨。
   void Publish(const std::string& topic, const Bytes& bytes) {
+    EXPECT_TRUE(static_cast<bool>(provider_.DeclareWriter(topic)));
     EXPECT_TRUE(static_cast<bool>(provider_.Publish(topic, bytes)));
   }
 
@@ -152,6 +156,7 @@ class Peer {
 struct BlockingState {
   std::atomic<int> entered{0};    ///< 已进入 Publish 的次数。
   std::atomic<int> completed{0};  ///< **跑完**的次数(用来证明它没被截断)。
+  std::atomic<int> declared{0};   ///< `DeclareWriter` 到达 provider 的次数(D13 补正)。
   std::chrono::milliseconds delay{400};
 };
 
@@ -164,6 +169,10 @@ class BlockingPublishProvider : public IDdsProvider {
     return Coro::Result<void>{};
   }
   void Shutdown() override {}
+  Coro::Result<void> DeclareWriter(const std::string&) override {
+    state_->declared.fetch_add(1);
+    return Coro::Result<void>{};
+  }
   Coro::Result<void> Publish(const std::string&, const Bytes&) override {
     state_->entered.fetch_add(1);
     std::this_thread::sleep_for(state_->delay);  // 打不断的一段(同真实 write())。
@@ -494,6 +503,52 @@ TEST(DdsTransport, DeclareIsIdempotentAndValidatesTopicAndLifecycle) {
   EXPECT_EQ(transport->DeclareReader("t").error(),
             make_error_code(TransportErrc::kInvalidState));
   transport->WaitClosed();
+}
+
+// `DeclareWriter` **真的落到 provider 上**(D13 补正),不再只往集合里塞一个 topic;
+// 幂等由传输层的集合闩住,provider 只被打扰一次。
+TEST(DdsTransport, DeclareWriterReachesProviderOnceAndIsIdempotent) {
+  auto [config, state] = MakeBlockingConfig();
+  auto* raw_state = state.get();
+  DdsTransport transport(config);
+  ASSERT_TRUE(static_cast<bool>(transport.Start()));
+  EXPECT_EQ(raw_state->declared.load(), 0);  // Start 一个端点都不建(D15)。
+
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
+  EXPECT_EQ(raw_state->declared.load(), 1) << "DeclareWriter 没落到 provider 上";
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
+  EXPECT_EQ(raw_state->declared.load(), 1) << "重复声明又建了一次端点";
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("u")));
+  EXPECT_EQ(raw_state->declared.load(), 2);
+
+  (void)transport.Close();
+  transport.WaitClosed();
+}
+
+// 未声明的 topic 现在发不出去:provider 返 kConfiguration(**不惰性建 writer**)。
+// 这条错误按写侧契约**不回传**,只落 `LastError()`。
+TEST(DdsTransport, WriteToUndeclaredTopicIsConfigurationInLastErrorAndSendsNothing) {
+  Fixture fixture;
+  Peer peer(fixture);
+  peer.Watch("out");
+  auto transport = fixture.MakeTransport();
+  ASSERT_TRUE(static_cast<bool>(transport->Start()));
+
+  // 没声明就写:入队照样成功(AsyncWrite 只判生命周期与入队)。
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{1}, Endpoint::Topic("out")})));
+  ASSERT_TRUE(pumpFiberUntil([&] {
+    return transport->LastError() ==
+           make_error_code(TransportErrc::kConfiguration);
+  }));
+  EXPECT_EQ(peer.Count(), 0u) << "未声明的 topic 竟发出去了(writer 还在惰性建?)";
+
+  // 声明之后同一条链路照常发得出——丢的只是"没声明"的那一条。
+  ASSERT_TRUE(static_cast<bool>(transport->DeclareWriter("out")));
+  ASSERT_TRUE(static_cast<bool>(
+      transport->AsyncWrite(Datagram{{2}, Endpoint::Topic("out")})));
+  ASSERT_TRUE(pumpFiberUntil([&] { return peer.Count() == 1; }));
+  EXPECT_EQ(peer.Received().front(), (Bytes{2}));
 }
 
 // ── 7. CurrentLinkState 三态(D9)────────────────────────────────────────

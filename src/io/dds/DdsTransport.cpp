@@ -114,8 +114,9 @@ void DdsTransport::RunWriteThread() {
       SetLastError(make_error_code(TransportErrc::kInvalidArgument));
       continue;
     }
-    // 写出的一切结果(含 `RETCODE_TIMEOUT`)**不回传,只落 LastError()**——与三介质
-    // 逐字相同。代价:背压信号被丢弃,调用方无从知道"这条因对端消费不过来而没发出去"。
+    // 写出的一切结果(含 `RETCODE_TIMEOUT`、以及**未 `DeclareWriter` 的 topic** 那条
+    // `kConfiguration`)**不回传,只落 LastError()**——与三介质逐字相同。代价:背压信号
+    // 被丢弃,调用方无从知道"这条因对端消费不过来而没发出去"。
     if (auto published = provider_->Publish(item.peer.topic, item.bytes);
         !published) {
       SetLastError(published.error());
@@ -218,15 +219,24 @@ void DdsTransport::WaitClosed() {
 // 端点声明(D15)。两个方法**都幂等**:注册里可能重复(同一 topic 既是订阅项、又是某条
 // client 的应答 topic),幂等让调用方不必先去重。
 //
-// **一处已知缺口**:`IDdsProvider` 上没有与 `Subscribe` 对称的 writer 声明钩子(D13 明确
-// 不增删该接口),故 `DeclareWriter` 只登记意图,真正的 `DataWriter` 仍由 provider 在首次
-// `Publish` 时惰性建——D15「运行期无 DDS 端点创建」在**写侧尚未真正兑现**。
+// 两者都**落到 provider 上真正建出端点**,不只登记意图:`DeclareWriter` →
+// `IDdsProvider::DeclareWriter(topic)`(D13 补正),`DeclareReader` → `Subscribe(topic, cb)`。
+// 这正是 D15「运行期无 DDS 端点创建」成立的前提——约 240ms 的发现窗口在**这里**付掉,
+// 而不是压在首帧上(惰性建 writer 与「`Reply()` 才建」后果一样:首次应答会丢)。
 Coro::Result<void> DdsTransport::DeclareWriter(const std::string& topic) {
   if (lifecycle_ != LifecycleState::kRunning) {
     return make_error_code(TransportErrc::kInvalidState);
   }
   if (topic.empty()) {
     return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (declared_writers_.count(topic) != 0) {
+    return Coro::Result<void>{};  // 幂等:同 topic 重复声明直接成功。
+  }
+  auto declared = provider_->DeclareWriter(topic);
+  if (!declared) {
+    SetLastError(declared.error());
+    return declared.error();
   }
   declared_writers_.insert(topic);
   return Coro::Result<void>{};

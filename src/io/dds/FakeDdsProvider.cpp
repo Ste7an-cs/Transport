@@ -24,17 +24,35 @@ void FakeDdsProvider::Shutdown() {
   {
     std::lock_guard<std::mutex> lk(mine_m_);
     mine.swap(mine_);
+    declared_writers_.clear();  // 端点集合在这一刻整体拆除(D16)。
   }
   if (bus_)
     for (auto& kv : mine)
       for (auto id : kv.second) bus_->Remove(kv.first, id);
 }
 
+// 写侧端点声明(ADR-0013 D13 补正)。Fake 的总线上没有"端点"这种东西,故本方法只登记
+// 意图——但**判据与真实 provider 完全一致**:登记过的 topic 才发得出去,这样用例里的
+// 调用序错误在 Fake 上也会当场暴露,而不是等换到 Fast DDS 才发作。
+Coro::Result<void> FakeDdsProvider::DeclareWriter(const std::string& topic) {
+  // 未 Init(无总线)即声明:调用序错误 → kInvalidState(与 Subscribe 一致)。
+  if (!bus_) return make_error_code(TransportErrc::kInvalidState);
+  std::lock_guard<std::mutex> lk(mine_m_);
+  declared_writers_.insert(topic);  // 幂等:set 天然去重。
+  return Coro::Result<void>{};
+}
+
 Coro::Result<void> FakeDdsProvider::Publish(const std::string& topic,
                                       const std::vector<uint8_t>& bytes) {
   // 未 Init(无总线)即发布:调用序错误 → kInvalidState。
   if (!bus_) return make_error_code(TransportErrc::kInvalidState);
-  bus_->Dispatch(topic, bytes);
+  {
+    std::lock_guard<std::mutex> lk(mine_m_);
+    // 未声明即发布 → kConfiguration(**不惰性建**,同 FastDdsProvider)。
+    if (declared_writers_.count(topic) == 0)
+      return make_error_code(TransportErrc::kConfiguration);
+  }
+  bus_->Dispatch(topic, bytes);  // 锁外分发:回调可能反过来调本对象。
   return Coro::Result<void>{};
 }
 

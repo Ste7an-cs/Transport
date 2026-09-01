@@ -110,6 +110,23 @@ dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
   return t;
 }
 
+// 写侧端点声明(ADR-0013 D13 补正)。**`DataWriter` 就在这里建**,不再等第一次 Publish
+// ——这样约 240ms 的发现窗口在启动时付掉,首帧(尤其服务端的第一次应答)才不会丢。
+Coro::Result<void> FastDdsProvider::DeclareWriter(const std::string& topic) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  // 未 Init / 正在 Shutdown:调用序错误 → kInvalidState(与 Subscribe 一致)。
+  if (!participant_ || closing_) return make_error_code(TransportErrc::kInvalidState);
+  if (writers_.count(topic)) return Coro::Result<void>{};  // 幂等
+  dds::Topic* t = GetOrCreateTopic(topic);
+  if (!t) return make_error_code(TransportErrc::kIo);
+  dds::DataWriterQos wqos = dds::DATAWRITER_QOS_DEFAULT;
+  ApplyQos(config_.qos, &wqos, nullptr);
+  dds::DataWriter* writer = publisher_->create_datawriter(t, wqos, nullptr);
+  if (!writer) return make_error_code(TransportErrc::kIo);
+  writers_[topic] = writer;
+  return Coro::Result<void>{};
+}
+
 Coro::Result<void> FastDdsProvider::Publish(const std::string& topic,
                                       const std::vector<uint8_t>& bytes) {
   dds::DataWriter* writer = nullptr;
@@ -118,17 +135,10 @@ Coro::Result<void> FastDdsProvider::Publish(const std::string& topic,
     // 未 Init / 正在 Shutdown:调用序错误 → kInvalidState(与 FakeDdsProvider 一致)。
     if (!participant_ || closing_) return make_error_code(TransportErrc::kInvalidState);
     auto it = writers_.find(topic);
-    if (it != writers_.end()) {
-      writer = it->second;
-    } else {
-      dds::Topic* t = GetOrCreateTopic(topic);
-      if (!t) return make_error_code(TransportErrc::kIo);
-      dds::DataWriterQos wqos = dds::DATAWRITER_QOS_DEFAULT;
-      ApplyQos(config_.qos, &wqos, nullptr);
-      writer = publisher_->create_datawriter(t, wqos, nullptr);
-      if (!writer) return make_error_code(TransportErrc::kIo);
-      writers_[topic] = writer;
-    }
+    // **不惰性建**(D13 补正):没声明过就是配置/调用序的错,返 kConfiguration。惰性建
+    // 会让 DeclareWriter 形同虚设——首帧照样在 writer 刚建出、尚未 match 时发出去而丢掉。
+    if (it == writers_.end()) return make_error_code(TransportErrc::kConfiguration);
+    writer = it->second;
     // write() 在锁外跑(它会阻塞,不能占着锁),故须记在途数——Shutdown 得等它跑完
     // 才能删 writer,否则是 use-after-free。
     ++in_flight_;
