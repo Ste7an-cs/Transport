@@ -669,6 +669,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - **四个批量注册方法**（**D16**）：`RegisterPublishers` / `RegisterSubscribers` / `RegisterClients` / `RegisterServices`，**只在 `Created` 受理**（其后返 `kInvalidState`），累加 + 幂等去重 + **整批生效或整批不生效**；`Start()` 失败不清空注册表。
 - **四个交互方法**（**D8**）：`Subscribe`（返 `Coro::Result<Ticket>`）/ `Publish` / `RequestForResultDirect`（**单阶段**，等结果时重发，耗尽 `kTimeout`）/ `Reply`（查自己的 `Services` 表，`reply_to` 作一致性交叉校验）。
 - **关联**（**D6**）：`Dispatcher<Message, topic, correlation_id, kind>`；`correlation_id` 为两段式 `"<uuid>#<request_seq>"`。**`Subscribe` 交出的订阅其 `corr` 位恒 `kAny`，而 `RequestForResultDirect` 内部登记的那一条用【具体值】**——共用应答 topic 之所以能区分客户端全靠这一点。
+- **`Subscribe` 的相位**（**D8**，#214）：`Created` / `Running` **放行**，`Closing` / `Closed` 返 `kClosed`；判据用 `NodeBase::CurrentLifecycle()`（`IsRunning()` 分不出 `Created` 与 `Closed`）。**`Created` 放行是有意的**——DDS 的 `DataReader` 建于 `DoStart()`，`Start()` 前一条消息也到不了本进程，故「注册 → 订阅 → `Start()`」是唯一**结构性**零丢失的次序；只许 `Running` 订阅的话，零丢失就只剩一条隐式调度约定撑着。**连带缺口见 #217**（`NodeBase::Close()` 从 `Created` 走时不调 `DoClose()`，`Dispatcher::CloseAll` 不执行）。
 - **传输的所有权**（**D8**）：节点**借用** `DdsTransport&`，**启停归宿主**——`DdsTransport::WaitClosed()` join 的是专属 OS 线程且最坏等待无上界，节点在 `DoJoin()` 里调它就是阻塞整条 fiber 线程。故节点 `Start()` 前宿主须先启传输。
 - 无连接、无 reactor/重连——重连由传输内部透明完成（**DD-11/DD-12**）。
 

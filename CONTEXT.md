@@ -42,8 +42,19 @@
 - **NodeBase** —— 交互节点的生命周期基类(非模板),四个公开方法 + 三个钩子:`Start()` / `Close()`(**只发信号**) / `WaitClosed()`(join,无时限) / `IsRunning()`,协议特有实事由子类经 `DoStart()` / `DoClose()` / `DoJoin()` 提供。`ProtocolNode`/`DdsNode` **继承**它。
   `Close()` 不含等待点,故**任何 fiber 都可调用**(含节点自己的读循环与业务处理器)——旧形态的 `SignalClose()` / `ConvergeAfterReadLoop()` / `MarkRunning()` 与"内部工作单元不得调 Close"的使用契约一并作废(ADR-0008 D2)。取代原 `NodeRuntime`(ADR-0006 D1/D5 已拆除删除)。
 - **HandlerLoop** —— 入站业务处理的**可选**小件:单消费者 fiber + 一条 `Coro::Awaitable` 业务队列 + 协作取消令牌 + 逃逸异常隔离。由 node **直接持有**(未设处理器的节点没有它),故**不进** `NodeBase`。队列的容量语义即 `FiberChannel` 的语义——**满时静默丢弃队首最旧的事件**,无计数、无归因,字节上界不再存在(ADR-0008 D8;见 #152)。
-- **丢弃归因** —— 框架每一次本地丢弃/重复抑制都归因到**恰好一个命名的原因**(六项:业务队列溢出、DDS 交接溢出、坏帧、迟到/重复/无匹配响应、关闭丢弃、无处理器丢弃),经 `ITraceSink` 上报。
-  **[已回退]** ADR-0008 D10 删除了全部计数接口,归因只剩 trace 一条出口;"Σ 命名原因 == 总丢弃"的 loss=0 等式因此不再可直接验证,须改由 sink 侧统计重建(未实施,见 #152)。同轮 `BoundedQueue` 换成 `FiberChannel` 后,业务队列的丢弃**既无计数也无归因**。迟到/重复/坏帧属**过滤非丢失**。
+- **丢弃归因** —— 框架每一次本地丢弃/重复抑制都归因到**恰好一个命名的原因**,经 `ITraceSink` 上报。
+  **现为两项**(2026-09-01,#212):`kBadFrame`(读循环 `codec.Decode` 失败)与 `kUnmatchedOrLateResponse`(`Dispatch` 未匹配),各有两个产生点(`ProtocolNode` / `DdsNode`)。**迟到/重复/坏帧属过滤非丢失。**
+
+  **由六项收窄至两项的四次删除**——每一次都是**产生点在设计上被取消**,不是暂时无人使用:
+
+  | 归因项 | 删除依据 |
+  |---|---|
+  | 无处理器丢弃 `kNoHandlerConfigured` | ADR-0009 废止内建 handler 通道,入站业务改由订阅承载,"未设 handler"这一时刻不复存在 |
+  | DDS 交接溢出 `kDdsHandoffOverflow` | ADR-0013 **D11**:DDS 接收队列与三介质同性质,三介质都不为它单设归因项 |
+  | 业务队列溢出 `kBusinessQueueOverflow` | ADR-0008 **D8** 删 `BoundedQueue`、ADR-0009 把队列容量降为宿主契约;**且 `FiberChannel` 无 `size()`、丢弃静默,溢出本身不可观测——连"何时该 `RecordDrop`"这个时刻都取不到** |
+  | 关闭丢弃 `kCloseDrop` | 归属组件"`NodeBase` 收敛 drain"随 ADR-0008 **D2** 删除;`CloseAll(kClosed)` 让在途请求**恰好一次返终结错误**,那是**错误终结不是丢弃**(记成 drop 会与 SRS §3.1.6.3 打架) |
+
+  **[已回退]** ADR-0008 D10 删除了全部计数接口,归因只剩 trace 一条出口;"Σ 命名原因 == 总丢弃"的 loss=0 等式因此不再可直接验证。**该等式已不再追求**——#152 于 2026-08-28 裁决"**不加归因、不改容量策略**",有界队列的静默丢弃**明确接受为不可观测**。
 - **按键分配（Dispatcher）** —— **[target]** 协议无关的入站消息路由器 `Dispatcher<T, Fields...>`(`transport/core/Dispatcher.hpp`),取代原 `PendingTable` 与 `CorrelationKeyStrategy`。调用方只提供**键提取函数**(给出一条消息各匹配字段的具体值),订阅时不参与匹配的字段填 `kAny`。一条消息投给**全部**键匹配的订阅者、各得一份,故支持多消费者与旁路监听;单条消息成本 O(在用 mask 种数 + 收件人数),与订阅者总数无关。见 ADR-0008 D6。
 - **kAny（通配）** —— **[target]** 订阅模式中标注"该字段不参与匹配"的具名标记。以 `std::optional` 的持值状态表达,**不占用字段值域**——故 `session_id` 这类 0..255 全用满的字段同样可以通配。`kAny` 与"该字段须等于 0"是两种不同的约束。
 - **订阅凭据（Ticket）** —— **[target]** `Dispatcher::Subscribe()` 的返回值:持有一个信箱并在析构时注销该订阅。信箱为队列语义,同一凭据可多次 `Wait()`——一次交互需分段等待多条报文时,各段各自登记、各自设定时限。
