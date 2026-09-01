@@ -1,535 +1,862 @@
 // -----------------------------------------------------------------------------
-// dds_node_test.cpp — P4-5 DdsNode:pub-sub + 多路请求-应答(D10 复用实证)
+// dds_node_test.cpp — DdsNode 的注册接口 + 两种交互模式(ADR-0013 D5/D6/D7/D8/D12/D15/D16)。
+// 在 fiber 调度器(coro_test_main)内跑。
 //
-// 验收(issue #73 / RT_NODE_001/003/004/005 / RT_REQUEST / RT_IF_DDS / ADR-0003 D10/D12):
-//   · Request → 对端 kReply(correlation_id 一致、发到 reply_to inbox)→ 恰好一次完成、
-//     返 Message、关联清理(PendingCount 归零)。
-//   · Publish(kNotify)→ 订阅方 handler 收到(kind==kNotify)。
-//   · 多路:不同 topic 并发 Request 各自 correlation_id 匹配、互不串。
-//   · 迟到 / 无匹配 correlation_id 的 kReply → 归因丢弃(UnmatchedReplyCount)不误配。
-//   · Close 收敛:在途 Request kClosed、WaitClosed 完成。
+// 确定化手段与 dds_transport_test 相同:每个 fixture 生成一个唯一的 provider 注册名并绑
+// 一条独立的 Fake 总线,`--gtest_repeat` 多轮之间不串。节点之间**真的经传输 + codec +
+// 总线**通信——不打桩 transport,故请求-响应的每一条断言都是端到端的。
 //
-// 用 FakeDdsProvider(共享 Bus 模拟多 participant)作底层、真实 DdsCodec 作 codec、
-// DdsTransport 作传输。测试 fiber 用 pumpFiberUntil 驱动(coro_test_main 范式);被测
-// Request(await)用 makeTask 起独立 fiber。
+// 覆盖七组事实:
+//   1. 注册接口(**D16**):只在 Created 受理、批量累加、幂等去重、**整批生效或整批不生效**、
+//      `Start()` 失败**不清空注册表**;
+//   2. 注册期校验:空串 / 键值相同 / **唯一要拦的方向冲突**(Clients 键 ∩ Services 键);
+//      其余"同一 topic 既有 writer 又有 reader"的组合**不拦**;
+//   3. 启动(**D12**/**D15**):四组全空 → kConfiguration;端点在 `DoStart()` 一次性建出,
+//      **服务的第一次应答不会丢**;
+//   4. 发布-订阅:`Publish` / `Subscribe(topic, kNotify)` 端到端;调用与注册的对应校验;
+//   5. `Subscribe` 返 **`Coro::Result<Ticket>`**(**D8**),topic 传 `kAny` 时**跳过**校验;
+//   6. ⭐ 请求-响应(**D7**):单阶段、等结果时重发、耗尽返 **kTimeout**、不回应;
+//      corr 两段式且 `uuid_override` 可注入;**重发复用同一份字节**(corr 不变);
+//   7. ⭐ 共用应答 topic 靠**内部登记的具体 corr** 区分客户端(**D6** 那处承重的区别);
+//      `Reply` 查自己的 `Services` 表、`reply_to` 作一致性交叉校验(**D15**)。
+//
+// 第 6、7 组是本文件的核心。
 // -----------------------------------------------------------------------------
-
 #include "transport/node/DdsNode.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "await/awaitable.hpp"
+#include "coro_test_util.hpp"
 #include "task/fibertask.h"
-#include "transport/io/dds/DdsTransport.hpp"
+#include "transport/codec/DdsCodec.hpp"
 #include "transport/core/DropReason.hpp"
-#include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
-#include "transport/codec/DdsCodec.hpp"
-#include "transport/codec/ICodec.hpp"
+#include "transport/core/TraceCategories.hpp"
+#include "transport/io/dds/DdsConfig.hpp"
+#include "transport/io/dds/DdsProviderRegistry.hpp"
+#include "transport/io/dds/DdsTransport.hpp"
 #include "transport/io/dds/FakeDdsProvider.hpp"
-#include "coro_test_util.hpp"
+#include "transport/io/dds/IDdsProvider.hpp"
 
 using namespace std::chrono_literals;
 using testutil::pumpFiberUntil;
-using transport::CapturingTraceSink;
 using transport::DdsCodec;
 using transport::DdsConfig;
-using transport::DdsHandlerContext;
 using transport::DdsNode;
 using transport::DdsNodeConfig;
+using transport::DdsProviderRegistry;
 using transport::DdsTransport;
 using transport::DropReason;
 using transport::DropReasonName;
-using transport::Endpoint;
 using transport::FakeDdsProvider;
 using transport::ICodec;
+using transport::IDdsProvider;
+using transport::ITraceSink;
+using transport::kAny;
 using transport::Message;
 using transport::MessageKind;
-using transport::OperationOptions;
-using transport::Result;
+using transport::RetryPolicy;
+using transport::TraceEvent;
 using transport::TransportErrc;
 using transport::make_error_code;
 
 namespace {
 
-// 过滤出 category=="drop" 的记录:sink 同时收 P5-3 的丢弃事件与 P5-4 的 send/recv/
-// decode/handler/close 等事件(共用同一 trace_sink),按 category 过滤才是"这次丢弃
-// 恰好一条 Trace"断言的正确写法,不能假设 sink 总记录数等于丢弃数。
-std::vector<CapturingTraceSink::Record> DropRecords(
-    const std::vector<CapturingTraceSink::Record>& records) {
-  std::vector<CapturingTraceSink::Record> out;
-  for (const auto& rec : records) {
-    if (rec.category == "drop") {
-      out.push_back(rec);
-    }
-  }
-  return out;
+using Bytes = std::vector<std::uint8_t>;
+
+int NextFixtureId() {
+  static std::atomic<int> counter{0};
+  return ++counter;
 }
 
-DdsConfig Cfg() {
-  DdsConfig c;
-  c.domain_id = 0;
-  return c;
-}
-
-OperationOptions Deadline(std::chrono::milliseconds d) {
-  OperationOptions o;
-  o.deadline = OperationOptions::Clock::now() + d;
-  return o;
-}
-
-// 共享 Bus 的节点工厂;并保留一个独立发布方 provider(tx)用于注入裸帧。
-struct Cluster {
+/// 一条独立的 Fake 总线 + 一个只属于本用例的 provider 注册名。
+struct Fixture {
   std::shared_ptr<FakeDdsProvider::Bus> bus =
       std::make_shared<FakeDdsProvider::Bus>();
-  FakeDdsProvider tx{bus};
-  Cluster() { (void)tx.Init(Cfg()); }
+  std::string provider_name = "fake-node-bus-" + std::to_string(NextFixtureId());
 
-  std::unique_ptr<DdsNode> MakeNode(std::vector<std::string> topics,
-                                    DdsNodeConfig config) {
-    return MakeNodeWithCodec(std::move(topics), std::make_unique<DdsCodec>(),
-                             std::move(config));
+  Fixture() {
+    DdsProviderRegistry::RegisterProvider(provider_name, [bus = bus] {
+      return std::unique_ptr<IDdsProvider>(new FakeDdsProvider(bus));
+    });
   }
 
-  // 同 MakeNode,但允许注入自定义 codec(供 P5-3 kBadFrame 用例:恒 Decode 失败的双)。
-  std::unique_ptr<DdsNode> MakeNodeWithCodec(std::vector<std::string> topics,
-                                             std::unique_ptr<ICodec> codec,
-                                             DdsNodeConfig config) {
-    auto provider = std::make_unique<FakeDdsProvider>(bus);
-    auto transport = std::make_unique<DdsTransport>(std::move(provider), Cfg(),
-                                                    std::move(topics));
-    return std::make_unique<DdsNode>(std::move(transport), std::move(codec),
-                                     std::move(config));
-  }
-
-  // 直接向 topic 注入一条已编码帧(模拟对端 / 裸帧,用于迟到-无匹配路径)。
-  void InjectRaw(const std::string& topic, MessageKind kind,
-                 const std::string& correlation_id, const std::string& reply_to,
-                 std::vector<std::uint8_t> payload) {
-    Message m;
-    m.kind = kind;
-    m.correlation_id = correlation_id;
-    m.reply_to = reply_to;
-    m.payload = std::move(payload);
-    DdsCodec codec;
-    auto bytes = codec.Encode(m);
-    ASSERT_TRUE(static_cast<bool>(bytes));
-    ASSERT_TRUE(static_cast<bool>(tx.Publish(topic, bytes.value())));
+  [[nodiscard]] DdsConfig Cfg() const {
+    DdsConfig config;
+    config.provider = provider_name;
+    return config;
   }
 };
 
-// 回显 handler:对 kRequest 原样回送 payload 作 kReply。
-DdsNodeConfig EchoServerConfig(std::string inbox, std::string node_id) {
-  DdsNodeConfig c;
-  c.inbox_topic = std::move(inbox);
-  c.node_id = std::move(node_id);
-  c.handler = [](const Message& msg, DdsHandlerContext& ctx) -> Coro::Result<void> {
-    Message reply;
-    reply.payload = msg.payload;  // 回显。
-    return ctx.Reply(msg, std::move(reply));
-  };
-  return c;
-}
-
-// codec 双:Encode 委托真实 DdsCodec(Publish 仍可正常编码上线),Decode 恒返回
-// kCodec——供确定性触发 DecodeAndDispatch 的坏帧分支(P5-3 kBadFrame)。
-class AlwaysFailDecodeCodec : public ICodec {
+/// 只数事件的 Trace 出口:本类没有观测计数器,丢弃归因**只经 sink 一条出口**。
+class CountingSink : public ITraceSink {
  public:
-  Coro::Result<std::vector<std::uint8_t>> Encode(const Message& msg) override {
-    return real_.Encode(msg);
+  void OnTrace(const TraceEvent& ev) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ev.category == transport::kTraceCategoryDrop) {
+      ++drops_[std::string(ev.message)];
+    }
   }
-  Coro::Result<std::vector<Message>> Decode(const std::uint8_t*, std::size_t) override {
-    return make_error_code(TransportErrc::kCodec);
+  [[nodiscard]] std::size_t Drops(DropReason reason) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = drops_.find(std::string(DropReasonName(reason)));
+    return found == drops_.end() ? 0 : found->second;
   }
 
  private:
-  DdsCodec real_;
+  mutable std::mutex mutex_;
+  std::map<std::string, std::size_t> drops_;
 };
+
+/// 一个"节点 + 它借用的那条传输"的组合体。
+///
+/// **传输归宿主**(ADR-0009 / ADR-0013 D15 的连带):本件模拟宿主——它建传输、`Start()`
+/// 它,把引用交给节点,并在析构里**先收敛节点、再关传输**(顺序不能反:节点借着它)。
+class Host {
+ public:
+  explicit Host(const Fixture& fixture, std::string uuid = {},
+                ITraceSink* sink = nullptr)
+      : transport_(fixture.Cfg()) {
+    DdsNodeConfig config;
+    config.uuid_override = std::move(uuid);
+    config.trace_sink = sink;
+    node_ = std::make_unique<DdsNode>(transport_, std::make_unique<DdsCodec>(),
+                                      std::move(config));
+  }
+
+  ~Host() {
+    node_.reset();  // 节点先收敛(它只关自己那一路读订阅,不触碰传输的生命周期)。
+    (void)transport_.Close();
+    transport_.WaitClosed();
+  }
+
+  Host(const Host&) = delete;
+  Host& operator=(const Host&) = delete;
+
+  /// 宿主先把传输启起来——节点 `Start()` 里的 `Declare*` 只能落在已 `Init` 的 provider 上。
+  void StartTransport() {
+    ASSERT_TRUE(static_cast<bool>(transport_.Start()));
+  }
+
+  [[nodiscard]] DdsNode& node() { return *node_; }
+  [[nodiscard]] DdsTransport& transport() { return transport_; }
+
+ private:
+  DdsTransport transport_;
+  std::unique_ptr<DdsNode> node_;  ///< 后声明 ⇒ 先析构,恰是需要的顺序。
+};
+
+/// 订阅消费小件:一条**调用方自己的** fiber 顺序消费自己的信箱(ADR-0009 D2 的样板)。
+/// 串行、异常隔离与 join 全由调用方负责,节点不代管。
+class Subscriber {
+ public:
+  Subscriber(DdsNode::Ticket ticket, std::function<void(const Message&)> on_message)
+      : ticket_(std::move(ticket)), mailbox_(ticket_.mailbox()) {
+    task_ = std::make_shared<Coro::FiberTask<void>>(
+        Coro::makeTask([this, on_message = std::move(on_message)] {
+          for (;;) {
+            Coro::Result<Message, std::error_code> msg = Coro::await(mailbox_);
+            if (!msg) {
+              break;  // 信箱被关(节点 Close 或本件 Join)→ 退出。
+            }
+            on_message(msg.value());
+          }
+        }));
+  }
+
+  ~Subscriber() { Join(); }
+
+  Subscriber(const Subscriber&) = delete;
+  Subscriber& operator=(const Subscriber&) = delete;
+
+  void Join() {
+    if (!task_) {
+      return;
+    }
+    mailbox_->close(make_error_code(TransportErrc::kClosed));
+    (void)task_->get();  // 让出式 join:返回即消费 fiber 已退出。
+    task_.reset();
+  }
+
+ private:
+  DdsNode::Ticket ticket_;
+  std::shared_ptr<Coro::Awaitable<Message>> mailbox_;
+  std::shared_ptr<Coro::FiberTask<void>> task_;
+};
+
+/// 取一张订阅凭据并断言拿到了(`Subscribe` 返 Result,忘了注册会在这里当场炸)。
+DdsNode::Ticket MustSubscribe(DdsNode& node, DdsNode::TopicKey topic,
+                              DdsNode::KindKey kind) {
+  auto ticket = node.Subscribe(std::move(topic), std::move(kind));
+  EXPECT_TRUE(static_cast<bool>(ticket)) << ticket.error().message();
+  return std::move(ticket).value();
+}
+
+Message Payload(std::string text) {
+  Message msg;
+  msg.payload.assign(text.begin(), text.end());
+  return msg;
+}
+
+std::string Text(const Message& msg) {
+  return std::string(msg.payload.begin(), msg.payload.end());
+}
+
+constexpr auto kCaseTimeout = 300ms;
 
 }  // namespace
 
-// 验收①:Request → 对端 kReply(correlation 一致、回 reply_to)→ 恰好一次、返 Message、清理。
-TEST(DdsNode, RequestGetsMatchingReplyAndCleansUp) {
-  Cluster c;
-  auto server = c.MakeNode({"svc", "srv_inbox"}, EchoServerConfig("srv_inbox", "srv"));
-  DdsNodeConfig client_cfg;
-  client_cfg.inbox_topic = "cli_inbox";
-  client_cfg.node_id = "cli";
-  auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
-  ASSERT_TRUE(static_cast<bool>(server->Start()));
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
+// ── 1. 注册接口:相位、累加、幂等、整批生效(D16)───────────────────────
 
-  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto req = Coro::makeTask([&] {
-    Message m;
-    m.payload = {0x11, 0x22, 0x33};
-    outcome = client->Request(std::move(m), Endpoint::Topic("svc"), Deadline(3000ms));
-    done = true;
-  });
+TEST(DdsNode, RegistrationIsAcceptedOnlyInCreated) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
 
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  ASSERT_TRUE(static_cast<bool>(outcome)) << outcome.error().message();
-  EXPECT_EQ(outcome.value().kind, MessageKind::kReply);
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0x11, 0x22, 0x33}));
-  EXPECT_EQ(outcome.value().correlation_id, "cli:1");  // 确定性、单调。
-  EXPECT_EQ(client->PendingCount(), 0u);               // 关联清理。
+  // Created:四个方法都受理。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"pub"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"sub"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterServices({{"own", "own.reply"}})));
 
-  client->Close();
-  server->Close();
-  EXPECT_TRUE(req.get());
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // Running:一律 kInvalidState——端点集合"启动即定型、运行期恒定",本设计不引入运行期
+  // 动态端点。
+  EXPECT_EQ(node.RegisterPublishers({"late"}).error(),
+            make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(node.RegisterSubscribers({"late"}).error(),
+            make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(node.RegisterClients({{"late", "late.reply"}}).error(),
+            make_error_code(TransportErrc::kInvalidState));
+  EXPECT_EQ(node.RegisterServices({{"late", "late.reply"}}).error(),
+            make_error_code(TransportErrc::kInvalidState));
+
+  ASSERT_TRUE(static_cast<bool>(node.Close()));
+  node.WaitClosed();
+  // Closing / Closed 同理。
+  EXPECT_EQ(node.RegisterPublishers({"later"}).error(),
+            make_error_code(TransportErrc::kInvalidState));
 }
 
-// 验收②:Publish(kNotify)→ 订阅方 handler 收到(kind==kNotify)。
-TEST(DdsNode, PublishNotifyReachesSubscriberHandler) {
-  Cluster c;
-  Message received;
-  bool got = false;
-  DdsNodeConfig sub_cfg;
-  sub_cfg.inbox_topic = "sub_inbox";
-  sub_cfg.node_id = "sub";
-  sub_cfg.handler = [&](const Message& msg, DdsHandlerContext&) -> Coro::Result<void> {
-    received = msg;
-    got = true;
-    return Coro::Result<void>{};
-  };
-  auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
+TEST(DdsNode, RegistrationAccumulatesAcrossCallsAndDeduplicates) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
 
-  DdsNodeConfig pub_cfg;
-  pub_cfg.inbox_topic = "pub_inbox";
-  pub_cfg.node_id = "pub";
-  auto publisher = c.MakeNode({"pub_inbox"}, std::move(pub_cfg));
-  ASSERT_TRUE(static_cast<bool>(subscriber->Start()));
-  ASSERT_TRUE(static_cast<bool>(publisher->Start()));
+  // 多次调用**累加**;重复项**幂等去重**,不报错。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a", "b"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"b", "c"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
 
-  Message note;
-  note.payload = {0xAB, 0xCD};
-  bool sent = false;
-  auto pub = Coro::makeTask([&] {
-    (void)publisher->Publish(std::move(note), Endpoint::Topic("news"));
-    sent = true;
-  });
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return got; }));
-  EXPECT_EQ(received.kind, MessageKind::kNotify);
-  EXPECT_EQ(received.payload, (std::vector<std::uint8_t>{0xAB, 0xCD}));
-  EXPECT_EQ(received.topic, "news");  // 引擎按来源 topic 填。
-
-  publisher->Close();
-  subscriber->Close();
-  (void)pub.get();
-  (void)sent;
+  // 三个都注册上了才发得出去(未注册为 Publishers 返 kConfiguration)。
+  for (const char* topic : {"a", "b", "c"}) {
+    EXPECT_TRUE(static_cast<bool>(node.Publish(topic, Payload("x"))));
+  }
+  EXPECT_EQ(node.Publish("d", Payload("x")).error(),
+            make_error_code(TransportErrc::kConfiguration));
 }
 
-// 验收③:不同 topic 并发 Request 各自 correlation_id 匹配、互不串。
-TEST(DdsNode, MultiTopicConcurrentRequestsDoNotCrossTalk) {
-  Cluster c;
-  auto s1 = c.MakeNode({"svc1", "s1_inbox"}, EchoServerConfig("s1_inbox", "s1"));
-  auto s2 = c.MakeNode({"svc2", "s2_inbox"}, EchoServerConfig("s2_inbox", "s2"));
-  DdsNodeConfig client_cfg;
-  client_cfg.inbox_topic = "cli_inbox";
-  client_cfg.node_id = "cli";
-  auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
-  ASSERT_TRUE(static_cast<bool>(s1->Start()));
-  ASSERT_TRUE(static_cast<bool>(s2->Start()));
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
+TEST(DdsNode, InvalidItemRollsBackTheWholeBatch) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
 
-  Coro::Result<Message> o1{make_error_code(TransportErrc::kInternal)};
-  Coro::Result<Message> o2{make_error_code(TransportErrc::kInternal)};
-  bool d1 = false, d2 = false;
-  auto r1 = Coro::makeTask([&] {
-    Message m;
-    m.payload = {0xA1};
-    o1 = client->Request(std::move(m), Endpoint::Topic("svc1"), Deadline(3000ms));
-    d1 = true;
-  });
-  auto r2 = Coro::makeTask([&] {
-    Message m;
-    m.payload = {0xB2};
-    o2 = client->Request(std::move(m), Endpoint::Topic("svc2"), Deadline(3000ms));
-    d2 = true;
-  });
+  // 一批里只要有一项非法,**整批回滚、一项都不落**。
+  EXPECT_EQ(node.RegisterPublishers({"good", ""}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_EQ(node.RegisterSubscribers({"", "good"}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_EQ(node.RegisterClients({{"ok", "ok.reply"}, {"bad", "bad"}}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
 
-  ASSERT_TRUE(pumpFiberUntil([&] { return d1 && d2; }));
-  ASSERT_TRUE(static_cast<bool>(o1)) << o1.error().message();
-  ASSERT_TRUE(static_cast<bool>(o2)) << o2.error().message();
-  // 各自回显各自 payload —— 未串线。
-  EXPECT_EQ(o1.value().payload, (std::vector<std::uint8_t>{0xA1}));
-  EXPECT_EQ(o2.value().payload, (std::vector<std::uint8_t>{0xB2}));
-  EXPECT_NE(o1.value().correlation_id, o2.value().correlation_id);
-  EXPECT_EQ(client->PendingCount(), 0u);
-
-  client->Close();
-  s1->Close();
-  s2->Close();
-  EXPECT_TRUE(r1.get());
-  EXPECT_TRUE(r2.get());
+  // 三批都没落下任何一项 ⇒ 四组仍全空 ⇒ Start 返 kConfiguration(D12)。
+  EXPECT_EQ(node.Start().error(), make_error_code(TransportErrc::kConfiguration));
 }
 
-// 验收④:迟到 / 无匹配 correlation_id 的 kReply → 归因丢弃、不误配。
-TEST(DdsNode, LateOrUnmatchedReplyIsAttributedAndDropped) {
-  Cluster c;
-  DdsNodeConfig client_cfg;
-  client_cfg.inbox_topic = "cli_inbox";
-  client_cfg.node_id = "cli";
-  auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
+TEST(DdsNode, PairRegistrationRejectsSameKeyAndValue) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
 
-  // 无任何在途 Request:注入一条带陌生 correlation_id 的 kReply → 无匹配、归因丢弃。
-  c.InjectRaw("cli_inbox", MessageKind::kReply, "cli:999", "", {0xEE});
-  ASSERT_TRUE(pumpFiberUntil([&] { return client->UnmatchedReplyCount() == 1u; }));
-  EXPECT_EQ(client->UnmatchedReplyCount(), 1u);
-  EXPECT_EQ(client->PendingCount(), 0u);  // 未误建 / 误配任何 entry。
-
-  client->Close();
+  // 请求与应答同 topic 必然自收自答。
+  EXPECT_EQ(node.RegisterClients({{"t", "t"}}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_EQ(node.RegisterServices({{"t", "t"}}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  // 空串同样不收。
+  EXPECT_EQ(node.RegisterClients({{"", "r"}}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_EQ(node.RegisterServices({{"q", ""}}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
 }
 
-// 验收⑤:Close 收敛——在途 Request 得 kClosed、WaitClosed 完成。
-TEST(DdsNode, CloseConvergesInflightRequestWithClosed) {
-  Cluster c;
-  // 无对端应答:Request 永挂,直到 Close 的 FailAll(kClosed) 收敛。
-  DdsNodeConfig client_cfg;
-  client_cfg.inbox_topic = "cli_inbox";
-  client_cfg.node_id = "cli";
-  auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
+// ⭐ **唯一要拦的方向冲突**:同一 topic 既是 Clients 的键、又是 Services 的键——自己请求
+// 自己,且 corr 由自己生成、Dispatcher **会真的匹配上**,形成毫无察觉的自问自答。
+TEST(DdsNode, ClientKeyAndServiceKeyOnSameTopicIsRejectedBothOrders) {
+  Fixture fixture;
+  {
+    Host host(fixture);
+    host.StartTransport();
+    ASSERT_TRUE(static_cast<bool>(
+        host.node().RegisterServices({{"svc", "svc.reply"}})));
+    EXPECT_EQ(host.node().RegisterClients({{"svc", "svc.reply"}}).error(),
+              make_error_code(TransportErrc::kInvalidArgument));
+  }
+  {
+    Host host(fixture);  // 反过来注册,同样拦下——两侧各查对方的表。
+    host.StartTransport();
+    ASSERT_TRUE(static_cast<bool>(
+        host.node().RegisterClients({{"svc", "svc.reply"}})));
+    EXPECT_EQ(host.node().RegisterServices({{"svc", "svc.reply"}}).error(),
+              make_error_code(TransportErrc::kInvalidArgument));
+  }
+}
 
-  Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
-  bool done = false;
-  auto req = Coro::makeTask([&] {
-    Message m;
-    m.payload = {0x01};
-    outcome = client->Request(std::move(m), Endpoint::Topic("svc"), Deadline(5000ms));
-    done = true;
+// 其余"同一 topic 上既有 writer 又有 reader"的组合**不拦**:只造成自收白干、不会误配,
+// 且可能是调用方有意为之(本地回环自测)。
+TEST(DdsNode, OtherWriterReaderOverlapsAreNotRejected) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+
+  // Publishers ∩ Subscribers:本地回环自测,合法。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
+  // Publishers ∩ Clients 的值:往某应答 topic 发布、同时又是该服务的客户端,合法。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"svc", "loop"}})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // 回环自测确实通:发出去的通知自己收得到。
+  auto seen = std::make_shared<std::vector<std::string>>();
+  Subscriber sub(MustSubscribe(node, std::string("loop"), MessageKind::kNotify),
+                 [seen](const Message& msg) { seen->push_back(Text(msg)); });
+  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("echo"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
+  ASSERT_EQ(seen->size(), 1u);
+  EXPECT_EQ(seen->front(), "echo");
+}
+
+// ── 2. 启动:四组全空 → kConfiguration,且**失败不清空注册表**(D12/D16)──
+
+TEST(DdsNode, StartWithNoRegistrationIsConfigurationAndKeepsRegistry) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+
+  // 一个什么都不收不发的节点必是漏了注册。
+  auto empty = node.Start();
+  ASSERT_FALSE(static_cast<bool>(empty));
+  EXPECT_EQ(empty.error(), make_error_code(TransportErrc::kConfiguration));
+  EXPECT_FALSE(node.IsRunning());
+
+  // **停在 Created ⇒ 还能接着注册**——补上漏项再 Start 一次即可,不必把全部注册重做一遍。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"b"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  EXPECT_TRUE(node.IsRunning());
+  // 两批分别注册、跨调用累加,启动后都生效。
+  EXPECT_TRUE(static_cast<bool>(node.Publish("a", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(
+      node.Subscribe(std::string("b"), MessageKind::kNotify)));
+}
+
+// 传输还没 Running 就 Start 节点:`Declare*` 返 kInvalidState,本次启动失败并停在
+// Created;把传输启起来再 Start 一次即成——**注册表原样保留**,这正是 D16 要的形态。
+TEST(DdsNode, StartBeforeTransportIsRunningFailsThenSucceedsAfterRetry) {
+  Fixture fixture;
+  Host host(fixture);  // 故意**不** StartTransport()
+  DdsNode& node = host.node();
+
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a"})));
+  EXPECT_EQ(node.Start().error(), make_error_code(TransportErrc::kInvalidState));
+  EXPECT_FALSE(node.IsRunning());
+
+  host.StartTransport();
+  ASSERT_TRUE(static_cast<bool>(node.Start()));  // 注册表没被清掉,一次就成。
+  EXPECT_TRUE(node.IsRunning());
+  EXPECT_TRUE(static_cast<bool>(node.Publish("a", Payload("x"))));
+}
+
+// ── 3. 发布-订阅 + 调用与注册的对应校验(D16)──────────────────────────
+
+TEST(DdsNode, PublishAndSubscribeDeliverAcrossNodes) {
+  Fixture fixture;
+  Host publisher(fixture);
+  Host subscriber(fixture);
+  publisher.StartTransport();
+  subscriber.StartTransport();
+
+  ASSERT_TRUE(static_cast<bool>(publisher.node().RegisterPublishers({"news"})));
+  ASSERT_TRUE(static_cast<bool>(subscriber.node().RegisterSubscribers({"news"})));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(subscriber.node().Start()));
+
+  auto seen = std::make_shared<std::vector<std::string>>();
+  Subscriber sub(
+      MustSubscribe(subscriber.node(), std::string("news"), MessageKind::kNotify),
+      [seen](const Message& msg) { seen->push_back(Text(msg)); });
+
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("one"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("two"))));
+
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2; }));
+  ASSERT_EQ(seen->size(), 2u);
+  EXPECT_EQ((*seen)[0], "one");
+  EXPECT_EQ((*seen)[1], "two");
+}
+
+TEST(DdsNode, PublishRequiresPublisherRegistrationAndRunning) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"ok"})));
+
+  // 未启动:**调用序错误先于配置错误**——即便 topic 没注册也先报 kClosed。
+  EXPECT_EQ(node.Publish("ok", Payload("x")).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
+            make_error_code(TransportErrc::kClosed));
+
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  EXPECT_TRUE(static_cast<bool>(node.Publish("ok", Payload("x"))));
+  // **不猜、不回落、不懒补**:忘了注册是显式错误,不是静默无效。
+  EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  ASSERT_TRUE(static_cast<bool>(node.Close()));
+  EXPECT_EQ(node.Publish("ok", Payload("x")).error(),
+            make_error_code(TransportErrc::kClosed));
+  node.WaitClosed();
+}
+
+// ── 4. Subscribe 返 Result(D8);topic 传 kAny 跳过校验(D16)─────────────
+
+TEST(DdsNode, SubscribeReturnsConfigurationWhenTopicNotRegisteredForThatRole) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"news"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterServices({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"far", "far.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // 对应关系:kNotify → Subscribers;kRequest → Services 的键。
+  EXPECT_TRUE(static_cast<bool>(
+      node.Subscribe(std::string("news"), MessageKind::kNotify)));
+  EXPECT_TRUE(static_cast<bool>(
+      node.Subscribe(std::string("svc"), MessageKind::kRequest)));
+
+  // 角色不对 ⇒ kConfiguration。**错误码就是 kConfiguration**,而不是推迟到第一次 `Wait`
+  // 才冒出来的 kInvalidState——这正是"返 Result 而不是裸 Ticket"要拿到的东西(D8)。
+  EXPECT_EQ(node.Subscribe(std::string("svc"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kConfiguration));
+  EXPECT_EQ(node.Subscribe(std::string("news"), MessageKind::kRequest).error(),
+            make_error_code(TransportErrc::kConfiguration));
+  EXPECT_EQ(node.Subscribe(std::string("unknown"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  // topic 传 `kAny` ⇒ **跳过该校验**:kAny 不对应任何一个具体 topic,拿它查注册表必然落空。
+  EXPECT_TRUE(static_cast<bool>(node.Subscribe(kAny, MessageKind::kNotify)));
+  EXPECT_TRUE(static_cast<bool>(node.Subscribe(kAny, kAny)));
+
+  // 其余 kind + 具体 topic:至少得在读侧集合内(Subscribers ∪ Services 键 ∪ Clients 值)。
+  EXPECT_TRUE(static_cast<bool>(node.Subscribe(std::string("far.reply"), kAny)));
+  EXPECT_EQ(node.Subscribe(std::string("far"), kAny).error(),
+            make_error_code(TransportErrc::kConfiguration));
+}
+
+// `Subscribe(kAny, kNotify)` 的实际语义是「**已注册为 reader 的 topic 的全部**」,
+// 不是"本 domain 上的全部"——未注册的 topic 其消息根本不会到达本进程。
+TEST(DdsNode, SubscribeAnyTopicCoversOnlyRegisteredReaderTopics) {
+  Fixture fixture;
+  Host publisher(fixture);
+  Host subscriber(fixture);
+  publisher.StartTransport();
+  subscriber.StartTransport();
+
+  ASSERT_TRUE(static_cast<bool>(publisher.node().RegisterPublishers({"in", "out"})));
+  ASSERT_TRUE(static_cast<bool>(subscriber.node().RegisterSubscribers({"in"})));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(subscriber.node().Start()));
+
+  auto seen = std::make_shared<std::vector<std::string>>();
+  Subscriber sub(MustSubscribe(subscriber.node(), kAny, MessageKind::kNotify),
+                 [seen](const Message& msg) { seen->push_back(msg.topic); });
+
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("out", Payload("x"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("in", Payload("y"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return !seen->empty(); }));
+  // 只收得到 "in"——"out" 上本节点没建 reader,那条样本压根不进本进程。
+  EXPECT_EQ(seen->size(), 1u);
+  EXPECT_EQ(seen->front(), "in");
+}
+
+// ── 5. ⭐ 请求-响应:单阶段、corr 两段式、重发、耗尽 kTimeout(D6/D7)─────
+
+namespace {
+
+/// 一个跑在自己 fiber 上的服务端:收 `kRequest` → 调 `Reply` 回一条 `kReply`。
+/// `skip` 指定**前几条请求直接吞掉不回**,用来逼出客户端的重发。
+class Service {
+ public:
+  Service(DdsNode& node, const std::string& request_topic, int skip = 0)
+      : node_(node), skip_(skip) {
+    sub_ = std::make_unique<Subscriber>(
+        MustSubscribe(node, request_topic, MessageKind::kRequest),
+        [this](const Message& request) { OnRequest(request); });
+  }
+
+  void Join() { sub_->Join(); }
+
+  [[nodiscard]] std::vector<std::string> seen_correlations() const {
+    return seen_correlations_;
+  }
+  [[nodiscard]] int received() const { return received_; }
+
+ private:
+  void OnRequest(const Message& request) {
+    ++received_;
+    seen_correlations_.push_back(request.correlation_id);
+    if (received_ <= skip_) {
+      return;  // 吞掉:客户端会在 retry.timeout 之后重发。
+    }
+    // 回一条把请求 payload 原样带回来的应答,便于客户端断言"这份确实是给我的"。
+    (void)node_.Reply(request, Payload(Text(request)));
+  }
+
+  DdsNode& node_;
+  int skip_;
+  int received_ = 0;
+  std::vector<std::string> seen_correlations_;
+  std::unique_ptr<Subscriber> sub_;
+};
+
+/// 建一对"客户端 + 服务端"的注册:两侧**传一模一样的实参**,各自按角色建各自那一侧。
+void RegisterPair(DdsNode& client, DdsNode& service, const std::string& request_topic,
+                  const std::string& reply_topic) {
+  ASSERT_TRUE(static_cast<bool>(client.RegisterClients({{request_topic, reply_topic}})));
+  ASSERT_TRUE(static_cast<bool>(service.RegisterServices({{request_topic, reply_topic}})));
+}
+
+}  // namespace
+
+TEST(DdsNode, RequestForResultDirectRoundTripsAndStampsTwoPartCorrelationId) {
+  Fixture fixture;
+  Host client(fixture, "node-a");  // uuid_override:保住确定性可测。
+  Host server(fixture, "node-b");
+  client.StartTransport();
+  server.StartTransport();
+
+  RegisterPair(client.node(), server.node(), "svc", "svc.reply");
+  ASSERT_TRUE(static_cast<bool>(client.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc");
+
+  EXPECT_EQ(client.node().uuid(), "node-a");
+
+  auto first = client.node().RequestForResultDirect("svc", Payload("ping"),
+                                                    RetryPolicy{kCaseTimeout, 3});
+  ASSERT_TRUE(static_cast<bool>(first)) << first.error().message();
+  EXPECT_EQ(Text(first.value()), "ping");
+  EXPECT_EQ(first.value().kind, MessageKind::kReply);
+  EXPECT_EQ(first.value().topic, "svc.reply");  // 应答落在该服务的应答 topic 上。
+
+  auto second = client.node().RequestForResultDirect("svc", Payload("pong"),
+                                                     RetryPolicy{kCaseTimeout, 3});
+  ASSERT_TRUE(static_cast<bool>(second));
+  EXPECT_EQ(Text(second.value()), "pong");
+
+  // corr **两段式**:`<uuid>#<request_seq>`,request_seq 从 0 起、每请求一个。
+  const auto correlations = service.seen_correlations();
+  ASSERT_EQ(correlations.size(), 2u);
+  EXPECT_EQ(correlations[0], "node-a#0");
+  EXPECT_EQ(correlations[1], "node-a#1");
+  service.Join();
+}
+
+// 等结果阶段**就重发**(与 ProtocolNode::RequestForResult 恰好相反),且重发的是**字节
+// 完全相同的原帧**——corr 不变,故订阅横跨全部重发继续有效,最先到达者即终结。
+TEST(DdsNode, RetriesInTheResultPhaseReusingTheSameCorrelationId) {
+  Fixture fixture;
+  Host client(fixture, "node-a");
+  Host server(fixture, "node-b");
+  client.StartTransport();
+  server.StartTransport();
+
+  RegisterPair(client.node(), server.node(), "svc", "svc.reply");
+  ASSERT_TRUE(static_cast<bool>(client.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc", /*skip=*/2);  // 前两条吞掉。
+
+  auto got = client.node().RequestForResultDirect("svc", Payload("retry"),
+                                                  RetryPolicy{100ms, 5});
+  ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
+  EXPECT_EQ(Text(got.value()), "retry");
+
+  const auto correlations = service.seen_correlations();
+  ASSERT_GE(correlations.size(), 3u);
+  for (const auto& correlation : correlations) {
+    EXPECT_EQ(correlation, "node-a#0") << "重发换了 correlation_id";
+  }
+  service.Join();
+}
+
+TEST(DdsNode, RetryExhaustionReturnsTimeoutNotNotAccepted) {
+  Fixture fixture;
+  Host client(fixture, "node-a");
+  Host server(fixture, "node-b");
+  client.StartTransport();
+  server.StartTransport();
+
+  RegisterPair(client.node(), server.node(), "svc", "svc.reply");
+  ASSERT_TRUE(static_cast<bool>(client.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc", /*skip=*/100);  // 永不回应。
+
+  auto got = client.node().RequestForResultDirect("svc", Payload("void"),
+                                                  RetryPolicy{60ms, 3});
+  ASSERT_FALSE(static_cast<bool>(got));
+  // **kTimeout,不是 kNotAccepted**:后者的语义是"对端没有受理",而本模型根本不存在
+  // 受理这一步。
+  EXPECT_EQ(got.error(), make_error_code(TransportErrc::kTimeout));
+  EXPECT_EQ(service.received(), 3) << "总发送次数应为 max_attempts(含首发)";
+  service.Join();
+}
+
+TEST(DdsNode, RequestValidatesLifecycleRetryPolicyAndClientRegistration) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({{"svc", "svc.reply"}})));
+
+  // 未启动:kClosed(先于一切)。
+  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {kCaseTimeout, 1}).error(),
+            make_error_code(TransportErrc::kClosed));
+
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  // 策略非法:零时限(不接受"零即永不超时")与零次数(一帧都不发)。
+  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {0ms, 1}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {kCaseTimeout, 0}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+  // topic 未注册为 Clients 的键:**查不到即 kConfiguration,不猜、不回落**。
+  EXPECT_EQ(node.RequestForResultDirect("other", Payload("x"), {kCaseTimeout, 1}).error(),
+            make_error_code(TransportErrc::kConfiguration));
+}
+
+// ── 6. ⭐ 共用应答 topic 靠内部登记的**具体 corr** 区分客户端(D6)────────
+
+TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
+  Fixture fixture;
+  CountingSink sink_a;
+  CountingSink sink_b;
+  Host client_a(fixture, "node-a", &sink_a);
+  Host client_b(fixture, "node-b", &sink_b);
+  Host server(fixture, "node-s");
+  client_a.StartTransport();
+  client_b.StartTransport();
+  server.StartTransport();
+
+  // **同一个应答 topic,两个客户端共用**——这正是 D6 那句"每服务一个、全体客户端共用"。
+  ASSERT_TRUE(static_cast<bool>(
+      client_a.node().RegisterClients({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(
+      client_b.node().RegisterClients({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(
+      server.node().RegisterServices({{"svc", "svc.reply"}})));
+  ASSERT_TRUE(static_cast<bool>(client_a.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(client_b.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc");
+
+  // 两个客户端并发发请求,各自 payload 不同;应答把 payload 原样带回。
+  Coro::Result<Message> reply_a = make_error_code(TransportErrc::kInternal);
+  Coro::Result<Message> reply_b = make_error_code(TransportErrc::kInternal);
+  auto task_a = Coro::makeTask([&] {
+    reply_a = client_a.node().RequestForResultDirect("svc", Payload("from-a"),
+                                                     RetryPolicy{1000ms, 1});
   });
+  auto task_b = Coro::makeTask([&] {
+    reply_b = client_b.node().RequestForResultDirect("svc", Payload("from-b"),
+                                                     RetryPolicy{1000ms, 1});
+  });
+  (void)task_a.get();
+  (void)task_b.get();
 
-  // 等请求登记在途(已发送、正等应答)。
-  ASSERT_TRUE(pumpFiberUntil([&] { return client->PendingCount() == 1u; }));
-  EXPECT_FALSE(done);
+  ASSERT_TRUE(static_cast<bool>(reply_a)) << reply_a.error().message();
+  ASSERT_TRUE(static_cast<bool>(reply_b)) << reply_b.error().message();
+  // ★ 各拿各的。若内部登记的 corr 也用 kAny,这里就会串——A 会匹配上该 topic 上**所有人**
+  //   的应答,谁先到就是谁。
+  EXPECT_EQ(Text(reply_a.value()), "from-a");
+  EXPECT_EQ(Text(reply_b.value()), "from-b");
 
-  ASSERT_TRUE(static_cast<bool>(client->Close()));
-  ASSERT_TRUE(pumpFiberUntil([&] { return done; }));
-  EXPECT_FALSE(static_cast<bool>(outcome));
+  // **读入放大是明确接受的代价**(代价 8):别人的那份应答确实一路进到了本节点、被解码,
+  // 然后才在 Dispatcher 处因 corr 不匹配而落空 —— 这里就是它留下的唯一痕迹。
+  EXPECT_TRUE(pumpFiberUntil([&sink_a] {
+    return sink_a.Drops(DropReason::kUnmatchedOrLateResponse) >= 1;
+  }));
+  EXPECT_GE(sink_a.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
+  EXPECT_GE(sink_b.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
+  service.Join();
+}
+
+// ── 7. Reply:查自己的 Services 表 + reply_to 交叉校验(D15)──────────────
+
+TEST(DdsNode, ReplyLooksUpItsOwnServicesTableAndCrossChecksReplyTo) {
+  Fixture fixture;
+  Host server(fixture, "node-s");
+  server.StartTransport();
+  DdsNode& node = server.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterServices({{"svc", "svc.reply"}})));
+
+  Message request;
+  request.topic = "svc";
+  request.kind = MessageKind::kRequest;
+  request.correlation_id = "node-a#0";
+
+  // 未启动:kClosed。
+  EXPECT_EQ(node.Reply(request, Payload("r")).error(),
+            make_error_code(TransportErrc::kClosed));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // 本节点根本不服务这个 topic ⇒ kConfiguration。
+  Message foreign = request;
+  foreign.topic = "other";
+  EXPECT_EQ(node.Reply(foreign, Payload("r")).error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  // `reply_to` 为空:**不取信于线缆**,照样按自己注册的应答 topic 发得出去。
+  EXPECT_TRUE(static_cast<bool>(node.Reply(request, Payload("r"))));
+
+  // `reply_to` 与自己注册的一致:通过。
+  Message matching = request;
+  matching.reply_to = "svc.reply";
+  EXPECT_TRUE(static_cast<bool>(node.Reply(matching, Payload("r"))));
+
+  // ★ `reply_to` 非空且不等 ⇒ kInvalidArgument。两侧注册实参写歪时(客户端在
+  //   `svc.reply` 上等、服务端注册成别的往外发),**不带它这种偏差完全不可见**,客户端
+  //   只会一路超时、看起来像对端没响应。
+  Message skewed = request;
+  skewed.reply_to = "cfg.reply";
+  EXPECT_EQ(node.Reply(skewed, Payload("r")).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+}
+
+// 应答 topic 的 writer 早在 `DoStart()` 就建好了(D15/D13 补正),故**服务的第一次应答
+// 不会丢**。Fake provider 不惰性建 writer——未声明就 Publish 直接 kConfiguration,故这条
+// 断言在 Fake 上如实成立。
+TEST(DdsNode, FirstReplyIsNotLostBecauseWritersAreDeclaredAtStart) {
+  Fixture fixture;
+  Host client(fixture, "node-a");
+  Host server(fixture, "node-s");
+  client.StartTransport();
+  server.StartTransport();
+
+  RegisterPair(client.node(), server.node(), "svc", "svc.reply");
+  ASSERT_TRUE(static_cast<bool>(client.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc");
+
+  // 只发**一次**(max_attempts = 1):首答一旦丢,这条就直接 kTimeout。
+  auto got = client.node().RequestForResultDirect("svc", Payload("first"),
+                                                  RetryPolicy{1000ms, 1});
+  ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
+  EXPECT_EQ(Text(got.value()), "first");
+  EXPECT_FALSE(server.transport().LastError())
+      << "应答走了未声明的 writer:" << server.transport().LastError().message();
+  service.Join();
+}
+
+// ── 8. 生命周期:关闭令在途请求恰好终结一次 ─────────────────────────────
+
+TEST(DdsNode, CloseTerminatesInFlightRequestExactlyOnce) {
+  Fixture fixture;
+  Host client(fixture, "node-a");
+  Host server(fixture, "node-s");
+  client.StartTransport();
+  server.StartTransport();
+
+  RegisterPair(client.node(), server.node(), "svc", "svc.reply");
+  ASSERT_TRUE(static_cast<bool>(client.node().Start()));
+  ASSERT_TRUE(static_cast<bool>(server.node().Start()));
+  Service service(server.node(), "svc", /*skip=*/100);  // 永不回应。
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome = client.node().RequestForResultDirect("svc", Payload("x"),
+                                                   RetryPolicy{5000ms, 1});
+  });
+  EXPECT_TRUE(pumpFiberUntil([&service] { return service.received() >= 1; }));
+
+  ASSERT_TRUE(static_cast<bool>(client.node().Close()));
+  (void)caller.get();
+  ASSERT_FALSE(static_cast<bool>(outcome));
   EXPECT_EQ(outcome.error(), make_error_code(TransportErrc::kClosed));
-  EXPECT_TRUE(static_cast<bool>(client->WaitClosed(Deadline(2000ms))));
-  EXPECT_EQ(client->PendingCount(), 0u);
-  EXPECT_TRUE(req.get());
+  client.node().WaitClosed();
+  service.Join();
 }
 
-// 关闭 / 未启动后 Request/Publish 一律 kClosed(拒新交互)。
-TEST(DdsNode, RequestAndPublishRejectedWhenNotRunning) {
-  Cluster c;
-  DdsNodeConfig cfg;
-  cfg.inbox_topic = "cli_inbox";
-  cfg.node_id = "cli";
-  auto client = c.MakeNode({"cli_inbox"}, std::move(cfg));
+// 传输终结 ⇒ 节点自终(读循环退出时无条件调公开的 Close())。
+TEST(DdsNode, TransportTerminationClosesTheNode) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"t"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  EXPECT_TRUE(node.IsRunning());
 
-  // 未 Start:kClosed。
-  Message m;
-  m.payload = {0x01};
-  auto r0 = client->Request(std::move(m), Endpoint::Topic("svc"), Deadline(200ms));
-  EXPECT_EQ(r0.error(), make_error_code(TransportErrc::kClosed));
-
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
-  ASSERT_TRUE(static_cast<bool>(client->Close()));
-
-  // 已 Close:kClosed。
-  Message m2;
-  m2.payload = {0x02};
-  auto r1 = client->Request(std::move(m2), Endpoint::Topic("svc"), Deadline(200ms));
-  EXPECT_EQ(r1.error(), make_error_code(TransportErrc::kClosed));
-  Message m3;
-  auto r2 = client->Publish(std::move(m3), Endpoint::Topic("news"));
-  EXPECT_EQ(r2.error(), make_error_code(TransportErrc::kClosed));
+  ASSERT_TRUE(static_cast<bool>(host.transport().Close()));
+  EXPECT_TRUE(pumpFiberUntil([&node] { return !node.IsRunning(); }));
+  EXPECT_FALSE(node.IsRunning());
+  node.WaitClosed();
 }
 
-// 非法 config(inbox/node_id 空)→ Start 返 kConfiguration、停 Created 可改配重试。
-TEST(DdsNode, InvalidConfigRejectedAtStart) {
-  Cluster c;
-  DdsNodeConfig bad;  // inbox_topic / node_id 均空。
-  auto node = c.MakeNode({"t"}, bad);
-  auto r = node->Start();
-  EXPECT_EQ(r.error(), make_error_code(TransportErrc::kConfiguration));
-}
+// 坏样本归因 kBadFrame:codec 解不出来的字节被丢弃,读循环照常继续。
+TEST(DdsNode, UndecodableSampleIsDroppedAsBadFrame) {
+  Fixture fixture;
+  CountingSink sink;
+  Host host(fixture, {}, &sink);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"t"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
 
-// -----------------------------------------------------------------------------
-// P5-3(issue #88):全线接入丢弃归因——配 CapturingTraceSink 时,各丢弃点计数与可辨识
-// 的 TraceEvent(category="drop", message=DropReasonName)同步产生。
-// -----------------------------------------------------------------------------
+  // 直接往总线上灌一条 kind 判别符非法的样本(0xFF > kNotify)。
+  FakeDdsProvider peer(fixture.bus);
+  ASSERT_TRUE(static_cast<bool>(peer.Init(fixture.Cfg())));
+  ASSERT_TRUE(static_cast<bool>(peer.DeclareWriter("t")));
+  ASSERT_TRUE(static_cast<bool>(peer.Publish("t", Bytes{0xFF, 0, 0, 0, 0})));
 
-// kUnmatchedOrLateResponse(DdsNode 的 UnmatchedReplyCount):迟到/无匹配 kReply 归因
-// 丢弃时,配置 trace_sink → 收到对应事件。
-TEST(DdsNode, UnmatchedReplyWithSinkEmitsDropTrace) {
-  Cluster c;
-  CapturingTraceSink sink;
-  DdsNodeConfig client_cfg;
-  client_cfg.inbox_topic = "cli_inbox";
-  client_cfg.node_id = "cli";
-  client_cfg.trace_sink = &sink;
-  auto client = c.MakeNode({"cli_inbox"}, std::move(client_cfg));
-  ASSERT_TRUE(static_cast<bool>(client->Start()));
-
-  c.InjectRaw("cli_inbox", MessageKind::kReply, "cli:999", "", {0xEE});
-  ASSERT_TRUE(pumpFiberUntil([&] { return client->UnmatchedReplyCount() == 1u; }));
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message,
-           DropReasonName(DropReason::kUnmatchedOrLateResponse));
-
-  client->Close();
-}
-
-// kNoHandlerConfigured(DdsNode 的 DroppedNoHandlerCount):未设 handler 的入站业务消息
-// 归因丢弃时,配置 trace_sink → 收到对应事件。
-TEST(DdsNode, DroppedNoHandlerWithSinkEmitsDropTrace) {
-  Cluster c;
-  CapturingTraceSink sink;
-  DdsNodeConfig sub_cfg;
-  sub_cfg.inbox_topic = "sub_inbox";
-  sub_cfg.node_id = "sub";
-  sub_cfg.trace_sink = &sink;  // 未设 handler。
-  auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
-  ASSERT_TRUE(static_cast<bool>(subscriber->Start()));
-
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0xAB});
-  ASSERT_TRUE(pumpFiberUntil([&] { return subscriber->DroppedNoHandlerCount() == 1u; }));
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kNoHandlerConfigured));
-
-  subscriber->Close();
-}
-
-// kBadFrame:codec.Decode 失败时,新增 BadFrameCount() 归因 +1,配置 trace_sink → 收到
-// 对应事件。
-TEST(DdsNode, BadFrameDecodeFailureCountedAndTraced) {
-  Cluster c;
-  CapturingTraceSink sink;
-  DdsNodeConfig cfg;
-  cfg.inbox_topic = "cli_inbox";
-  cfg.node_id = "cli";
-  cfg.trace_sink = &sink;
-  auto node = c.MakeNodeWithCodec({"cli_inbox"}, std::make_unique<AlwaysFailDecodeCodec>(),
-                                  std::move(cfg));
-  ASSERT_TRUE(static_cast<bool>(node->Start()));
-
-  EXPECT_EQ(node->BadFrameCount(), 0u);
-  ASSERT_TRUE(static_cast<bool>(c.tx.Publish("cli_inbox", {0xDE, 0xAD})));
-
-  ASSERT_TRUE(pumpFiberUntil([&] { return node->BadFrameCount() == 1u; }));
-  EXPECT_EQ(node->BadFrameCount(), 1u);
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 1u);
-  EXPECT_EQ(records.front().category, "drop");
-  EXPECT_EQ(records.front().message, DropReasonName(DropReason::kBadFrame));
-
-  node->Close();
-}
-
-// kBusinessQueueOverflow(DdsNode 经 HandlerLoop 组合的业务队列):满 tail-drop 时,
-// 配置 trace_sink → 逐条 RecordDrop,计数与 Trace 条数同步。
-TEST(DdsNode, BusinessQueueOverflowWithSinkEmitsDropTrace) {
-  Cluster c;
-  CapturingTraceSink sink;
-  auto gate = std::make_shared<Coro::Awaitable<void>>();
-  int entered = 0;
-  DdsNodeConfig sub_cfg;
-  sub_cfg.inbox_topic = "sub_inbox";
-  sub_cfg.node_id = "sub";
-  sub_cfg.trace_sink = &sink;
-  sub_cfg.business_queue_max_events = 1;
-  sub_cfg.handler = [&](const Message&, DdsHandlerContext&) -> Coro::Result<void> {
-    ++entered;
-    Coro::await(gate);  // 卡住首条,让后续帧只入队不启动 → 可控溢出。
-    return Coro::Result<void>{};
-  };
-  auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
-  ASSERT_TRUE(static_cast<bool>(subscriber->Start()));
-
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x01});  // 被消费、卡住。
-  ASSERT_TRUE(pumpFiberUntil([&] { return entered == 1; }));
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x02});  // 入队(size 1 满)。
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x03});  // 满 → tail-drop。
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x04});  // 满 → tail-drop。
-
-  ASSERT_TRUE(
-      pumpFiberUntil([&] { return subscriber->BusinessQueueOverflowCount() == 2u; }));
-  EXPECT_EQ(subscriber->BusinessQueueOverflowCount(), 2u);
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 2u);
-  for (const auto& rec : records) {
-    EXPECT_EQ(rec.category, "drop");
-    EXPECT_EQ(rec.message, DropReasonName(DropReason::kBusinessQueueOverflow));
-  }
-
-  gate->resolve();
-  gate->close();
-  subscriber->Close();
-}
-
-// kCloseDrop(DdsNode 经 HandlerLoop 组合的业务队列 Close 批量归因):未启动的排队业务
-// → Close 时逐条 RecordDrop,配置 trace_sink → 收到对应事件。
-TEST(DdsNode, CloseDropWithSinkEmitsTraceEvents) {
-  Cluster c;
-  CapturingTraceSink sink;
-  auto gate = std::make_shared<Coro::Awaitable<void>>();
-  int entered = 0;
-  DdsNodeConfig sub_cfg;
-  sub_cfg.inbox_topic = "sub_inbox";
-  sub_cfg.node_id = "sub";
-  sub_cfg.trace_sink = &sink;
-  sub_cfg.handler = [&](const Message&, DdsHandlerContext& ctx) -> Coro::Result<void> {
-    ++entered;
-    ctx.cancellation().Wait();  // 卡住首条,让后续帧只入队不启动。
-    return Coro::Result<void>{};
-  };
-  auto subscriber = c.MakeNode({"news", "sub_inbox"}, std::move(sub_cfg));
-  ASSERT_TRUE(static_cast<bool>(subscriber->Start()));
-
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x01});  // 被消费、卡住。
-  ASSERT_TRUE(pumpFiberUntil([&] { return entered == 1; }));
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x02});  // 入队,未启动。
-  c.InjectRaw("news", MessageKind::kNotify, "", "", {0x03});  // 入队,未启动。
-  pumpFiberUntil([&] { return false; }, 40);
-
-  ASSERT_TRUE(static_cast<bool>(subscriber->Close()));
-  EXPECT_TRUE(static_cast<bool>(subscriber->WaitClosed()));
-  EXPECT_EQ(subscriber->CloseDropCount(), 2u);
-
-  const auto records = DropRecords(sink.Records());
-  ASSERT_EQ(records.size(), 2u);
-  for (const auto& rec : records) {
-    EXPECT_EQ(rec.category, "drop");
-    EXPECT_EQ(rec.message, DropReasonName(DropReason::kCloseDrop));
-  }
-}
-
-// RT_TRACE_002:未配置 trace_sink(默认 nullptr)时,坏帧计数行为不受影响。
-TEST(DdsNode, NoSinkConfiguredCountsUnaffected) {
-  Cluster c;
-  DdsNodeConfig cfg;
-  cfg.inbox_topic = "cli_inbox";
-  cfg.node_id = "cli";
-  auto node = c.MakeNodeWithCodec({"cli_inbox"}, std::make_unique<AlwaysFailDecodeCodec>(),
-                                  std::move(cfg));
-  ASSERT_TRUE(static_cast<bool>(node->Start()));  // trace_sink 缺省 nullptr。
-
-  ASSERT_TRUE(static_cast<bool>(c.tx.Publish("cli_inbox", {0xFF})));
-  ASSERT_TRUE(pumpFiberUntil([&] { return node->BadFrameCount() == 1u; }));
-  EXPECT_EQ(node->BadFrameCount(), 1u);
-
-  node->Close();
+  EXPECT_TRUE(pumpFiberUntil(
+      [&sink] { return sink.Drops(DropReason::kBadFrame) >= 1; }));
+  EXPECT_GE(sink.Drops(DropReason::kBadFrame), 1u);
+  peer.Shutdown();
 }

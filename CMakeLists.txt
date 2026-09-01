@@ -136,7 +136,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_transport_test.cpp
-    # —— tests/dds/dds_node_test.cpp 仍在面外:它测的 DdsNode 是 #204 的活。——
+    tests/dds/dds_node_test.cpp
   )
   # 真实 provider 的用例只在装了 Fast DDS 时编入(缺席时非 DDS 部分照常可测)。
   if(TRANSPORT_HAS_FASTDDS)
