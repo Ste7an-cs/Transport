@@ -1,8 +1,14 @@
 #pragma once
 
-// FastDdsProvider.hpp — IDdsProvider 的 Fast DDS 2.13 实现(pub-sub only)。
+// FastDdsProvider.hpp — IDdsProvider 的 Fast DDS 3.x 实现(pub-sub only)。
 // participant + RawBytes 类型注册 + topic→writer/reader 懒加载 + DdsQos 映射。
+//
+// 3.x 相对 2.13.x 的断裂(ADR-0013 D14):CMake 包名 fastrtps → fastdds;
+// eprosima::fastrtps::rtps → eprosima::fastdds::rtps;fastrtps/types/TypesBase.h
+// 已不存在(ReturnCode_t 移入 fastdds/dds/core/ReturnCode.hpp,且由 class 退化成
+// int32_t 的 typedef —— 见 .cpp 里 Publish 的返回值判定)。
 
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -30,10 +36,12 @@ class FastDdsProvider : public IDdsProvider {
 
   Coro::Result<void> Init(const DdsConfig& config) override;
   void         Shutdown() override;
+  /// **可阻塞**:RELIABLE 准入满时 park 调用线程至多一个 `max_blocking_time`(D13)。
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
   Coro::Result<void> Subscribe(const std::string& topic,
                          std::function<void(const std::vector<uint8_t>&)> cb) override;
   Coro::Result<void> Unsubscribe(const std::string& topic) override;
+  [[nodiscard]] DdsMatchedCount MatchedCount() const override;
   std::string Name() const override { return "fastdds"; }
 
  private:
@@ -46,7 +54,11 @@ class FastDdsProvider : public IDdsProvider {
   eprosima::fastdds::dds::Subscriber* subscriber_ = nullptr;
   eprosima::fastdds::dds::TypeSupport type_;
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
+  /// 在途 `Publish` 归零的信号:`write()` 在锁外阻塞,`Shutdown` 删 writer 前须等它。
+  std::condition_variable idle_cv_;
+  int  in_flight_ = 0;
+  bool closing_ = false;
   std::map<std::string, eprosima::fastdds::dds::Topic*> topics_;
   std::map<std::string, eprosima::fastdds::dds::DataWriter*> writers_;
   struct ReaderEntry {

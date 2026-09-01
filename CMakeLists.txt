@@ -64,20 +64,26 @@ add_library(transport STATIC
   src/io/serial/SerialTransport.cpp
   src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
+  # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内(DdsTransport / DdsNode 仍在面外,
+  # 它们的双队列重写是 #203 / #204)。
+  src/io/dds/FakeDdsProvider.cpp
 )
 target_include_directories(transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(transport PUBLIC cxx_std_17)
 target_link_libraries(transport PUBLIC asynctask Qt5::Core Qt5::Network Qt5::SerialPort Threads::Threads)
 
+# ---------------------------------------------------------------------------
+# Fast DDS(可选依赖 —— SRS RT_IF_DDS):找不到就**只**丢掉 FastDdsProvider,
+# 框架其余能力照常构建可用。3.x 起包名由 fastrtps 改为 fastdds(ADR-0013 D14)。
+# ---------------------------------------------------------------------------
 find_package(fastcdr QUIET)
-# redesign 分支:工程收窄到 UDP + ProtocolNode,DDS provider 一并排除。
-find_package(fastrtps QUIET)
-if(FALSE)  # redesign: 暂时禁用 FastDDS(DdsTransport 已排除)
+find_package(fastdds QUIET)
+if(fastdds_FOUND AND fastcdr_FOUND)
   set(TRANSPORT_HAS_FASTDDS ON)
-  message(STATUS "Fast DDS found: enabling FastDdsProvider")
+  message(STATUS "Fast DDS found (${fastdds_VERSION}): enabling FastDdsProvider")
   target_sources(transport PRIVATE src/io/dds/FastDdsRawType.cpp src/io/dds/FastDdsProvider.cpp)
-  target_link_libraries(transport PUBLIC fastrtps fastcdr)
+  target_link_libraries(transport PUBLIC fastdds fastcdr)
   target_compile_definitions(transport PUBLIC TRANSPORT_HAS_FASTDDS)
 else()
   set(TRANSPORT_HAS_FASTDDS OFF)
@@ -123,7 +129,16 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp
+    tests/dds/fake_dds_provider_test.cpp
+    # —— tests/dds/ 的其余三个用例仍在面外:它们测的 DdsTransport / DdsNode /
+    #    DdsProviderRegistry 是 #203 / #204 的活,本轮只到 provider 层。——
   )
+  # 真实 provider 的用例只在装了 Fast DDS 时编入(缺席时非 DDS 部分照常可测)。
+  if(TRANSPORT_HAS_FASTDDS)
+    target_sources(transport_tests PRIVATE tests/dds/fast_dds_provider_test.cpp)
+    # FastDdsProvider.hpp 不是公共头(在 src/ 下),用例须直接见到它。
+    target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  endif()
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   # 供 observability_test.cpp 的协议无关自审读取 core/ 头文件源码文本核验(而非硬编码 grep)。
