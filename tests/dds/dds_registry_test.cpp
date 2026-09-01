@@ -16,6 +16,9 @@ class StubProvider : public IDdsProvider {
  public:
   Coro::Result<void> Init(const DdsConfig&) override { return Coro::Result<void>{}; }
   void   Shutdown() override {}
+  Coro::Result<void> DeclareWriter(const std::string&) override {
+    return Coro::Result<void>{};
+  }
   Coro::Result<void> Publish(const std::string&, const std::vector<uint8_t>&) override {
     return Coro::Result<void>{};
   }

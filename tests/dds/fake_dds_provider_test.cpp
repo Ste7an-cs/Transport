@@ -21,6 +21,7 @@ TEST(FakeDdsProvider, SharedBusDeliversAcrossProviders) {
   std::vector<uint8_t> got;
   ASSERT_TRUE(static_cast<bool>(
       rx.Subscribe("t", [&](const std::vector<uint8_t>& b) { got = b; })));
+  ASSERT_TRUE(static_cast<bool>(tx.DeclareWriter("t")));
   ASSERT_TRUE(static_cast<bool>(tx.Publish("t", {1, 2, 3})));
   EXPECT_EQ(got, (std::vector<uint8_t>{1, 2, 3}));
 }
@@ -29,6 +30,7 @@ TEST(FakeDdsProvider, UnsubscribeStopsDelivery) {
   auto bus = std::make_shared<FakeDdsProvider::Bus>();
   FakeDdsProvider tx(bus), rx(bus);
   (void)tx.Init(Cfg(0)); (void)rx.Init(Cfg(0));
+  (void)tx.DeclareWriter("t");
   int count = 0;
   (void)rx.Subscribe("t", [&](const std::vector<uint8_t>&) { ++count; });
   (void)tx.Publish("t", {1});
@@ -36,6 +38,49 @@ TEST(FakeDdsProvider, UnsubscribeStopsDelivery) {
   (void)rx.Unsubscribe("t");
   (void)tx.Publish("t", {2});
   EXPECT_EQ(count, 1);  // 不再投递
+}
+
+// ADR-0013 D13 补正:写侧声明钩子。Fake 上没有真端点可建,但**判据与真实 provider 一致**
+// ——声明过才发得出去,这样调用序错误在 Fake 上就暴露,不必等换到 Fast DDS 才发作。
+TEST(FakeDdsProvider, DeclareWriterIsIdempotentAndGatesPublish) {
+  auto bus = std::make_shared<FakeDdsProvider::Bus>();
+  FakeDdsProvider tx(bus), rx(bus);
+  ASSERT_TRUE(static_cast<bool>(tx.Init(Cfg(0))));
+  ASSERT_TRUE(static_cast<bool>(rx.Init(Cfg(0))));
+
+  int count = 0;
+  ASSERT_TRUE(static_cast<bool>(
+      rx.Subscribe("t", [&](const std::vector<uint8_t>&) { ++count; })));
+
+  // 未声明即发布 → kConfiguration,且**一条都没发出去**(不惰性建 writer)。
+  auto undeclared = tx.Publish("t", {1});
+  ASSERT_FALSE(static_cast<bool>(undeclared));
+  EXPECT_EQ(undeclared.error(),
+            make_error_code(transport::TransportErrc::kConfiguration));
+  EXPECT_EQ(count, 0);
+
+  // 幂等:重复声明直接成功,且不会把一条样本投递两次。
+  ASSERT_TRUE(static_cast<bool>(tx.DeclareWriter("t")));
+  ASSERT_TRUE(static_cast<bool>(tx.DeclareWriter("t")));
+  ASSERT_TRUE(static_cast<bool>(tx.Publish("t", {1})));
+  EXPECT_EQ(count, 1);
+
+  // 声明只对该 topic 生效,不是一声明就全网开闸。
+  EXPECT_EQ(tx.Publish("other", {1}).error(),
+            make_error_code(transport::TransportErrc::kConfiguration));
+
+  // 端点集合在 Shutdown 时整体拆除(D16:没有单独撤销一个 writer 的时机)。
+  tx.Shutdown();
+  ASSERT_TRUE(static_cast<bool>(tx.Init(Cfg(0))));
+  EXPECT_EQ(tx.Publish("t", {1}).error(),
+            make_error_code(transport::TransportErrc::kConfiguration));
+}
+
+TEST(FakeDdsProvider, DeclareWriterBeforeInitIsInvalidState) {
+  FakeDdsProvider p;  // 未 Init:没接上总线。
+  auto r = p.DeclareWriter("t");
+  ASSERT_FALSE(static_cast<bool>(r));
+  EXPECT_EQ(r.error(), make_error_code(transport::TransportErrc::kInvalidState));
 }
 
 TEST(FakeDdsProvider, StaticBusIsolatesByDomain) {
@@ -50,6 +95,7 @@ TEST(FakeDdsProvider, StaticBusIsolatesByDomain) {
   } cleanup{{&tx, &rx_same, &rx_other}};
 
   (void)tx.Init(Cfg(7)); (void)rx_same.Init(Cfg(7)); (void)rx_other.Init(Cfg(8));
+  (void)tx.DeclareWriter("t");
   int same = 0, other = 0;
   (void)rx_same.Subscribe("t", [&](const std::vector<uint8_t>&) { ++same; });
   (void)rx_other.Subscribe("t", [&](const std::vector<uint8_t>&) { ++other; });

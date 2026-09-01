@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,13 @@ class FakeDdsProvider : public IDdsProvider {
 
   Coro::Result<void> Init(const DdsConfig& config) override;
   void         Shutdown() override;
+
+  /// @brief 记下该 topic 的写侧端点(幂等)。真实 provider 在这一步建 `DataWriter`;
+  ///        Fake 无端点可建,只登记——`Publish` 据此判"未声明"。未 `Init` 返 `kInvalidState`。
+  Coro::Result<void> DeclareWriter(const std::string& topic) override;
+
+  /// @brief 向 topic 同步分发。**该 topic 须已 `DeclareWriter`**,否则返 `kConfiguration`
+  ///        (**D13** 补正:不惰性建,两个实现一致)。
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
   Coro::Result<void> Subscribe(const std::string& topic, Sink cb) override;
   Coro::Result<void> Unsubscribe(const std::string& topic) override;
@@ -79,6 +87,9 @@ class FakeDdsProvider : public IDdsProvider {
   std::shared_ptr<Bus> bus_;
   mutable std::mutex mine_m_;
   std::map<std::string, std::vector<uint64_t>> mine_;  // 本 provider 的订阅 id
+  /// 已声明的写侧 topic(与 `mine_` 同锁)。`Shutdown()` 整体清掉——端点集合只在那一刻
+  /// 拆除,没有单独撤销一个 writer 的时机(**D16**,故不设 `UndeclareWriter`)。
+  std::set<std::string> declared_writers_;
 };
 
 }  // namespace transport

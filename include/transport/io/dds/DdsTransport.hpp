@@ -171,17 +171,18 @@ class DdsTransport final : public ITransport {
 
   // ── DDS 专有:端点声明(D15,在 ITransport 七方法之外)────────────────
 
-  /// @brief 声明本节点在该 topic 上**发**(建 `DataWriter` 的意图)。**幂等**。
+  /// @brief 声明本节点在该 topic 上**发**:落到 provider 就是 `DeclareWriter(topic)`,
+  ///        **当场建出 `DataWriter`**(**D13** 补正)。**幂等**。
   ///
   /// **只由外部在启动时调用**(`DdsNode::DoStart()`,**D15**):运行期不再有建端点的路径。
   /// **必须幂等**,因为注册里可能重复(同一 topic 既是订阅项、又是某条 client 的应答 topic)。
   ///
-  /// **一处已知缺口**:`IDdsProvider` 上**没有**与 `Subscribe` 对称的 writer 声明钩子
-  /// (**D13** 明确不增删该接口),故本方法只登记意图,真正的 `DataWriter` 仍由 provider
-  /// 在**首次 `Publish`** 时惰性创建——D15「运行期无 DDS 端点创建」在**写侧尚未真正兑现**,
-  /// 首帧仍可能吃一个发现窗口。读侧(`DeclareReader`)则是真建。
+  /// 与读侧对称、且同样是**真建端点**:约 240ms 的发现窗口在这里付掉,首帧(尤其服务端
+  /// 的第一次应答)不再赶在 `DataWriter` 刚建出、与对端 reader 尚未 match 时发出去而丢掉。
+  /// 未经本方法声明的 topic,写线程上的 `Publish` 会返 `kConfiguration` 并落到 `LastError()`。
   ///
-  /// @return 成功;topic 为空返 `kConfiguration`;未 `Start()` / 关闭中 / 已关闭返 `kInvalidState`。
+  /// @return 成功;topic 为空返 `kConfiguration`;未 `Start()` / 关闭中 / 已关闭返
+  ///         `kInvalidState`;provider 建 writer 失败原样返其错误。
   [[nodiscard]] Coro::Result<void> DeclareWriter(const std::string& topic);
 
   /// @brief 声明本节点在该 topic 上**收**:落到 provider 就是 `Subscribe(topic, cb)`。**幂等**。
