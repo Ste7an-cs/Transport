@@ -737,8 +737,12 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
 
   // **读入放大是明确接受的代价**(代价 8):别人的那份应答确实一路进到了本节点、被解码,
   // 然后才在 Dispatcher 处因 corr 不匹配而落空 —— 这里就是它留下的唯一痕迹。
-  EXPECT_TRUE(pumpFiberUntil([&sink_a] {
-    return sink_a.Drops(DropReason::kUnmatchedOrLateResponse) >= 1;
+  //
+  // 两个方向都要等:B 的应答先发出、A 那边先落空,而 A 的应答后发出——`task_b.get()` 一
+  // 返回只说明 B 收到了**自己**那份,别人那份还可能没走完 B 的读循环。故两个计数一起等。
+  EXPECT_TRUE(pumpFiberUntil([&sink_a, &sink_b] {
+    return sink_a.Drops(DropReason::kUnmatchedOrLateResponse) >= 1 &&
+           sink_b.Drops(DropReason::kUnmatchedOrLateResponse) >= 1;
   }));
   EXPECT_GE(sink_a.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
   EXPECT_GE(sink_b.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
