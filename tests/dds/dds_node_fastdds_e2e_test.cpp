@@ -147,7 +147,12 @@ TEST(DdsNodeFastDds, PublishSubscribeRoundTripOverRealDds) {
 }
 
 // 请求-响应:`RegisterClients` / `RegisterServices` → `RequestForResultDirect` →
-// 服务端 `Subscribe(topic, kRequest)` 收到 → `Reply` → 客户端拿到结果。
+// 服务端 `ServeRequests(服务名)` 收到 → `Reply` → 客户端拿到结果。
+//
+// ⭐ **两侧只说服务名 `"e2e.svc"` 这一个词**(**D6**,2026-09-02):两个 topic
+// (`cfg.e2e.svc.request` / `cfg.e2e.svc.response`)由框架按同一个派生函数算出,**在真实
+// Fast DDS 上真的建成了对得上的端点**——这是 Fake 抹不掉的那一层证据,因为真实 DDS 的
+// reader / writer 必须 topic 名逐字相同才 `matched`,派生若两侧算歪,这条用例只会超时。
 //
 // 这里**不等 kUp**,而是让 `RetryPolicy` 去吸收发现窗口——这正是 D7 那句"丢的不是网络,
 // 是队列……重发是对这一段的补救"在真实介质上的形态:首帧若抢在匹配之前发出就永久丢失,
@@ -158,16 +163,13 @@ TEST(DdsNodeFastDds, RequestResponseRoundTripOverRealDds) {
   client.StartTransport();
   server.StartTransport();
 
-  // 两侧**传一模一样的实参**,各自按角色建各自那一侧(**D16**)。
-  ASSERT_TRUE(static_cast<bool>(
-      client.node().RegisterClients({{"e2e.svc", "e2e.svc.reply"}})));
-  ASSERT_TRUE(static_cast<bool>(
-      server.node().RegisterServices({{"e2e.svc", "e2e.svc.reply"}})));
+  // 两侧**传一模一样的服务名**,各自按角色建各自那一侧(**D16**)。
+  ASSERT_TRUE(static_cast<bool>(client.node().RegisterClients({"e2e.svc"})));
+  ASSERT_TRUE(static_cast<bool>(server.node().RegisterServices({"e2e.svc"})));
   ASSERT_TRUE(static_cast<bool>(client.node().Start()));
   ASSERT_TRUE(static_cast<bool>(server.node().Start()));
 
-  auto ticket =
-      server.node().Subscribe(std::string("e2e.svc"), MessageKind::kRequest);
+  auto ticket = server.node().ServeRequests("e2e.svc");
   ASSERT_TRUE(static_cast<bool>(ticket)) << ticket.error().message();
   DdsNode::Ticket requests = std::move(ticket).value();
 
@@ -201,7 +203,8 @@ TEST(DdsNodeFastDds, RequestResponseRoundTripOverRealDds) {
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "echo:ping");
   EXPECT_EQ(got.value().kind, MessageKind::kReply);
-  EXPECT_EQ(got.value().topic, "e2e.svc.reply");
+  // ⭐ 应答落在**派生出的**应答 topic 上——服务名 `e2e.svc` → `cfg.e2e.svc.response`。
+  EXPECT_EQ(got.value().topic, "cfg.e2e.svc.response");
   // corr 两段式(**D6**):应答沿用请求那一份,故它必是本节点的 `<uuid>#0`。
   EXPECT_EQ(got.value().correlation_id, client.node().uuid() + "#0");
   EXPECT_GE(served, 1);
