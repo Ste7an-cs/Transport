@@ -118,16 +118,27 @@ Coro::Result<void> TcpTransport::Start() {
 //
 //   while (!closing) {
 //     connect_waiter = connectToHost;              ← 句柄存成员,供 Close 打断 (D15)
+//     if (closing) break;                          ← 【建完即复查】(D15 补正)
 //     if (await_for(connect_waiter, timeout)) {
 //       ++generation; socket_ready 先清后发;
 //       read_stream = readAll();                   ← 同样存成员 (D15)
-//       for(;;) { r = await_for(read_stream, timeout); if (r) push else break }
+//       while (!closing) { r = await_for(read_stream, timeout);  ← 同上,判据即复查
+//                          if (r) push else break }
 //     } else { 归因; await_for(close_signal, timeout) }   ← 退避
 //     abort()                                      ← 每轮末尾无条件清理,不是打断手段
 //   }
 //
 // **重连不是独立机制**:它就是本 while 转第二圈;首连与重连走同一段代码,不作区分。
 // 三处的 timeout 是**同一个量**(D5):等连上 / 多久没数据算链路坏 / 多久重试一次。
+//
+// ★ **两处「建完即复查」是不变式,不是防御性冗余**(D15 补正,#200)。循环顶部的判据与
+//   等待器的创建之间**不是原子的**:`await_for(connect_waiter_, ...)` 是一个真实的挂起点,
+//   泵可能在那里被"连上"唤醒(runnable)却尚未被调度,而 `Close()` 恰在此间跑完——它置了
+//   kClosing、也 `close()` 了两个句柄,但那一刻 `read_stream_` 还是 null,**它关不到未来
+//   才出现的句柄**。此后泵接着往下跑、建出一个**没有任何人会唤醒**的读流,挂满一个
+//   `silence_timeout`(实测 3011ms),而读队列只在泵退出循环后才关。
+//   **`corosocket::readAll()` 的出生守卫救不了这一格**:它只在 socket 处于
+//   `UnconnectedState` 时当场关流,而此处 socket 刚刚**连上**。
 void TcpTransport::RunSocketPump() {
   const std::chrono::milliseconds timeout = config_.silence_timeout;
 
@@ -137,6 +148,14 @@ void TcpTransport::RunSocketPump() {
     // 窗口内唤不醒任何等待(D15)。
     connect_waiter_ = Coro::coro(socket_).connectToHost(
         QString::fromStdString(config_.host), config_.port);
+    // 【建完即复查】(D15 补正):已 kClosing 说明 `Close()` 在本行之前跑完、关的是一个
+    // 当时还是 null 的 `connect_waiter_`。**就地终结,不进 await**;轮末的两个清理动作
+    // 在此原样补做,故 socket 仍回到确定状态。
+    if (lifecycle_ >= LifecycleState::kClosing) {
+      connect_waiter_.reset();
+      socket_->abort();
+      break;
+    }
     auto connected = Coro::await_for(connect_waiter_, timeout);
     if (connected) {
       ++generation_;  // 纯内部记账(D9/D12):不驱动任何控制流。
@@ -150,7 +169,11 @@ void TcpTransport::RunSocketPump() {
       // 每代重建读流(旧流已随上一轮 abort 死掉);建流时会 drain 订阅前已到的字节。
       // 同样**存成成员**供 Close 打断(D15)。
       read_stream_ = Coro::coro(socket_).readAll();
-      for (;;) {
+      // 【建完即复查】(D15 补正,#200):**本循环的判据就是那次复查**——它在第一次
+      // `await_for` 之前求值,故"`Close()` 已跑完、关的是一个当时还是 null 的
+      // `read_stream_`"这一格在此当场终结,**不进 await**。判据每轮复查还顺带覆盖了
+      // "推完一片切片才轮到我被调度、而 `Close()` 在其间跑完"的同形窗口。
+      while (lifecycle_ < LifecycleState::kClosing) {
         auto chunk = Coro::await_for(read_stream_, timeout);
         if (!chunk) {
           // 三条成因**不作区分**,一律 break 回外层重连:
@@ -305,6 +328,10 @@ Coro::Result<void> TcpTransport::AsyncWrite(Datagram datagram) {
 // 不发 errorOccurred,而 corosocket 的 waitForSignal / readAll 都靠 socket error 或
 // disconnected 终结——实测 abort() 两处都唤不醒、挂满整个超时,持句柄 close() 则 1ms 内
 // 双双唤醒。UDP 没有"连接中"这个窗口,故其 `socket_->close()` 打断读流有效,**不可照搬**。
+//
+// ★ ②③ 只能关到**此刻已经存在**的句柄。"泵在本函数跑完之后才建出来的那一个"由泵侧的
+//   **两处「建完即复查」**接住(D15 补正,#200),见 `RunSocketPump()`——两边合起来才是
+//   完整的不变式,**Close() 一侧单独看是对的、也仍然不够**。
 Coro::Result<void> TcpTransport::Close() {
   if (lifecycle_ >= LifecycleState::kClosing) {
     return Coro::Result<void>{};  // 幂等。

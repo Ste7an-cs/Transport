@@ -221,10 +221,10 @@ void SerialTransport::AbsorbDeviceError() {
 //     if (已打开 || Open()) {
 //       device_ready 先清后发;
 //       read_stream = readAll();                  ← 存成员,供 Close 打断 (D6)
-//       for(;;) { r = await_for(read_stream, timeout);
-//                 if (!r) { 归因; break }
-//                 if (r->isEmpty()) continue      ← 【D5:串口独有的一行】
-//                 push(切片) }
+//       while (!closing) { r = await_for(read_stream, timeout);  ← 判据即「建完即复查」
+//                          if (!r) { 归因; break }
+//                          if (r->isEmpty()) continue      ← 【D5:串口独有的一行】
+//                          push(切片) }
 //     } else { await_for(close_signal, timeout) }  ← 退避
 //     port->close()                                ← 每轮末尾无条件清理
 //   }
@@ -232,6 +232,15 @@ void SerialTransport::AbsorbDeviceError() {
 // **重开不是独立机制**:它就是本 while 转第二圈;首开与重开走同一段代码,不作区分。
 // 两处的 timeout 是**同一个量**(D3):多久没数据算链路坏 / 多久试一次 open。**比 TCP
 // 少一处用途**——`open()` 同步,没有"等连上"。
+//
+// ★ **「建完即复查」**(ADR-0011 D15 补正,#200):`Close()` 只关得到它跑的那一刻**已经
+//   存在**的句柄;泵之后才建出的读流没有任何人会唤醒,会挂满一个 `silence_timeout`。
+//   TCP 上这一格是**实证可达**的(它在建读流之前多一个真实挂起点:等连上)。串口**未
+//   复现**——`Open()` 同步,循环顶部判据到建流之间没有挂起点,窗口目前是空的。但句柄形态
+//   与 TCP 同构,且这里**更没有兜底**:`coroiodevice::readAll()` 连出生守卫都没有
+//   (`coroudpsocket::receiveDatagram()` 有"socket 已 Unconnected 就当场关流"那一条,UDP
+//   因此结构免疫),窗口一旦被打开就是挂满超时。故照同一条不变式加固,判据由 `for(;;)`
+//   改为复查 `lifecycle_`。
 void SerialTransport::RunDevicePump() {
   const std::chrono::milliseconds timeout = config_.silence_timeout;
 
@@ -250,7 +259,10 @@ void SerialTransport::RunDevicePump() {
       // 返回 `shared_ptr` 不同),故此处自行装箱——句柄要持为成员供 `Close()` 打断(D6)。
       read_stream_ = std::make_shared<Coro::Awaitable<QByteArray>>(
           Coro::coro(static_cast<QIODevice*>(port_)).readAll());
-      for (;;) {
+      // 【建完即复查】(ADR-0011 D15 补正,#200):**本循环的判据就是那次复查**——它在第
+      // 一次 `await_for` 之前求值,故"`Close()` 已跑完、关的是一个当时还是 null 的
+      // `read_stream_`"这一格当场终结,**不进 await**。
+      while (lifecycle_ < LifecycleState::kClosing) {
         auto chunk = Coro::await_for(read_stream_, timeout);
         if (!chunk) {
           // 三条成因**不作区分**,一律 break 回外层重开:
