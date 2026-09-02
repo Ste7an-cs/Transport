@@ -360,7 +360,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 |---|---|---|---|
 | 外层动作 | `bind` —— 同步瞬时 | `connectToHost` —— **异步**，等待用同一个量 | `open` —— **同步**，故**无"等连上"这一处** |
 | 判活主判据 | `silence_timeout`（**唯一**） | **对端断开事件**（主）+ 静默超时（辅） | `silence_timeout`（**唯一**，**反转回 UDP 形态**） |
-| 空切片 | 不会出现 | 不会出现（`corosocket` 判空） | **必须显式跳过，且【不重置静默计时】**（`coroiodevice` **不判空**；见 DD-16 注） |
+| 空切片 | 不会出现 | 不会出现（`corosocket` 判空） | **必须显式跳过**（`coroiodevice` **不判空**） |
 
 **时间量比 TCP 少一处用途**：串口的 `silence_timeout` 只承担**读静默判活**与**重开退避**两处（TCP 是三处，多一个"等连上"）——因为 `open()` 同步。这一点上串口回到 **UDP 的形态**。
 
@@ -709,8 +709,6 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 > **三处"照抄样板就会漏"的串口独有点**（ADR-0012）：
 > 1. **跳空切片**（**D5**）——`coroiodevice::readAll()` 的 `readyRead` 处理器是 `ch->push(dev->readAll())`，**无 `bytesAvailable()` 判断、无 `isEmpty()` 守卫**；其初次 drain 处**有**该检查，`corosocket::readAll()` 两处都有。**这是 `coroiodevice` 独有的结构性缺口**，UDP/TCP 都不需要这一行。
->    **⚠ 不能写成裸 `continue`**（ADR-0012 **D5**，2026-09-02 裁决 #196）：裸 `continue` 会重新进入 `await_for(read_stream_, timeout)`、**静默超时的计时随之重置**。若出现空切片风暴（`readyRead` 连续携零字节），读泵**永远等不到静默超时** → **D4 的"唯一主动判据"失效、拔线不重开**，同时忙循环烧 CPU——**一条防御性的 `continue` 架空了唯一的判活判据**。
->    **处置**：记住本轮 deadline，`await_for` 用**剩余**时限而非整个 `timeout`；只有**非空**数据才给 deadline 续期。这是 **D4** 的语义细化（"多久没收到**非空**数据"），**不是新增旋钮**——`silence_timeout` 仍是唯一的时间量（**D3**）。
 >    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
 > 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
