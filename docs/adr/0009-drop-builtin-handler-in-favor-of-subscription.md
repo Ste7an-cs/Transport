@@ -23,6 +23,22 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
 - **D1（废止节点内置 handler 通道）：** 删除 `ProtocolNode::Config::handler`、`HandlerContext` 与 `ProtocolNode::handler_loop_`（`HandlerLoop<Event>` 类本身因 `DdsNode` 仍在用而暂留，见 D2 删除时机）。入站业务帧一律经 `Subscribe(Key)` 交付：宿主按 `FrameType` 等字段显式订阅自己关心的帧，在**自己的 fiber** 上消费。
   `Dispatch()` 因此只剩**一条投递路径**（按键投给全部匹配的订阅者），删去尾部"无匹配业务帧 → `handler_loop_.Enqueue`"及其兜底的 `kNoHandlerConfigured` 归因。**保留**终结帧（`kResponse`/`kResult`）无人认领时的 `kUnmatchedOrLateResponse` 归因——该分支属请求-响应侧，与 handler 无关。
 
+- **D1′（补正，2026-09-02）：`Subscribe` 返 `Coro::Result<Ticket>`，并判生命周期相位。** 本 ADR 初版让 `ProtocolNode::Subscribe` 返**裸 `Ticket`**——**没有错误通道**。这带来两处后果，均已实证：
+
+  **① 拦不住 `Created` 期订阅，而那条路径会静默挂死宿主（#217）。** `NodeBase::Close()` 从 `Created` 走时**直接落 `kClosed`、不调 `DoClose()`**（`NodeBase.cpp:57-64`），`Dispatcher::CloseAll` 因此**从不执行**——而"信箱被关"是本 ADR **D4** 给订阅者定的**唯一**协作取消信号。宿主若照 **D2** 的样板在 `Created` 期订阅并 spawn 消费 fiber、随后放弃启动（`Start()` 失败或直接 `Close()`），`Coro::await(ticket.mailbox())` **永远等不到唤醒**，末尾那句 `task.get()` **挂死**。
+  **不是悬垂**（`Ticket` 持 `weak_ptr`，内存安全），是**唤醒信号永远不发**——静默挂起，不崩溃，排查代价高。**D2 的文档示例本身就是这个形状**，触发条件并不苛刻。
+
+  **② 错误只能推迟到首次等待才暴露。** 裸 `Ticket` 表达不了任何拒绝理由，空凭据的 `Wait` 返的是 `kInvalidState`——**错误码不对，且推迟一步**。ADR-0013 **D8** 为同一理由把 `DdsNode::Subscribe` 定为 `Coro::Result<Ticket>`；本决策与之对齐。
+
+  ```cpp
+  // 改后（与 DdsNode::Subscribe 齐平）
+  [[nodiscard]] Coro::Result<MessageDispatcher::Ticket> Subscribe(MessageDispatcher::Key key);
+  ```
+
+  **相位规则与 ADR-0013 D8 逐字相同**：**只在 `Running` 受理**；`Created` / `Closing` / `Closed` **一律返 `kClosed`**（沿用本项目既有约定——`kClosed` 一并覆盖"未启动 / 已关闭"，见 `ProtocolNode.hpp` 的 `@return`）。**`Created` 期订阅是禁用法**，不是"早一点也行"。
+
+  **这是一处破坏性变更**：调用点须从 `auto t = node.Subscribe(k);` 改为取 `Result` 再解包。**明确接受**——本 ADR **D2** 已把消费样板判给调用方，样板本就在每个调用点重复；让它多一步错误检查，换掉一类会静默挂死的用法，划算。
+
 - **D2（消费样板彻底交给调用方，不保留任何辅助件）：** `HandlerLoop` **终将整体删除**，不降级为公开小件、也不另造 `SubscriptionLoop`。宿主自行编写：
   ```cpp
   auto ticket = node.Subscribe({kAny, kAny, FrameType::kCommand});
@@ -38,6 +54,13 @@ ADR-0008 引入 `Dispatcher` 与 `Subscribe(Key)` 之后，入站消息事实上
   (void)task.get();                  // 宿主自己 join
   ```
   **明确接受**：该样板会在每个调用方处重复。取舍是"少一个框架件、少一套需要维护的语义"胜过"少几行重复代码"。
+
+  > **样板的首行随 D1′ 更新**（2026-09-02）：`Subscribe` 现返 `Coro::Result<Ticket>`，**且只在 `Running` 受理**——须在 `Start()` 之后订阅：
+  > ```cpp
+  > auto sub = node.Subscribe({kAny, kAny, FrameType::kCommand});   // Start() 之后
+  > if (!sub) { /* kClosed：未启动 / 已关闭 */ }
+  > auto ticket = std::move(sub).value();
+  > ```
   **删除时机——初稿判断有误，已更正（2026-08-25，#163）**：初稿写"因 `DdsNode` 仍在用而暂留"，**该前提不成立**。核对结果：
 
   - `src/node/DdsNode.cpp` 调用着 `MarkRunning()`、`transport_->Read()`、`transport_->Write()`、`node_->SignalClose()` —— 四者分别被 ADR-0006（前者与末者）与 ADR-0008（中间两者）删除，**编译不过**；

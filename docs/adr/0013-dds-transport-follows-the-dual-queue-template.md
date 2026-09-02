@@ -230,6 +230,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`Created` 与 `Closed` 都返 `kClosed`，不做区分**——这是**本项目既有的、写进公开文档的约定**：`ProtocolNode.hpp` 的 `@return` 两处均写作 **`kClosed（未启动 / 已关闭）`**，`ProtocolNode.cpp:151` 的注释亦为"未启动 / 关闭中 / 已关闭"。四个交互方法（`Subscribe` / `Publish` / `Reply` / `RequestForResultDirect`）在**两个节点类型上一律齐平**。
 
+  **`ProtocolNode::Subscribe` 已于 2026-09-02 对齐**（ADR-0009 **D1′**）：同样返 `Coro::Result<Ticket>`、同样只在 `Running` 受理。两个节点类型的订阅面自此**完全齐平**，#217 那条"`Created` 期订阅 → 消费 fiber 永远等不到关闭信号"的挂死路径**两侧都被堵住**。
+
   > **曾拟让 `Created` 返 `kInvalidState`**（理由是"调用序错误，与注册方法在非 `Created` 相位返 `kInvalidState` 对称"），**已否决**：那会让 `Subscribe` 成为四个交互方法里**唯一**区分"没启动"与"已关闭"的一个，单方面不守已文档化的承诺，读代码的人反而困惑。
   > **"区分二者"本身有诊断价值**——"忘了 `Start()`"与"节点已关"是两种不同的 bug——但那应当是**四个方法、两个节点类型一起**的改动，须另行裁决，不在本条捎带。
 
