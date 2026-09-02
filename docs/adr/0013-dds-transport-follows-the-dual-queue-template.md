@@ -222,13 +222,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   | 相位 | `Subscribe` |
   |---|---|
-  | **`Created`（尚未 `Start()`）** | **`kInvalidState`——不允许** |
+  | **`Created`（尚未 `Start()`）** | **`kClosed`——不允许** |
   | `Running` | 放行 |
   | `Closing` / `Closed` | `kClosed` |
 
-  判据用 `NodeBase::CurrentLifecycle()`（**不能用 `IsRunning()`**——它分不出 `Created` 与 `Closed`，而这两段要返不同的错误码）；相位判定放在注册校验**之前**，与另外三个方法同序。
+  相位判定放在注册校验**之前**，与另外三个方法同序。
 
-  **`Created` 返 `kInvalidState` 而非 `kClosed`**：那是**调用序错误**（还没启动就订阅），与四个注册方法在非 `Created` 相位返 `kInvalidState` 恰成对称——**注册只在 `Created`、订阅只在 `Running`，两段互不重叠**，各自用 `kInvalidState` 表达"相位不对"。
+  **`Created` 与 `Closed` 都返 `kClosed`，不做区分**——这是**本项目既有的、写进公开文档的约定**：`ProtocolNode.hpp` 的 `@return` 两处均写作 **`kClosed（未启动 / 已关闭）`**，`ProtocolNode.cpp:151` 的注释亦为"未启动 / 关闭中 / 已关闭"。四个交互方法（`Subscribe` / `Publish` / `Reply` / `RequestForResultDirect`）在**两个节点类型上一律齐平**。
+
+  > **曾拟让 `Created` 返 `kInvalidState`**（理由是"调用序错误，与注册方法在非 `Created` 相位返 `kInvalidState` 对称"），**已否决**：那会让 `Subscribe` 成为四个交互方法里**唯一**区分"没启动"与"已关闭"的一个，单方面不守已文档化的承诺，读代码的人反而困惑。
+  > **"区分二者"本身有诊断价值**——"忘了 `Start()`"与"节点已关"是两种不同的 bug——但那应当是**四个方法、两个节点类型一起**的改动，须另行裁决，不在本条捎带。
 
   ### 为什么"`Start()` 之后再订阅"是安全的
 
