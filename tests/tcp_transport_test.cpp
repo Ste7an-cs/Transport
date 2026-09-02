@@ -10,7 +10,9 @@
 //   4. 透明重连(①'):对端断开后泵自动重连,新连接上的数据**照常从同一个 `AsyncRead()`
 //      句柄**取到——队列不随连接重建而更换;不自终(D2),连不上时无限重试;
 //   5. `Close()` 的三处打断(**D15 的回归证据**):连接窗口 / 读等待 / 退避中关闭,
-//      都须在**远小于 silence_timeout** 的时间内收敛。
+//      都须在**远小于 silence_timeout** 的时间内收敛;外加**「建完即复查」**
+//      (**D15 补正**,#200):`Close()` 跑完之后泵**不得再建一个没人关的等待器**——
+//      三处打断只关得到已存在的句柄,这一条管的是"未来才出现的那一个"。
 //
 // 第 5 组是本文件的核心,是 D15 的**回归证据**(原始探针已随 ADR 定稿删除)。本次实现
 // 时逐条做过负向对照(去掉对应的一处打断后重跑,silence_timeout = 3s / 2s):
@@ -577,4 +579,44 @@ TEST(CoroTcpTransport, CloseDoesNotWaitForFlush) {
   t.WaitClosed();
   EXPECT_LT(Since(began), 500ms) << "Close 等了刷出(D13:写出后不得再 await)";
   // 未刷出的部分随 `abort()` 丢弃——**不断言"全部送达"**,丢弃是预期行为(D7/D13)。
+}
+
+// —— 9. 「建完即复查」:Close() 之后泵不得再建一个没人关的等待器(D15 补正,#200)——
+
+// 【D15 补正的回归证据】`Close()` 只关得到**它跑的那一刻已经存在**的句柄。泵停在
+// `await_for(connect_waiter_, 3s)` 上被"连上"唤醒(runnable)、却尚未被调度时,`Close()`
+// 可能整个跑完——那一刻 `read_stream_` 还是 null,它关了个空;泵随后建出的读流**没有任何
+// 人会唤醒**,挂满一个 `silence_timeout`,而读队列只在泵退出循环后才关。于是
+// `CloseTerminatesReadQueueAndBlocksRestart` 偶发拿到 kTimeout 而非 kClosed(#200)。
+//
+// **该窗口只有几百微秒宽,靠单次用例撞不到**:整组 40 轮才命中 1 次(#200 实测),单独跑
+// 那一条 40 轮 0 次——这正是它当初 57 轮没复现、连名字都丢了的原因。本用例改为**扫过**
+// 它:把 `Close()` 的时刻按微秒推进,覆盖"连上"前后 0..3000us 的整段。实测修复前每轮
+// 201 个采样点里**稳定**有 10~11 个挂满 3s(连跑三轮:10 / 11 / 10),修复后 0 个。
+//
+// **不与 `CloseDuringConnectWindowConvergesPromptly` 重复**:那一条钉的是"泵**正停在**
+// 连接等待里"(黑洞地址,连接永不完成),证的是 `Close()` 关得到**已存在**的句柄;本条
+// 钉的是"连接**刚刚完成**、泵尚未被调度",证的是泵不会再建一个**新的、关不到**的句柄。
+//
+// AC:每个采样点上,`Close()` 之后读句柄都在远小于 `silence_timeout` 的预算内拿到
+// kClosed,且 `WaitClosed()` 当场收敛。
+TEST(CoroTcpTransport, CloseInterruptsWaitersBornAfterItAcrossConnectHandoff) {
+  constexpr int kSpanUs = 3000;  // 覆盖回环连上前后的整段(实测命中区 ~960..1200us)。
+  constexpr int kStepUs = 15;    // 201 个采样点;全绿时总开销就是那些 sleep 之和(~0.3s)。
+  for (int slack_us = 0; slack_us <= kSpanUs; slack_us += kStepUs) {
+    LoopbackServer server;  // 不必 Accept():QTcpServer 自动收进 pending 队列即已连上。
+    TcpTransport t(ConfigFor(kLoopback, server.port(), 3000ms));
+    ASSERT_TRUE(t.Start());
+    boost::this_fiber::sleep_for(std::chrono::microseconds(slack_us));
+
+    auto rx = t.AsyncRead();
+    const auto began = std::chrono::steady_clock::now();
+    ASSERT_TRUE(t.Close());
+    auto got = AwaitRead(rx, 1000ms);
+    ASSERT_FALSE(got) << "slack=" << slack_us << "us";
+    EXPECT_EQ(got.error(), make_error_code(TransportErrc::kClosed))
+        << "slack=" << slack_us << "us:Close() 之后泵又建了一个没人关的等待器";
+    t.WaitClosed();
+    EXPECT_LT(Since(began), 500ms) << "slack=" << slack_us << "us:收敛慢于一次让出";
+  }
 }
