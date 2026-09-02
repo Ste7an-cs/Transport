@@ -416,7 +416,9 @@ Coro::Result<void> RegisterClients (std::vector<std::string> service_names);    
 Coro::Result<void> RegisterServices(std::vector<std::string> service_names);      // 只收服务名
 ```
 
-方法名用**复数**——直说是批量，免得读者以为要一个 topic 调一次。两个 pair 型用 **`std::map`** 而非 `vector<pair>`：天然去重，且从类型上排除"同一请求 topic 配了两个不同应答 topic"。
+方法名用**复数**——直说是批量，免得读者以为要一个 topic 调一次。**请求-响应两项收 `std::vector<std::string>` 服务名**（2026-09-02 起，**D6**）：两个 topic 由 `cfg.<名>.request` / `cfg.<名>.response` 派生，调用方不再给 topic。
+
+> 派生化之前它们收的是 `std::map<请求 topic, 应答 topic>`，当时的理由是「天然去重，且排除同一请求 topic 配了两个不同应答 topic」——**该理由连同那两条校验一并失效**：派生是确定的、同名必同值，**连能配歪的入口都没有了**。
 
 **只允许 `Start()` 之前注册**：端点集合仍"启动即定型、运行期恒定"，本步只把填结构体换成调四个函数，**没有引入运行期动态端点**——故各路径上都不会突然冒出 ~240ms 发现窗口，`DoStart()` 仍是唯一建端点的地方。
 
@@ -432,7 +434,7 @@ Coro::Result<void> RegisterServices(std::vector<std::string> service_names);    
 
 **不新增 provider 侧的数据观察者接口**（**D13**）：既有的 `IDdsProvider::Subscribe(topic, cb)`（`cb` 收 `std::vector<uint8_t>`）已经是所需的钩子，`DeclareReader` 落到 provider 就是调它，闭包捕获 `topic` 即可填 `Datagram.peer`。**曾拟新增的 `SetDataObserver(std::function<void(Message)>)` 已否决**——`Message` 是 codec **之后**的产物而 provider 在 codec **之下**（跨层），且它与既有 `Subscribe` 是同一钩子的两种写法（重复）。
 
-**注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`、`Subscribe(topic, kRequest)` 为 `Services` 的键、`RequestForResultDirect` 为 `Clients` 的键，否则返 `kConfiguration`。这让"忘了注册"从**静默无效**（端点不存在，消息永远不来，看起来像对端没发）变成**显式错误**。**`Subscribe` 的 topic 键传 `kAny` 时跳过该校验**——`kAny` 不对应任何具体 topic，且它本就只在已注册范围内起作用。
+**注册与调用一一对应校验**：`Publish` 须已注册为 `Publishers`、`Subscribe(topic, kNotify)` 为 `Subscribers`；**请求-响应两个方法按【服务名】查**——`ServeRequests(名)` 须已注册为 `Services`、`RequestForResultDirect(名, …)` 须已注册为 `Clients`，未命中一律返 `kConfiguration`。`Subscribe(topic, kRequest)` 仍可直接给派生出的请求 topic（`Subscribe` 的第一参**永远是 topic**），其校验落在「该 topic 是否为某个已注册 `Services` 的派生请求 topic」上。这让「忘了注册」从**静默无效**（端点不存在、消息永远不来，看起来像对端没发）变成**显式错误**。**`Subscribe` 的 topic 键传 `kAny` 时跳过该校验**——`kAny` 不对应任何具体 topic，且它本就只在已注册范围内起作用。
 
 **`Subscribe` 因此必须返 `Coro::Result<Ticket>`、不能返裸 `Ticket`**（**D8**）：`Ticket` 装不下 `kConfiguration`；返裸 `Ticket` 只能交出一个空凭据，其 `Wait` 返的是 `kInvalidState`（`Dispatcher.hpp:203`）——**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
 
@@ -493,8 +495,10 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - 数据元素：`Message`、`std::chrono::milliseconds`（时限）、`RetryPolicy`（ADR-0010）、各 `*Config`、`MessageDispatcher::Key` / `Ticket`、`Coro::Result<Message>` / `Coro::Result<void>`。
   **变更（2026-08-26 核对）**：原文所列 `OperationOptions`（随 ADR-0006 D3 取消令牌一并退化为时限）、`InboundHandler`（随 ADR-0009 废止 handler 通道而删除）、`Status`（别名已删）**均已不存在**。
 - 通信方式：同步函数调用；`RequestFor*`/`Send`/`Publish`/`WaitClosed` 为协程内让出式（不阻塞线程）。
-- 协议特征：`ProtocolNode(transport,codec,config)` → `Start/Close/WaitClosed`、`Send(Message)`、`RequestForResponse(Message,RetryPolicy)`、`RequestForResult(Message,RetryPolicy,result_mid,result_timeout)`、`RequestForResultDirect(Message,RetryPolicy,result_mid)`、`Subscribe(Key)`；`DdsNode` → `Request(Message,target,options)`、`Publish(Message,topic)`；`TcpServer(config,factory)` 每连接派生 node。
-  **变更（ADR-0010，2026-08-26）**：`ProtocolNode::Request(Message,options)` **已删除**（D10，#171）——时限与重试改由 `RetryPolicy` **逐次传参**（D6），节点配置面上不再有任何时限缺省值（#173 删除 `ProtocolNodeConfig::default_request_timeout`）。所列 `DdsNode::Request` 是**另一个方法**（三参、DDS 侧），不受此变更影响。
+- 协议特征：`ProtocolNode(transport,codec,config)` → `Start/Close/WaitClosed`、`Send(Message)`、`RequestForResponse(Message,RetryPolicy)`、`RequestForResult(Message,RetryPolicy,result_mid,result_timeout)`、`RequestForResultDirect(Message,RetryPolicy,result_mid)`、`Subscribe(Key)`；`DdsNode`(transport,codec,config) → 四个批量注册方法（`RegisterPublishers`/`RegisterSubscribers` 收 topic 列表，`RegisterClients`/`RegisterServices` **收服务名**）+ `Publish(topic,Message)`、`Subscribe(TopicKey,KindKey)`、`RequestForResultDirect(服务名,Message,RetryPolicy)`、`ServeRequests(服务名)`、`Reply(request,result)`。两个 `Subscribe` 均返 `Coro::Result<Ticket>`。
+  **变更（ADR-0010，2026-08-26）**：`ProtocolNode::Request(Message,options)` **已删除**（D10，#171）——时限与重试改由 `RetryPolicy` **逐次传参**（D6），节点配置面上不再有任何时限缺省值（#173 删除 `ProtocolNodeConfig::default_request_timeout`）。
+  **再变更（ADR-0013，2026-09-01/02）**：`DdsNode` 已整体重写——原 `Request(Message,target,options)` / `Publish(Message,topic)` 那套**不复存在**；改为四个批量注册方法 + 五个交互方法，请求-响应**只说服务名**、topic 由 `cfg.<名>.request` / `cfg.<名>.response` 派生。
+  **再变更（ADR-0009 D1′，2026-09-02）**：`ProtocolNode::Subscribe` 由裸 `Ticket` 改返 `Coro::Result<Ticket>` 并判相位（只在 `Running` 受理）。
 
 #### 4.3.3 编解码扩展点（JK_CODEC）
 - 优先级：高（公共扩展点）。

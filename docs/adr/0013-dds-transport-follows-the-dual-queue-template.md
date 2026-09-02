@@ -545,12 +545,13 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   `Publish` / `Subscribe` / `RequestForResultDirect` 的 topic 若未注册为对应角色，返 **`kConfiguration`**：
 
-  | 调用 | 须已注册为 |
-  |---|---|
-  | `Publish(topic, …)` | `Publishers` |
-  | `Subscribe(topic, kNotify)` | `Subscribers` |
-  | `Subscribe(topic, kRequest)` | `Services` 的键 |
-  | `RequestForResultDirect(topic, …)` | `Clients` 的键 |
+  | 调用 | 第一参 | 须已注册为 |
+  |---|---|---|
+  | `Publish(topic, …)` | topic | `Publishers` |
+  | `Subscribe(topic, kNotify)` | topic | `Subscribers` |
+  | `Subscribe(topic, kRequest)` | topic | 该 topic 须是**某个已注册 `Services` 的派生请求 topic** |
+  | **`ServeRequests(名)`** | **服务名** | `Services` |
+  | **`RequestForResultDirect(名, …)`** | **服务名** | `Clients` |
 
   **上表只列了 `kNotify` / `kRequest` 两种 `kind`。其余 `kind` 配【具体 topic】时**（#204 落地时补）：要求该 topic **至少在读侧集合内**——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值，否则返 `kConfiguration`。**不在读侧的 topic，其消息根本到不了本进程**，订阅它必然是本决策要消灭的那种"静默无效"。该规则是上表两行的**超集**，不与之冲突。
 
@@ -560,7 +561,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   ### 一处必须写进接口文档的限制
 
-  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader 的 topic 的全部**」——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值，**不是**"本 domain 上的全部"。未注册的 topic，其消息**根本不会到达本进程**。
+  **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的，而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader 的 topic 的全部**」——即 `Subscribers` ∪ `{cfg.<名>.request | 名 ∈ Services}` ∪ `{cfg.<名>.response | 名 ∈ Clients}`，**不是**"本 domain 上的全部"。未注册的 topic，其消息**根本不会到达本进程**。
 
   **这是确定会被理解反的一处**，接口文档须明写。
 
