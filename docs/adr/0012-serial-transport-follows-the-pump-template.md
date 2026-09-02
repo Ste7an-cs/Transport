@@ -73,7 +73,40 @@
   >
   > **本决策不变，但依据改为结构性的那一条**：守卫确实缺失，空推送在 `readyRead` 携零字节时必然发生；是否触发依 Qt 版本与设备驱动而异。相应地，`tests/serial_transport_test.cpp` 中该用例的定位是**契约断言**，而非已复现故障的回归——测试注释已写明。
 
-  故串口读泵须显式 `if (chunk->isEmpty()) continue;`。**UDP/TCP 都不需要这一行**——这是串口独有的一处，且是"照抄样板就会漏"的典型。
+  故串口读泵须显式跳过空切片。**UDP/TCP 都不需要这一行**——这是串口独有的一处，且是"照抄样板就会漏"的典型。
+
+  ### ⚠ 但**不能**写成裸 `continue` —— 那会架空 D4（2026-09-02 裁决，#196）
+
+  **D4 与 D5 是分别推导的，二者的相互作用初稿未讨论。** 裸 `continue` 会重新进入 `await_for(read_stream_, timeout)`，**静默超时的计时随之重置**。若真出现**空切片风暴**（`readyRead` 连续携零字节触发）：
+
+  - 读泵**永远等不到静默超时** → **D4 的"唯一主动判据"失效，拔线不重开**
+  - 同时它在忙循环 → **烧 CPU**
+
+  **一条防御性的 `continue` 架空了唯一的判活判据。**
+
+  ### 裁决：空切片**不重置**静默计时；`silence_timeout` 的语义精确为"多久没收到【非空】数据"
+
+  ```cpp
+  auto deadline = Clock::now() + timeout;
+  for (;;) {
+    auto remaining = deadline - Clock::now();
+    if (remaining <= 0ms) { /* 判链路坏，重开 */ }
+    auto chunk = await_for(read_stream_, remaining);   // ← 用【剩余】时限，不是整个 timeout
+    if (!chunk) { /* 静默超时或流终止 */ }
+    if (chunk->isEmpty()) continue;                    // ← 不重置 deadline
+    deadline = Clock::now() + timeout;                 // ← 只有【非空】数据才续期
+    ...
+  }
+  ```
+
+  **这是 D4 的语义细化，不是新增旋钮**：D4 原意就是"多久没**有效数据**算链路坏"，空切片本就不是有效数据。`silence_timeout` 仍是**唯一的时间量**（**D3**），没有引入第二个。
+
+  **否决的两条备选**：
+
+  - **空切片计数阈值**（连续 N 次即判异常）：引入新旋钮，与 **D3**"唯一的时间量"相悖；且 N 取多少无依据。
+  - **不跳过、直接判坏**（推翻 D5）：D5 的结构性依据仍在（`coroiodevice::readAll()` 的 `readyRead` 处理器确无守卫），一个空切片就重开设备是过度反应。
+
+  **现状记明**：本环境（Qt 5.15 / Linux PTY）**未观测到空切片**——#193 加计数探针跑完整个串口用例集（含拔线后）一次都没有。故本条修的是**结构性缺口**，不是已复现的故障；实现时须在注释里如实标明这一点。
 
 - **D6（`Close()` 四处打断，`port->close()` 是有效打断手段——**D15 反向不成立**）：** 实测：一条 fiber 挂在 `await_for(read_stream_, 3000ms)`，另一条 50ms 后 `port->close()` → **50ms 处唤醒**（走 `aboutToClose`）。
 
