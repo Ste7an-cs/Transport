@@ -194,6 +194,29 @@ ADR-0007 **D6** 曾就字节流留下一条预设：
 
   **代价**：多两个成员与两处 `Close()` 动作。`Close()` 的动作数由 UDP 的四个增至**五个**（`close_signal_` / `connect_waiter_` / `read_stream_` / `write_queue_` / `socket_ready_`），另加一次非打断性的 `abort()`。**这是必要的复杂度，不是可省的**——UDP 的"四处打断缺一不可，漏一处即一次收敛挂死"在这里是"五处"。
 
+  ### 补正（2026-09-02，#200 归因后）：持句柄还不够，建完须【复查生命周期】
+
+  持成员句柄只解决了"`Close()` 够得着已存在的等待器"，**没解决"等待器是在 `Close()` 跑完之后才被创建"**——那种情况下 `Close()` 关的是两个 `nullptr`，新建的等待器**没有任何人会唤醒它**。
+
+  ```cpp
+  while (lifecycle_ < LifecycleState::kClosing) {   // ① 检查：此刻仍是 Running
+      // ★ 若在此让出，Close() 跑完：置 kClosing，close 掉两个【当时还是 null】的句柄
+      connect_waiter_ = coro(socket).connectToHost(...);   // ② 建一个【没人会关】的等待器
+      auto connected = await_for(connect_waiter_, timeout); // ③ 干等满一个 silence_timeout
+  ```
+
+  **这是 check-then-act 竞态**：`lifecycle_` 的检查与等待器的创建之间不是原子的。`Close()` 的内部顺序没有错（它**先**置 `kClosing` **再**关句柄），错在它**关不到未来才出现的句柄**。
+
+  **实证**（#200）：`CoroTcpTransport.CloseTerminatesReadQueueAndBlocksRestart` 在 master 上整组跑约 2.5%–10% 概率失败——`Close()` 后 `AwaitRead(rx, 1000ms)` 拿到 **`kTimeout`** 而非 `kClosed`，该轮耗时 **3011ms ≈ 恰好一个 `silence_timeout`**。读队列只在泵退出循环后才关，而泵正卡在那个无人唤醒的等待器上。
+
+  **故本决策补一条不变式**：
+
+  > **句柄一旦赋给成员，须立即复查 `lifecycle_`；已 `kClosing` 则就地终结，不进 `await`。**
+
+  `connect_waiter_`（②）与 `read_stream_`（②之后建流处）**两处都要**。**只在循环顶部判 `lifecycle_` 是不够的**——那正是被竞态跨过的那一步。
+
+  **裁决（2026-09-02）**：`Close()` **须当场打断**，不接受"最坏等一个 `silence_timeout`"。放宽用例 budget 的方案**已否决**——用例名断言的就是"`Close()` **终结**读队列"，调用方看到的确实是"`Close()` 之后读句柄还会挂数秒"，那是**实现缺陷**，不是用例太严。
+
 ## 明确接受的代价
 
 1. **队列丢弃对四种交互的后果不均等。** `Send`（noresponse）是纯 fire-and-forget、**无重试**——丢掉它的字节就是永久丢失，没有任何恢复路径。D6 的第 2 层补救只覆盖三个 `RequestFor*`。这不推翻 D6（noresponse 本就不保证送达），但调用方须知：**在丢弃可能发生的链路上，`Send` 的送达率低于带重发的交互**。
