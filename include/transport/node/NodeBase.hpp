@@ -8,7 +8,7 @@
  *
  * | | 语义 |
  * |---|---|
- * | `Start()` | 幂等启动;`DoStart()` 返回成功即 Running |
+ * | `Start()` | 幂等启动;`DoStart()` 返回成功即 Running(除非这期间 `Close()` 已受理,#220) |
  * | `Close()` | **只发信号,不等待收敛**。幂等,**任何 fiber 都可调**(含节点自己的内部 fiber) |
  * | `WaitClosed()` | join 全部内部 fiber——返回即可安全析构。**单调用方** |
  * | `IsRunning()` | 交互前置判据(`Request`/`Send`/`Publish`) |
@@ -74,6 +74,12 @@ class NodeBase {
    * 返回成功则由**基类**置 Running;失败退回 Created,允许宿主改配后重试(实现须保证失败
    * 时未 spawn 任何 fiber)。已 Running 再启幂等成功;Closing/Closed 返 `kInvalidState`。
    *
+   * **`DoStart()` 期间来过 `Close()` 则关闭赢**(#220):置 Running 前复查这一笔,
+   * `DoStart()` 成功即置 Closing 并**在此补发 `DoClose()`**(那次 `Close()` 只受理、未发
+   * 信号),返 `kInvalidState`——节点不曾也不会进入 Running;`DoStart()` 失败则直接落
+   * Closed(无 fiber 可收),返 `DoStart()` 的错误码,且不再可重试。**不无条件写回 Running**:
+   * 那会把一个已答应关闭的节点复活,而那次关闭的收敛信号从未发出。
+   *
    * **不承诺并发调用可共享同一次初始化结果**:另一次 `Start()` 正在初始化时返
    * `kInvalidState`。旧形态用一个一次性 `SharedCompletion` 共享首次结果,而它 latch 后不再
    * 更新,第二轮重试的调用方会拿到上一轮的陈旧失败(#150);启动是宿主调一次的动作,
@@ -87,6 +93,11 @@ class NodeBase {
    * 首个关闭者:Running→Closing(立即拒新交互)→ 锁外调 `DoClose()` 发出全部汇合信号
    * (transport.Close + 业务队列 Close + handler 协作取消 + PendingTable.FailAll)。从未
    * `Start()` 过则直接落 Closed(无 fiber 可汇合,不调 `DoClose()`)。
+   *
+   * **`Start()` 正跑在 `DoStart()` 里时只记账**(#220):此刻的 `Created` 是"启动未完成",
+   * 有没有 fiber 要收还不知道,故本方法受理即返回、不落相位、不调 `DoClose()`,处置由
+   * `Start()` 收尾统一做(见其说明)。对调用方而言语义不变:返回即"已受理",要确认收敛
+   * 仍须 `WaitClosed()`。
    *
    * **不含任何等待点,故任何 fiber 都可调**——包括节点自己的读循环与业务处理器。读循环退出
    * 时无条件调本方法即可:我方 `Close` 所致时它是幂等空操作,底层致命错误所致时它就是自终
@@ -162,7 +173,9 @@ class NodeBase {
   mutable std::mutex mutex_;  ///< 守生命周期状态(ADR-0003 D8)。
   LifecycleState lifecycle_{LifecycleState::kCreated};
   bool starting_{false};  ///< `DoStart()` 正在锁外执行;并发 Start 据此返 kInvalidState。
-  bool joined_{false};    ///< `DoJoin()` 已执行过;`WaitClosed()` 据此幂等(get() 一次性)。
+  /// `starting_` 期间来过 `Close()`(已受理、尚未落相位),由 `Start()` 收尾处置(#220)。
+  bool close_pending_{false};
+  bool joined_{false};  ///< `DoJoin()` 已执行过;`WaitClosed()` 据此幂等(get() 一次性)。
 };
 
 }  // namespace transport
