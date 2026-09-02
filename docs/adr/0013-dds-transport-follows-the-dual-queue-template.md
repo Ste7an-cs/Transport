@@ -99,17 +99,26 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **应答 topic 是【每服务一个、该服务的全体客户端共用】的**（2026-08-31 裁决）。**"每服务一个"是字面意思——它绑在【服务】上，不是绑在【节点】上**：
 
-  ```cpp
-  // 请求 topic ──► 该服务的应答 topic，【一服务一条】。两侧【实参一模一样、端点方向相反】（D16）
-  RegisterClients ({{"cfg.get", "cfg.get.reply"}, {"log.tail", "log.tail.reply"}});  // 客户端
-  RegisterServices({{"cfg.get", "cfg.get.reply"}, {"log.tail", "log.tail.reply"}});  // 服务端
+  **两个 topic 由【服务名派生】，不由调用方给出**（2026-09-02 裁决）：
+
+  ```
+  请求 topic  =  cfg.<服务名>.request        应答 topic  =  cfg.<服务名>.response
   ```
 
-  `RequestForResultDirect(topic, ...)` 按 `topic` 查已注册的 `Clients` 表取应答 topic；**查不到即 `kConfiguration`，不猜、不回落到某个默认值**。
+  `cfg.` 是**固定字面前缀，不可配**。两侧**用同一个派生函数**算，故**不可能算歪**：
 
-  **故一个客户端同时调多个服务时，各服务的应答落在各自的 topic 上，互不相扰**——这正是"每服务一个"要保证的。若把它做成节点级的单一字段，多个服务的应答会挤在一起、读入放大从 `N` 倍恶化为 `N×M` 倍（`M` 为服务数），**那不是本裁决的意思**。
+  ```cpp
+  RegisterClients ({"get", "log.tail"});   // 客户端：cfg.get.request 发、cfg.get.response 收
+  RegisterServices({"get", "log.tail"});   // 服务端：cfg.get.request 收、cfg.get.response 发
+  ```
 
-  **不用约定式派生**（如 `<topic>/reply`）：省下的是一行配置，代价是 topic 命名空间被框架侵占，且与既有 topic 命名冲突时无从规避。显式表更笨但可控。
+  **调用面也只说服务名**（**D8**）：`RequestForResultDirect(服务名, …)` 与 `ServeRequests(服务名)`——**派生规则不外泄到调用方**。未注册即 `kConfiguration`，不猜、不回落。
+
+  **故一个客户端同时调多个服务时，各服务的应答落在各自的 topic 上，互不相扰**——服务名不同则派生出的应答 topic 必不同，**这一点自此由框架保证，不再依赖调用方配对**。
+
+  > **⚠ 本条推翻了初版的「不用约定式派生」，记此以免反复。** 初版写的是：「**不用约定式派生**（如 `<topic>/reply`）：省下的是一个实参，代价是 topic 命名空间被框架侵占，且与既有 topic 命名冲突时无从规避。显式给出更笨但可控。」
+  > **那条顾虑本身没有消失** —— 框架确实占用了 `cfg.*.request` / `cfg.*.response` 这一命名空间，与既有命名冲突时无从规避。
+  > **改判依据是收益压过了它**：① 用户面从"每服务两个 topic、且两侧必须配成一模一样"降为"一个服务名"；② **两侧配歪这类部署错误从根上消失**——不再需要 `reply_to` 之外的任何配对约定；③ 见下「三条校验的消失」与「代价 8 的收紧」。
 
   区分**同一服务的不同客户端**则**全靠 `correlation_id`**，故它必须**全局唯一**，为此定死两段式构成：
 
@@ -207,13 +216,12 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   // —— 发布-订阅 ——
   Coro::Result<void> Publish(const std::string& topic, Message msg);
 
-  // —— 请求-响应（客户端）：单阶段，等结果时重发，不回应（D7）——
-  //     【没有 result_timeout】——只有一个等待阶段，其时限即 retry.timeout
-  Coro::Result<Message> RequestForResultDirect(const std::string& topic, Message req,
-                                               RetryPolicy retry);
-
-  // —— 请求-响应（服务端）：【只有一个方法】——
-  Coro::Result<void> Reply(const Message& request, Message result);  // 回结果 kReply
+  // —— 请求-响应：【三个方法，一律只说服务名】（2026-09-02 裁决）——
+  //     单阶段，等结果时重发，不回应（D7）；【没有 result_timeout】
+  Coro::Result<Message> RequestForResultDirect(const std::string& service_name,
+                                               Message req, RetryPolicy retry);   // 客户端
+  Coro::Result<Ticket>  ServeRequests(const std::string& service_name);           // 服务端收请求
+  Coro::Result<void>    Reply(const Message& request, Message result);            // 服务端回 kReply
   ```
 
   **`Subscribe` 必须返 `Coro::Result<Ticket>`，不能返裸 `Ticket`**：**D16** 规定"topic 未注册为对应角色即返 `kConfiguration`"，而 `Ticket` **装不下错误码**。若返裸 `Ticket`，"忘了注册"只能交出一个空 `Ticket`——其 `Wait` 返的是 **`kInvalidState`**（`Dispatcher.hpp:203`），**错误码不对，且推迟到第一次 `Wait` 才暴露**，与"显式错误"的初衷正相反。
@@ -277,6 +285,19 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   > `DdsTransport::WaitClosed()` join 的是那条**专属 OS 线程**（**D3**），而它的最坏等待**没有上界**（「明确接受的代价」7）。节点若在 `DoJoin()` 里调它，就是**阻塞整条 fiber 线程**——与 `NodeBase::WaitClosed()` 的**让出式 join** 正相反。**传输的关闭必须留在宿主那条控制流上。**
 
   **连带后果**：节点 `Start()` 之前宿主**必须先启传输**，否则 `Declare*` 返 `kInvalidState`。这一条须写进使用文档。
+
+  ### 参数含义按模式分家：发布-订阅只说 topic，请求-响应只说服务名（2026-09-02）
+
+  | 方法 | 第一参 |
+  |---|---|
+  | `Publish` / `Subscribe` | **topic**（永远） |
+  | `RequestForResultDirect` / `ServeRequests` | **服务名**（永远） |
+
+  **`Subscribe` 保持通用**——它的第一参**永远是 topic**，`ServeRequests(name)` 是它在服务名一侧的封装（内部即 `Subscribe(cfg.<name>.request, kRequest)`）。这样两条路各自的参数含义唯一，**不存在"同一个参数因 `kind` 而异"的陷阱**。
+
+  > **`ServeRequests` 这个名字曾于 2026-08-28 取消，现恢复。** 当时的理由是「两个键全开放后它与 `Subscribe(topic, kRequest)` **完全等价**，留两个签名相同的方法只会让人以为有语义差别」——**该理由随派生化失效**：二者签名已不同（服务名 vs topic）、语义也不再等价。
+
+  > **不叫 `Request`**：那个名字在 ADR-0010 **D10**（#171）被**删除过**，拿回来配不同语义会造成混淆。沿用 `RequestForResultDirect`，只是首参从 topic 变为服务名。
 
   **服务端没有 `Accept()`**：本模型无受理阶段（**D7**）。**`MessageKind::kFeedback` 在本设计中不使用**——它是 `Message` 为别的路径预留的值。
 
@@ -406,7 +427,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`reply_to` 仍留在线缆上，但降为【一致性交叉校验】**：若 `request.reply_to` 非空且与查出的 `reply_topic` **不等**，返 `kInvalidArgument`。
 
-  > **保留它是有价值的，不是冗余**：两侧注册实参写歪时（客户端在 `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发），**若不带 `reply_to`，这种偏差完全不可见**——客户端只会一路超时到 `kTimeout`，看起来像对端没响应。带上它，服务端**当场就能报出**"你等的地方和我发的地方不一样"。这 20 来个字节买的是一类部署错误的可诊断性。
+  > **保留它仍有价值**：`reply_to` 是一致性交叉校验的载体。**派生化（2026-09-02）之后两侧配歪已不可能**——服务名相同即派生相同——故它的诊断价值大幅下降；但对**版本不一致的对端**（派生规则将来若变更）仍是唯一能当场发现偏差的手段。历史上它防的是：客户端在某 topic 上等、服务端往另一个 topic 发，**若不带 `reply_to`，这种偏差完全不可见**——客户端只会一路超时到 `kTimeout`，看起来像对端没响应。带上它，服务端**当场就能报出**"你等的地方和我发的地方不一样"。这 20 来个字节买的是一类部署错误的可诊断性。
 
   ### 三处连带收益
 
@@ -429,8 +450,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   //   【批量】：一次给一组，不必一个 topic 调一次
   Coro::Result<void> RegisterPublishers (std::vector<std::string> topics);
   Coro::Result<void> RegisterSubscribers(std::vector<std::string> topics);
-  Coro::Result<void> RegisterClients (std::map<std::string, std::string> topics);  // 请求 → 应答
-  Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics);  // 请求 → 应答
+  Coro::Result<void> RegisterClients (std::vector<std::string> service_names);     // 只收服务名
+  Coro::Result<void> RegisterServices(std::vector<std::string> service_names);     // 只收服务名
   ```
 
   **与原配置项一一对应，方向与端点全不变：**
@@ -439,8 +460,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   |---|---|---|
   | `RegisterPublishers` | 发布者 | 每个 topic 的 **Writer** |
   | `RegisterSubscribers` | 订阅者 | 每个 topic 的 **Reader** |
-  | `RegisterClients` | 请求-响应**客户端** | 键 → **Writer**（发请求）　值 → **Reader**（收应答） |
-  | `RegisterServices` | 请求-响应**服务端** | 键 → **Reader**（收请求）　值 → **Writer**（发应答） |
+  | `RegisterClients` | 请求-响应**客户端** | `cfg.<名>.request` → **Writer**（发请求）　`cfg.<名>.response` → **Reader**（收应答） |
+  | `RegisterServices` | 请求-响应**服务端** | `cfg.<名>.request` → **Reader**（收请求）　`cfg.<名>.response` → **Writer**（发应答） |
 
   **方法名用复数**——名字直接说明是批量，免得读者以为要一个 topic 调一次。
   **两个 pair 型用 `std::map` 而非 `vector<pair>`**：天然去重，且排除"同一请求 topic 配了两个不同应答 topic"这种自相矛盾的输入。
@@ -483,9 +504,15 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   |---|---|
   | 不在 `Created` 阶段 | `kInvalidState` |
   | topic 为空串 | `kInvalidArgument` |
-  | `Clients` / `Services` 某条的键与值相同 | `kInvalidArgument`（请求与应答同 topic 必然自收自答） |
-  | 同一 topic 既是 `Clients` 的键、又是 `Services` 的键 | `kInvalidArgument`——**自己请求自己**，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答 |
-  | **同一请求 topic 跨批次被配了两个不同的应答 topic** | `kInvalidArgument`——`std::map` 的去重只在单批内成立，跨批次 `insert` 会静默保留第一个值（见上「更正」） |
+  | 服务名为空串 | `kInvalidArgument` |
+  | **同一服务名同时注册为 `Clients` 与 `Services`** | `kInvalidArgument`——**自己请求自己**，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答 |
+
+  ### 派生化让两条校验从根上消失（2026-09-02）
+
+  | 原校验 | 现状 |
+  |---|---|
+  | `Clients` / `Services` 某条的**键值相同** | **不可能发生**——`cfg.N.request` 与 `cfg.N.response` 派生出来必然不同 |
+  | 同一请求 topic **跨批次被配了两个不同的应答 topic** | **不可能发生**——派生是确定的，同名必同值。**这条正是 #204 复核时补上的运行期校验**（当时发现 `std::map` 的"类型上排除"只在单批内成立）；派生化比补校验更彻底：连能配歪的入口都没有了 |
 
   **只拦这一种组合。** 其余"同一 topic 上既有 writer 又有 reader"的组合（判据见「代价 9」）**只造成自收白干、不会误配**，且可能是调用方有意为之（本地回环自测），故**不拦、只在文档记明**。
 
@@ -506,7 +533,7 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   ```
     客户端                                              服务端
-    RegisterClients({{"cfg.get", "cfg.get.reply"}})     RegisterServices({{"cfg.get", "cfg.get.reply"}})
+    RegisterClients({"get"})                            RegisterServices({"get"})
          │              │                                    │              │
       DataWriter    DataReader                           DataReader     DataWriter
       （发请求）    （收应答）                            （收请求）     （发应答）
@@ -565,8 +592,8 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
    **未采用的缓解手段**：DDS 的 `ContentFilteredTopic` 能把按 `corr` 前缀的过滤下推到 DDS 侧、使多余样本根本不进我方队列。**本轮不采用**，因 2026-08-28 裁决"不需要考虑优先使用 DDS 自己的机制"；若实测中放大成为瓶颈，这是**第一顺位**的优化入口。
 
-   **只要不同服务用不同的应答 topic，放大就只限于同一服务内**（**D6**），调多个服务不叠成 `N×M`。
-   **但这一点靠调用方保证，框架不强制**：`RegisterClients` 的 map 只排除了"同一请求 topic 配两个应答 topic"，**不排除两个请求 topic 共用一个应答 topic**（`{"a":"r","b":"r"}`）——那样写就**会**叠。
+   **放大只限于同一服务内**（**D6**），调多个服务**不会**叠成 `N×M`——**且这一点自 2026-09-02 起由框架保证**：应答 topic 由服务名派生（`cfg.<名>.response`），服务名不同则应答 topic 必不同，**调用方无从把两个服务配到同一个应答 topic 上**。
+   > 派生化之前这只是一句"靠调用方保证"的妥协：`RegisterClients` 的 map 只排除了"同一请求 topic 配两个应答 topic"，不排除 `{"a":"r","b":"r"}` 这种共用，那样写就会叠。
 
    **上界未实测**：`N` 多大时开始丢自己的应答，**实现票须补测**。
 

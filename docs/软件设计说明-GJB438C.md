@@ -394,7 +394,11 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **四条纪律里三条不适用**（这正是它与 `RequestForResult` 的分界）：只登记一个订阅（无受理）、无 `ack.Reset()`、**等结果阶段恰恰要重发**、不回应。**仍沿用两条**：先登记再发出（`Dispatcher` 用法的固有要求）、重发沿用同一 `correlation_id` 且以首帧为准。
 
-**应答 topic 每服务一个、由该服务的全体客户端共用**（**D6**）：它**绑在服务上、不绑在节点上**——`RegisterClients` 与 `RegisterServices` 都收 `请求 topic → 应答 topic` 的表（**实参相同、端点方向相反**，见 **D16**）；`RequestForResultDirect` 按目标 topic 查已注册的 `Clients` 表，**查不到即 `kConfiguration`**。故一个客户端同时调多个服务时，各服务的应答落在各自 topic 上互不相扰。
+**请求与应答 topic 由【服务名派生】**（**D6**，2026-09-02 裁决）：`请求 = cfg.<服务名>.request`、`应答 = cfg.<服务名>.response`，`cfg.` 为**固定字面前缀、不可配**；两侧用同一个派生函数算，**不可能算歪**。**注册与调用一律只说服务名**，派生规则不外泄到调用方。应答 topic 仍是**每服务一个、由该服务的全体客户端共用**，且"不同服务必用不同应答 topic"自此**由框架保证**（调用方无从把两个服务配到同一应答 topic 上）。
+
+**参数含义按模式分家**：`Publish` / `Subscribe` 第一参**永远是 topic**；`RequestForResultDirect` / `ServeRequests` 第一参**永远是服务名**。`ServeRequests(name)` 是 `Subscribe(cfg.<name>.request, kRequest)` 的封装——该名曾于 2026-08-28 以"与 `Subscribe(topic, kRequest)` 完全等价"为由取消，**派生化后二者签名与语义均不再等价，故恢复**。不叫 `Request`：那个名字在 ADR-0010 D10（#171）被删除过，拿回来配不同语义会造成混淆。
+
+> **本条推翻了初版的「不用约定式派生」。** 那条顾虑——框架侵占 `cfg.*.request` / `cfg.*.response` 命名空间、与既有命名冲突时无从规避——**本身没有消失**；改判依据是收益压过了它：用户面从"每服务两个 topic、且两侧必须配成一模一样"降为"一个服务名"，且**两侧配歪这类部署错误从根上不可能**。
 
 区分**同一服务的不同客户端**全靠 `correlation_id`，故它定为两段式 `"<uuid>#<request_seq>"`——uuid 在**节点初始化时生成一次**（`QUuid::createUuid()`，`Qt5::Core` 已 PUBLIC 链入，不引入新依赖）保证跨节点不撞；`request_seq`（`uint32`）**从 0 自增**保证节点内不撞，**回绕明确接受**（届时旧订阅早已注销）。自增半段**不叫 `session_id`**——那是外部协议的匹配键，DDS 路径留缺省 `0`，同名会造成阅读陷阱。`Message::correlation_id` 本是 `std::string`，`≤47` 字节装得下，无需改结构。
 
@@ -408,8 +412,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 // 【须在 Start() 之前调用】，Running/Closing/Closed 一律返 kInvalidState；【批量】
 Coro::Result<void> RegisterPublishers (std::vector<std::string> topics);          // 每个建 Writer
 Coro::Result<void> RegisterSubscribers(std::vector<std::string> topics);          // 每个建 Reader
-Coro::Result<void> RegisterClients (std::map<std::string, std::string> topics);   // 键 Writer、值 Reader
-Coro::Result<void> RegisterServices(std::map<std::string, std::string> topics);   // 键 Reader、值 Writer
+Coro::Result<void> RegisterClients (std::vector<std::string> service_names);      // 只收服务名
+Coro::Result<void> RegisterServices(std::vector<std::string> service_names);      // 只收服务名
 ```
 
 方法名用**复数**——直说是批量，免得读者以为要一个 topic 调一次。两个 pair 型用 **`std::map`** 而非 `vector<pair>`：天然去重，且从类型上排除"同一请求 topic 配了两个不同应答 topic"。
