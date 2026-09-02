@@ -302,8 +302,11 @@ TEST(ProtocolNodeTcpE2E, InboundBusinessFrameReachesSubscriberAndReplyGoesOut) {
   auto sink = [](const Message&) { return std::vector<Message>{}; };
   auto peer = std::make_unique<PeerSession>(accepted, sink);
 
-  // **登记须先于报文到达**(ADR-0009 D1):先订阅,再让对端推帧。
-  auto ticket = node.Subscribe(AnyOfType(FrameType::kState));
+  // **登记须先于报文到达**(ADR-0009 D1):先订阅,再让对端推帧。节点已 `Start()`,
+  // 订阅这才受理(D1′:`Subscribe` 只在 `Running` 放行,返 `Coro::Result<Ticket>`)。
+  auto sub = node.Subscribe(AnyOfType(FrameType::kState));
+  ASSERT_TRUE(static_cast<bool>(sub)) << sub.error().message();
+  auto ticket = std::move(sub).value();
   auto mailbox = ticket.mailbox();
 
   Message business;

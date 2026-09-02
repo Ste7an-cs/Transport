@@ -331,8 +331,26 @@ void ProtocolNode::Dispatch(const Message& msg) {
   // 成为不可见丢弃,完整性归因的覆盖面随之变窄——已明确接受。
 }
 
-MessageDispatcher::Ticket ProtocolNode::Subscribe(MessageDispatcher::Key key) {
-  return dispatcher_.Subscribe(std::move(key));
+Coro::Result<MessageDispatcher::Ticket> ProtocolNode::Subscribe(
+    MessageDispatcher::Key key) {
+  // **相位判定**,判据与三个交互方法**同一个** `IsRunning()`——`kClosed` 一并覆盖"未启动 /
+  // 关闭中 / 已关闭",这是本类各 `@return` 早已写明的既有约定,本方法不单开一份。写法与
+  // `DdsNode::Subscribe` 逐字一致(ADR-0009 D1′ / ADR-0013 D8)。
+  //
+  // - **`Created` 也返 `kClosed`**:`Subscribe` **只在 `Running` 受理**,还没 `Start()` 就
+  //   订阅是**禁用法**,不是"早一点也行"。放行它有一处真实危害:`NodeBase::Close()` 从
+  //   `Created` 走时**不调 `DoClose()`**,`dispatcher_.CloseAll` 因此从不执行——而"信箱被
+  //   关"是订阅者**唯一**的协作取消信号(D4)。宿主若在此相位订阅并 spawn 了消费 fiber、
+  //   随后放弃启动,那条 fiber 的信箱**永远等不到关闭信号**,join 时挂住。
+  //   不是悬垂(`Ticket` 持 `weak_ptr`),是唤醒信号永远不发——静默挂起。
+  // - **`Closing` / `Closed` 同样 `kClosed`**:此时 `DoClose()` 已 `CloseAll`,再登记只能
+  //   得到一张信箱已关闭的凭据。让它**在返回处**就说清楚,而不是推迟到第一次 `Wait`——
+  //   D1′ 把本方法从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的理由原样适用于相位。
+  if (!IsRunning()) {
+    return make_error_code(TransportErrc::kClosed);  // 未启动 / 关闭中 / 已关闭。
+  }
+  return Coro::Result<MessageDispatcher::Ticket>{
+      dispatcher_.Subscribe(std::move(key))};
 }
 
 }  // namespace transport

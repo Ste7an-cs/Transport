@@ -284,9 +284,39 @@ class ProtocolNode : public NodeBase {
    * **登记须先于对应报文到达**,否则先到的报文因无订阅而被丢弃(业务帧静默丢弃,
    * ADR-0009 D5)。
    *
+   * **返 `Coro::Result<Ticket>` 而不是裸 `Ticket`**(ADR-0009 **D1′**,与 `DdsNode::Subscribe`
+   * 齐平):`Ticket` **装不下错误码**——返裸凭据时"相位不对"只能交出一张信箱已关闭的空凭据,
+   * 其 `Wait` 返的是 `kInvalidState`,**错误码不对,且推迟到第一次 `Wait` 才暴露**。在
+   * **返回处**说清楚,而不是把 `kClosed` 推给下一步。
+   *
+   * ## 相位规则:**只在 `Running` 放行**
+   *
+   * | 相位 | 返回 |
+   * |---|---|
+   * | `Created`(尚未 `Start()`) | `kClosed` |
+   * | `Running` | 放行 |
+   * | `Closing` / `Closed` | `kClosed` |
+   *
+   * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是"早一点也行"。判据与
+   * 三个交互方法**同一个** `IsRunning()`:`kClosed` 一并覆盖"未启动 / 关闭中 / 已关闭",这是
+   * 本类各 `@return` 早已写明的既有约定,本方法不为"没启动"单开一个错误码。
+   *
+   * **不放行 `Created` 有一处真实危害要挡**:`NodeBase::Close()` 从 `Created` 走时**不调
+   * `DoClose()`**,`Dispatcher::CloseAll` 因此从不执行——而"信箱被关"是订阅者**唯一**的协作
+   * 取消信号(ADR-0009 D4)。宿主若在此相位订阅并 spawn 了消费 fiber、随后放弃启动
+   * (`Start()` 失败或直接 `Close()`),`Coro::await(ticket.mailbox())` **永远等不到唤醒**,
+   * 下面样板末尾那句 `task.get()` 就**挂死**在那儿。不是悬垂(`Ticket` 持 `weak_ptr`,内存
+   * 安全),是**唤醒信号永远不发**——静默挂起,不崩溃,排查代价高。
+   *
+   * **而 `Running` 期订阅是安全的**:此相位 `Close()` 必经 `DoClose()`,`CloseAll` 一定执行,
+   * 在途 `await` 恰好终结一次,消费 fiber 自然退出。
+   *
    * 消费在**调用方自己的 fiber** 内进行,节点不代管:
    * ```cpp
-   * auto ticket = node.Subscribe(AnyOfType(FrameType::kCommand));
+   * (void)node.Start();                            // ★ 订阅必须在 Start() 之后
+   * auto sub = node.Subscribe(AnyOfType(FrameType::kCommand));
+   * if (!sub) { return; }                          // kClosed:未启动 / 已关闭
+   * auto ticket = std::move(sub).value();
    * auto task = Coro::makeTask([&] {
    *   for (;;) {
    *     auto m = Coro::await(ticket.mailbox());
@@ -305,9 +335,10 @@ class ProtocolNode : public NodeBase {
    *
    * @param key 订阅键;不参与匹配的字段填 `kAny`。见 `ResponseTo` / `FrameOf` /
    *            `AnyOfType` 三个具名工厂。
-   * @return 订阅凭据,析构时自动注销。
+   * @return 订阅凭据,析构时自动注销;或 kClosed(未启动 / 已关闭)。
    */
-  [[nodiscard]] MessageDispatcher::Ticket Subscribe(MessageDispatcher::Key key);
+  [[nodiscard]] Coro::Result<MessageDispatcher::Ticket> Subscribe(
+      MessageDispatcher::Key key);
 
  protected:
   // —— NodeBase 生命周期钩子 ————————————————————————————————————————————
