@@ -30,8 +30,9 @@
  * `kInvalidState`。端点集合"**启动即定型、运行期恒定**"——本设计**不引入运行期动态端点**,
  * 故回应、发布、订阅路径上都不会突然冒出一个约 240ms 的发现窗口(**D9**)。
  *
- * `Subscribe` 与之**互不重叠**:它**只在 `Running` 受理**,`Created` 同样返 `kInvalidState`
- * (见该方法的注释)。全流程即「注册 → `Start()` → 订阅」。
+ * `Subscribe` 与之**互不重叠**:它**只在 `Running` 受理**,`Created` 期订阅是禁用法、返
+ * `kClosed`(与另外三个交互方法同一个判据,见该方法的注释)。全流程即
+ * 「注册 → `Start()` → 订阅」。
  *
  * ## 角色由"注册了什么"表达,不设 role 枚举(**D16**)
  *
@@ -257,14 +258,15 @@ class DdsNode : public NodeBase {
    *
    * | 相位 | 返回 |
    * |---|---|
-   * | `Created`(尚未 `Start()`) | `kInvalidState` |
+   * | `Created`(尚未 `Start()`) | `kClosed` |
    * | `Running` | 放行 |
    * | `Closing` / `Closed` | `kClosed` |
    *
    * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是"早一点也行"。
-   * 这与四个 `Register*`(只在 `Created` 受理,其余相位 `kInvalidState`)恰成对称:注册
-   * 只在 `Created`、订阅只在 `Running`,两段互不重叠,各自用 `kInvalidState` 表达"相位
-   * 不对"。推荐写法就是紧挨着的两句:
+   * 判据与另外三个交互方法**同一个** `IsRunning()`:`kClosed` 一并覆盖"未启动 / 关闭中 /
+   * 已关闭",这是本库已经写进公开 `@return` 的既有约定(见 `ProtocolNode`),本方法不为
+   * "没启动"单开一个错误码。注册面与订阅面**互不重叠**——注册只在 `Created`(其余相位
+   * `kInvalidState`)、订阅只在 `Running`。推荐写法就是紧挨着的两句:
    *
    * ```cpp
    * (void)node.Start();
@@ -282,10 +284,9 @@ class DdsNode : public NodeBase {
    *
    * @param topic 具体 topic,或 `kAny`。
    * @param kind  具体 `MessageKind`,或 `kAny`。
-   * @return 订阅凭据(析构时自动注销);节点尚在 `Created` 返 `kInvalidState`,处于
-   *         `Closing` / `Closed` 返 `kClosed`(两者都**先于**下面的注册校验,故未启动或已
-   *         关闭的节点上订阅未注册的 topic 报相位错误,不报 `kConfiguration`);
-   *         topic 未注册为对应角色返 `kConfiguration`:
+   * @return 订阅凭据(析构时自动注销);`kClosed`(未启动 / 已关闭)——**先于**下面的注册
+   *         校验,故未启动或已关闭的节点上订阅未注册的 topic 报 `kClosed`,不报
+   *         `kConfiguration`;topic 未注册为对应角色返 `kConfiguration`:
    *         `kNotify` 须已注册为 `Subscribers`,`kRequest` 须是 `Services` 的键,其余
    *         `kind` 须至少在读侧集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值)
    *         ——不在读侧的 topic 其消息根本不会到达本进程,订阅它必然是**静默无效**。
