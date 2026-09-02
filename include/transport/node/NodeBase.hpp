@@ -8,7 +8,7 @@
  *
  * | | 语义 |
  * |---|---|
- * | `Start()` | 幂等启动;`DoStart()` 返回成功即 Running |
+ * | `Start()` | 幂等启动;`DoStart()` 返回成功即 Running(除非这期间 `Close()` 已受理,#220) |
  * | `Close()` | **只发信号,不等待收敛**。幂等,**任何 fiber 都可调**(含节点自己的内部 fiber) |
  * | `WaitClosed()` | join 全部内部 fiber——返回即可安全析构。**单调用方** |
  * | `IsRunning()` | 交互前置判据(`Request`/`Send`/`Publish`) |
