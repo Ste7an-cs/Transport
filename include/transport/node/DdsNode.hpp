@@ -11,19 +11,43 @@
  * | 模式 | 客户端/发布侧 | 服务端/订阅侧 |
  * |---|---|---|
  * | 发布-订阅 | `Publish(topic, msg)` | `Subscribe(topic, kNotify)` |
- * | 请求-响应(**单阶段** `Direct`,**D7**) | `RequestForResultDirect(topic, req, retry)` | `Subscribe(topic, kRequest)` + `Reply(request, result)` |
+ * | 请求-响应(**单阶段** `Direct`,**D7**) | `RequestForResultDirect(服务名, req, retry)` | `ServeRequests(服务名)` + `Reply(request, result)` |
  *
- * **公开面只有这四个交互方法**(**D8**):服务端**没有** `Accept()`(本模型无受理阶段);
+ * **公开面只有这五个交互方法**(**D8**):服务端**没有** `Accept()`(本模型无受理阶段);
  * `MessageKind::kFeedback` **在本设计中不使用**;**不提供旁路监听**——机制上
  * `Subscribe(kAny, kAny)` 可达,但不作为受支持的用法。
+ *
+ * ## 请求-响应的两个 topic 由【服务名派生】(**D6**,2026-09-02 裁决)
+ *
+ * ```
+ * 请求 topic  =  cfg.<服务名>.request        应答 topic  =  cfg.<服务名>.response
+ * ```
+ *
+ * `cfg.` 是**固定字面前缀,不可配**。注册与调用**一律只说服务名**,派生规则不外泄到调用方:
+ *
+ * ```cpp
+ * (void)client.RegisterClients ({"get"});   // cfg.get.request 发请求、cfg.get.response 收应答
+ * (void)server.RegisterServices({"get"});   // cfg.get.request 收请求、cfg.get.response 发应答
+ * ```
+ *
+ * **两侧算的是同一个派生函数**(实现于 `DdsNode.cpp` 的 `DeriveServiceTopics`,**一处实现、
+ * 处处调用**),故**不可能算歪**——先前那种"每服务两个 topic、且客户端与服务端必须配成
+ * 一模一样"的部署错误从根上消失。**服务名的唯一约束是非空**:`cfg.<名>.request` 与
+ * `cfg.<名>.response` 对任意非空名都互不相同(两个后缀首字符不同,长度差 1,拼不到一起),
+ * 故不存在"派生出歧义 topic"的字符,无须再限制字符集。
+ *
+ * @warning **框架由此占用了 `cfg.*.request` / `cfg.*.response` 这一命名空间**(**D6** 明确
+ *          接受的代价):它们与 `RegisterPublishers` / `RegisterSubscribers` 收的普通 topic
+ *          处在同一个平面上,重名时无从规避——`RegisterSubscribers({"cfg.get.request"})`
+ *          与 `RegisterServices({"get"})` 指的是同一条 topic。**不拦**,同代价 9。
  *
  * ## topic 由注册接口给出,不进配置(**D16**)
  *
  * ```cpp
  * DdsNode node(transport, std::make_unique<DdsCodec>());
- * (void)node.RegisterPublishers({"telemetry"});                        // 发布者
- * (void)node.RegisterServices({{"cfg.get", "cfg.get.reply"}});         // 服务端
- * (void)node.Start();                                                  // 端点在此一次性建出
+ * (void)node.RegisterPublishers({"telemetry"});   // 发布者:topic
+ * (void)node.RegisterServices({"get"});           // 服务端:服务名
+ * (void)node.Start();                             // 端点在此一次性建出
  * ```
  *
  * **四个注册方法一律只在 `Created` 相位受理**,`Running` / `Closing` / `Closed` 返
@@ -36,15 +60,26 @@
  *
  * ## 角色由"注册了什么"表达,不设 role 枚举(**D16**)
  *
- * | 注册方法 | 该节点就是 | `DoStart()` 建的端点 |
- * |---|---|---|
- * | `RegisterPublishers` | 发布者 | 每个 topic 的 **Writer** |
- * | `RegisterSubscribers` | 订阅者 | 每个 topic 的 **Reader** |
- * | `RegisterClients` | 请求-响应**客户端** | 键 → **Writer**(发请求)　值 → **Reader**(收应答) |
- * | `RegisterServices` | 请求-响应**服务端** | 键 → **Reader**(收请求)　值 → **Writer**(发应答) |
+ * | 注册方法 | 收什么 | 该节点就是 | `DoStart()` 建的端点 |
+ * |---|---|---|---|
+ * | `RegisterPublishers` | **topic** | 发布者 | 每个 topic 的 **Writer** |
+ * | `RegisterSubscribers` | **topic** | 订阅者 | 每个 topic 的 **Reader** |
+ * | `RegisterClients` | **服务名** | 请求-响应**客户端** | `cfg.<名>.request` → **Writer**(发请求)　`cfg.<名>.response` → **Reader**(收应答) |
+ * | `RegisterServices` | **服务名** | 请求-响应**服务端** | `cfg.<名>.request` → **Reader**(收请求)　`cfg.<名>.response` → **Writer**(发应答) |
  *
- * 四者可任意并存(一个节点常常兼任)。请求-响应两侧**传一模一样的实参**,各自按角色建
+ * 四者可任意并存(一个节点常常兼任)。请求-响应两侧**传一模一样的服务名**,各自按角色建
  * 各自那一侧,不会填错方向、也不必协调。
+ *
+ * ## 参数含义按模式分家(**D8**)
+ *
+ * | 方法 | 第一参 |
+ * |---|---|
+ * | `Publish` / `Subscribe` | **topic**(永远) |
+ * | `RequestForResultDirect` / `ServeRequests` | **服务名**(永远) |
+ *
+ * **`Subscribe` 保持通用**——它的第一参**永远是 topic**,`ServeRequests(名)` 是它在服务名
+ * 一侧的封装(内部即 `Subscribe(cfg.<名>.request, kRequest)`)。两条路各自的参数含义唯一,
+ * **不存在"同一个参数因 `kind` 而异"的陷阱**。
  *
  * ## 关联键 `correlation_id` 是两段式(**D6**)
  *
@@ -54,8 +89,8 @@
  *       节点构造时生成一次    uint32,从 0 开始自增,每请求一个
  * ```
  *
- * uuid 半段保证**跨节点**不撞——这是"每服务一个应答 topic、该服务全体客户端共用"得以
- * 成立的**全部**根据;`request_seq` 保证**节点内**不撞。`uint32` 回绕(约 42.9 亿次请求后)
+ * uuid 半段保证**跨节点**不撞——这是"每服务一个应答 topic(`cfg.<名>.response`)、该服务
+ * 全体客户端共用"得以成立的**全部**根据;`request_seq` 保证**节点内**不撞。`uint32` 回绕(约 42.9 亿次请求后)
  * **明确接受、不加防回绕逻辑**:届时重复的是本节点很久以前用过的值,那条订阅早已注销。
  *
  * @warning **一处承重的区别**:`Subscribe` 交出去的订阅其 `corr` 位**恒为 `kAny`**,而
@@ -67,8 +102,9 @@
  *
  * **`Subscribe(kAny, kind)` 建不了任何 `DataReader`。** DDS 的 reader 是**按 topic** 建的,
  * 而 `kAny` 只是**分发键**上的通配符。故"订阅所有 topic"的实际语义是「**已注册为 reader
- * 的 topic 的全部**」——即 `Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值,**不是**
- * "本 domain 上的全部"。未注册的 topic,其消息**根本不会到达本进程**。
+ * 的 topic 的全部**」——即 `Subscribers` ∪ 各已注册服务的 `cfg.<名>.request` ∪ 各已注册
+ * 客户端的 `cfg.<名>.response`,**不是**"本 domain 上的全部"。未注册的 topic,其消息
+ * **根本不会到达本进程**。
  *
  * ## 不管 transport 的生命周期
  *
@@ -98,7 +134,6 @@
  */
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -198,35 +233,40 @@ class DdsNode : public NodeBase {
       std::vector<std::string> topics);
 
   /**
-   * @brief 注册**请求-响应客户端**:`请求 topic → 应答 topic`,**一服务一条**。
+   * @brief 注册**请求-响应客户端**——**只收服务名**,两个 topic 由框架派生(**D6**)。
    *
-   * 键在 `DoStart()` 建 **Writer**(发请求)、值建 **Reader**(收应答)。与服务端
-   * `RegisterServices` **传一模一样的实参**,各自按角色建各自那一侧(**D16**)。
+   * `cfg.<名>.request` 在 `DoStart()` 建 **Writer**(发请求)、`cfg.<名>.response` 建
+   * **Reader**(收应答)。与服务端 `RegisterServices` **传一模一样的服务名**,各自按角色建
+   * 各自那一侧(**D16**);两侧算的是**同一个派生函数**,故不可能算歪。
    *
-   * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**),故一个客户端同时调
-   * 多个服务时各服务的应答落在各自 topic 上、互不相扰。用 `std::map` 而非
-   * `vector<pair>`:天然去重,且**从类型上排除"同一请求 topic 配了两个不同应答 topic"**。
+   * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**)。"不同服务不叠成
+   * `N×M`"自此**由框架保证**:服务名不同则派生出的应答 topic 必不同,调用方无从把两个
+   * 服务配到同一个应答 topic 上。
    *
-   * @param topics 请求 topic → 应答 topic。
+   * 批量 / 累加 / 幂等去重 / 整批生效,同 `RegisterPublishers`。
+   *
+   * @param service_names 待注册的服务名集合。
    * @return 成功;不在 `Created` 相位返 `kInvalidState`;下列任一非法返 `kInvalidArgument`
    *         (整批不落):
-   *         - 键或值为空串;
-   *         - 某条的**键与值相同**(请求与应答同 topic 必然自收自答);
-   *         - 某个键**已注册为 `Services` 的键**——**自己请求自己**,且 `corr` 由自己生成、
+   *         - **服务名为空串**;
+   *         - 某个服务名**已注册为 `Services`**——**自己请求自己**,且 `corr` 由自己生成、
    *           `Dispatcher` **会真的匹配上**,形成调用方毫无察觉的自问自答。**这是唯一要拦的
    *           方向冲突**;其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收白干、
-   *           不会误配,且可能是有意的回环自测,**不拦**;
-   *         - 某个键**此前已注册为 `Clients` 的键但应答 topic 不同**——与上面那条 map 的
-   *           类型保证同源:一个请求 topic 只能有一个应答 topic,跨批次亦然。
+   *           不会误配,且可能是有意的回环自测,**不拦**。
+   *
+   * @note **服务名除"非空"外不限制字符**:`cfg.<名>.request` 与 `cfg.<名>.response` 对任意
+   *       非空名都互不相同,且不同服务名派生出的 topic 亦必不同(拼接是单射的),故不存在
+   *       会产生歧义的字符。真正非法的 topic 名会由 provider 在 `Start()` 的 `Declare*`
+   *       处显式报错,不会静默走坏。
    */
   [[nodiscard]] Coro::Result<void> RegisterClients(
-      std::map<std::string, std::string> topics);
+      std::vector<std::string> service_names);
 
-  /// @brief 注册**请求-响应服务端**:`请求 topic → 应答 topic`,键建 **Reader**(收请求)、
-  ///        值建 **Writer**(发应答)。校验与返回值与 `RegisterClients` 逐条对称
-  ///        (方向冲突查的是 `Clients` 的键)。
+  /// @brief 注册**请求-响应服务端**——**只收服务名**:`cfg.<名>.request` 建 **Reader**
+  ///        (收请求)、`cfg.<名>.response` 建 **Writer**(发应答)。校验与返回值与
+  ///        `RegisterClients` 逐条对称(方向冲突查的是 `Clients`)。
   [[nodiscard]] Coro::Result<void> RegisterServices(
-      std::map<std::string, std::string> topics);
+      std::vector<std::string> service_names);
 
   // ── 公开面:两种交互模式(D8)────────────────────────────────────────────
 
@@ -238,10 +278,14 @@ class DdsNode : public NodeBase {
    * 服务端事先不可能知道客户端会生成什么值,发布-订阅侧的"应用自定义子通道"能力已裁决
    * 为不需要。暴露一个只能填一个值的参数是陷阱,不是灵活性。
    *
+   * **第一参永远是 topic,不因 `kind` 而异**(**D8**)。收某个服务的请求请调
+   * `ServeRequests(服务名)`——它是本方法在服务名一侧的封装,内部即
+   * `Subscribe(cfg.<名>.request, kRequest)`。
+   *
    * | 用途 | 这样调 | 实际键 |
    * |---|---|---|
    * | 订阅某 topic 的通知 | `Subscribe("t", MessageKind::kNotify)` | `{"t", kAny, kNotify}` |
-   * | 收某 topic 的请求 | `Subscribe("t", MessageKind::kRequest)` | `{"t", kAny, kRequest}` |
+   * | 收某服务的请求 | `ServeRequests("get")` | `{"cfg.get.request", kAny, kRequest}` |
    * | 收全部(已注册 reader 的)topic 的通知 | `Subscribe(kAny, MessageKind::kNotify)` | `{kAny, kAny, kNotify}` |
    *
    * 消费在**调用方自己的 fiber** 内进行,节点不代管;串行、异常隔离与信箱容量之外的背压
@@ -287,9 +331,10 @@ class DdsNode : public NodeBase {
    * @return 订阅凭据(析构时自动注销);`kClosed`(未启动 / 已关闭)——**先于**下面的注册
    *         校验,故未启动或已关闭的节点上订阅未注册的 topic 报 `kClosed`,不报
    *         `kConfiguration`;topic 未注册为对应角色返 `kConfiguration`:
-   *         `kNotify` 须已注册为 `Subscribers`,`kRequest` 须是 `Services` 的键,其余
-   *         `kind` 须至少在读侧集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的值)
-   *         ——不在读侧的 topic 其消息根本不会到达本进程,订阅它必然是**静默无效**。
+   *         `kNotify` 须已注册为 `Subscribers`,`kRequest` 须是某个已注册服务的
+   *         `cfg.<名>.request`,其余 `kind` 须至少在读侧集合内(`Subscribers` ∪ 各服务的
+   *         `cfg.<名>.request` ∪ 各客户端的 `cfg.<名>.response`)——不在读侧的 topic 其消息
+   *         根本不会到达本进程,订阅它必然是**静默无效**。
    *         **topic 传 `kAny` 时跳过该校验**:`kAny` 不对应任何一个具体 topic,拿它去查
    *         注册表必然落空;它的作用域本就已由注册天然限定(见文件头的限制一节)。
    */
@@ -318,9 +363,12 @@ class DdsNode : public NodeBase {
    * ← kReply                                ⇒ 成功(返回该帧,【不回应】)
    * ```
    *
-   * 步骤:按 `topic` 查已注册的 `Clients` 表取应答 topic(**查不到即 `kConfiguration`,
-   * 不猜、不回落**)→ 盖 `kind` / `corr` / `reply_to` → **先登记订阅再发出** → 编码**一次**、
-   * 重发复用同一份字节 → 首个到达即成功。
+   * 步骤:查 `service_name` 是否已注册为 `Clients`(**查不到即 `kConfiguration`,不猜、
+   * 不回落**)→ 派生出 `cfg.<名>.request` / `cfg.<名>.response` → 盖 `kind` / `corr` /
+   * `reply_to` → **先登记订阅再发出** → 编码**一次**、重发复用同一份字节 → 首个到达即成功。
+   *
+   * **第一参是【服务名】,不是 topic**(**D8**):派生规则不外泄到调用方。**没有改名为
+   * `Request`**——那个名字在 ADR-0010 **D10** 被删除过,拿回来配不同语义会造成混淆。
    *
    * **签名里没有 `result_timeout`**:本交互只有**一个**等待阶段,其时限即 `retry.timeout`。
    * **耗尽返 `kTimeout` 而不是 `kNotAccepted`**——后者的语义是"对端没有受理",而本模型
@@ -330,33 +378,53 @@ class DdsNode : public NodeBase {
    * 满时静默丢最旧,且共用应答 topic 把这一段的压力放大了 `N` 倍(**D11** / 代价 8)。
    * 重发正是对这一段的补救。代价是**要求对端能容忍重复请求**,框架不校验。
    *
-   * @param topic 请求 topic,**须已注册为 `Clients` 的键**。
+   * @param service_name 服务名,**须已注册为 `Clients`**。
    * @param req   请求 Message(`payload` 由调用方填;`kind` / `correlation_id` /
-   *              `reply_to` 由本节点盖)。
+   *              `reply_to` / `topic` 由本节点盖)。
    * @param retry 重发策略,见 `RetryPolicy`。
-   * @return 收到的 `kReply`;或 `kTimeout`(重发次数耗尽)、`kInvalidArgument`(策略非法)、
-   *         `kConfiguration`(topic 未注册为客户端)、`kClosed`、编码错误。
+   * @return 收到的 `kReply`(其 `topic` 是 `cfg.<名>.response`);或 `kTimeout`(重发次数
+   *         耗尽)、`kInvalidArgument`(策略非法)、`kConfiguration`(服务名未注册为客户端)、
+   *         `kClosed`、编码错误。
    */
   [[nodiscard]] Coro::Result<Message> RequestForResultDirect(
-      const std::string& topic, Message req, RetryPolicy retry);
+      const std::string& service_name, Message req, RetryPolicy retry);
+
+  /**
+   * @brief 服务端收请求——`Subscribe(cfg.<名>.request, kRequest)` 的**服务名封装**(**D8**)。
+   *
+   * **不是另一套机制**:它派生出请求 topic 之后原样交给 `Subscribe`,相位与注册两道校验
+   * 也都落在那里。之所以另起一个名字,是因为派生化之后它与 `Subscribe(topic, kRequest)`
+   * **签名与语义均不再等价**——一个收服务名、一个收 topic;而让 `Subscribe` 的第一参"因
+   * `kind` 而异"正是本设计要避免的陷阱。
+   *
+   * 消费方式与 `Subscribe` 完全相同:凭据交给调用方自己的 fiber 顺序消费,收到 `kRequest`
+   * 后调 `Reply(request, result)` 回一条终结应答。
+   *
+   * @param service_name 服务名,**须已注册为 `Services`**。
+   * @return 订阅凭据;`kClosed`(未启动 / 关闭中 / 已关闭,**先于**注册校验)、
+   *         `kConfiguration`(服务名未注册为服务端——空串亦然,它永远注册不上)。
+   */
+  [[nodiscard]] Coro::Result<Ticket> ServeRequests(
+      const std::string& service_name);
 
   /**
    * @brief 服务端回一条终结应答 `kReply`——请求-响应服务端**唯一**的方法(无受理阶段)。
    *
-   * **应答 topic 从自己注册的 `Services` 表查**(`services_[request.topic]`),**不取信于
-   * 线缆、不建端点**(**D15**):运行期不再有任何建端点的路径,该 topic 的 writer 早在
-   * `DoStart()` 就建好了,故服务的**第一次应答也不会丢**。
+   * **签名不变**(**D8**):它由 `request.topic`(即派生出的 `cfg.<名>.request`)**反查自己
+   * 注册的服务**,再派生出该服务的 `cfg.<名>.response`。**不取信于线缆、不建端点**
+   * (**D15**):运行期不再有任何建端点的路径,该 topic 的 writer 早在 `DoStart()` 就建好了,
+   * 故服务的**第一次应答也不会丢**。反查走的是**同一个派生函数**,不另写解析器。
    *
-   * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的应答 topic 不等即返
-   * `kInvalidArgument`。**保留它是有价值的,不是冗余**——两侧注册实参写歪时(客户端在
-   * `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发),不带它这种偏差**完全不可见**,
-   * 客户端只会一路超时、看起来像对端没响应;带上它,服务端**当场就能报出**"你等的地方和
-   * 我发的地方不一样"。
+   * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与派生出的应答 topic 不等即返
+   * `kInvalidArgument`。**派生化之后两侧配歪已不可能**,故它的诊断价值大幅下降;但对
+   * **版本不一致的对端**(派生规则将来若变更)它仍是唯一能当场发现偏差的手段——否则客户端
+   * 只会一路超时、看起来像对端没响应。
    *
    * @param request 收到的请求(其 `topic` 与 `correlation_id` 是本方法的全部输入)。
-   * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` 由本节点盖)。
-   * @return 已入队;`kClosed`、`kConfiguration`(本节点根本不服务 `request.topic`)、
-   *         `kInvalidArgument`(`reply_to` 交叉校验不过)、编码错误。
+   * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` / `topic`
+   *                由本节点盖)。
+   * @return 已入队;`kClosed`、`kConfiguration`(`request.topic` 不是本节点任何一个已注册
+   *         服务的请求 topic)、`kInvalidArgument`(`reply_to` 交叉校验不过)、编码错误。
    */
   [[nodiscard]] Coro::Result<void> Reply(const Message& request, Message result);
 
@@ -403,8 +471,8 @@ class DdsNode : public NodeBase {
   /// @brief 取用下一个 `correlation_id`:`"<uuid>#<request_seq>"`,`request_seq` 自增。
   ///        **`uint32` 回绕明确接受**,不加防回绕逻辑(**D6**)。
   [[nodiscard]] std::string NextCorrelationId();
-  /// @brief 该 topic 是否在**读侧**集合内(`Subscribers` ∪ `Services` 的键 ∪ `Clients` 的
-  ///        值)——即"它的消息有没有可能到达本进程"。
+  /// @brief 该 topic 是否在**读侧**集合内(`Subscribers` ∪ 各服务的 `cfg.<名>.request` ∪
+  ///        各客户端的 `cfg.<名>.response`)——即"它的消息有没有可能到达本进程"。
   [[nodiscard]] bool IsReaderSideTopic(const std::string& topic) const;
 
   DdsTransport& transport_;  ///< **借用**:宿主拥有并启停,寿命须长于本节点。
@@ -418,11 +486,13 @@ class DdsNode : public NodeBase {
   /// (`Message::session_id`,DDS 路径留缺省 `0`),同名是确定的阅读陷阱(**D6**)。
   std::uint32_t request_seq_{0};
 
-  // —— 四组注册表(**D16**)。`Start()` 之前填,此后只读;`Start()` 失败**不清空**。——
-  std::set<std::string> publishers_;             ///< topic → Writer。
-  std::set<std::string> subscribers_;            ///< topic → Reader。
-  std::map<std::string, std::string> clients_;   ///< 请求 topic → 应答 topic(键 W、值 R)。
-  std::map<std::string, std::string> services_;  ///< 请求 topic → 应答 topic(键 R、值 W)。
+  // —— 四组注册表(**D16**)。`Start()` 之前填,此后只读;`Start()` 失败**不清空**。
+  //    请求-响应两组存的是**服务名**,两个 topic 一律由 `DeriveServiceTopics` 现算
+  //    (**D6**)——不缓存派生结果,免得同一事实存两份、将来改派生规则时漏改一处。——
+  std::set<std::string> publishers_;   ///< topic → Writer。
+  std::set<std::string> subscribers_;  ///< topic → Reader。
+  std::set<std::string> clients_;      ///< 服务名:request → W(发请求)、response → R(收应答)。
+  std::set<std::string> services_;     ///< 服务名:request → R(收请求)、response → W(发应答)。
 
   /// 本节点在传输 `read_queue` 上的订阅(`shared()`);`DoClose` 关闭之——**关闭是整流
   /// 传播的**,连源队列与其它订阅者一并终结(见文件头 warning)。

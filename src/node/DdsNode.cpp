@@ -2,7 +2,8 @@
 
 #include <chrono>
 #include <cstdint>
-#include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -20,8 +21,9 @@
 #include "transport/core/Observability.hpp"
 #include "transport/core/TraceCategories.hpp"
 
-// DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):四组注册表、两段式
-// correlation_id、Dispatcher 键 (topic, corr, kind)、单阶段请求-响应、应答寻址。生命周期
+// DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):四组注册表、服务名 → 两个
+// topic 的派生、两段式 correlation_id、Dispatcher 键 (topic, corr, kind)、单阶段
+// 请求-响应、应答寻址。**派生只此一处实现**(`DeriveServiceTopics`)。生命周期
 // (幂等 Start / 关闭仲裁 / join)由基类 NodeBase 承载,本类只填三个钩子。
 //
 // 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不持有业务队列与 handler
@@ -64,35 +66,68 @@ std::string MakeUuid(const std::string& uuid_override) {
   return Coro::Result<void>{};
 }
 
-/// 成对型注册批(`Clients` / `Services`)的校验。四条,逐条都有明确依据:
+/// 服务名派生出的两个 topic(**D6**)。
+struct ServiceTopics {
+  std::string request;  ///< `cfg.<服务名>.request`
+  std::string reply;    ///< `cfg.<服务名>.response`
+};
+
+/// `cfg.` 是**固定字面前缀,不可配**(**D6**)——不是配置项,不许做成可注入的。
+constexpr char kServicePrefix[] = "cfg.";
+constexpr char kRequestSuffix[] = ".request";
+constexpr char kReplySuffix[] = ".response";
+
+/// 服务名 → 两个 topic 的**唯一**派生实现(**D6**)。
+///
+/// ★ **一处实现、处处调用**:客户端与服务端、注册面(`DoStart` 建端点)与调用面
+///   (`RequestForResultDirect` / `ServeRequests` / `Reply` / `Subscribe` 的校验)**全都从
+///   这一个函数取值**。「两侧不可能算歪」这个保证**全部依赖于此**——任何一处另写一遍
+///   字符串拼接,保证当场失效。
+///
+/// **拼接是单射的,故不需要限制服务名的字符**:`.request` 与 `.response` 首字符不同、长度
+/// 差 1,两者拼不到一起;不同服务名派生出的 topic 亦必不同。空串在注册处已拦。
+[[nodiscard]] ServiceTopics DeriveServiceTopics(const std::string& service_name) {
+  return ServiceTopics{kServicePrefix + service_name + kRequestSuffix,
+                       kServicePrefix + service_name + kReplySuffix};
+}
+
+/// 反查:`request_topic` 是不是 `service_names` 里某个服务派生出来的请求 topic。
+///
+/// **仍走 `DeriveServiceTopics`,不另写"剥前缀去后缀"的解析器**——派生与反查一旦分成两份
+/// 实现,就又有了两边算不到一处去的余地,而这正是本轮设计要根除的东西。
+[[nodiscard]] std::optional<ServiceTopics> FindServiceByRequestTopic(
+    const std::set<std::string>& service_names,
+    const std::string& request_topic) {
+  for (const auto& name : service_names) {
+    ServiceTopics topics = DeriveServiceTopics(name);
+    if (topics.request == request_topic) {
+      return topics;
+    }
+  }
+  return std::nullopt;
+}
+
+/// 服务名注册批(`Clients` / `Services`)的校验。派生化之后**只剩两条**:
 ///
 /// | 检查 | 依据 |
 /// |---|---|
-/// | 键或值为空串 | 空 topic 建不出端点 |
-/// | 键 == 值 | 请求与应答同 topic,必然自收自答(**D16**) |
-/// | 键已是**反向表**的键 | **唯一要拦的方向冲突**——自己请求自己,且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**,形成毫无察觉的自问自答 |
-/// | 键在**本表**里已配了**别的**应答 topic | 与 `std::map` 的类型保证同源:一个请求 topic 只能有一个应答 topic,跨批次亦然 |
+/// | 服务名为空串 | 空名派生出的 `cfg..request` 无从表达"哪个服务" |
+/// | 服务名已注册为**反向角色** | **唯一要拦的方向冲突**——自己请求自己,且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**,形成毫无察觉的自问自答 |
+///
+/// **另外两条随派生化从根上消失**(**D16**,2026-09-02):"请求与应答同 topic"——派生出来
+/// 必然不同;"同一请求 topic 跨批次配了两个不同应答 topic"——派生确定、同名必同值。留着
+/// 是死代码。
 ///
 /// **只拦这一种方向冲突。** 其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收
 /// 白干、不会误配,且可能是调用方有意为之(本地回环自测),**不拦**(**D16** / 代价 9)。
-[[nodiscard]] Coro::Result<void> ValidatePairBatch(
-    const std::map<std::string, std::string>& batch,
-    const std::map<std::string, std::string>& own,
-    const std::map<std::string, std::string>& opposite) {
-  for (const auto& entry : batch) {
-    const std::string& request_topic = entry.first;
-    const std::string& reply_topic = entry.second;
-    if (request_topic.empty() || reply_topic.empty()) {
+[[nodiscard]] Coro::Result<void> ValidateServiceNameBatch(
+    const std::vector<std::string>& batch,
+    const std::set<std::string>& opposite) {
+  for (const auto& service_name : batch) {
+    if (service_name.empty()) {
       return make_error_code(TransportErrc::kInvalidArgument);
     }
-    if (request_topic == reply_topic) {
-      return make_error_code(TransportErrc::kInvalidArgument);
-    }
-    if (opposite.count(request_topic) != 0) {
-      return make_error_code(TransportErrc::kInvalidArgument);
-    }
-    const auto existing = own.find(request_topic);
-    if (existing != own.end() && existing->second != reply_topic) {
+    if (opposite.count(service_name) != 0) {
       return make_error_code(TransportErrc::kInvalidArgument);
     }
   }
@@ -154,27 +189,27 @@ Coro::Result<void> DdsNode::RegisterSubscribers(std::vector<std::string> topics)
 }
 
 Coro::Result<void> DdsNode::RegisterClients(
-    std::map<std::string, std::string> topics) {
+    std::vector<std::string> service_names) {
   if (CurrentLifecycle() != LifecycleState::kCreated) {
     return make_error_code(TransportErrc::kInvalidState);
   }
-  // 反向表是 `services_`:同一 topic 既是 Clients 的键、又是 Services 的键 = 自己请求自己。
-  if (auto valid = ValidatePairBatch(topics, clients_, services_); !valid) {
+  // 反向角色是 `services_`:同一服务名既注册为 Clients 又注册为 Services = 自己请求自己。
+  if (auto valid = ValidateServiceNameBatch(service_names, services_); !valid) {
     return valid;
   }
-  clients_.insert(topics.begin(), topics.end());  // 重复键幂等(值已校验过一致)。
+  clients_.insert(service_names.begin(), service_names.end());
   return Coro::Result<void>{};
 }
 
 Coro::Result<void> DdsNode::RegisterServices(
-    std::map<std::string, std::string> topics) {
+    std::vector<std::string> service_names) {
   if (CurrentLifecycle() != LifecycleState::kCreated) {
     return make_error_code(TransportErrc::kInvalidState);
   }
-  if (auto valid = ValidatePairBatch(topics, services_, clients_); !valid) {
+  if (auto valid = ValidateServiceNameBatch(service_names, clients_); !valid) {
     return valid;
   }
-  services_.insert(topics.begin(), topics.end());
+  services_.insert(service_names.begin(), service_names.end());
   return Coro::Result<void>{};
 }
 
@@ -203,20 +238,23 @@ Coro::Result<void> DdsNode::DoStart() {
       return declared;
     }
   }
-  for (const auto& entry : clients_) {
-    if (auto declared = transport_.DeclareWriter(entry.first); !declared) {
-      return declared;  // 键 → Writer(发请求)。
+  // 请求-响应两组存的是**服务名**,两个 topic 在此由**同一个派生函数**算出(D6)。
+  for (const auto& service_name : clients_) {
+    const ServiceTopics topics = DeriveServiceTopics(service_name);
+    if (auto declared = transport_.DeclareWriter(topics.request); !declared) {
+      return declared;  // cfg.<名>.request → Writer(发请求)。
     }
-    if (auto declared = transport_.DeclareReader(entry.second); !declared) {
-      return declared;  // 值 → Reader(收应答)。
+    if (auto declared = transport_.DeclareReader(topics.reply); !declared) {
+      return declared;  // cfg.<名>.response → Reader(收应答)。
     }
   }
-  for (const auto& entry : services_) {
-    if (auto declared = transport_.DeclareReader(entry.first); !declared) {
-      return declared;  // 键 → Reader(收请求)。
+  for (const auto& service_name : services_) {
+    const ServiceTopics topics = DeriveServiceTopics(service_name);
+    if (auto declared = transport_.DeclareReader(topics.request); !declared) {
+      return declared;  // cfg.<名>.request → Reader(收请求)。
     }
-    if (auto declared = transport_.DeclareWriter(entry.second); !declared) {
-      return declared;  // 值 → Writer(发应答)。**服务的第一次应答不会丢**就靠这一行。
+    if (auto declared = transport_.DeclareWriter(topics.reply); !declared) {
+      return declared;  // cfg.<名>.response → Writer(发应答)。**首次应答不会丢**靠这一行。
     }
   }
 
@@ -335,7 +373,9 @@ Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
     if (kind.has_value() && kind.value() == MessageKind::kNotify) {
       registered = subscribers_.count(name) != 0;  // 发布-订阅的订阅侧。
     } else if (kind.has_value() && kind.value() == MessageKind::kRequest) {
-      registered = services_.count(name) != 0;  // 请求-响应的服务端收请求。
+      // 请求-响应的服务端收请求:第一参**仍然是 topic**,须是某个已注册服务派生出的请求
+      // topic。`ServeRequests(名)` 正是从这条路进来的——**本方法不为 kind 改参数含义**。
+      registered = FindServiceByRequestTopic(services_, name).has_value();
     } else {
       // 其余 kind(含 kind 传 kAny):**至少**得在读侧集合内——不在读侧的 topic 其消息
       // 根本不会到达本进程,订阅它必然是静默无效,正是 D16 要消灭的那种失败。
@@ -368,9 +408,8 @@ Coro::Result<void> DdsNode::Publish(const std::string& topic, Message msg) {
   return EncodeAndWrite(msg, topic);
 }
 
-Coro::Result<Message> DdsNode::RequestForResultDirect(const std::string& topic,
-                                                      Message req,
-                                                      RetryPolicy retry) {
+Coro::Result<Message> DdsNode::RequestForResultDirect(
+    const std::string& service_name, Message req, RetryPolicy retry) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
@@ -380,21 +419,23 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(const std::string& topic,
       retry.timeout <= std::chrono::milliseconds::zero()) {
     return make_error_code(TransportErrc::kInvalidArgument);
   }
-  // 应答 topic 从**已注册的 `Clients` 表**查:**查不到即 kConfiguration,不猜、不回落到
-  // 某个默认值**(D6)。这让"忘了注册"从一个静默无效变成一个显式错误。
-  const auto client = clients_.find(topic);
-  if (client == clients_.end()) {
+  // **第一参是服务名**(D8):查它有没有注册为 `Clients`,**查不到即 kConfiguration,不猜、
+  // 不回落**(D6)。这让"忘了注册"从一个静默无效变成一个显式错误。
+  if (clients_.count(service_name) == 0) {
     return make_error_code(TransportErrc::kConfiguration);
   }
-  const std::string reply_topic = client->second;
+  // 两个 topic 在此派生——**与服务端建端点时调的是同一个函数**,故两侧必然算到一处去。
+  const ServiceTopics topics = DeriveServiceTopics(service_name);
+  const std::string& request_topic = topics.request;
+  const std::string& reply_topic = topics.reply;
 
   const std::string correlation_id = NextCorrelationId();
   req.kind = MessageKind::kRequest;
   req.correlation_id = correlation_id;
-  // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15):两侧注册实参写歪时,不带它
-  // 这种偏差完全不可见,客户端只会一路超时、看起来像对端没响应。
+  // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15)。派生化之后两侧配歪已不可能,
+  // 它剩下的用途是对**版本不一致的对端**(派生规则将来若变更)当场报出偏差。
   req.reply_to = reply_topic;
-  req.topic = topic;
+  req.topic = request_topic;
 
   // **编码一次**,重发复用同一份字节(ADR-0010 D3:重发的是字节完全相同的原帧,
   // `correlation_id` 不变,故订阅横跨全部重发继续有效)。
@@ -414,7 +455,7 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(const std::string& topic,
       {reply_topic, correlation_id, MessageKind::kReply});
 
   for (int attempt = 0; attempt < retry.max_attempts; ++attempt) {
-    if (auto queued = WriteEncoded(bytes, topic); !queued) {
+    if (auto queued = WriteEncoded(bytes, request_topic); !queued) {
       return queued.error();  // 生命周期非法——不属超时,不重试。
     }
     auto got = result.Wait(retry.timeout);
@@ -432,16 +473,28 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(const std::string& topic,
   return make_error_code(TransportErrc::kTimeout);
 }
 
+Coro::Result<DdsNode::Ticket> DdsNode::ServeRequests(
+    const std::string& service_name) {
+  // **是 `Subscribe` 在服务名一侧的封装,不是另一套机制**(D8):派生出请求 topic 之后原样
+  // 交给它,相位与注册两道校验都落在那里。`Subscribe` 由此得以**保持通用**——它的第一参
+  // 永远是 topic,不需要为 `kind` 分叉出"这个参数其实是服务名"的分支。
+  //
+  // 空服务名走到这里也无妨:`cfg..request` 永远注册不上,`Subscribe` 报 kConfiguration。
+  return Subscribe(DeriveServiceTopics(service_name).request,
+                   MessageKind::kRequest);
+}
+
 Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
-  // **应答 topic 从自己注册的 `Services` 表查,不取信于线缆、不建端点**(D15)。
-  const auto service = services_.find(request.topic);
-  if (service == services_.end()) {
+  // **应答目的地由自己注册的服务反查,不取信于线缆、不建端点**(D15):`request.topic` 是
+  // 派生出来的 `cfg.<名>.request`,反查同样走 `DeriveServiceTopics`(不另写解析器)。
+  const auto service = FindServiceByRequestTopic(services_, request.topic);
+  if (!service.has_value()) {
     return make_error_code(TransportErrc::kConfiguration);  // 我根本不服务这个 topic。
   }
-  const std::string& reply_topic = service->second;
+  const std::string& reply_topic = service->reply;
   // 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的不等即报错。这 20 来个
   // 字节买的是"两侧注册实参写歪"这一类部署错误的可诊断性。
   if (!request.reply_to.empty() && request.reply_to != reply_topic) {
@@ -464,13 +517,16 @@ std::string DdsNode::NextCorrelationId() {
 }
 
 bool DdsNode::IsReaderSideTopic(const std::string& topic) const {
-  // 读侧 = Subscribers ∪ Services 的键 ∪ Clients 的值(D16 的判据,与代价 9 的
-  // "reader 侧"逐字相同)。
-  if (subscribers_.count(topic) != 0 || services_.count(topic) != 0) {
+  // 读侧 = Subscribers ∪ 各服务的 cfg.<名>.request ∪ 各客户端的 cfg.<名>.response
+  // (D16 的判据,与代价 9 的 "reader 侧"逐字相同,只是两个 topic 现在是派生出来的)。
+  if (subscribers_.count(topic) != 0) {
     return true;
   }
-  for (const auto& entry : clients_) {
-    if (entry.second == topic) {
+  if (FindServiceByRequestTopic(services_, topic).has_value()) {
+    return true;
+  }
+  for (const auto& service_name : clients_) {
+    if (DeriveServiceTopics(service_name).reply == topic) {
       return true;
     }
   }
