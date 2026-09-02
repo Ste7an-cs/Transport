@@ -122,6 +122,15 @@ std::size_t DropCount(const transport::CapturingTraceSink& sink) {
   return count;
 }
 
+/// 取一张订阅凭据并断言拿到了。`Subscribe` 返 `Coro::Result<Ticket>` 且**只在 `Running`
+/// 受理**(ADR-0009 D1′):相位不对会在这里当场炸,而不是交出一张永远等不到唤醒的凭据。
+MessageDispatcher::Ticket MustSubscribe(ProtocolNode& node,
+                                        MessageDispatcher::Key key) {
+  auto ticket = node.Subscribe(std::move(key));
+  EXPECT_TRUE(static_cast<bool>(ticket)) << ticket.error().message();
+  return std::move(ticket).value();
+}
+
 /**
  * 订阅 + 自有消费 fiber——ADR-0009 D2 的调用方样板,本文件内收一份复用。
  *
@@ -136,7 +145,8 @@ class Subscriber {
  public:
   Subscriber(ProtocolNode& node, MessageDispatcher::Key key,
              std::function<void(const Message&)> on_message)
-      : ticket_(node.Subscribe(std::move(key))), mailbox_(ticket_.mailbox()) {
+      : ticket_(MustSubscribe(node, std::move(key))),
+        mailbox_(ticket_.mailbox()) {
     task_ = std::make_shared<Coro::FiberTask<void>>(
         Coro::makeTask([this, on_message = std::move(on_message)] {
           for (;;) {
@@ -590,8 +600,13 @@ TEST(ProtocolNode, CloseTerminatesSubscriberAwaitAndConsumerExits) {
   (void)fake.Close();
 }
 
-// 关闭后新登记的订阅其信箱已处于关闭态:消费 fiber 起来即退出,不会挂死。
-TEST(ProtocolNode, SubscribeAfterCloseYieldsClosedMailbox) {
+// 关闭后再订阅**在返回处**就报 `kClosed`(ADR-0009 D1′),不再交出一张信箱已关闭的凭据。
+//
+// 改判之前本用例叫 `SubscribeAfterCloseYieldsClosedMailbox`,断言的是"拿得到凭据、但其
+// 消费 fiber 起来即退出"。裸 `Ticket` 装不下错误码,那是当时唯一能表达的形式;`Subscribe`
+// 改返 `Coro::Result<Ticket>` 之后,错误在**返回处**说清楚,不再推迟到第一次 `Wait`
+// (那还会返错误码不对的 `kInvalidState`)。
+TEST(ProtocolNode, SubscribeAfterCloseIsClosed) {
   FakeTransport fake;
   ASSERT_TRUE(fake.Start());
   ProtocolNode node(fake, MakeCodec(), BaseConfig());
@@ -599,11 +614,40 @@ TEST(ProtocolNode, SubscribeAfterCloseYieldsClosedMailbox) {
   ASSERT_TRUE(node.Close());
   node.WaitClosed();
 
-  Subscriber late(node, transport::AnyOfType(FrameType::kCommand),
-                  [](const Message&) { ADD_FAILURE() << "关闭后不应再有投递"; });
-  late.Join();
-  EXPECT_TRUE(late.exited());
-  EXPECT_EQ(late.stop_error(), make_error_code(TransportErrc::kClosed));
+  auto late = node.Subscribe(transport::AnyOfType(FrameType::kCommand));
+  ASSERT_FALSE(static_cast<bool>(late));
+  EXPECT_EQ(late.error(), make_error_code(TransportErrc::kClosed));
+  (void)fake.Close();
+}
+
+// `Subscribe` **只在 `Running` 受理**:`Created` 期订阅是**禁用法**,返 `kClosed`
+// (ADR-0009 D1′,与 `DdsNode::Subscribe` 逐字相同的相位规则)。
+//
+// 判据与三个交互方法**同一个** `IsRunning()`——`kClosed` 一并覆盖"未启动 / 关闭中 / 已
+// 关闭",是本类各 `@return` 早已写明的既有约定,`Subscribe` 不为"没启动"单开错误码。
+//
+// **拦的是一条会静默挂死宿主的路径**(#217):`NodeBase::Close()` 从 `Created` 走时不调
+// `DoClose()`,`Dispatcher::CloseAll` 因此从不执行——而"信箱被关"是订阅者唯一的协作取消
+// 信号(D4)。放行 `Created` 期订阅,宿主就能拿着一张**永远等不到唤醒**的凭据 spawn 消费
+// fiber,随后放弃启动、join 时挂死。凭据根本发不出去,那条路径即不可达。
+TEST(ProtocolNode, SubscribeBeforeStartIsClosed) {
+  FakeTransport fake;
+  ASSERT_TRUE(fake.Start());
+  ProtocolNode node(fake, MakeCodec(), BaseConfig());
+
+  // ★ 尚未 Start():一张凭据也拿不到。
+  auto early = node.Subscribe(transport::AnyOfType(FrameType::kCommand));
+  ASSERT_FALSE(static_cast<bool>(early));
+  EXPECT_EQ(early.error(), make_error_code(TransportErrc::kClosed));
+
+  // 放弃启动、从 `Created` 直接 `Close()`(正是 #217 那条不走 `DoClose()` 的路径):
+  // 相位直落 `Closed`,答案不变。
+  ASSERT_TRUE(node.Close());
+  auto after = node.Subscribe(transport::AnyOfType(FrameType::kCommand));
+  ASSERT_FALSE(static_cast<bool>(after));
+  EXPECT_EQ(after.error(), make_error_code(TransportErrc::kClosed));
+
+  node.WaitClosed();
   (void)fake.Close();
 }
 
@@ -680,7 +724,7 @@ TEST(ProtocolNode, InteractionsRejectNonPositiveTimeout) {
 TEST(ProtocolNode, SubscribeSupportsMultiPhaseInteraction) {
   Fixture fx;
   // 结果帧的命令码与请求不同,故按"任意会话 + 该命令码 + 结果"登记。
-  auto result = fx.node->Subscribe({kAny, 0x03F2, FrameType::kResult});
+  auto result = MustSubscribe(*fx.node, {kAny, 0x03F2, FrameType::kResult});
 
   Coro::Result<Message> ack = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask(
@@ -707,7 +751,8 @@ TEST(ProtocolNode, SubscribeSupportsMultiPhaseInteraction) {
 // 旁路监听与精确等待同时命中同一条消息,各得一份。
 TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
   Fixture fx;
-  auto audit = fx.node->Subscribe(transport::AnyOfType(FrameType::kResponse));
+  auto audit =
+      MustSubscribe(*fx.node, transport::AnyOfType(FrameType::kResponse));
 
   Coro::Result<Message> reply = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask(
