@@ -12,10 +12,10 @@
 namespace transport {
 
 /**
- * @brief `TcpTransport` 的配置(取代已删除的 `TcpClientConfig`,ADR-0011 D1)。
+ * @brief `TcpTransport` 的配置。
  *
- * **只有一个时间量**(D5):`connect_timeout` / `reconnect_interval` / `silence_timeout`
- * 三个旋钮合一。三处用途——等连上 / 读静默判链路坏 / 连不上时的重连退避——共用它。
+ * **只有一个时间量**(D5):三处用途——等连上 / 读静默判链路坏 / 连不上时的重连退避
+ * ——共用它,不设三个旋钮。
  */
 struct TcpConfig {
   /// 对端主机(非空,否则 `Start()` 返 kConfiguration)。

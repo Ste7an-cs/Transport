@@ -40,11 +40,10 @@ class IDdsProvider {
   virtual Coro::Result<void> Init(const DdsConfig& config) = 0;
   virtual void         Shutdown() = 0;
 
-  /// @brief 声明写侧端点——**当场建出该 topic 的 `DataWriter`**(**D13** 补正)。**幂等**。
+  /// @brief 声明写侧端点——**当场建出该 topic 的 `DataWriter`**(**D13**)。**幂等**。
   ///
   /// 与 `Subscribe` 对称的写侧钩子。有它,发现窗口(约 240ms)才能在**启动时**付掉,
-  /// 而不是压在第一帧上:惰性建 writer 与"`Reply()` 才建"后果一模一样——**该服务的
-  /// 第一次应答会丢**(**D15/D16**)。
+  /// 而不是压在第一帧上——否则**该服务的第一次应答会丢**(**D15/D16**)。
   ///
   /// **不设 `UndeclareWriter`**:端点集合启动即定型、运行期恒定(**D16**),只在
   /// `Shutdown()` 时整体拆除。
@@ -54,13 +53,13 @@ class IDdsProvider {
 
   /// @brief 向 topic 发一份字节。**该 topic 须已 `DeclareWriter`**。
   ///
-  /// **可阻塞**(ADR-0013 **D13**,语义自"必成功"改判):`RELIABLE` 下 writer 准入满时
+  /// **可阻塞**(ADR-0013 **D13**):`RELIABLE` 下 writer 准入满时
   /// 实现方会 **park 调用线程**至多一个 `DdsQos::max_blocking_time`,超时返 `kIo`。
   /// 这是**线程级**阻塞、不是 fiber 级——调用方须在**专属 OS 线程**上调用(**D3**),
   /// 否则会卡住整条 fiber 调度线程。
   ///
-  /// **不惰性建 writer**(**D13** 补正):未声明的 topic 返 `kConfiguration`——惰性建
-  /// 会让 `DeclareWriter` 形同虚设,首帧照样吃发现窗口。
+  /// **不惰性建 writer**(**D13**):未声明的 topic 返 `kConfiguration`——惰性建会让
+  /// `DeclareWriter` 形同虚设,首帧照样吃发现窗口。
   ///
   /// @return 成功空 `Result`;写超时返 `kIo`;topic 未声明返 `kConfiguration`;
   ///         未 `Init` 返 `kInvalidState`。

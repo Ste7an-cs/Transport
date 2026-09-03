@@ -74,9 +74,8 @@ Coro::Result<void> DdsTransport::Start() {
     return error;
   }
   if (auto inited = provider->Init(config_); !inited) {
-    // Init 失败同样**停在 Created**,且**不留半个 provider**——DDS 没有重连相位
-    // (与三介质的"首次链路就绪失败不算启动失败"分歧:那三个有泵可以无限重试,
-    // 而 participant 建不出来多半是配置问题,留着只会让后续每次 Publish 都失败)。
+    // Init 失败同样**停在 Created**,且**不留半个 provider**——DDS 没有重连相位:
+    // participant 建不出来多半是配置问题,留着只会让后续每次 Publish 都失败。
     SetLastError(inited.error());
     return inited.error();
   }
@@ -195,9 +194,8 @@ Coro::Result<void> DdsTransport::Close() {
 //
 // **最坏等待没有上界**(ADR-0013「明确接受的代价」7):`Close()` 落在一次在途 `Publish`
 // 上时,那次写**打不断**——Fast DDS 3.6.1 的 `DataWriter` 上没有任何中止 `write()` 的
-// 入口(实测 5 轮,`Shutdown()` 一次也没截断过它)。故等待时长 = 那次 `Publish` 自己跑完
-// 所需的时间,而它由**同进程内最慢的那个订阅回调**决定,**不是**一个 `max_blocking_time`
-// (实测 `max_blocking_time` 设 300ms 而 `Publish` 跑满 2000ms)。
+// 入口。故等待时长 = 那次 `Publish` 自己跑完所需的时间,而它由**同进程内最慢的那个订阅
+// 回调**决定,**不是**一个 `max_blocking_time`。
 //
 // **顺序不能反**:先 join 才 `Shutdown()`。provider 内部已按在途计数守着 writer 的删除
 // (`write()` 在锁外跑,直接删 writer 就是 use-after-free),我方 join 在前是同一条纪律的
@@ -220,9 +218,9 @@ void DdsTransport::WaitClosed() {
 // client 的应答 topic),幂等让调用方不必先去重。
 //
 // 两者都**落到 provider 上真正建出端点**,不只登记意图:`DeclareWriter` →
-// `IDdsProvider::DeclareWriter(topic)`(D13 补正),`DeclareReader` → `Subscribe(topic, cb)`。
+// `IDdsProvider::DeclareWriter(topic)`(D13),`DeclareReader` → `Subscribe(topic, cb)`。
 // 这正是 D15「运行期无 DDS 端点创建」成立的前提——约 240ms 的发现窗口在**这里**付掉,
-// 而不是压在首帧上(惰性建 writer 与「`Reply()` 才建」后果一样:首次应答会丢)。
+// 而不是压在首帧上。
 Coro::Result<void> DdsTransport::DeclareWriter(const std::string& topic) {
   if (lifecycle_ != LifecycleState::kRunning) {
     return make_error_code(TransportErrc::kInvalidState);
@@ -292,7 +290,7 @@ std::error_code DdsTransport::LastError() const {
 // 同定位:统一的 I/O 事实查询,不面向业务调用方。
 //
 // `kEstablishing` 那约 240ms 的发现窗口**没有 DDS 原生事件**,是由我方状态(端点已声明 +
-// matched 尚未 > 0)推出来的,这是 ADR-0013 已登记的代价 5。
+// matched 尚未 > 0)推出来的。
 LinkState DdsTransport::CurrentLinkState() const {
   if (lifecycle_ != LifecycleState::kRunning || !provider_) {
     return LinkState::kDown;  // 未 Start / 关闭中 / 已关闭。
@@ -311,7 +309,7 @@ LinkState DdsTransport::CurrentLinkState() const {
   }
   // matched > 0 但 alive == 0:对端端点还在,但已被 `AUTOMATIC_LIVELINESS` 判死。
   // **必须配 liveliness**——只靠 matched 时对端被硬杀要等 participant lease(默认 20s)
-  // 才检出,期间谎报 kUp;配 2s 后 2.0s 检出(D9)。
+  // 才检出,期间谎报 kUp(D9)。
   return LinkState::kDown;
 }
 

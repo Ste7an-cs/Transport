@@ -4,10 +4,8 @@
  * @file RetryPolicy.hpp
  * @brief 一次交互中**重发策略**的公共值类型(ADR-0010 D6 / RT_NODE_002_e)。
  *
- * 本结构原先内嵌在 `ProtocolNode.hpp` 里,`DdsNode::RequestForResultDirect`
- * (ADR-0013 **D7** 与 **D8**)也要用同一个类型,故提到独立头文件——**只是搬家,字段与语义
- * 一个字不改**。`ProtocolNode.hpp` 转为 include 本头,既有调用方按
- * `transport::RetryPolicy` 使用的写法不受影响。
+ * 独立成头,因为 `ProtocolNode` 的三个交互方法与 `DdsNode::RequestForResultDirect`
+ * (ADR-0013 **D7** 与 **D8**)用的是同一个类型;`ProtocolNode.hpp` include 本头。
  *
  * **逐次调用传入而不进节点配置**:同一节点上不同命令的耐受度不同,不宜由节点级配置一刀切;
  * 两阶段模型里两个等待阶段更是数量级不同的量。
