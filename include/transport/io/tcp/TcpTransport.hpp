@@ -170,8 +170,8 @@ class TcpTransport final : public ITransport {
   LifecycleState lifecycle_{LifecycleState::kCreated};
   bool joined_{false};  ///< WaitClosed 已 join:`FiberTask::get()` 是一次性的。
   std::error_code last_error_;
-  /// 每次连上 +1。**纯内部记账**(D9/D12):不对外暴露、不驱动任何控制流、不做代际隔离,
-  /// 唯一用途是 Trace 事件的归类与内部判重。
+  /// 每次连上 +1。**纯内部记账**(D9/D12):不对外暴露、不驱动任何控制流、不做代际隔离。
+  /// 原本供 Trace 事件归类,观测面随 ADR-0014 **D1** 撤销后已无消费者。
   std::uint32_t generation_{0};
 
   /// 对外读队列:**不随连接重建而更换**——这正是"重连对调用方透明"的载体。

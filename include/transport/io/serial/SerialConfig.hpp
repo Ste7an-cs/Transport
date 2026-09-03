@@ -2,7 +2,7 @@
 
 /**
  * @file SerialConfig.hpp
- * @brief 串口传输配置——设备参数 + 唯一的时间量 + 观测出口(ADR-0012 D3/D12)。
+ * @brief 串口传输配置——设备参数 + 唯一的时间量(ADR-0012 D3/D12)。
  */
 
 #include <chrono>
@@ -10,8 +10,6 @@
 #include <string>
 
 namespace transport {
-
-class ITraceSink;
 
 /**
  * @brief `SerialTransport` 的配置。
@@ -43,9 +41,6 @@ struct SerialConfig {
   /// **调用方须按协议特征配置**(ADR-0012 代价 4):缺省 5s 对"周期性上报"类协议足够;
   /// "长时间静默、偶发指令"类协议须调大,否则会周期性无谓重开设备。
   std::chrono::milliseconds silence_timeout{5000};
-
-  /// 可选观测出口(未配置零影响)。
-  ITraceSink* trace_sink = nullptr;
 };
 
 }  // namespace transport

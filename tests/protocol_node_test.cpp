@@ -5,9 +5,8 @@
 //   1. 出站盖章:frm_type / protocol_id / session_id 的填写与 session_id 的循环递增;
 //   2. 请求-响应关联:由 Dispatcher 按"会话 + 命令码 + 帧类型"三字段匹配,任一不符即不
 //      终结该请求;
-//   3. 分发去向(ADR-0009 D1/D5):入站只有订阅一条通路——业务帧投给键匹配的订阅者,
-//      无人认领的终结帧归因 unmatched-or-late-response,无人认领的业务帧静默丢弃且**不**
-//      产生任何 drop 归因;
+//   3. 分发去向(ADR-0009 D1/D5、ADR-0014 D1):入站只有订阅一条通路——消息投给键匹配的
+//      订阅者,无人认领的一律静默丢弃(终结帧与业务帧无别,框架不作任何记录);
 //   4. 生命周期:节点关闭令在途请求恰好终结一次、并关闭全部订阅信箱(即订阅者的协作取消
 //      信号,ADR-0009 D4);传输终结使节点自行关闭;节点不启停传输;
 //   5. 分段交互:`Subscribe` 允许一次交互登记多段等待,各段各自设定时限。
@@ -34,7 +33,6 @@
 #include "task/fibertask.h"
 #include "transport/codec/SystemDatagramCodec.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
 
@@ -100,26 +98,6 @@ Message DecodeSent(const FakeTransport& fake, std::size_t index) {
   EXPECT_TRUE(decoded);
   EXPECT_EQ(decoded.value().size(), 1u);
   return decoded.value().front();
-}
-
-bool SawDrop(const transport::CapturingTraceSink& sink, const std::string& reason) {
-  for (const auto& record : sink.Records()) {
-    if (record.category == "drop" && record.message == reason) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/// drop 类事件总数(不问归因),用于证明"一条都没有"。
-std::size_t DropCount(const transport::CapturingTraceSink& sink) {
-  std::size_t count = 0;
-  for (const auto& record : sink.Records()) {
-    if (record.category == "drop") {
-      ++count;
-    }
-  }
-  return count;
 }
 
 /// 取一张订阅凭据并断言拿到了。`Subscribe` 返 `Coro::Result<Ticket>` 且**只在 `Running`
@@ -389,10 +367,7 @@ TEST(ProtocolNode, BusinessFrameIsDeliveredToSubscriber) {
 // 这条替代旧的"命中订阅者的消息不再进入业务队列"——第二条通路已不存在,同一事实现在由
 // 键匹配本身保证。
 TEST(ProtocolNode, MatchedResponseDoesNotReachBusinessSubscriber) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
+  Fixture fx;
 
   std::vector<FrameType> seen;
   Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
@@ -412,69 +387,35 @@ TEST(ProtocolNode, MatchedResponseDoesNotReachBusinessSubscriber) {
 
   boost::this_fiber::sleep_for(50ms);
   EXPECT_TRUE(seen.empty()) << "响应帧不应投给订阅命令帧的业务订阅者";
-  EXPECT_EQ(DropCount(sink), 0u) << "被请求认领的响应不是丢弃";
   business.Join();
 }
 
-// 【新增语义 ③】终结帧无人认领 → 仍归因 kUnmatchedOrLateResponse。
-// 该分支属请求-响应侧,与 handler 无关,ADR-0009 明确**保留**。
-TEST(ProtocolNode, UnmatchedTerminalFrameIsStillAttributed) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
+// 无人认领的终结帧被**丢弃**:不投给业务订阅者,也不以任何形式外泄(ADR-0009 D1、
+// ADR-0014 D1——归因记录已撤销,只剩丢弃动作本身可观察)。
+TEST(ProtocolNode, UnmatchedTerminalFrameIsDroppedAndNotDelivered) {
+  Fixture fx;
 
   // 订的是命令帧,故终结帧无人认领。
   std::vector<FrameType> seen;
   Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
                       [&seen](const Message& msg) { seen.push_back(msg.frm_type); });
 
+  // 回应帧与结果帧同为终结帧,走同一条分支。
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kResponse)));
-  ASSERT_TRUE(testutil::pumpFiberUntil(
-      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
-      << "未归因 unmatched-or-late-response";
-  EXPECT_TRUE(seen.empty()) << "终结帧不应投给业务订阅者";
-
-  // 结果帧同为终结帧,走同一条归因分支。
   ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kResult)));
-  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return DropCount(sink) >= 2u; }, 500));
-  EXPECT_EQ(DropCount(sink), 2u) << "两条终结帧各归因一次,不多不少";
+  // 后随一条**命令帧**:它必被投递,其到达即证明前两帧已走完分发路径。
+  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(9, 0x0099, FrameType::kCommand)));
+  ASSERT_TRUE(testutil::pumpFiberUntil([&] { return !seen.empty(); }, 500));
+  boost::this_fiber::sleep_for(20ms);
+  EXPECT_EQ(seen, (std::vector<FrameType>{FrameType::kCommand}))
+      << "终结帧不应投给业务订阅者";
   business.Join();
 }
 
-// 【新增语义 ②】业务帧无订阅者 → 静默丢弃,drop 类 Trace **一条都没有**(ADR-0009 D5)。
-// 这是"完整性归因覆盖面明确变窄"的行为证据:旧形态此处归因 no-handler-configured。
-TEST(ProtocolNode, UnclaimedBusinessFrameIsSilentlyDropped) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
-
-  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(1, 0x0033, FrameType::kCommand)));
-  ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(2, 0x0034, FrameType::kState)));
-  // 先确认两帧确已被解出并走完分发(recv 事件到齐),再断言"无归因"——否则可能只是还没到。
-  ASSERT_TRUE(testutil::pumpFiberUntil(
-      [&] {
-        std::size_t recv = 0;
-        for (const auto& record : sink.Records()) {
-          if (record.category == "recv") {
-            ++recv;
-          }
-        }
-        return recv >= 2;
-      },
-      500));
-  boost::this_fiber::sleep_for(20ms);
-  EXPECT_EQ(DropCount(sink), 0u) << "无订阅者的业务帧不得产生任何 drop 归因";
-}
-
-// 坏帧不影响后续报文(丢弃由 codec 内部 resync 消化,故此处不断言 bad-frame 归因:
-// SystemDatagramCodec 的 Decode 对扫不出帧的报文返回空成功,不报错)。
+// 坏帧不影响后续报文(丢弃由 codec 内部 resync 消化;SystemDatagramCodec 的 Decode 对扫
+// 不出帧的报文返回空成功,不报错)。
 TEST(ProtocolNode, BadFrameIsDroppedAndDoesNotBlockLaterFrames) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
+  Fixture fx;
 
   std::vector<std::uint16_t> seen;
   Subscriber business(*fx.node, transport::AnyOfType(FrameType::kCommand),
@@ -976,14 +917,11 @@ TEST(ProtocolNode, RequestForResultTimesOutWithoutRetransmittingAfterAck) {
       << "等结果阶段不得重发,失败时也不回应结果";
 }
 
-// ⑧ 受理阶段的**重复 kResponse**(重发引起)在该阶段完成后到达 → 归因
-//    kUnmatchedOrLateResponse。这是 D5"阶段一完成后立即注销 ack 订阅"的行为证据:
-//    不注销则重复回应继续落入信箱、被后续逻辑误读。
-TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsAttributedAsUnmatched) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
+// ⑧ 受理阶段的**重复 kResponse**(重发引起)在该阶段完成后到达 → 无匹配,**丢弃**。
+//    这是 D5"阶段一完成后立即注销 ack 订阅"的行为证据:不注销则重复回应继续落入信箱、
+//    被后续逻辑误读。归因记录随 ADR-0014 D1 撤销,故只断言"交互不受它影响"。
+TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsDropped) {
+  Fixture fx;
   constexpr std::uint16_t kResultId = 0x03F2;
 
   Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
@@ -999,13 +937,12 @@ TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsAttributedAsUnmatched) {
       EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
   // 让调用方 fiber 走完受理阶段(含 ack.Reset())再投重复回应。
   boost::this_fiber::sleep_for(30ms);
-  ASSERT_EQ(DropCount(sink), 0u) << "首个受理帧被认领,不是丢弃";
 
   ASSERT_TRUE(fx.transport.Deliver(
       EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
-  EXPECT_TRUE(testutil::pumpFiberUntil(
-      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
-      << "阶段完成后的重复受理帧应无匹配、按迟到终结帧归因";
+  boost::this_fiber::sleep_for(30ms);
+  EXPECT_FALSE(outcome) << "阶段完成后的重复受理帧无匹配、被丢弃,不得终结交互";
+  EXPECT_EQ(fx.transport.sent().size(), 1u) << "重复受理帧不引起任何我方动作";
 
   // 收尾:交付结果,让交互正常终结。
   ASSERT_TRUE(fx.transport.Deliver(
@@ -1020,7 +957,7 @@ TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsAttributedAsUnmatched) {
 // 本组与第 6 组**分属两种协议**。两条与 `RequestForResult` 恰好相反的规则各有一条用例作为
 // 行为分界证据:⑩ 证明"等结果阶段确实重发"(对比 ⑦ 的"不得重发"),⑪ 证明"失败返
 // kTimeout 而非 kNotAccepted"(对比 ③)。此外 ⑨ 证明"收到结果后不回应"(对比 ⑤ 的 D8
-// 末步),⑫ 证明"本交互不订阅受理帧,中途到达的 kResponse 无匹配、按迟到终结帧归因丢弃"。
+// 末步),⑫ 证明"本交互不订阅受理帧,中途到达的 kResponse 无匹配、被丢弃"。
 
 // ⑨ 一次成功:发命令 → 回 kResult → 返回该帧,且**我方未回发任何帧**。
 //    与 ⑤ 对照:`RequestForResult` 收到结果后必回一帧 kResponse(D8),本交互没有这一步。
@@ -1105,13 +1042,10 @@ TEST(ProtocolNode, RequestForResultDirectReturnsTimeoutWhenAttemptsExhausted) {
       << "应恰好发出 max_attempts 帧,且失败时不回应任何帧";
 }
 
-// ⑫ 中途到达的 kResponse **不影响本交互**:本交互不订阅受理帧,故该帧无匹配、按
-//    kUnmatchedOrLateResponse 归因丢弃,交互继续等结果并正常成功。
+// ⑫ 中途到达的 kResponse **不影响本交互**:本交互不订阅受理帧,故该帧无匹配、被丢弃,
+//    交互继续等结果并正常成功。
 TEST(ProtocolNode, RequestForResultDirectIgnoresInterveningResponseFrame) {
-  transport::CapturingTraceSink sink;
-  ProtocolNodeConfig config = BaseConfig();
-  config.trace_sink = &sink;
-  Fixture fx(std::move(config));
+  Fixture fx;
   constexpr std::uint16_t kResultId = 0x03F2;
 
   Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
@@ -1127,9 +1061,7 @@ TEST(ProtocolNode, RequestForResultDirectIgnoresInterveningResponseFrame) {
   // 一条"同会话、同命令码"的受理帧——若本交互登记了 ack 订阅,它会被认领。
   ASSERT_TRUE(fx.transport.Deliver(
       EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
-  EXPECT_TRUE(testutil::pumpFiberUntil(
-      [&] { return SawDrop(sink, "unmatched-or-late-response"); }, 500))
-      << "本交互不订阅受理帧,该帧应无匹配、按迟到终结帧归因丢弃";
+  boost::this_fiber::sleep_for(30ms);
   EXPECT_FALSE(outcome) << "交互不应被受理帧终结,应继续等结果";
   EXPECT_EQ(fx.transport.sent().size(), 1u) << "受理帧不引起任何我方动作";
 

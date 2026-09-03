@@ -20,9 +20,9 @@
  * 即得串行,需要并发就自己起多条;消费代码的逃逸异常须自行 `try/catch`;队列容量即订阅
  * 信箱的容量。框架三者一概不保证。
  *
- * **无订阅者的业务帧静默丢弃、不归因**(ADR-0009 D5):订阅模型下"没人订阅"是宿主的正常
- * 选择而非异常。终结帧(kResponse / kResult)无人认领仍归因 `kUnmatchedOrLateResponse`——
- * 那属请求-响应侧的迟到/乱序,是真正的异常。
+ * **无人认领的入站消息一律静默丢弃**(ADR-0009 D5 / ADR-0014 D1):业务帧如此——订阅模型
+ * 下"没人订阅"是宿主的正常选择而非异常;终结帧(kResponse / kResult)亦如此——它属请求-
+ * 响应侧的迟到/乱序,确是异常,但框架撤销观测面后已无处记录,只丢不记。
  *
  * **不管 transport 的生命周期**:传输由**宿主**创建、`Start()`、`Close()`、`WaitClosed()`,
  * 本节点只按引用借用它:读侧取它的读队列句柄,写侧调它的 `Write()`。链路的绑定、静默超时、重连、退避**全部是传输内部的事**,
@@ -54,8 +54,9 @@
  *          中,一条响应将同时投递给二者。若协议存在此量级的并发,应在键中引入更宽的
  *          区分字段。
  *
- * **无观测接口**:各类丢弃与时延一律只经 `config.trace_sink` 上报(`RecordEvent`),不再
- * 有计数器成员与其 getter。要统计就在 sink 里统计——一个事实一条出口。
+ * **无观测面**(ADR-0014 D1):既无计数器与 getter,也无 Trace 出口。框架内部的丢弃
+ * (坏帧 / 无匹配响应 / 队列满)自此完全静默、亦无归因;要看现场,由宿主自行在 codec
+ * 或订阅侧加日志。
  *
  * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
  * fiber,读-分发循环运行于自持 fiber,二者同线程且仅在挂起点交错,而 session 取用与投递
@@ -72,7 +73,6 @@
 
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/Dispatcher.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/ITransport.hpp"
@@ -102,7 +102,7 @@ using MessageDispatcher =
 /// @brief 任意会话、任意命令码的某类帧,用于旁路监听。
 [[nodiscard]] MessageDispatcher::Key AnyOfType(FrameType type);
 
-/// ProtocolNode 配置:默认外部协议 id + 可选 Trace 出口。
+/// ProtocolNode 配置:只有默认外部协议 id 一项。
 ///
 /// 交互时限**不在配置面上**(SRS §3.1.4.4):四种交互各阶段的时限是数量级不同的量,一个
 /// 节点级缺省值套不上去,故逐次传参(ADR-0010 D6)。"不得永不超时"的保护由
@@ -112,11 +112,6 @@ using MessageDispatcher =
 /// 既无处理器字段,也无业务队列容量字段(容量即订阅信箱的容量,ADR-0009 D3)。
 struct ProtocolNodeConfig {
   std::uint8_t protocol_id = 0;
-  /// 可选 Trace 出口(ADR-0003 D13);非拥有,可为 nullptr。**观测的唯一出口**——本类不再
-  /// 有任何计数器与 getter。本类在两个丢弃点(kBadFrame / kUnmatchedOrLateResponse)与
-  /// send/recv/decode 边界上报事件。无订阅者的业务帧**不**在此列(ADR-0009 D5)。
-  /// RT_TRACE_002:为空时不改变任何控制流/字节流/错误结果,仅一次判空。
-  ITraceSink* trace_sink = nullptr;
 };
 
 /**
@@ -374,8 +369,8 @@ class ProtocolNode : public NodeBase {
 
   /// @brief 读循环体内的协议特有处理:Decode 一帧 → 逐条 Dispatch。
   void DecodeAndDispatch(Datagram datagram);
-  /// 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时终结帧
-  /// 归因丢弃、业务帧静默丢弃(ADR-0009 D1/D5)。
+  /// 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时一律
+  /// 静默丢弃,终结帧与业务帧无别(ADR-0009 D1/D5、ADR-0014 D1)。
   ///
   /// 取 const 引用:投递只读源消息(命中的订阅者各拷一份副本),本函数不再有"把消息移交
   /// 第二条队列"的分支,故不需要按值取走所有权。
