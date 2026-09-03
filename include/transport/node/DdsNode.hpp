@@ -17,7 +17,7 @@
  * `MessageKind::kFeedback` **在本设计中不使用**;**不提供旁路监听**——机制上
  * `Subscribe(kAny, kAny)` 可达,但不作为受支持的用法。
  *
- * ## 请求-响应的两个 topic 由【服务名派生】(**D6**,2026-09-02 裁决)
+ * ## 请求-响应的两个 topic 由【服务名派生】(**D6**)
  *
  * ```
  * 请求 topic  =  cfg.<服务名>.request        应答 topic  =  cfg.<服务名>.response
@@ -30,16 +30,8 @@
  * (void)server.RegisterServices({"get"});   // cfg.get.request 收请求、cfg.get.response 发应答
  * ```
  *
- * **两侧算的是同一个派生函数**(实现于 `DdsNode.cpp` 的 `DeriveServiceTopics`,**一处实现、
- * 处处调用**),故**不可能算歪**——先前那种"每服务两个 topic、且客户端与服务端必须配成
- * 一模一样"的部署错误从根上消失。**服务名的唯一约束是非空**:`cfg.<名>.request` 与
- * `cfg.<名>.response` 对任意非空名都互不相同(两个后缀首字符不同,长度差 1,拼不到一起),
- * 故不存在"派生出歧义 topic"的字符,无须再限制字符集。
- *
- * @warning **框架由此占用了 `cfg.*.request` / `cfg.*.response` 这一命名空间**(**D6** 明确
- *          接受的代价):它们与 `RegisterPublishers` / `RegisterSubscribers` 收的普通 topic
- *          处在同一个平面上,重名时无从规避——`RegisterSubscribers({"cfg.get.request"})`
- *          与 `RegisterServices({"get"})` 指的是同一条 topic。**不拦**,同代价 9。
+ * 两侧算的是同一个派生函数(`DdsNode.cpp` 的 `DeriveServiceTopics`)。**服务名的唯一约束
+ * 是非空**,不限制字符集。
  *
  * ## topic 由注册接口给出,不进配置(**D16**)
  *
@@ -51,8 +43,7 @@
  * ```
  *
  * **四个注册方法一律只在 `Created` 相位受理**,`Running` / `Closing` / `Closed` 返
- * `kInvalidState`。端点集合"**启动即定型、运行期恒定**"——本设计**不引入运行期动态端点**,
- * 故回应、发布、订阅路径上都不会突然冒出一个约 240ms 的发现窗口(**D9**)。
+ * `kInvalidState`。端点集合"**启动即定型、运行期恒定**",无运行期动态端点(**D9**)。
  *
  * `Subscribe` 与之**互不重叠**:它**只在 `Running` 受理**,`Created` 期订阅是禁用法、返
  * `kClosed`(与另外三个交互方法同一个判据,见该方法的注释)。全流程即
@@ -78,8 +69,7 @@
  * | `RequestForResultDirect` / `ServeRequests` | **服务名**(永远) |
  *
  * **`Subscribe` 保持通用**——它的第一参**永远是 topic**,`ServeRequests(名)` 是它在服务名
- * 一侧的封装(内部即 `Subscribe(cfg.<名>.request, kRequest)`)。两条路各自的参数含义唯一,
- * **不存在"同一个参数因 `kind` 而异"的陷阱**。
+ * 一侧的封装(内部即 `Subscribe(cfg.<名>.request, kRequest)`)。
  *
  * ## 关联键 `correlation_id` 是两段式(**D6**)
  *
@@ -89,9 +79,8 @@
  *       节点构造时生成一次    uint32,从 0 开始自增,每请求一个
  * ```
  *
- * uuid 半段保证**跨节点**不撞——这是"每服务一个应答 topic(`cfg.<名>.response`)、该服务
- * 全体客户端共用"得以成立的**全部**根据;`request_seq` 保证**节点内**不撞。`uint32` 回绕(约 42.9 亿次请求后)
- * **明确接受、不加防回绕逻辑**:届时重复的是本节点很久以前用过的值,那条订阅早已注销。
+ * uuid 半段保证**跨节点**不撞,`request_seq` 保证**节点内**不撞。`uint32` 回绕(约 42.9 亿
+ * 次请求后)**明确接受、不加防回绕逻辑**。
  *
  * @warning **一处承重的区别**:`Subscribe` 交出去的订阅其 `corr` 位**恒为 `kAny`**,而
  *          `RequestForResultDirect` **内部**登记的那一条**用具体值**。共用应答 topic 之所以
@@ -113,21 +102,17 @@
  * `DeclareReader`(**D15**:这是**唯一**建端点的地方),故**调用 `Start()` 之前宿主必须先
  * 把传输启起来**,否则声明一律返 `kInvalidState`。
  *
- * **借用而非拥有,还有一条硬理由**:`DdsTransport::WaitClosed()` join 的是一条**专属 OS
- * 线程**且**最坏等待无上界**(在途 `Publish` 打不断)。若由本节点在 `DoJoin()` 里调它,
- * 那是**阻塞整条 fiber 线程**,与 `NodeBase::WaitClosed()`「让出式 join」的纪律正相反。
- *
  * @warning `close()` 是**整流传播**的(AsyncTask `417790c` 起):`DoClose()` 关闭本节点这一路
- *          读订阅时,源读队列与同一条传输上的其它订阅者**一并终结**。与 `ProtocolNode`
- *          同形、同为有意为之——节点关闭即读侧终结,宿主随后关传输。
+ *          读订阅时,源读队列与同一条传输上的其它订阅者**一并终结**。节点关闭即读侧终结,
+ *          宿主随后关传输。
  *
- * ## 明确接受、框架不管的两件事
+ * ## 框架不管的两件事
  *
  * - **重发要求对端能容忍重复请求**(幂等,或自行按 `correlation_id` 去重)。协议层假设,
  *   **框架不校验**(**D7**)。
  * - **共用应答 topic 带来读入放大**:同一服务的每个客户端都会收到该服务的**全部**应答,
- *   多余样本一路进读队列、解码后才在 `Dispatcher` 处落空(「明确接受的代价」8)。这类
- *   落空在客户端侧**本来就是常态**,不是异常;框架静默丢弃、不作记录(ADR-0014 D1)。
+ *   多余样本一路进读队列、解码后才在 `Dispatcher` 处落空——框架静默丢弃、不作记录
+ *   (ADR-0014 D1)。
  *
  * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
  * fiber,读-分发循环运行于自持 fiber,二者同线程且仅在挂起点交错,故普通成员不加锁。
@@ -157,21 +142,16 @@ namespace transport {
 /// 参与 DDS 分发的字段:**topic + correlation_id + kind**(ADR-0013 **D6**)。
 ///
 /// 三者分别是 **DDS 的寻址维度**、**其关联符**、**消息类别**;部分匹配由 `Dispatcher`
-/// 实现,本类只需在键提取函数里给出各字段的具体值。**这不是照搬 `ProtocolNode`**——
-/// 它选 `(session_id, message_id, frm_type)` 是**它的协议**决定的(DD-4:协议无关基座可复用)。
+/// 实现,本类只需在键提取函数里给出各字段的具体值。
 using DdsDispatcher = Dispatcher<Message, std::string /*topic*/,
                                           std::string /*correlation_id*/,
                                           MessageKind /*kind*/>;
 
-/// DdsNode 配置——**只剩一项**(ADR-0013 **D16**;原 Trace 出口字段随 ADR-0014 **D1** 删除)。
-///
-/// 全部 topic 字段已移出配置、改由四个注册方法给出;历史遗留的 `inbox_topic` / `node_id` /
-/// `handler` / `business_queue_max_*` 一并删除(入站业务由订阅承载,ADR-0009 D1)。
+/// DdsNode 配置——topic 一律由四个注册方法给出,不进配置(ADR-0013 **D16**)。
 struct DdsNodeConfig {
   /// 节点 uuid:**非空则用它,为空才 `QUuid::createUuid()`**(**D6**)。
   ///
-  /// `QUuid` 是随机的,而 `correlation_id` 的前缀确定与否直接决定测试能不能断言具体值;
-  /// 故留这一个注入口:**测试填固定值,生产留空**。
+  /// **测试填固定值,生产留空**——`QUuid` 是随机的,前缀确定才能断言具体 `correlation_id`。
   std::string uuid_override;
 };
 
@@ -232,11 +212,10 @@ class DdsNode : public NodeBase {
    *
    * `cfg.<名>.request` 在 `DoStart()` 建 **Writer**(发请求)、`cfg.<名>.response` 建
    * **Reader**(收应答)。与服务端 `RegisterServices` **传一模一样的服务名**,各自按角色建
-   * 各自那一侧(**D16**);两侧算的是**同一个派生函数**,故不可能算歪。
+   * 各自那一侧(**D16**)。
    *
-   * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**)。"不同服务不叠成
-   * `N×M`"自此**由框架保证**:服务名不同则派生出的应答 topic 必不同,调用方无从把两个
-   * 服务配到同一个应答 topic 上。
+   * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**);不同服务的应答落在
+   * 各自派生出的 topic 上,互不相扰。
    *
    * 批量 / 累加 / 幂等去重 / 整批生效,同 `RegisterPublishers`。
    *
@@ -245,14 +224,10 @@ class DdsNode : public NodeBase {
    *         (整批不落):
    *         - **服务名为空串**;
    *         - 某个服务名**已注册为 `Services`**——**自己请求自己**,且 `corr` 由自己生成、
-   *           `Dispatcher` **会真的匹配上**,形成调用方毫无察觉的自问自答。**这是唯一要拦的
-   *           方向冲突**;其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收白干、
-   *           不会误配,且可能是有意的回环自测,**不拦**。
+   *           `Dispatcher` **会真的匹配上**,形成调用方毫无察觉的自问自答。
    *
-   * @note **服务名除"非空"外不限制字符**:`cfg.<名>.request` 与 `cfg.<名>.response` 对任意
-   *       非空名都互不相同,且不同服务名派生出的 topic 亦必不同(拼接是单射的),故不存在
-   *       会产生歧义的字符。真正非法的 topic 名会由 provider 在 `Start()` 的 `Declare*`
-   *       处显式报错,不会静默走坏。
+   * @note **服务名除"非空"外不限制字符**。真正非法的 topic 名会由 provider 在 `Start()` 的
+   *       `Declare*` 处显式报错,不会静默走坏。
    */
   [[nodiscard]] Coro::Result<void> RegisterClients(
       std::vector<std::string> service_names);
@@ -269,9 +244,7 @@ class DdsNode : public NodeBase {
    * @brief 登记一个订阅——**取用入站消息的唯一入口**(ADR-0009 D1 / **D6**)。
    *
    * 两个键均可传 `kAny`。**交出去的订阅其 `corr` 位恒为 `kAny`**(见文件头的承重区别):
-   * `correlation_id` 不进公开接口——请求-响应侧它由框架在 `RequestForResultDirect` 内生成、
-   * 服务端事先不可能知道客户端会生成什么值,发布-订阅侧的"应用自定义子通道"能力已裁决
-   * 为不需要。暴露一个只能填一个值的参数是陷阱,不是灵活性。
+   * `correlation_id` 不进公开接口。
    *
    * **第一参永远是 topic,不因 `kind` 而异**(**D8**)。收某个服务的请求请调
    * `ServeRequests(服务名)`——它是本方法在服务名一侧的封装,内部即
@@ -287,12 +260,6 @@ class DdsNode : public NodeBase {
    * 一律是调用方契约(RT_INBOUND_005)。**多 topic 用多次 `Subscribe`,每 topic 一条消费
    * fiber**——各自独立信箱,一路慢不拖累另一路。
    *
-   * **返 `Coro::Result<Ticket>` 而不是裸 `Ticket`**(**D8**):"topic 未注册为对应角色"要返
-   * `kConfiguration`,而 `Ticket` **装不下错误码**——返裸 `Ticket` 时"忘了注册"只能交出一个
-   * 空凭据,其 `Wait` 返的是 `kInvalidState`,**错误码不对,且推迟到第一次 `Wait` 才暴露**。
-   * **相位同理**:关闭之后订阅要返 `kClosed`,也要在**返回处**返,而不是交出一张信箱已经
-   * 关闭的凭据、把 `kClosed` 推给第一次 `Wait`。
-   *
    * ## 相位规则:**只在 `Running` 放行**
    *
    * | 相位 | 返回 |
@@ -301,25 +268,16 @@ class DdsNode : public NodeBase {
    * | `Running` | 放行 |
    * | `Closing` / `Closed` | `kClosed` |
    *
-   * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是"早一点也行"。
-   * 判据与另外三个交互方法**同一个** `IsRunning()`:`kClosed` 一并覆盖"未启动 / 关闭中 /
-   * 已关闭",这是本库已经写进公开 `@return` 的既有约定(见 `ProtocolNode`),本方法不为
-   * "没启动"单开一个错误码。注册面与订阅面**互不重叠**——注册只在 `Created`(其余相位
-   * `kInvalidState`)、订阅只在 `Running`。推荐写法就是紧挨着的两句:
+   * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是“早一点也行”。注册面
+   * 与订阅面**互不重叠**:注册只在 `Created`、订阅只在 `Running`。推荐写法是紧挨着的两句:
    *
    * ```cpp
    * (void)node.Start();
    * auto ticket = node.Subscribe("telemetry", MessageKind::kNotify);
    * ```
    *
-   * **这样不会漏收启动初期的消息**:`DataReader` 建于 `DoStart()`,而 DDS 发现约需
-   * **~240ms**——`Start()` 返回之后的头 ~240ms 对端还没 match,一条样本也到不了。宿主得在
-   * 两句之间干**超过 240 毫秒**的事才谈得上丢,而上面这种写法(中间连一次让出都没有)离
-   * 那个边界差着几个数量级。
-   *
-   * 反之放行 `Created` 有一处真实危害:`NodeBase::Close()` 从 `Created` 走时**不调
-   * `DoClose()`**,分发器的 `CloseAll` 因此从不执行——在此相位订阅并 spawn 了消费 fiber、
-   * 随后又放弃启动的话,那条 fiber 的信箱**永远等不到关闭信号**,join 时挂住。
+   * `DataReader` 建于 `DoStart()`,而 DDS 发现约需 **~240ms**,故 `Start()` 之后紧接着
+   * 订阅不会漏收启动初期的消息。
    *
    * @param topic 具体 topic,或 `kAny`。
    * @param kind  具体 `MessageKind`,或 `kAny`。
@@ -338,8 +296,7 @@ class DdsNode : public NodeBase {
   /**
    * @brief 单向发布一条 `kNotify`(fire-and-forget,发布-订阅):不登记任何订阅、不期待应答。
    *
-   * 本节点盖 `kind = kNotify` 并**清空** `correlation_id` / `reply_to`——**D6** 之后
-   * `correlation_id` 只有框架生成的关联符一个来源,发布路径上它没有第二种用法。
+   * 本节点盖 `kind = kNotify` 并**清空** `correlation_id` / `reply_to`(**D6**)。
    *
    * @param topic 目标 topic,**须已注册为 `Publishers`**。
    * @param msg   出站 Message(`payload` 由调用方填)。
@@ -362,16 +319,13 @@ class DdsNode : public NodeBase {
    * 不回落**)→ 派生出 `cfg.<名>.request` / `cfg.<名>.response` → 盖 `kind` / `corr` /
    * `reply_to` → **先登记订阅再发出** → 编码**一次**、重发复用同一份字节 → 首个到达即成功。
    *
-   * **第一参是【服务名】,不是 topic**(**D8**):派生规则不外泄到调用方。**没有改名为
-   * `Request`**——那个名字在 ADR-0010 **D10** 被删除过,拿回来配不同语义会造成混淆。
+   * **第一参是【服务名】,不是 topic**(**D8**):派生规则不外泄到调用方。
    *
-   * **签名里没有 `result_timeout`**:本交互只有**一个**等待阶段,其时限即 `retry.timeout`。
-   * **耗尽返 `kTimeout` 而不是 `kNotAccepted`**——后者的语义是"对端没有受理",而本模型
-   * **根本不存在受理这一步**。
+   * **签名里没有 `result_timeout`**:本交互只有**一个**等待阶段,其时限即 `retry.timeout`;
+   * 耗尽返 `kTimeout`(本模型没有受理阶段,故不用 `kNotAccepted`)。
    *
-   * **为什么 `RELIABLE` 的 DDS 上还要重发**:丢的不是网络,是**队列**——读队列有界 1024、
-   * 满时静默丢最旧,且共用应答 topic 把这一段的压力放大了 `N` 倍(**D11** / 代价 8)。
-   * 重发正是对这一段的补救。代价是**要求对端能容忍重复请求**,框架不校验。
+   * **`RELIABLE` 的 DDS 上仍要重发**:丢的不是网络,是**队列**——读队列有界 1024、满时
+   * 静默丢最旧(**D11**)。代价是**要求对端能容忍重复请求**,框架不校验。
    *
    * @param service_name 服务名,**须已注册为 `Clients`**。
    * @param req   请求 Message(`payload` 由调用方填;`kind` / `correlation_id` /
@@ -388,9 +342,7 @@ class DdsNode : public NodeBase {
    * @brief 服务端收请求——`Subscribe(cfg.<名>.request, kRequest)` 的**服务名封装**(**D8**)。
    *
    * **不是另一套机制**:它派生出请求 topic 之后原样交给 `Subscribe`,相位与注册两道校验
-   * 也都落在那里。之所以另起一个名字,是因为派生化之后它与 `Subscribe(topic, kRequest)`
-   * **签名与语义均不再等价**——一个收服务名、一个收 topic;而让 `Subscribe` 的第一参"因
-   * `kind` 而异"正是本设计要避免的陷阱。
+   * 也都落在那里。
    *
    * 消费方式与 `Subscribe` 完全相同:凭据交给调用方自己的 fiber 顺序消费,收到 `kRequest`
    * 后调 `Reply(request, result)` 回一条终结应答。
@@ -405,15 +357,13 @@ class DdsNode : public NodeBase {
   /**
    * @brief 服务端回一条终结应答 `kReply`——请求-响应服务端**唯一**的方法(无受理阶段)。
    *
-   * **签名不变**(**D8**):它由 `request.topic`(即派生出的 `cfg.<名>.request`)**反查自己
-   * 注册的服务**,再派生出该服务的 `cfg.<名>.response`。**不取信于线缆、不建端点**
-   * (**D15**):运行期不再有任何建端点的路径,该 topic 的 writer 早在 `DoStart()` 就建好了,
-   * 故服务的**第一次应答也不会丢**。反查走的是**同一个派生函数**,不另写解析器。
+   * 它由 `request.topic`(即派生出的 `cfg.<名>.request`)**反查自己注册的服务**,再派生出
+   * 该服务的 `cfg.<名>.response`(走的是**同一个派生函数**,不另写解析器)。**不取信于
+   * 线缆、不建端点**(**D15**):该应答 topic 的 writer 早在 `DoStart()` 就建好了,故服务
+   * 的**第一次应答也不会丢**。
    *
    * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与派生出的应答 topic 不等即返
-   * `kInvalidArgument`。**派生化之后两侧配歪已不可能**,故它的诊断价值大幅下降;但对
-   * **版本不一致的对端**(派生规则将来若变更)它仍是唯一能当场发现偏差的手段——否则客户端
-   * 只会一路超时、看起来像对端没响应。
+   * `kInvalidArgument`——对**版本不一致的对端**,它是唯一能当场发现偏差的手段。
    *
    * @param request 收到的请求(其 `topic` 与 `correlation_id` 是本方法的全部输入)。
    * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` / `topic`
@@ -477,8 +427,8 @@ class DdsNode : public NodeBase {
   /// 本节点 uuid,**构造时生成一次、此后不变**(**D6**):`config_.uuid_override` 非空则用
   /// 它,为空才 `QUuid::createUuid().toString(QUuid::WithoutBraces)`。
   std::string uuid_;
-  /// `correlation_id` 的自增半段。**不叫 `session_id`**:那是**外部协议**的匹配键
-  /// (`Message::session_id`,DDS 路径留缺省 `0`),同名是确定的阅读陷阱(**D6**)。
+  /// `correlation_id` 的自增半段(**D6**)。**与 `Message::session_id` 无关**——后者是
+  /// **外部协议**的匹配键,DDS 路径留缺省 `0`。
   std::uint32_t request_seq_{0};
 
   // —— 四组注册表(**D16**)。`Start()` 之前填,此后只读;`Start()` 失败**不清空**。
