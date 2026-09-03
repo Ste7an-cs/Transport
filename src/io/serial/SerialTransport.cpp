@@ -108,10 +108,8 @@ bool IsValidParity(char parity) {
 SerialTransport::SerialTransport(SerialConfig config)
     : config_(std::move(config)),
       // 固定设备端点,构造时算出一次(D9):读侧每个切片的 peer 都是它,写侧忽略调用方
-      // 填的 peer 一律写往它。**`Endpoint` 现有三种 kind 里只有 `kDefault` 能如实表达
-      // 串口**——设备既不是 `kNet` 的 ip:port、也不是 `kTopic` 的 DDS 主题,而 `kDefault`
-      // 的语义正是"本传输配置的默认对端",对单设备介质即 `config.device` 那一个设备。
-      // 不为串口新增 `Endpoint::Kind`(那会牵动跨介质的枚举语义,不在 ADR-0012 范围内)。
+      // 填的 peer 一律写往它。`Endpoint::Default()` 的语义即“本传输配置的默认对端”,
+      // 对单设备介质就是 `config.device` 那一个设备。
       peer_(Endpoint::Default()) {}
 
 SerialTransport::~SerialTransport() {
@@ -132,9 +130,9 @@ Coro::Result<void> SerialTransport::ValidateConfig() const {
       !IsValidStopBits(config_.stop_bits) || !IsValidParity(config_.parity)) {
     return make_error_code(TransportErrc::kConfiguration);
   }
-  // **须为正,没有"0 = 禁用"这一档**(与 UDP 的差异,同 TCP):它同时是退避间隔,零值
-  // 直接退化为紧循环(设备不存在时 `open()` 微秒级失败,烧 CPU);且 D4 已定静默超时是
-  // 串口判活的**唯一**判据,禁用它等于放弃判活。
+  // **须为正,没有“0 = 禁用”这一档**:它同时是退避间隔,零值直接退化为紧循环(设备不
+  // 存在时 `open()` 微秒级失败,烧 CPU);且静默超时是串口判活的**唯一**判据(D4),
+  // 禁用它等于放弃判活。
   if (config_.silence_timeout <= std::chrono::milliseconds::zero()) {
     return make_error_code(TransportErrc::kConfiguration);
   }
@@ -157,10 +155,9 @@ Coro::Result<void> SerialTransport::Start() {
   port_ = new QSerialPort();
   lifecycle_ = LifecycleState::kRunning;
 
-  // **首次打开就地做一次**(不等泵被调度)——与 UDP 同、**与 TCP 异**:串口的 `open()`
-  // 是**同步**的(TCP 的 connect 是异步的,就地等会把 `Start()` 变成一个最长一个
-  // silence_timeout 的阻塞调用),故 `CurrentLinkState()` 在 `Start()` 返回后即可如实
-  // 观测。**打开失败不算启动失败**(D1)——泵会退避后无限重试。
+  // **首次打开就地做一次**(不等泵被调度)——串口的 `open()` 是**同步**的,故
+  // `CurrentLinkState()` 在 `Start()` 返回后即可如实观测。**打开失败不算启动失败**
+  // (D1)——泵会退避后无限重试。
   (void)Open();
 
   write_pump_ = std::make_shared<Coro::FiberTask<void>>(
@@ -200,9 +197,8 @@ bool SerialTransport::Open() {
 
 // 采样设备错误:**只落 `LastError()`,绝不改控制流**(D11 + D4)。
 //
-// 这是"不订阅 `errorOccurred`"的替代路径——实测拔线后该信号以 **~950 次/秒**风暴式
-// 连发(1500ms 内 1416 次),是**噪声而非事件**;要用须自行订阅并去抖,不划算。改为在
-// 读泵每轮就地**采样一次**当前错误位并清除:代价恒定,且天生不会被风暴淹没。
+// 这是“不订阅 `errorOccurred`”的替代路径:在读泵每轮就地**采样一次**当前错误位并清除,
+// 代价恒定,且天生不会被错误风暴淹没。
 //
 // 线路噪声类(`ParityError`/`FramingError`/`BreakConditionError`)**不触发设备重建**
 // ——噪声帧本就该由 codec 的 CRC 与重同步处置(DD-15 的第一层补救),重建反而丢掉更多
@@ -235,12 +231,7 @@ void SerialTransport::AbsorbDeviceError() {
 //
 // ★ **「建完即复查」**(ADR-0011 D15 补正,#200):`Close()` 只关得到它跑的那一刻**已经
 //   存在**的句柄;泵之后才建出的读流没有任何人会唤醒,会挂满一个 `silence_timeout`。
-//   TCP 上这一格是**实证可达**的(它在建读流之前多一个真实挂起点:等连上)。串口**未
-//   复现**——`Open()` 同步,循环顶部判据到建流之间没有挂起点,窗口目前是空的。但句柄形态
-//   与 TCP 同构,且这里**更没有兜底**:`coroiodevice::readAll()` 连出生守卫都没有
-//   (`coroudpsocket::receiveDatagram()` 有"socket 已 Unconnected 就当场关流"那一条,UDP
-//   因此结构免疫),窗口一旦被打开就是挂满超时。故照同一条不变式加固,判据由 `for(;;)`
-//   改为复查 `lifecycle_`。
+//   故内层循环的判据是复查 `lifecycle_`,而不是 `for(;;)`。
 void SerialTransport::RunDevicePump() {
   const std::chrono::milliseconds timeout = config_.silence_timeout;
 
@@ -278,9 +269,9 @@ void SerialTransport::RunDevicePump() {
         const QByteArray& bytes = chunk.value();
         // ★★ 【D5,串口独有的一行】`coroiodevice::readAll()` 的 push **不判空**
         // (`ch->push(dev->readAll())`),而 `corosocket::readAll()` 有
-        // `if(!bytes.isEmpty())` 守卫。实测:设备重开后读流**立刻吐一个 0 字节切片**。
-        // 漏了这一行,调用方就会在 `read_queue` 上取到空 `Datagram`——UDP/TCP 都不需要
-        // 它,这是"照抄样板就会漏"的典型。
+        // `if(!bytes.isEmpty())` 守卫、其初次 drain 亦有 `bytesAvailable() > 0` 检查。
+        // 少了这一行,调用方就可能在 `read_queue` 上取到空 `Datagram`——UDP/TCP 都不
+        // 需要它,这是“照抄样板就会漏”的典型。
         if (bytes.isEmpty()) {
           continue;
         }
@@ -323,10 +314,8 @@ void SerialTransport::RunDevicePump() {
 // 单消费者天然保证写入串行化(RT_TRANSPORT_004:两帧字节不交错)。
 //
 // 不变式:**取到设备到写出之间没有挂起点**(D8)——`write()` 交给 Qt 内部写缓冲即返回,
-// 而我们**不等刷出**,故写泵 fiber 不可能在"判 isOpen"与"write"之间被调度走、让管理泵
-// 把设备关掉。实测 `QSerialPort::write(4096)` 返 4096(不短写)、`bytesToWrite()` 立刻查
-// 是 4096(不同步刷出)、50ms 后归 0——与 `QTcpSocket::write()` 逐条一致,**三个写泵在
-// 这一点上结构完全同构**(`UdpTransport` 注释里那个悬案由本 ADR 关闭)。
+// 而我们**不等刷出**,故写泵 fiber 不可能在“判 isOpen”与“write”之间被调度走、让管理泵
+// 把设备关掉。
 void SerialTransport::RunWritePump() {
   for (;;) {
     // ── 阻塞点①:等数据 ──(Close 关 write_queue 唤醒)
@@ -336,9 +325,8 @@ void SerialTransport::RunWritePump() {
     }
     const Datagram& unit = item.value();
     // `unit.peer` **被忽略**(D9):串口只有一个设备,一律写往它。**不判
-    // kInvalidArgument**——那会让恒发 `Endpoint::Default()`(或填了别的目的地)的"传输
-    // 无关调用方"在串口上跑不起来。**这与 UDP 相反**:UDP 一次一报文、目的地是报文的
-    // 一部分,解析不了会丢该条并记 LastError。
+    // kInvalidArgument**——那会让恒发 `Endpoint::Default()`(或填了别的目的地)的“传输
+    // 无关调用方”在串口上跑不起来。
 
     // ── 阻塞点②:等设备就绪 ──(Close 关 device_ready 唤醒)
     // 设备不可用(重开退避中)时就停在这里,数据留在队列里等,**不丢弃、不回传错误**;
@@ -420,11 +408,9 @@ Coro::Result<void> SerialTransport::AsyncWrite(Datagram datagram) {
 // | ③ | 写泵:`await(write_queue_)` 等数据              | `write_queue_->close()` + `discard_pending()` |
 // | ④ | 写泵:`await(device_ready_)` 等设备就绪         | `device_ready_->close()`  |
 //
-// **只有四处,不是 TCP 的五处**(D6):串口没有"连接窗口",故 ADR-0011 **D15** 的第五处
-// (`connect_waiter_`)不适用。且 `port_->close()` **确实能**打断活跃读流(实测 50ms
-// 唤醒,走 `aboutToClose`)——**这与 TCP 恰好相反**(其 `abort()` 在连接窗口内唤不醒任何
-// 等待)。`read_stream_->close()` 仍保留:成本一行、与 TCP 形态一致,且不依赖 Qt 的信号
-// 时序。
+// **只有四处,不是 TCP 的五处**(D6):串口没有“连接窗口”,ADR-0011 **D15** 的第五处
+// (`connect_waiter_`)不适用。`port_->close()` 也能打断活跃读流(走 `aboutToClose`);
+// `read_stream_->close()` 仍保留,它不依赖 Qt 的信号时序。
 Coro::Result<void> SerialTransport::Close() {
   if (lifecycle_ >= LifecycleState::kClosing) {
     return Coro::Result<void>{};  // 幂等。
@@ -467,8 +453,8 @@ bool SerialTransport::IsRunning() const {
 
 std::error_code SerialTransport::LastError() const { return last_error_; }
 
-// **无状态成员,当场算出**(D10)。**只有两值**——与 UDP 一致、与 TCP 分歧:退避重开
-// 期间报 `kDown` 更诚实(此刻确实收发不了字节),`kEstablishing` **永不出现**。
+// **无状态成员,当场算出**(D10)。**只有两值**:退避重开期间报 `kDown`(此刻确实收发
+// 不了字节),`kEstablishing` **永不出现**。
 LinkState SerialTransport::CurrentLinkState() const {
   if (lifecycle_ != LifecycleState::kRunning || !port_) {
     return LinkState::kDown;
