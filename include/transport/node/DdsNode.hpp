@@ -33,6 +33,11 @@
  * 两侧算的是同一个派生函数(`DdsNode.cpp` 的 `DeriveServiceTopics`)。**服务名的唯一约束
  * 是非空**,不限制字符集。
  *
+ * @warning 派生出的 `cfg.*.request` / `cfg.*.response` 与 `RegisterPublishers` /
+ *          `RegisterSubscribers` 收的普通 topic **处在同一平面**:
+ *          `RegisterSubscribers({"cfg.get.request"})` 与 `RegisterServices({"get"})`
+ *          指的是**同一条 topic**。**框架不拦**。
+ *
  * ## topic 由注册接口给出,不进配置(**D16**)
  *
  * ```cpp
