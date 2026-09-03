@@ -10,19 +10,17 @@
  * 请求-响应。
  *
  * **入站只有一条通路:订阅**(ADR-0009 D1 / RT_INBOUND_001)。读循环解出的每条消息一律交
- * `Dispatcher` 按键投递给全部匹配的订阅者,各得一份副本;节点**不再内置**"入站业务处理器"
- * 通道,也不再持有第二条业务队列与第二条消费者 fiber。请求-响应的关联与入站业务的取用
- * 因此是同一套机制的两种用法:前者由各 `RequestFor*` 内部按"同会话、同命令码、帧类型为
- * 回应"临时登记,后者由宿主经公开的 `Subscribe(Key)` 长期登记,在**自己的 fiber** 上
- * 消费自己的信箱。
+ * `Dispatcher` 按键投递给全部匹配的订阅者,各得一份副本。请求-响应的关联与入站业务的
+ * 取用因此是同一套机制的两种用法:前者由各 `RequestFor*` 内部按“同会话、同命令码、帧
+ * 类型为回应”临时登记,后者由宿主经公开的 `Subscribe(Key)` 长期登记,在**自己的 fiber**
+ * 上消费自己的信箱。
  *
  * **串行、异常隔离与背压是调用方契约**(ADR-0009 D3 / RT_INBOUND_005):一条 fiber 顺序消费
  * 即得串行,需要并发就自己起多条;消费代码的逃逸异常须自行 `try/catch`;队列容量即订阅
  * 信箱的容量。框架三者一概不保证。
  *
- * **无人认领的入站消息一律静默丢弃**(ADR-0009 D5 / ADR-0014 D1):业务帧如此——订阅模型
- * 下"没人订阅"是宿主的正常选择而非异常;终结帧(kResponse / kResult)亦如此——它属请求-
- * 响应侧的迟到/乱序,确是异常,但框架撤销观测面后已无处记录,只丢不记。
+ * **无人认领的入站消息一律静默丢弃**(ADR-0009 D5 / ADR-0014 D1):业务帧与终结帧
+ * (`kResponse` / `kResult`)一视同仁,只丢不记。
  *
  * **不管 transport 的生命周期**:传输由**宿主**创建、`Start()`、`Close()`、`WaitClosed()`,
  * 本节点只按引用借用它:读侧取它的读队列句柄,写侧调它的 `Write()`。链路的绑定、静默超时、重连、退避**全部是传输内部的事**,
@@ -32,10 +30,9 @@
  * 读循环的 `await` 随即得到终止错误而退出。
  *
  * **注意 `close()` 是整流传播的**:AsyncTask `417790c` 起,`Awaitable::close()` 关闭 hub 表里
- * **全部**消费者队列——源队列与同一条传输上的其它订阅者**一并终结**。这是**有意为之**:
- * 节点关闭即读侧终结,宿主随后关传输。若只想退订自己而不影响他人,新语义下的做法是
- * **析构句柄**(`~Awaitable()` 内部 `hub_->detach()`),本类不用该路径——它唤不醒正阻塞在
- * `await(rx_)` 上的读循环。
+ * **全部**消费者队列——源队列与同一条传输上的其它订阅者**一并终结**。节点关闭即读侧
+ * 终结,宿主随后关传输。(只退订自己的做法是析构句柄,本类不用该路径——它唤不醒正
+ * 阻塞在 `await(rx_)` 上的读循环。)
  *
  * 由此:多个节点**可以**共用一条传输并各得全量副本,但它们在关闭上是**一荣俱荣**——
  * 任一节点 `Close()` 即终结整条读流,不支持独立关停。
@@ -55,7 +52,7 @@
  *          区分字段。
  *
  * **无观测面**(ADR-0014 D1):既无计数器与 getter,也无 Trace 出口。框架内部的丢弃
- * (坏帧 / 无匹配响应 / 队列满)自此完全静默、亦无归因;要看现场,由宿主自行在 codec
+ * (坏帧 / 无匹配响应 / 队列满)完全静默、亦无归因;要看现场,由宿主自行在 codec
  * 或订阅侧加日志。
  *
  * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
@@ -77,8 +74,8 @@
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/ITransport.hpp"
 #include "transport/node/NodeBase.hpp"
-// RetryPolicy 已提到独立头(`DdsNode` 亦用同一类型,ADR-0013 D7);此处 include 使既有
-// 调用方"include ProtocolNode.hpp 即得 RetryPolicy"的写法继续成立。
+// `RetryPolicy` 在独立头(`DdsNode` 亦用同一类型,ADR-0013 D7);此处 include 使
+// “include ProtocolNode.hpp 即得 RetryPolicy”的写法继续成立。
 #include "transport/node/RetryPolicy.hpp"
 
 namespace transport {
@@ -104,12 +101,12 @@ using MessageDispatcher =
 
 /// ProtocolNode 配置:只有默认外部协议 id 一项。
 ///
-/// 交互时限**不在配置面上**(SRS §3.1.4.4):四种交互各阶段的时限是数量级不同的量,一个
-/// 节点级缺省值套不上去,故逐次传参(ADR-0010 D6)。"不得永不超时"的保护由
-/// `ValidateInteraction` 的参数校验直接承担——它**拒绝**任何非正时限。
+/// 交互时限**不在配置面上**,逐次传参(SRS §3.1.4.4 / ADR-0010 D6):四种交互各阶段的
+/// 时限数量级不同,一个节点级缺省值套不上去。“不得永不超时”由 `ValidateInteraction`
+/// 拒绝任何非正时限来保证。
 ///
-/// 入站业务不在配置面上——它由宿主经 `Subscribe(Key)` 自行登记(ADR-0009 D1),故本结构
-/// 既无处理器字段,也无业务队列容量字段(容量即订阅信箱的容量,ADR-0009 D3)。
+/// 入站业务同样不在配置面上——它由宿主经 `Subscribe(Key)` 自行登记(ADR-0009 D1),
+/// 容量即订阅信箱的容量(ADR-0009 D3)。
 struct ProtocolNodeConfig {
   std::uint8_t protocol_id = 0;
 };
@@ -161,10 +158,8 @@ class ProtocolNode : public NodeBase {
    * ← kResponse                                ⇒ 成功(返回该帧)
    * ```
    *
-   * 本方法是 needresponse 的**唯一**入口(ADR-0010 D10:旧的 `Request` 已删除,因
-   * `RequestForResponse(req, {timeout, 1})` 完全覆盖其行为——单次尝试时"总超时"与
-   * "单次超时"等价)。耗尽次数时返回的是 `kNotAccepted`(对端**始终没有受理**)而非
-   * `kTimeout`(D12)。
+   * 本方法是 needresponse 的**唯一**入口。耗尽次数时返回的是 `kNotAccepted`(对端**始终
+   * 没有受理**)而非 `kTimeout`(D12)。
    *
    * 重发的是**字节完全相同**的原帧,`session_id` 不变(D3),故原订阅横跨全部重发继续有效,
    * **最先到达**的那一帧即终结本次交互,框架不区分它对应第几次尝试。由此要求对端能容忍
@@ -180,7 +175,7 @@ class ProtocolNode : public NodeBase {
                                                          RetryPolicy retry);
 
   /**
-   * @brief 交付一次 `withfeedback` / `needfeedback` 交互(**同一模型**,ADR-0010 D1 修正)。
+   * @brief 交付一次 `withfeedback` / `needfeedback` 交互(**同一模型**,ADR-0010 D1)。
    *
    * ```
    * → kCommand
@@ -224,28 +219,24 @@ class ProtocolNode : public NodeBase {
    * ```
    *
    * **它不是外部系统协议的第五种交互**:`Send` / `RequestForResponse` / `RequestForResult`
-   * 属外部系统协议,本方法属另一种协议,二者并存于同一节点(D13)。`ProtocolNode` 对线缆
-   * 格式不透明(编解码经 `ICodec` 注入),协议差异只体现在"用哪些帧类型、走哪种交互",
-   * 不构成新的节点类型,故不另起节点。
-   * **调用方须自行确保所用方法与对端协议匹配,框架不校验**——它对协议语义不透明(D13,
-   * 已记为明确接受的代价)。
+   * 属外部系统协议,本方法属另一种协议,二者并存于同一节点(D13)。
+   * **调用方须自行确保所用方法与对端协议匹配,框架不校验**——它对协议语义不透明(D13)。
    *
    * 与 `RequestForResult` **恰好相反的三条**,勿混:
-   * 1. **本交互在"等结果"阶段就重发**。`RequestForResult` 的"等 `kResult` 时不得重发"
-   *    (RT_NODE_002_c)**只约束外部系统协议**,不是框架的普遍规则(该条 2026-08-26 已明确
-   *    适用面)。本交互没有受理阶段,唯一的等待就是等结果——不重发则命令帧一旦丢包即
-   *    彻底失败、无任何补救(RT_NODE_002_g)。
+   * 1. **本交互在“等结果”阶段就重发**。`RequestForResult` 的“等 `kResult` 时不得重发”
+   *    (RT_NODE_002_c)**只约束外部系统协议**,不是框架的普遍规则。本交互没有受理阶段,
+   *    唯一的等待就是等结果——不重发则命令帧一旦丢包即彻底失败、无任何补救
+   *    (RT_NODE_002_g)。
    * 2. **重发耗尽返 `kTimeout` 而非 `kNotAccepted`**(D12):后者的语义是"对端**没有受理**",
    *    而本交互**根本不存在受理这一步**。
    * 3. **收到 `kResult` 后不回应任何帧**(对比 D8:那是 `RequestForResult` 模型固有的最后
    *    一步)。
    *
-   * 因此本方法**不复用** `AwaitAccept()`:那个骨架等的是 `kResponse`、耗尽返 `kNotAccepted`,
-   * 两处语义都不对。它自带一个独立的重发循环,且**只登记一个订阅**(无受理帧可订)。
+   * 本方法**不复用** `AwaitAccept()`,自带一个独立的重发循环,且**只登记一个订阅**
+   * (无受理帧可订)。
    *
    * 重发的是**字节完全相同**的原帧、`session_id` 不变(D3),以最先到达的那一帧为准;由此
    * **要求对端能容忍重复命令**(幂等,或自行按 session_id 去重)——协议层假设,框架不校验。
-   * 因本交互在唯一的等待阶段重发,该要求的适用面比 `RequestForResult` 更广。
    *
    * @param req               请求 Message(payload + message_id 由调用方填);本节点盖
    *                          kCommand / protocol_id / session_id。
@@ -279,11 +270,6 @@ class ProtocolNode : public NodeBase {
    * **登记须先于对应报文到达**,否则先到的报文因无订阅而被丢弃(业务帧静默丢弃,
    * ADR-0009 D5)。
    *
-   * **返 `Coro::Result<Ticket>` 而不是裸 `Ticket`**(ADR-0009 **D1′**,与 `DdsNode::Subscribe`
-   * 齐平):`Ticket` **装不下错误码**——返裸凭据时"相位不对"只能交出一张信箱已关闭的空凭据,
-   * 其 `Wait` 返的是 `kInvalidState`,**错误码不对,且推迟到第一次 `Wait` 才暴露**。在
-   * **返回处**说清楚,而不是把 `kClosed` 推给下一步。
-   *
    * ## 相位规则:**只在 `Running` 放行**
    *
    * | 相位 | 返回 |
@@ -292,19 +278,7 @@ class ProtocolNode : public NodeBase {
    * | `Running` | 放行 |
    * | `Closing` / `Closed` | `kClosed` |
    *
-   * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是"早一点也行"。判据与
-   * 三个交互方法**同一个** `IsRunning()`:`kClosed` 一并覆盖"未启动 / 关闭中 / 已关闭",这是
-   * 本类各 `@return` 早已写明的既有约定,本方法不为"没启动"单开一个错误码。
-   *
-   * **不放行 `Created` 有一处真实危害要挡**:`NodeBase::Close()` 从 `Created` 走时**不调
-   * `DoClose()`**,`Dispatcher::CloseAll` 因此从不执行——而"信箱被关"是订阅者**唯一**的协作
-   * 取消信号(ADR-0009 D4)。宿主若在此相位订阅并 spawn 了消费 fiber、随后放弃启动
-   * (`Start()` 失败或直接 `Close()`),`Coro::await(ticket.mailbox())` **永远等不到唤醒**,
-   * 下面样板末尾那句 `task.get()` 就**挂死**在那儿。不是悬垂(`Ticket` 持 `weak_ptr`,内存
-   * 安全),是**唤醒信号永远不发**——静默挂起,不崩溃,排查代价高。
-   *
-   * **而 `Running` 期订阅是安全的**:此相位 `Close()` 必经 `DoClose()`,`CloseAll` 一定执行,
-   * 在途 `await` 恰好终结一次,消费 fiber 自然退出。
+   * **必须在 `Start()` 之后订阅**——`Created` 期订阅是**禁用法**,不是“早一点也行”。
    *
    * 消费在**调用方自己的 fiber** 内进行,节点不代管:
    * ```cpp
@@ -372,8 +346,7 @@ class ProtocolNode : public NodeBase {
   /// 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时一律
   /// 静默丢弃,终结帧与业务帧无别(ADR-0009 D1/D5、ADR-0014 D1)。
   ///
-  /// 取 const 引用:投递只读源消息(命中的订阅者各拷一份副本),本函数不再有"把消息移交
-  /// 第二条队列"的分支,故不需要按值取走所有权。
+  /// 取 const 引用:投递只读源消息,命中的订阅者各拷一份副本。
   void Dispatch(const Message& msg);
   /// @brief 编码 + 交给传输(`Send` 与各 `RequestFor*` 共用的出站尾段)。
   ///        **不盖任何章**——这正是 D8 的回应结果帧走本函数而非 `Send()` 的原因。
