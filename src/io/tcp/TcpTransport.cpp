@@ -120,7 +120,7 @@ Coro::Result<void> TcpTransport::Start() {
 //     connect_waiter = connectToHost;              ← 句柄存成员,供 Close 打断 (D15)
 //     if (closing) break;                          ← 【建完即复查】(D15 补正)
 //     if (await_for(connect_waiter, timeout)) {
-//       ++generation; socket_ready 先清后发;
+//       socket_ready 先清后发;
 //       read_stream = readAll();                   ← 同样存成员 (D15)
 //       while (!closing) { r = await_for(read_stream, timeout);  ← 同上,判据即复查
 //                          if (r) push else break }
@@ -158,15 +158,13 @@ void TcpTransport::RunSocketPump() {
     }
     auto connected = Coro::await_for(connect_waiter_, timeout);
     if (connected) {
-      ++generation_;  // 纯内部记账(D9/D12):不驱动任何控制流。
-
       // 通告写泵(#180 的消费者;本轮无人取)。**先清后发**:每轮外层都是一次真实的
       // down→up 跃迁,而写泵停在"等数据"时没人来取,不清就会一直堆积。信号因此恒定
       // 只有 0 或 1 个 token。
       socket_ready_->channel()->discard_pending();
       socket_ready_->resolve();
 
-      // 每代重建读流(旧流已随上一轮 abort 死掉);建流时会 drain 订阅前已到的字节。
+      // 每轮重建读流(旧流已随上一轮 abort 死掉);建流时会 drain 订阅前已到的字节。
       // 同样**存成成员**供 Close 打断(D15)。
       read_stream_ = Coro::coro(socket_).readAll();
       // 【建完即复查】(D15 补正,#200):**本循环的判据就是那次复查**——它在第一次
