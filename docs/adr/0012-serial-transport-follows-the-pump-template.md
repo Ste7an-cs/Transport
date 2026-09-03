@@ -91,6 +91,10 @@
 
 - **D9（`peer` 一律填固定设备端点，沿用 ADR-0011 D8）：** 串口无 peer 概念。读侧每个切片的 `peer` 填由 `device` 导出的固定端点；写侧**忽略**调用方填的 `peer`，**不判 `kInvalidArgument`**——理由同 ADR-0011 D8（让传输无关的调用方换传输即可运行）。
 
+  **固定端点取 `Endpoint::Default()`，不为串口新增一个 `Endpoint::Kind`**（2026-09-03 补记依据）：`Endpoint::Kind` 现有三值 `kDefault` / `kNet`（UDP `ip:port`）/ `kTopic`（DDS）。串口既不是网络地址也不是 topic，看似该有第四值——**否决**，理由是**新增枚举值会牵动跨介质的语义**：`Endpoint` 是 `Datagram` 的公共字段，四个传输与两个节点都要面对它，加一个值等于要求所有既有的 `switch` / 判据重新表态，而串口从中**得不到任何东西**——它的"端点"是恒定的，取值域只有一个元素。
+
+  `Default()` 的语义恰好就是"**本传输配置里的那个默认对端**"，串口的固定设备端点正是此意。**这一取舍不在 ADR-0012 的原定范围内**，属实现期判定，故补记于此。
+
 - **D10（`CurrentLinkState()` 不给 `kEstablishing`）：** 只有 `kDown` / `kUp`，当场由 `lifecycle_` 与 `port->isOpen()` 算出，**不设状态成员**。
 
   依据：与 UDP 一致——其注释即"UDP 无连接，故**永不出现** `kEstablishing`（退避是连接管理策略，不经本查询暴露）"。串口同理，退避重开期间报 `kDown` 更诚实：此刻**确实收发不了字节**。`LinkState` 的枚举注释"仅具连接管理的传输会给出 `kEstablishing`"因此无需改动。

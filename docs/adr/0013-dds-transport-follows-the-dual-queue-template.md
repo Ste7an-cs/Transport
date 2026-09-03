@@ -505,6 +505,15 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   | 不在 `Created` 阶段 | `kInvalidState` |
   | topic 为空串 | `kInvalidArgument` |
   | 服务名为空串 | `kInvalidArgument` |
+
+  **服务名【只要求非空】，不额外限制字符**（#221 落地时判定，2026-09-03 补记依据）。理由是**拼接是单射的，没有可拦的对象**：
+
+  - 不同服务名必派生出不同 topic；
+  - `cfg.X.request` 与 `cfg.Y.response` **对任何 X、Y 都不可能相等**——两串末 8 字符分别是 `.request` 与 `response`，首字符 `.` ≠ `r`。
+
+  **故不存在"会派生出歧义 topic"的字符。** 空串是唯一例外，已由上表拦下。
+
+  加字符限制也**堵不住真正的洞**——唯一残留的重名风险是框架侵占 `cfg.*` 命名空间（**D6** 明确接受的代价），**那个洞不在服务名一侧**；且 `RegisterPublishers` / `RegisterSubscribers` 本就只校验非空，单给这两个方法加严只会让接口自相矛盾。真正非法的 topic 名另有 backstop：`Start()` 的 `Declare*` 会把 provider 的错误原样返回、停在 `Created`。
   | **同一服务名同时注册为 `Clients` 与 `Services`** | `kInvalidArgument`——**自己请求自己**，且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**，形成调用方毫无察觉的自问自答 |
 
   ### 派生化让两条校验从根上消失（2026-09-02）
