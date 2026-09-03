@@ -170,9 +170,6 @@ class TcpTransport final : public ITransport {
   LifecycleState lifecycle_{LifecycleState::kCreated};
   bool joined_{false};  ///< WaitClosed 已 join:`FiberTask::get()` 是一次性的。
   std::error_code last_error_;
-  /// 每次连上 +1。**纯内部记账**(D9/D12):不对外暴露、不驱动任何控制流、不做代际隔离。
-  /// 原本供 Trace 事件归类,观测面随 ADR-0014 **D1** 撤销后已无消费者。
-  std::uint32_t generation_{0};
 
   /// 对外读队列:**不随连接重建而更换**——这正是"重连对调用方透明"的载体。
   std::shared_ptr<Coro::Awaitable<Datagram>> read_queue_{
@@ -181,7 +178,7 @@ class TcpTransport final : public ITransport {
   /// 写泵一律忽略它(**D8**)。有界 1024 且满时静默丢最旧(**D6**)。
   std::shared_ptr<Coro::Awaitable<Datagram>> write_queue_{
       std::make_shared<Coro::Awaitable<Datagram>>()};
-  /// 管理泵 → 写泵的"可以写了"通告(复用一个,不换代;**先清后发**恒定 0 或 1 个 token)。
+  /// 管理泵 → 写泵的"可以写了"通告(整个生命期复用一个;**先清后发**恒定 0 或 1 个 token)。
   std::shared_ptr<Coro::Awaitable<void>> socket_ready_{
       std::make_shared<Coro::Awaitable<void>>()};
   /// 只为打断重连退避:退避须用独立的延时原语(拿"在未连接的 socket 上建读流"当退避会
