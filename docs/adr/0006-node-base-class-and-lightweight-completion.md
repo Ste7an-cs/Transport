@@ -34,6 +34,37 @@
 
 - **D5（读循环骨架与观测计数并入各 node）〔已由 #140 实施；`NodeRuntime.hpp` 随之删除〕：** 13 行的读循环回到它本来的归属（node 自己的 `Read → decode → dispatch`）；五个观测计数成为各 node 的成员。二者都不构成需要共享的机制。
 
+- **D1′（补正，2026-09-03，#220）：`DoStart()` 跑在锁外，故生命周期多一条暂态 `close_pending_`。** `Start()` 的形状是「置 `starting_` → **放锁** → 跑 `DoStart()` → 重新取锁收尾」，那段放锁窗口里 `Close()` 可以进来（运行时是 M:N 的，`Close()` 的使用契约只要求"由节点外部"，**没要求同线程**）。
+
+  **初版的缺陷**：窗口内的 `Close()` 看到 `lifecycle_ == kCreated`，据此判定"无 fiber、无 transport 可关"，直接落 `kClosed` 并返回**成功**；随后 `Start()` 收尾时**无条件**写回 `kRunning`。
+  **后果**：一个**已被 `Close()` 过、调用方已收到成功返回**的节点被复活成 `Running`，而那次关闭的收敛信号**从未发出**（`DoClose()` 没跑）。
+
+  **可达性已判实**（#220）：
+
+  | | 结论 | 依据 |
+  |---|---|---|
+  | 同一执行域内 | **不可达** | 两个真实 `DoStart()` 全程无挂起点；且 `Coro::makeTask` spawn 走 `boost::fibers::fiber(props, fn)`，该构造器策略是 **`launch::post`**（`boost/fiber/fiber.hpp:125`）——**创建时不切换**到新 fiber |
+  | **跨 OS 线程** | **今天就成立** | 窗口内的 `Close()` 走 `has_fibers == false` 分支，**全程只碰基类 mutex 与相位**、不触碰任何 fiber 亲和之物，在外来线程上执行定义良好 |
+
+  **故这是已可复现的缺陷，不是防御性加固**——回归用例在修复前的代码上确实失败。
+
+  ### 处置：`Close()` 在 `starting_` 期间只记账，由 `Start()` 收尾裁决
+
+  ```
+  Close()  见 starting_  → 置 close_pending_，【不落相位、不发信号】，返回"已受理"
+  Start()  收尾复查：
+     DoStart() 成功 + 待关闭 →  kClosing + 锁外补发 DoClose()  + 返 kInvalidState
+     DoStart() 失败 + 待关闭 →  kClosed（那次关闭已答应过，不许退回 Created 重试）
+                                 返回值仍报【启动失败的成因】
+     无待关闭                →  kRunning（原路径）
+  ```
+
+  相位序列仍是正规的 `Created → Closing → Closed`，**没有新增对外可见的状态**——`close_pending_` 是私有暂态，外部永远观察不到"半关"。
+
+  **否决的另一条**（`Start()` 末尾只在 `kCreated` 时才写 `kRunning`）：它**仍要在 `DoStart()` 还在跑时对外公开 `kClosed`**，而相位是全库仲裁点——`WaitClosed()` 会据此去 `DoJoin()`，与仍在写 `read_task_`（子类成员、无锁守）的 spawn 过程撞车，甚至在 fiber 尚未 spawn 出来时就宣告收敛完成；`DoClose()` 也只能由外来线程去动 `DoStart()` 正在写的成员。**两条修法都要由 `Start()` 收尾补发信号，那就别在中途先说假话。**
+
+  > **⚠ 同源但未处置的第三条路径**：`WaitClosed()` 在 `starting_` 期间仍会因 `lifecycle_ == kCreated` **立即返回**，宣告"无 fiber 可汇合"。宿主若在另一条线程 `Close()` 后紧接 `WaitClosed()`，拿到的是**提前的"已收敛"**。#220 **既没修好它、也没让它变坏**（修前 `WaitClosed()` 会去 `DoJoin()` 一个可能还是空的 `read_task_`，同样是假收敛）。**待另行处置。**
+
 - **D6（收敛留在基类）：** 收敛（读循环退出 → join handler → Drain 未启动业务归因 `close_drop` → 置 `Closed` → 广播唤醒）留在 `NodeBase`。
   理由：这是本轮改造中唯一**不可下放**的部分。`Awaitable` 是通知原语——`close()` 只保证等待者被唤醒，不保证被唤醒的 fiber 已经跑完并不再触碰 `this`；安全释放要的是后者，只能靠 join。ADR-0005 的 D1/D5 行为结论（读循环兼任收敛者、致命错误自终）**原样保留**，只是承载类改名换姓；其 D6（重入守卫）由本 ADR **D8 撤销**。
 

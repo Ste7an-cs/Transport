@@ -609,6 +609,16 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 **单元设计决策**：本单元只装**每个节点都有的**生命周期机制——状态机 `Created→Running→Closing→Closed`、幂等 `Start`、关闭仲裁与汇合。基类**非模板**、不持 `ITransport*`、对协议类型无感知；**不 include 任何协议或消息类型**。
 
+**`DoStart()` 跑在锁外，故多一条私有暂态 `close_pending_`**（ADR-0006 **D1′**，#220，2026-09-03）：`Start()` 的形状是「置 `starting_` → **放锁** → 跑 `DoStart()` → 重新取锁收尾」，那段放锁窗口里 `Close()` **可以从另一条 OS 线程进来**（运行时是 M:N 的，`Close()` 的契约只要求"由节点外部"、没要求同线程）。
+
+初版在此窗口内直接落 `kClosed` 并返回成功，随后 `Start()` 收尾**无条件**写回 `kRunning`——**一个已被 `Close()` 过、调用方已收到成功返回的节点被复活，且那次关闭的收敛信号从未发出**。
+
+**处置**：`Close()` 见 `starting_` 只置 `close_pending_`、**不落相位、不发信号**、返回"已受理"；`Start()` 收尾复查——`DoStart()` 成功 + 待关闭 → `kClosing` + 锁外补发 `DoClose()` + 返 `kInvalidState`；`DoStart()` 失败 + 待关闭 → `kClosed`（那次关闭已答应过，不许退回 `Created` 重试），返回值仍报**启动失败的成因**。
+
+**相位序列仍是正规的 `Created→Closing→Closed`**，`close_pending_` 是**私有暂态、外部永远观察不到"半关"**。
+
+> **同源但未处置**：`WaitClosed()` 在 `starting_` 期间仍会因 `lifecycle_ == kCreated` 立即返回、宣告假收敛。#220 既没修好它也没让它变坏，**待另行处置**。
+
 **关键决策：`Close()` 只发信号，`WaitClosed()` 单独汇合。** 旧形态的 `Close()` 结尾无条件等待收敛，内部工作单元调用它即等于等自己退出、静默挂死，为此先后尝试过运行时重入守卫（ADR-0005 D6）与使用契约（ADR-0006 D8）。拆开之后：
 
 - `Close()` **不含任何等待点**，因此**任何 fiber 都可调用**，包括节点自己的读-分发循环与入站业务处理器；
