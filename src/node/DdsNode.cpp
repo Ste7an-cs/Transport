@@ -23,8 +23,8 @@
 // 请求-响应、应答寻址。**派生只此一处实现**(`DeriveServiceTopics`)。生命周期
 // (幂等 Start / 关闭仲裁 / join)由基类 NodeBase 承载,本类只填三个钩子。
 //
-// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不持有业务队列与 handler
-// 消费者 fiber:入站业务由宿主 `Subscribe` 后在自己的 fiber 上消费。
+// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1):入站业务由宿主 `Subscribe`
+// 后在自己的 fiber 上消费。
 //
 // 本类**不触碰 transport 的生命周期**:不 Start、不 Close、不 WaitClosed,只在 `DoStart()`
 // 里逐项 `Declare*`(D15:唯一建端点的地方),此外只借它的两条队列。
@@ -34,8 +34,7 @@ namespace {
 
 /// 节点 uuid(**D6**):`uuid_override` 非空则用它,为空才 `QUuid::createUuid()`。
 ///
-/// **不自搓**(`random_device` 在 WSL 下质量存疑,且要自行论证碰撞率),**不引第三方 uuid
-/// 库**(为一个字段引依赖不划算);`Qt5::Core` 本就 `PUBLIC` 链进 `transport`,不引入新依赖。
+/// **不自搓**、**不引第三方 uuid 库**;`Qt5::Core` 本就 `PUBLIC` 链进 `transport`,不引入新依赖。
 std::string MakeUuid(const std::string& uuid_override) {
   if (!uuid_override.empty()) {
     return uuid_override;  // 测试注入固定值,保住确定性可测。
@@ -63,7 +62,7 @@ struct ServiceTopics {
   std::string reply;    ///< `cfg.<服务名>.response`
 };
 
-/// `cfg.` 是**固定字面前缀,不可配**(**D6**)——不是配置项,不许做成可注入的。
+/// `cfg.` 是**固定字面前缀,不可配**(**D6**)。
 constexpr char kServicePrefix[] = "cfg.";
 constexpr char kRequestSuffix[] = ".request";
 constexpr char kReplySuffix[] = ".response";
@@ -72,11 +71,9 @@ constexpr char kReplySuffix[] = ".response";
 ///
 /// ★ **一处实现、处处调用**:客户端与服务端、注册面(`DoStart` 建端点)与调用面
 ///   (`RequestForResultDirect` / `ServeRequests` / `Reply` / `Subscribe` 的校验)**全都从
-///   这一个函数取值**。「两侧不可能算歪」这个保证**全部依赖于此**——任何一处另写一遍
-///   字符串拼接,保证当场失效。
+///   这一个函数取值**——任何一处另写一遍字符串拼接,“两侧不可能算歪”当场失效。
 ///
-/// **拼接是单射的,故不需要限制服务名的字符**:`.request` 与 `.response` 首字符不同、长度
-/// 差 1,两者拼不到一起;不同服务名派生出的 topic 亦必不同。空串在注册处已拦。
+/// **拼接是单射的,故不需要限制服务名的字符**;空串在注册处已拦。
 [[nodiscard]] ServiceTopics DeriveServiceTopics(const std::string& service_name) {
   return ServiceTopics{kServicePrefix + service_name + kRequestSuffix,
                        kServicePrefix + service_name + kReplySuffix};
@@ -84,8 +81,8 @@ constexpr char kReplySuffix[] = ".response";
 
 /// 反查:`request_topic` 是不是 `service_names` 里某个服务派生出来的请求 topic。
 ///
-/// **仍走 `DeriveServiceTopics`,不另写"剥前缀去后缀"的解析器**——派生与反查一旦分成两份
-/// 实现,就又有了两边算不到一处去的余地,而这正是本轮设计要根除的东西。
+/// **仍走 `DeriveServiceTopics`,不另写“剥前缀去后缀”的解析器**——派生与反查分成两份实现
+/// 就又有了两边算不到一处去的余地。
 [[nodiscard]] std::optional<ServiceTopics> FindServiceByRequestTopic(
     const std::set<std::string>& service_names,
     const std::string& request_topic) {
@@ -98,19 +95,15 @@ constexpr char kReplySuffix[] = ".response";
   return std::nullopt;
 }
 
-/// 服务名注册批(`Clients` / `Services`)的校验。派生化之后**只剩两条**:
+/// 服务名注册批(`Clients` / `Services`)的校验,**只有两条**:
 ///
 /// | 检查 | 依据 |
 /// |---|---|
-/// | 服务名为空串 | 空名派生出的 `cfg..request` 无从表达"哪个服务" |
-/// | 服务名已注册为**反向角色** | **唯一要拦的方向冲突**——自己请求自己,且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**,形成毫无察觉的自问自答 |
+/// | 服务名为空串 | 空名派生出的 `cfg..request` 无从表达“哪个服务” |
+/// | 服务名已注册为**反向角色** | 自己请求自己,且 `corr` 由自己生成、`Dispatcher` **会真的匹配上**,形成毫无察觉的自问自答 |
 ///
-/// **另外两条随派生化从根上消失**(**D16**,2026-09-02):"请求与应答同 topic"——派生出来
-/// 必然不同;"同一请求 topic 跨批次配了两个不同应答 topic"——派生确定、同名必同值。留着
-/// 是死代码。
-///
-/// **只拦这一种方向冲突。** 其余"同一 topic 上既有 writer 又有 reader"的组合只造成自收
-/// 白干、不会误配,且可能是调用方有意为之(本地回环自测),**不拦**(**D16** / 代价 9)。
+/// **只拦这一种方向冲突。** 其余“同一 topic 上既有 writer 又有 reader”的组合只造成自收
+/// 白干、不会误配,且可能是调用方有意为之(本地回环自测),**不拦**(**D16**)。
 [[nodiscard]] Coro::Result<void> ValidateServiceNameBatch(
     const std::vector<std::string>& batch,
     const std::set<std::string>& opposite) {
@@ -298,8 +291,7 @@ void DdsNode::DecodeAndDispatch(const Datagram& datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    // 坏样本 / codec 语义错误:**丢弃**。观测面撤销后不再归因、不再记录,丢弃动作本身
-    // 不变(ADR-0014 D1/D4)。
+    // 坏样本 / codec 语义错误:**丢弃**,不归因、不记录(ADR-0014 D1/D4)。
     return;
   }
   for (auto& msg : decoded.value()) {
@@ -317,30 +309,17 @@ void DdsNode::Dispatch(const Message& msg) {
     return;
   }
   // 无人认领的 `kReply` 是迟到、乱序,或**别人的应答**——共用应答 topic 之下,同一服务的
-  // 每个客户端都会收到该服务的全部应答,自己那份只是其中之一(代价 8);业务消息无人订阅
-  // 则是宿主的正常选择(ADR-0009 D5)。**两者的处置相同:丢弃。** 观测面随 ADR-0014 D1
-  // 撤销后框架已无处记录二者之别,故此处不再分支;代价(D4)是丢弃完全不可见,已明确接受。
+  // 每个客户端都会收到该服务的全部应答,自己那份只是其中之一;业务消息无人订阅则是宿主
+  // 的正常选择(ADR-0009 D5)。**两者的处置相同:丢弃,且不作记录**(ADR-0014 D1/D4)。
 }
 
 // ── 公开面:两种交互模式(D8)──────────────────────────────────────────
 
 Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
   // **相位判定先于配置校验**,与另外三个交互方法同序(调用序错误先于配置错误);判据也
-  // **与它们同一个** `IsRunning()`——`kClosed` 一并覆盖"未启动 / 关闭中 / 已关闭",这是
-  // `ProtocolNode` 已经写进公开 `@return` 的既有约定,本方法不单开一份。
-  //
-  // - **`Created` 也返 `kClosed`**:`Subscribe` **只在 `Running` 受理**,还没 `Start()` 就
-  //   订阅是**禁用法**,不是"早一点也行"。放行它有一处真实危害:`NodeBase::Close()` 从
-  //   `Created` 走时**不调 `DoClose()`**,`dispatcher_.CloseAll` 因此从不执行——宿主若在
-  //   此相位订阅并 spawn 了消费 fiber、随后放弃启动,那条 fiber 的信箱**永远等不到关闭
-  //   信号**,join 时挂住。
-  //   而它本要换来的"不漏收启动初期消息"是空的:`DataReader` 建于 `DoStart()`,**DDS 发现
-  //   约 240ms**,`Start()` 返回之后的头 ~240ms 对端根本还没 match,一条样本也到不了。
-  //   宿主得在 `Start()` 与 `Subscribe()` 之间干超过 240 毫秒的事才谈得上丢,而
-  //   `Start(); Subscribe();` 这样的正常写法离那个边界差着几个数量级。
-  // - **`Closing` / `Closed` 同样 `kClosed`**:此时 `DoClose()` 已 `CloseAll`,再登记只能
-  //   得到一张信箱已关闭的凭据。让它**在返回处**就说清楚,而不是推迟到第一次 `Wait`——D8
-  //   把本方法从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的理由原样适用于相位。
+  // **与它们同一个** `IsRunning()`——`kClosed` 一并覆盖“未启动 / 关闭中 / 已关闭”。
+  // `Subscribe` **只在 `Running` 受理**,还没 `Start()` 就订阅是**禁用法**;`Closing` /
+  // `Closed` 期 `DoClose()` 已 `CloseAll`,再登记只能得到一张信箱已关闭的凭据。
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);  // 未启动 / 关闭中 / 已关闭。
   }
@@ -381,8 +360,8 @@ Coro::Result<void> DdsNode::Publish(const std::string& topic, Message msg) {
   }
   msg.kind = MessageKind::kNotify;
   msg.topic = topic;
-  // D6 之后 `correlation_id` **只有框架生成的关联符一个来源**,发布路径上它没有第二种
-  // 用法("应用自定义子通道"已裁决为不需要);`reply_to` 同理——本调用不期待应答。
+  // `correlation_id` **只有框架生成的关联符一个来源**(D6),发布路径上不使用它;
+  // `reply_to` 同理——本调用不期待应答。
   msg.correlation_id.clear();
   msg.reply_to.clear();
   return EncodeAndWrite(msg, topic);
@@ -404,7 +383,7 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(
   if (clients_.count(service_name) == 0) {
     return make_error_code(TransportErrc::kConfiguration);
   }
-  // 两个 topic 在此派生——**与服务端建端点时调的是同一个函数**,故两侧必然算到一处去。
+  // 两个 topic 在此派生——与服务端建端点时调的是**同一个函数**。
   const ServiceTopics topics = DeriveServiceTopics(service_name);
   const std::string& request_topic = topics.request;
   const std::string& reply_topic = topics.reply;
@@ -412,8 +391,7 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(
   const std::string correlation_id = NextCorrelationId();
   req.kind = MessageKind::kRequest;
   req.correlation_id = correlation_id;
-  // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15)。派生化之后两侧配歪已不可能,
-  // 它剩下的用途是对**版本不一致的对端**(派生规则将来若变更)当场报出偏差。
+  // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15)。
   req.reply_to = reply_topic;
   req.topic = request_topic;
 
@@ -448,16 +426,14 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(
     // 超时 → 重发。**本模型恰恰要在等结果阶段重发**(D7):丢的不是网络(DDS 是
     // RELIABLE 的),是我方或对端的**本地队列**——那一段 RELIABLE 覆盖不到。
   }
-  // **耗尽返 kTimeout,不是 kNotAccepted**(D7 / ADR-0010 D12):后者的语义是"对端没有
-  // 受理",而本模型根本不存在受理这一步。
+  // **耗尽返 kTimeout,不是 kNotAccepted**(D7 / ADR-0010 D12):本模型没有受理这一步。
   return make_error_code(TransportErrc::kTimeout);
 }
 
 Coro::Result<DdsNode::Ticket> DdsNode::ServeRequests(
     const std::string& service_name) {
   // **是 `Subscribe` 在服务名一侧的封装,不是另一套机制**(D8):派生出请求 topic 之后原样
-  // 交给它,相位与注册两道校验都落在那里。`Subscribe` 由此得以**保持通用**——它的第一参
-  // 永远是 topic,不需要为 `kind` 分叉出"这个参数其实是服务名"的分支。
+  // 交给它,相位与注册两道校验都落在那里。
   //
   // 空服务名走到这里也无妨:`cfg..request` 永远注册不上,`Subscribe` 报 kConfiguration。
   return Subscribe(DeriveServiceTopics(service_name).request,
@@ -475,8 +451,8 @@ Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
     return make_error_code(TransportErrc::kConfiguration);  // 我根本不服务这个 topic。
   }
   const std::string& reply_topic = service->reply;
-  // 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的不等即报错。这 20 来个
-  // 字节买的是"两侧注册实参写歪"这一类部署错误的可诊断性。
+  // 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与查出的不等即报错——对版本不
+  // 一致的对端,它是唯一能当场报出偏差的手段。
   if (!request.reply_to.empty() && request.reply_to != reply_topic) {
     return make_error_code(TransportErrc::kInvalidArgument);
   }
@@ -491,14 +467,12 @@ Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
 
 std::string DdsNode::NextCorrelationId() {
   // 两段式(D6):uuid 保证**跨节点**不撞,自增半段保证**节点内**不撞。
-  // `uint32` 回绕(约 42.9 亿次请求后)**明确接受**——届时重复的是本节点很久以前用过的
-  // 值,那条订阅早已注销,`Dispatcher` 里已无对应登记,不会误配。
+  // `uint32` 回绕(约 42.9 亿次请求后)**明确接受**,不加防回绕逻辑。
   return uuid_ + "#" + std::to_string(request_seq_++);
 }
 
 bool DdsNode::IsReaderSideTopic(const std::string& topic) const {
-  // 读侧 = Subscribers ∪ 各服务的 cfg.<名>.request ∪ 各客户端的 cfg.<名>.response
-  // (D16 的判据,与代价 9 的 "reader 侧"逐字相同,只是两个 topic 现在是派生出来的)。
+  // 读侧 = Subscribers ∪ 各服务的 cfg.<名>.request ∪ 各客户端的 cfg.<名>.response(D16)。
   if (subscribers_.count(topic) != 0) {
     return true;
   }

@@ -67,7 +67,7 @@ class FakeDdsProvider : public IDdsProvider {
   Coro::Result<void> DeclareWriter(const std::string& topic) override;
 
   /// @brief 向 topic 同步分发。**该 topic 须已 `DeclareWriter`**,否则返 `kConfiguration`
-  ///        (**D13** 补正:不惰性建,两个实现一致)。
+  ///        (**D13**:不惰性建,两个实现一致)。
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
   Coro::Result<void> Subscribe(const std::string& topic, Sink cb) override;
   Coro::Result<void> Unsubscribe(const std::string& topic) override;

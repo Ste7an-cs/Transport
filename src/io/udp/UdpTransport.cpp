@@ -108,8 +108,7 @@ bool UdpTransport::Bind() {
                              static_cast<int>(config_.ttl));
     socket_->joinMulticastGroup(ToAddress(config_.multicast_group));  // close 会退组。
   }
-  // 临时端口(local_port 配 0)每次重 bind 会拿到不同端口:对端若记着源端口会失联。
-  // 是否"重 bind 时沿用上次端口"未定,本轮不处理。
+    // 临时端口(local_port 配 0)每次重 bind 会拿到不同端口:对端若记着源端口会失联。
   local_port_ = socket_->localPort();
   return true;
 }
@@ -203,13 +202,8 @@ void UdpTransport::RunSocketPump() {
 // 不变式:**取到 socket 到写出之间没有挂起点**——writeDatagram 同步非阻塞,故泵 fiber
 // 不可能在中间被调度起来解绑 socket,由此不需要代际号校验。
 //
-// **该不变式对 TCP 与串口同样成立**——原注此处写着"只对 UDP 成立(串口/TCP 的写有挂起
-// 点)",那是二者尚未重构时的判断,现已【逐条实测证伪】:
-//   TCP(ADR-0011 D13,2026-08-27):写泵 write() 之后**不等刷出**,写出段无挂起点。
-//   串口(ADR-0012 D8,2026-08-28):实测 QSerialPort::write(4096) 返 4096(不短写)、
-//     bytesToWrite() 立刻查是 4096(不同步刷出)、50ms 后归 0 —— 与 QTcpSocket::write()
-//     逐条一致。
-// **三个写泵在这一点上结构完全同构**,本悬案关闭。
+// **该不变式对 TCP 与串口同样成立**(ADR-0011 D13 / ADR-0012 D8):两者的写泵同样
+// 写完不等刷出,写出段无挂起点。**三个写泵在这一点上结构完全同构**。
 void UdpTransport::RunWritePump() {
   for (;;) {
     // ── 阻塞点①:等数据 ──(Close 关 write_queue 唤醒)

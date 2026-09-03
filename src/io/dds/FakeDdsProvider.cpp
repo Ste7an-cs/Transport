@@ -31,7 +31,7 @@ void FakeDdsProvider::Shutdown() {
       for (auto id : kv.second) bus_->Remove(kv.first, id);
 }
 
-// 写侧端点声明(ADR-0013 D13 补正)。Fake 的总线上没有"端点"这种东西,故本方法只登记
+// 写侧端点声明(ADR-0013 D13)。Fake 的总线上没有"端点"这种东西,故本方法只登记
 // 意图——但**判据与真实 provider 完全一致**:登记过的 topic 才发得出去,这样用例里的
 // 调用序错误在 Fake 上也会当场暴露,而不是等换到 Fast DDS 才发作。
 Coro::Result<void> FakeDdsProvider::DeclareWriter(const std::string& topic) {

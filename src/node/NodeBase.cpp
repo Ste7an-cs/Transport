@@ -54,8 +54,8 @@ Coro::Result<void> NodeBase::Start() {
       lifecycle_ = LifecycleState::kClosing;  // 已 spawn fiber,故走 Closing 而非 Closed。
       signal_close = true;
     } else {
-      // 置 Running 由**基类**做(旧形态是子类在 DoStart 中途回调 MarkRunning())。DoStart
-      // spawn 的 fiber 与本调用同线程亲和(Affinity::fixed),且 spawn 后至此无挂起点,故
+      // 置 Running 由**基类**做。DoStart spawn 的 fiber 与本调用同线程亲和
+      // (Affinity::fixed),且 spawn 后至此无挂起点,故
       // 它们不可能先于本行运行、观察到"已 spawn 但尚未 Running"。
       lifecycle_ = LifecycleState::kRunning;
     }
@@ -101,8 +101,8 @@ Coro::Result<void> NodeBase::Close() {
   if (!has_fibers) {
     return Coro::Result<void>{};
   }
-  // 锁外发出全部汇合信号。**本函数至此没有任何等待点**——这正是"读循环 / handler 可以
-  // 直接调公开的 Close()"的全部依据(旧形态为此另设了受保护的 SignalClose())。
+  // 锁外发出全部汇合信号。**本函数至此没有任何等待点**——这正是“读循环 / 订阅消费者可以
+  // 直接调公开的 Close()”的全部依据。
   // 关闭一经置 Closing 即不可回滚,故不据返回值分支(签名与 DoStart 对称)。
   (void)DoClose();
   return Coro::Result<void>{};

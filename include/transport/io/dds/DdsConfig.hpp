@@ -29,17 +29,16 @@ struct DdsQos {
   ///
   /// 100ms 即 Fast DDS 的默认值。
   ///
-  /// ⚠ **它不是关闭路径的最坏等待**(ADR-0013「明确接受的代价」7 已改判):`Publish` 的
-  /// 阻塞主要来自**同进程订阅方的交付回调在发布线程上同步执行**(默认
-  /// `INTRAPROCESS_FULL`),本项**根本不参与**——实测它设 300ms 而 `Publish` 跑满 2000ms。
-  /// 关闭时的最坏等待**没有上界**,由同进程内最慢的那个订阅回调决定。
+  /// ⚠ **它不是关闭路径的最坏等待**(ADR-0013「明确接受的代价」7):`Publish` 的阻塞主要
+  /// 来自**同进程订阅方的交付回调在发布线程上同步执行**(默认 `INTRAPROCESS_FULL`),
+  /// 本项**根本不参与**。关闭时的最坏等待**没有上界**,由同进程内最慢的那个订阅回调决定。
   std::chrono::milliseconds max_blocking_time{100};
 
   /// `LivelinessQosPolicy::lease_duration`,kind 固定为 `AUTOMATIC`(ADR-0013 D9/D10)。
   /// **须为正**。
   ///
   /// **不可省**:仅靠 `matched` 时对端被硬杀要等 participant lease(默认 20s)才检出,
-  /// 期间谎报 `kUp`;配 2s 后 2.0s 检出。
+  /// 期间谎报 `kUp`。
   std::chrono::milliseconds liveliness_lease{2000};
 };
 

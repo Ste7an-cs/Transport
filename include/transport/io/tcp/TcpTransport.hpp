@@ -26,9 +26,8 @@ namespace transport {
  *
  * **形态与 `UdpTransport` 同构**(ADR-0011 D2,ADR-0007 D1/D2/D3/D4 的样板):外层
  * socket 管理泵负责连接/重连,内层数据泵把读到的字节切片投入 `read_queue`;队列
- * **不随连接重建而更换**,故重连对调用方完全透明(DD-11)。三件套(`TcpTransport` /
- * `TcpClientTransport` / `TcpClientConfig`)已收成本类一件(**D1**)——重连是 TCP 客户端的
- * 固定语义,做成外层泵的一部分即可,不需要单设"重连外壳"一层。
+ * **不随连接重建而更换**,故重连对调用方完全透明(DD-11)。重连是 TCP 客户端的固定语义,
+ * 做成外层泵的一部分即可,不单设“重连外壳”一层(**D1**)。
  *
  * - **重连不是独立机制**(SDD §5.6.1 ①'):它就是外层 `while` 转第二圈。首连与重连
  *   不作区分、走同一段代码;没有重连状态、没有重连专用 fiber。
@@ -47,29 +46,26 @@ namespace transport {
  *   按序发出积压(RT_TCP_RECONNECT_003)——**但积压超过队列上界时静默丢最旧**(**D6**)。
  * - **写不等刷出**(**D13**):`socket_->write()` 把字节交给 Qt 内部写缓冲即返回,写泵
  *   **不等 `bytesWritten`、不等 `bytesToWrite() == 0`**。写本就是 fire-and-forget,等刷出
- *   不改变该语义、只让写泵多挂起一次。代价是 **Qt 内部写缓冲无上限**(`setWriteBufferSize`
- *   未设,Qt 默认 0 = 无上限),它是有界 `write_queue_` 挡不住的那一段;要给它设上界会让
- *   `write()` 真的开始短写,须连同 D13 与 D7 重新评审,**本轮不设**。
- * - 由此**写泵没有任何挂起点**:`UdpTransport` 写泵那条"取到 socket 到写出之间没有挂起点"
- *   的不变式**对本类同样成立**,两个写泵在结构上完全同构(TCP 侧只是把"等 bind 就绪"换成
- *   "等连接就绪")。**单消费者写泵**保证 `RT_TRANSPORT_004`(并发写串行化、两帧字节不交错);
- *   断链把一帧截断**不属于交错**,半条即半条,由对端重同步(**D7**)。
+ *   不改变该语义、只让写泵多挂起一次。**Qt 内部写缓冲无上限**(`setWriteBufferSize`
+ *   未设,Qt 默认 0 = 无上限),是有界 `write_queue_` 挡不住的那一段。
+ * - 由此**写泵没有任何挂起点**,与 `UdpTransport` 写泵在结构上完全同构(TCP 侧只是把
+ *   “等 bind 就绪”换成“等连接就绪”)。**单消费者写泵**保证 `RT_TRANSPORT_004`(并发写
+ *   串行化、两帧字节不交错);断链把一帧截断**不属于交错**,半条即半条,由对端重同步
+ *   (**D7**)。
  * - **整个生命期一个 `QTcpSocket`**(**D3**):每轮末尾 `abort()` 使其回到
  *   `UnconnectedState`,下轮在同一对象上重连,不新建 socket 对象。
  *
- * **`socket_->abort()` 是清理动作,不是打断手段**(**D15**,实测结论):Qt 的 `abort()`
- * 在**连接中**的 socket 上不发 `errorOccurred`,而 `corosocket` 的 `waitForSignal` /
- * `readAll` 都靠 socket error 或 `disconnected` 终结——故它在连接窗口内**唤不醒任何
- * 等待**(实测挂满整个超时)。因此 `connect_waiter_` 与 `read_stream_` **持为成员**,
+ * **`socket_->abort()` 是清理动作,不是打断手段**(**D15**):Qt 的 `abort()` 在**连接中**
+ * 的 socket 上不发 `errorOccurred`,而 `corosocket` 的 `waitForSignal` / `readAll` 都靠
+ * socket error 或 `disconnected` 终结——故它在连接窗口内**唤不醒任何等待**。
  * `Close()` 逐个 `close()` 它们。UDP 没有这个窗口(其 `bind()` 同步),故其 `close()`
  * 打断活跃读流是有效的——**这条不可照搬**。
  *
  * **持句柄还不够,建完须复查生命周期**(**D15 补正**,#200):`Close()` 只关得到**它跑
- * 的那一刻已经存在**的句柄。泵在 `await_for(connect_waiter_, ...)` 上被"连上"唤醒、却
- * 尚未被调度时,`Close()` 可能整个跑完(此刻 `read_stream_` 还是 null),泵随后建出的读流
- * 便**没有任何人会唤醒**,挂满一个 `silence_timeout`——而读队列只在泵退出循环后才关。故
- * 泵在**每一处把句柄赋给成员之后**都立即复查 `lifecycle_`,已 `kClosing` 即就地终结、
- * 不进 `await`。**只在循环顶部判一次是不够的**,那正是被竞态跨过的那一步。
+ * 的那一刻已经存在**的句柄。泵随后建出的等待器便**没有任何人会唤醒**,挂满一个
+ * `silence_timeout`——而读队列只在泵退出循环后才关。故泵在**每一处把句柄赋给成员之后**
+ * 都立即复查 `lifecycle_`,已 `kClosing` 即就地终结、不进 `await`。**只在循环顶部判一次
+ * 是不够的**,那正是被竞态跨过的那一步。
  *
  * **单线程(fiber 协作式),不加锁**:泵由 `Start()` 用 `Coro::makeTask` 起,默认亲和是
  * `fixed(调用线程)`,故它与本对象的全部公开方法跑在**同一个线程**上、只在 await 点交错。
@@ -115,9 +111,9 @@ class TcpTransport final : public ITransport {
   /// 或填了别的目的地)在 TCP 上跑不起来。这与 `UdpTransport` 不同,后者解析不了目的地
   /// 会丢该条并记 `LastError()`。
   ///
-  /// 链路不可用时**照常入队、返回成功**(RT_TCP_RECONNECT_003:"投入发送队列等待链路
-  /// 恢复,不拒绝、不丢弃")。**"不丢弃"有限定**:`write_queue_` 默认有界 1024 且
-  /// **静默丢最旧**(**D6**),积压超界即丢,`push` 仍报成功——已知且已接受(见 #176)。
+  /// 链路不可用时**照常入队、返回成功**(RT_TCP_RECONNECT_003:“投入发送队列等待链路
+  /// 恢复,不拒绝、不丢弃”)。**“不丢弃”有限定**:`write_queue_` 默认有界 1024 且
+  /// **静默丢最旧**(**D6**),积压超界即丢,`push` 仍报成功。
   ///
   /// @return 成功仅表示**已入队**;未 `Start()` 返 `kInvalidState`,关闭中/已关闭返
   ///         `kClosed`。写出的一切结果(socket 写失败、短写)只落 `LastError()`,不回传。
@@ -138,9 +134,6 @@ class TcpTransport final : public ITransport {
   /// @brief 是否处于 Running(泵在跑;链路是否连上另见 `CurrentLinkState()`)。
   [[nodiscard]] bool IsRunning() const;
 
-  // 观测面——I/O 事实。三个 TCP 独有的诊断方法(`Generation()` / `AttemptCount()` /
-  // `LastFailure()`)与 `State()` / `WaitForState()` 已随 ADR-0011 D9/D12 删除。
-
   /// @brief 最近一次操作错误(无则默认构造的 error_code)。
   [[nodiscard]] std::error_code LastError() const override;
 
@@ -148,8 +141,8 @@ class TcpTransport final : public ITransport {
   ///        算出**(D12)。已连接 → `kUp`;未 `Start()` / 已关闭 → `kDown`;连接中、
   ///        主机名解析中与**退避重连中**一律 `kEstablishing`。
   ///
-  /// 最后一支是 TCP 与 UDP 的**真正分歧**(UDP 未绑定即报 `kDown`,永不出现
-  /// `kEstablishing`)。**定位**:统一的 I/O 事实查询,**不面向业务调用方**,仅供诊断与
+  /// 最后一支是 TCP 与 UDP 的分歧(UDP 未绑定即报 `kDown`,永不出现 `kEstablishing`)。
+  /// **定位**:统一的 I/O 事实查询,**不面向业务调用方**,仅供诊断与
   /// 测试观测——重连对交互层完全透明,链路不可用时发送入队等待,调用方不必先查链路。
   [[nodiscard]] LinkState CurrentLinkState() const override;
 
