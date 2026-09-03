@@ -2,7 +2,7 @@
 
 /**
  * @file TcpConfig.hpp
- * @brief TCP 客户端传输配置——对端端点 + 唯一的时间量 + 观测出口(ADR-0011 D5/D14)。
+ * @brief TCP 客户端传输配置——对端端点 + 唯一的时间量(ADR-0011 D5/D14)。
  */
 
 #include <chrono>
@@ -10,8 +10,6 @@
 #include <string>
 
 namespace transport {
-
-class ITraceSink;
 
 /**
  * @brief `TcpTransport` 的配置(取代已删除的 `TcpClientConfig`,ADR-0011 D1)。
@@ -31,9 +29,6 @@ struct TcpConfig {
   /// 内核立即回 RST,`connect` 微秒级失败,烧 CPU 且向对端刷 SYN)。故 TCP **不设**
   /// UDP 那档"0 = 禁用静默判活",非正值由 `Start()` 直接拒绝。
   std::chrono::milliseconds silence_timeout{5000};
-
-  /// 可选观测出口(未配置零影响)。
-  ITraceSink* trace_sink = nullptr;
 };
 
 }  // namespace transport

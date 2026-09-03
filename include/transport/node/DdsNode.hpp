@@ -126,8 +126,8 @@
  * - **重发要求对端能容忍重复请求**(幂等,或自行按 `correlation_id` 去重)。协议层假设,
  *   **框架不校验**(**D7**)。
  * - **共用应答 topic 带来读入放大**:同一服务的每个客户端都会收到该服务的**全部**应答,
- *   多余样本一路进读队列、解码后才在 `Dispatcher` 处落空(「明确接受的代价」8)。由此
- *   `kUnmatchedOrLateResponse` 这条丢弃归因在客户端侧**本来就会很吵**,不是异常。
+ *   多余样本一路进读队列、解码后才在 `Dispatcher` 处落空(「明确接受的代价」8)。这类
+ *   落空在客户端侧**本来就是常态**,不是异常;框架静默丢弃、不作记录(ADR-0014 D1)。
  *
  * 与传输、`Dispatcher` 一致,本类面向**单线程 fiber 协作**模型:交互方法运行于调用方
  * fiber,读-分发循环运行于自持 fiber,二者同线程且仅在挂起点交错,故普通成员不加锁。
@@ -146,7 +146,6 @@
 
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/Dispatcher.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/dds/DdsTransport.hpp"
@@ -164,7 +163,7 @@ using DdsDispatcher = Dispatcher<Message, std::string /*topic*/,
                                           std::string /*correlation_id*/,
                                           MessageKind /*kind*/>;
 
-/// DdsNode 配置——**只剩两项**(ADR-0013 **D16**)。
+/// DdsNode 配置——**只剩一项**(ADR-0013 **D16**;原 Trace 出口字段随 ADR-0014 **D1** 删除)。
 ///
 /// 全部 topic 字段已移出配置、改由四个注册方法给出;历史遗留的 `inbox_topic` / `node_id` /
 /// `handler` / `business_queue_max_*` 一并删除(入站业务由订阅承载,ADR-0009 D1)。
@@ -174,10 +173,6 @@ struct DdsNodeConfig {
   /// `QUuid` 是随机的,而 `correlation_id` 的前缀确定与否直接决定测试能不能断言具体值;
   /// 故留这一个注入口:**测试填固定值,生产留空**。
   std::string uuid_override;
-  /// 可选 Trace 出口(ADR-0003 D13);非拥有,可为 `nullptr`。**观测的唯一出口**——本类没有
-  /// 任何计数器与 getter。发射点:两个丢弃归因(`kBadFrame` / `kUnmatchedOrLateResponse`)
-  /// 与 send / recv / decode 三个边界。RT_TRACE_002:为空时仅一次判空,不改变任何控制流。
-  ITraceSink* trace_sink = nullptr;
 };
 
 /**
@@ -457,7 +452,7 @@ class DdsNode : public NodeBase {
   ///        → 逐条 Dispatch。**topic 不上线缆**(**D5**),入站只能由 `Datagram.peer` 带出。
   void DecodeAndDispatch(const Datagram& datagram);
   /// @brief 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时
-  ///        `kReply` 归因 `kUnmatchedOrLateResponse`、其余静默丢弃(ADR-0009 D5)。
+  ///        一律静默丢弃,`kReply` 与业务消息无别(ADR-0009 D5、ADR-0014 D1)。
   void Dispatch(const Message& msg);
   /// @brief 编码 + 交给传输的出站尾段(`Publish` / `Reply` 共用)。**不盖任何章**——盖章
   ///        各自做完再进来,故本函数对交互模式不透明。

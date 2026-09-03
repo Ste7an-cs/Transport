@@ -56,7 +56,6 @@ target_link_libraries(asynctask PUBLIC Qt5::Core Qt5::Network boost_fiber_local)
 add_library(transport STATIC
   src/core/version.cpp
   src/core/Error.cpp
-  src/core/Cancellation.cpp
   src/node/NodeBase.cpp
   src/node/ProtocolNode.cpp
   src/io/udp/UdpTransport.cpp
@@ -108,8 +107,6 @@ if(TRANSPORT_BUILD_TESTS)
     # —— 重设计(redesign 分支)后仍成立的用例 ——
     tests/version_test.cpp
     tests/error_test.cpp
-    tests/cancellation_test.cpp
-    tests/observability_test.cpp
     tests/dispatcher_test.cpp
     tests/coro_harness_test.cpp
     tests/udp_transport_test.cpp
@@ -149,9 +146,6 @@ if(TRANSPORT_BUILD_TESTS)
   endif()
   target_include_directories(transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  # 供 observability_test.cpp 的协议无关自审读取 core/ 头文件源码文本核验(而非硬编码 grep)。
-  target_compile_definitions(transport_tests PRIVATE
-    TRANSPORT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(transport_tests PRIVATE transport asynctask GTest::gtest Qt5::Core Qt5::Network util)
   add_test(NAME transport_tests COMMAND transport_tests)
 endif()

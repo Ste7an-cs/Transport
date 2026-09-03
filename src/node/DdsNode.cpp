@@ -15,11 +15,8 @@
 
 #include "task/fibertask.h"  // Coro::makeTask —— 读-分发循环 fiber。
 
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/Observability.hpp"
-#include "transport/core/TraceCategories.hpp"
 
 // DdsNode.cpp — 见 .hpp。DDS 特有语义内联于此(D10 红线):四组注册表、服务名 → 两个
 // topic 的派生、两段式 correlation_id、Dispatcher 键 (topic, corr, kind)、单阶段
@@ -34,12 +31,6 @@
 
 namespace transport {
 namespace {
-
-/// 丢弃归因:只上报,不计数(本类无观测面)。级别 kWarn——丢弃是需要关注的信号。
-void TraceDrop(ITraceSink* sink, DropReason reason) {
-  RecordEvent(kTraceCategoryDrop, sink, DropReasonName(reason), {}, {}, {},
-              kNoNum, -1, kNoTag, TraceLevel::kWarn);
-}
 
 /// 节点 uuid(**D6**):`uuid_override` 非空则用它,为空才 `QUuid::createUuid()`。
 ///
@@ -307,20 +298,15 @@ void DdsNode::DecodeAndDispatch(const Datagram& datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    // 坏样本 / codec 语义错误:丢弃,归因 kBadFrame。
-    TraceDrop(config_.trace_sink, DropReason::kBadFrame);
+    // 坏样本 / codec 语义错误:**丢弃**。观测面撤销后不再归因、不再记录,丢弃动作本身
+    // 不变(ADR-0014 D1/D4)。
     return;
   }
-  // Decode 成功边界:一次 Decode 调用一条事件,不逐条消息重复。
-  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
-              static_cast<long>(bytes.size()));
   for (auto& msg : decoded.value()) {
     // **topic 不上线缆**(D5):它是 DDS 的寻址维度,入站只能由 `Datagram.peer` 带出。
     // 这两个字段同时也是 `Dispatcher` 键的第一位,故这一行是分发能成立的前提。
     msg.source = datagram.peer.topic;
     msg.topic = datagram.peer.topic;
-    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, msg.source, {},
-                static_cast<long>(msg.payload.size()));
     Dispatch(msg);
   }
 }
@@ -330,16 +316,10 @@ void DdsNode::Dispatch(const Message& msg) {
   if (dispatcher_.Dispatch(msg) > 0) {
     return;
   }
-  // 无人认领的 `kReply`:迟到、乱序,或**别人的应答**——共用应答 topic 之下,同一服务的
-  // 每个客户端都会收到该服务的全部应答,自己那份只是其中之一(代价 8)。故这条归因在
-  // 客户端侧**本来就会很吵**,不代表异常;它仍归因,是因为"应答无人认领"在请求-响应侧
-  // 确实是需要看得见的一类事实。
-  if (msg.kind == MessageKind::kReply) {
-    TraceDrop(config_.trace_sink, DropReason::kUnmatchedOrLateResponse);
-    return;
-  }
-  // 其余为业务消息:**静默丢弃、不归因**(ADR-0009 D5)。订阅模型下"没人订阅"是宿主的
-  // 正常选择而非异常。
+  // 无人认领的 `kReply` 是迟到、乱序,或**别人的应答**——共用应答 topic 之下,同一服务的
+  // 每个客户端都会收到该服务的全部应答,自己那份只是其中之一(代价 8);业务消息无人订阅
+  // 则是宿主的正常选择(ADR-0009 D5)。**两者的处置相同:丢弃。** 观测面随 ADR-0014 D1
+  // 撤销后框架已无处记录二者之别,故此处不再分支;代价(D4)是丢弃完全不可见,已明确接受。
 }
 
 // ── 公开面:两种交互模式(D8)──────────────────────────────────────────
@@ -544,7 +524,6 @@ Coro::Result<void> DdsNode::EncodeAndWrite(const Message& msg,
 
 Coro::Result<void> DdsNode::WriteEncoded(std::vector<std::uint8_t> bytes,
                                           const std::string& topic) {
-  const std::size_t sent_bytes = bytes.size();
   // fire-and-forget:返回成功只表示"已入队",不表示已发出;写出的一切结果不回传,只落
   // 传输的 `LastError()`。这里能拿到的错误只有生命周期非法一种。
   //
@@ -554,8 +533,6 @@ Coro::Result<void> DdsNode::WriteEncoded(std::vector<std::uint8_t> bytes,
       !queued) {
     return queued;
   }
-  RecordEvent(kTraceCategorySend, config_.trace_sink, {}, {}, topic, {},
-              static_cast<long>(sent_bytes));
   return Coro::Result<void>{};
 }
 

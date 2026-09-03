@@ -9,10 +9,7 @@
 
 #include "task/fibertask.h"  // Coro::makeTask —— 读-分发循环 fiber。
 
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/Observability.hpp"
-#include "transport/core/TraceCategories.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
@@ -25,15 +22,6 @@
 // 队列句柄。链路的绑定/超时/重连/退避全在传输内部,对本类不可见。
 
 namespace transport {
-namespace {
-
-// 丢弃归因:只上报,不计数(本类无观测面)。级别 kWarn——丢弃是需要关注的信号。
-void TraceDrop(ITraceSink* sink, DropReason reason) {
-  RecordEvent(kTraceCategoryDrop, sink, DropReasonName(reason), {}, {}, {},
-              kNoNum, -1, kNoTag, TraceLevel::kWarn);
-}
-
-}  // namespace
 
 MessageDispatcher::Key ResponseTo(const Message& request) {
   return {request.session_id, request.message_id, FrameType::kResponse};
@@ -131,7 +119,6 @@ Coro::Result<void> ProtocolNode::EncodeAndWrite(const Message& msg) {
     return encoded.error();
   }
   std::vector<std::uint8_t> bytes = std::move(encoded).value();
-  const std::size_t sent_bytes = bytes.size();
   // 目的地恒填 `Endpoint::Default()`,交给传输解析成它自己配置的默认对端:本类传输无关,
   // 不知道也不该知道对端是 ip:port 还是 topic。
   //
@@ -141,8 +128,6 @@ Coro::Result<void> ProtocolNode::EncodeAndWrite(const Message& msg) {
       !written) {
     return written;
   }
-  RecordEvent(kTraceCategorySend, config_.trace_sink, {}, {}, {}, {},
-              static_cast<long>(sent_bytes));
   return Coro::Result<void>{};
 }
 
@@ -300,17 +285,11 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    // 坏帧 / codec 错误:丢弃(codec 内部 resync)。归因 kBadFrame。
-    TraceDrop(config_.trace_sink, DropReason::kBadFrame);
+    // 坏帧 / codec 错误:**丢弃**(codec 内部 resync)。观测面撤销后不再归因、不再记录,
+    // 丢弃动作本身不变(ADR-0014 D1/D4)。
     return;
   }
-  // Decode 成功边界:一次 Decode 调用一条事件,不逐条消息重复。
-  RecordEvent(kTraceCategoryDecode, config_.trace_sink, {}, {}, {}, {},
-              static_cast<long>(bytes.size()));
   for (const auto& msg : decoded.value()) {
-    // Read 解出消息边界:按解出的消息计,不逐字节。
-    RecordEvent(kTraceCategoryRecv, config_.trace_sink, {}, {}, {}, {},
-                static_cast<long>(msg.payload.size()));
     Dispatch(msg);
   }
 }
@@ -321,14 +300,9 @@ void ProtocolNode::Dispatch(const Message& msg) {
     return;
   }
   // 无人认领。终结帧(kResponse / kResult)此时属于迟到、乱序或无对应请求——这是请求-响应
-  // 侧的异常,仍须归因。
-  if (msg.frm_type == FrameType::kResponse || msg.frm_type == FrameType::kResult) {
-    TraceDrop(config_.trace_sink, DropReason::kUnmatchedOrLateResponse);
-    return;
-  }
-  // 其余为业务帧:**静默丢弃,不归因**(ADR-0009 D5)。订阅模型下"没人订阅"是宿主的正常
-  // 选择(只订阅自己关心的帧)而非异常,记为丢弃会把常态噪声混进丢弃归因。代价是这类帧
-  // 成为不可见丢弃,完整性归因的覆盖面随之变窄——已明确接受。
+  // 侧的异常;业务帧则是宿主"只订阅自己关心的帧"的正常选择(ADR-0009 D5)。**两者的处置
+  // 相同:丢弃。** 观测面随 ADR-0014 D1 撤销后框架已无处记录二者之别,故此处不再分支。
+  // 代价(ADR-0014 D4)是丢弃完全不可见——已明确接受。
 }
 
 Coro::Result<MessageDispatcher::Ticket> ProtocolNode::Subscribe(
