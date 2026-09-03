@@ -111,7 +111,9 @@
 
 
 
-- **DD-10 可插拔观测 + 完整性归因（满足 RT_TRACE_001/002、RT_DATA_BUFFER、D13）：** 每个丢弃点经唯一 `RecordDrop` 归因到**五项** `DropReason` 之一（原七项：`kGenerationIsolationDrop` 随 ADR-0004 D3 移除，`kNoHandlerConfigured` 随 ADR-0009 于 #163 移除） + 命名计数；可选 `ITraceSink` 结构化 Trace（push）与命名计数（pull）双面；未配 sink 时零控制流影响。"无静默丢失"结构性可断言（Σ命名 = 总丢弃）。
+- ~~**DD-10 可插拔观测 + 完整性归因**~~ —— **整条撤销**（**ADR-0014**，2026-09-03）。框架**不再提供任何可观测性**：`Observability` / `ITraceSink` / `TraceCategories` / `DropReason` 四个头文件、四处 `trace_sink` 配置字段、8 处 `RecordEvent` 发射点与两个 `TraceDrop` 助手一并删除；`Cancellation` 同轮删除（产品代码零调用，取消语义由 `Awaitable::close()` 承载）。
+  **撤销依据**：ADR-0003 **D13** 定的双面观测早已塌缩——pull 面随 ADR-0008 **D10** 删尽，队列丢弃随 **D8** 换 `FiberChannel` 后既无计数也无归因，#152 裁决"不加归因"，#212 把 `DropReason` 六项减为两项。**要么留一个完整可信的观测面，要么删干净；留半条最坏**（ADR-0014 **D3**）。
+  **明确接受的代价**：框架内部的丢弃（队列满丢最旧 / 坏帧 / 迟到·无匹配响应）**自此完全静默**，**丢失的是"框架侧的第一手现场"**——宿主看到的是"消息没来"，看不到"它到过、然后被丢了"，也看不到丢在哪一层。排障只能靠宿主在 codec 或订阅侧自行加日志。
 
 ## 4. CSCI 体系结构设计
 
@@ -131,14 +133,14 @@
 
 | 部件 | 目录 | 主要内容 | 响应需求 |
 |---|---|---|---|
-| **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、`Cancellation`、**`Dispatcher`**、`ITraceSink`、`Observability`、`DropReason`、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 |
+| **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、~~`Cancellation`~~、**`Dispatcher`**、~~`ITraceSink`~~、~~`Observability`~~、~~`DropReason`~~、`TraceCategories`（**ADR-0008**：`Result`/`Status` 改用 `Coro::Result`，`SharedCompletion` 已删除） | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | **（划掉者随 ADR-0014 删除：观测/Trace 整条与 `Cancellation`）**
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`IDdsProvider`；`TcpServer`（本轮不做，ADR-0011 D10）（**已合并**：`TcpClientTransport` 并入 `TcpTransport`，ADR-0011 D1） | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
 | **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
 | **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、**`DdsNode`**（三者**均在编译面内**；`DdsNode` 已按 ADR-0013 重写，`DdsHandlerContext` **随之删除**）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记）（**已删除**：`PendingTable`/`BoundedQueue` 随 ADR-0008 D8，`HandlerLoop` 随 ADR-0009 #163） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
 
-- **用途**：与协议/介质无关的值类型与基础并发原语，为上层提供结果承载、协作取消、多等待者完成、统一寻址与观测原语。响应 RT_ERROR_*（结果/错误）、RT_DATA_MESSAGE、RT_TRACE_*、RT_DESIGN_005。
+- **用途**：与协议/介质无关的值类型与基础并发原语，为上层提供结果承载、~~协作取消~~（**已随 ADR-0014 删除**）、多等待者完成、统一寻址与观测原语。响应 RT_ERROR_*（结果/错误）、RT_DATA_MESSAGE、RT_TRACE_*、RT_DESIGN_005。
 - **主要内容**：`Coro::Result<T,error_code>`（无返回值者用 `Coro::Result<void>`；~~`Status` 别名已删除~~）；`TransportErrc` **十四类**机器可判别错误；`Message`（payload + 两套元数据）；`Endpoint`（kDefault/kNet/kTopic 统一寻址）；`Cancellation`（Source/Token/Registration 协作取消）；`SharedCompletion<T>`（多等待者一次性完成，原子首胜）；`ITraceSink`+`RecordDrop`/`RecordEvent`+`DropReason`+`TraceCategories`（观测）。
 - **关系与结构**：被 CSC_IO / CSC_CODEC / CSC_NODE 依赖；自身仅依赖 AsyncTask（`Coro::Result`/`Awaitable`）。结构简单，无独立类图（同 AsyncTask CSC_DETAIL 惯例），详见 §5.1。
 
@@ -482,12 +484,12 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 [transport]
    │ ITransport 内部缝                  (JK_TRANSPORT 传输内部接口, CSC_IO)
    │ IDdsProvider                      (JK_PROVIDER DDS 抽象, CSC_IO)
-   │ ITraceSink                        (JK_TRACE 观测出口, CSC_CORE)
+   │ ~~ITraceSink~~  【已随 ADR-0014 删除】
    ▼
 [Qt / Fast DDS / AsyncTask]
 ```
 
-外部（面向使用方）接口 JK_NODE_API、JK_CODEC、JK_TRACE；内部缝 JK_TRANSPORT、JK_PROVIDER（框架自用，不对使用方开放为主 API）。**JK_OBSERVABLE 已随 ADR-0004 D2 取消**——连接观察能力并入 JK_TRANSPORT 的链路可用性，不再是独立多态缝。
+外部（面向使用方）接口 JK_NODE_API、JK_CODEC（~~JK_TRACE 已随 ADR-0014 撤销~~）；内部缝 JK_TRANSPORT、JK_PROVIDER（框架自用，不对使用方开放为主 API）。**JK_OBSERVABLE 已随 ADR-0004 D2 取消**——连接观察能力并入 JK_TRANSPORT 的链路可用性，不再是独立多态缝。
 
 #### 4.3.2 编程接口（JK_NODE_API）
 - 优先级：高（核心对外 API）。
@@ -507,14 +509,11 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - 通信方式：同步函数调用，收发边界处装配到 node。
 - 协议特征：`Encode(Message)→Result<bytes>`（一对一）；`Decode(data,len)→Result<Message[]>`（半包空、粘包多条）；分帧错误 `kFrame`、语义错误 `kCodec`。
 
-#### 4.3.4 观测出口（JK_TRACE）
-- 优先级：中（可选，未配置零影响）。
-- 接口类型：C++ 抽象类 `ITraceSink`（`core/ITraceSink.hpp`）。
-- 数据元素：`TraceEvent`（零分配视图：level/category/message/key/endpoint/error/size 等）。
-- 通信方式：push，`OnTrace` 在库内部**可能持锁调用**——实现须快速返回、不阻塞、不回调本库任何 API（重入契约）。
-- 协议特征：`TraceCategories.hpp` 定义 **12 个** category 常量（connect / generation / send / recv / decode / match / timeout / cancel / handler / reconnect / lifecycle / drop）。
-  **实况标注（2026-08-26 核对）**：当前编译面内**仅 4 个有发射点**——`send` / `recv` / `decode`（`ProtocolNode`）与 `drop`（`RecordDrop` 专用）。`connect` / `generation` / `reconnect` 只由未参与编译的 `TcpClientTransport` 发射；`match` / `timeout` / `cancel` / `lifecycle` / `handler` **无任何发射点**（前四者自 ADR-0006/0008 重设计起即无来源，`handler` 更随 ADR-0009 废止 handler 通道而永久失去来源）。本条描述目标覆盖面，不表示已实现；是否重新接线或删除待评审。
-  **实况标注（2026-08-20）**：`match`、`timeout·cancel`、`handler` 三类当前**定义了但无任何发射点**（ADR-0006/0008 重设计遗留漂移，非 ADR-0009 造成）；`handler` 一类随本轮 handler 通道废止而更无来源。是否重新接线或删除待评审。
+#### 4.3.4 ~~观测出口（JK_TRACE）~~ —— **整节撤销（ADR-0014，2026-09-03）**
+
+> **本节内容全部作废。** 原描述的 `ITraceSink` 抽象类（`core/ITraceSink.hpp`）、`TraceEvent` 结构、`RecordEvent` / `RecordDrop` 原语与 `DropReason` 归因枚举**均已删除**（ADR-0014 **D1**）。
+>
+> **不留空接口**（ADR-0014 **D3**）：无人实现、无人发射的接口比没有更糟——它会让读代码的人以为观测面还在，而实际上一个事件也不会发出。若将来重新需要可观测性，**应当重新设计**，不继承这一套。
 
 #### 4.3.5 传输内部接口（JK_TRANSPORT）
 - 优先级：高（框架正确性核心，内部缝）。
@@ -556,7 +555,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 **单元设计决策**：直接复用 `Coro::Result<T,error_code>`（避免两套 expected 类型；~~原 `Result`/`Status` 两个别名已删除~~）；错误用 `TransportErrc` 机器可判别类别，不解析字符串（DD-5）；`SharedCompletion` 提供多等待者一次性完成（原子首胜 Complete），供多方共享收敛通知。
 
-**设计约束**：不抛异常表达预期失败；并发数据受锁/原子保护；观测原语未配 sink 时仅一次判空（RT_TRACE_002）。
+**设计约束**：不抛异常表达预期失败；并发数据受锁/原子保护。~~观测原语未配 sink 时仅一次判空（RT_TRACE_002）。
 
 **软件逻辑**：
 - **错误承载 / TransportErrc**：统一用 `Coro::Result<T,error_code>`，无返回值者 `Coro::Result<void>`（~~`Result`/`Status` 别名已删除~~）；`TransportErrc` **十四类**（kInvalidArgument/kInvalidState/kConfiguration/kConnection/kClosed/kTimeout/kCancelled/kIo/kFrame/kCodec/kResourceExhausted/kUnsupported/kInternal/**kNotAccepted**）经 `make_error_code` 归入 `transport_error_category()`。
@@ -1071,7 +1070,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | 设计单元 | 类型 | 对应 SRS 需求 | 章节 |
 |---|---|---|---|
 | DD-1..DD-17 | 设计决策 | 见各决策标注（DD-11/12 由 ADR-0004 引入，DD-13 由 ADR-0005 引入且已被 ADR-0008 推翻，DD-14 由 ADR-0010 引入） | §3 |
-| CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_DESIGN_005 | §4.1.1、§5.1 |
+| CSC_CORE | 部件 | RT_ERROR、RT_DATA_MESSAGE、RT_DESIGN_005（~~RT_TRACE 已撤销~~） | §4.1.1、§5.1 |
 | CSC_IO | 部件 | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 | §4.1.2、§5.6 |
 | CSC_CODEC | 部件 | RT_CODEC、RT_IF_SYSFRAME | §4.1.3、§5.7 |
 | CSC_NODE | 部件 | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 | §4.1.4、§5.2–5.5 |
@@ -1089,10 +1088,10 @@ LinkState TcpTransport::CurrentLinkState() const {
 | MS_DYNAMIC_LIFECYCLE | 执行方案 | RT_CORO_RUNTIME、RT_NODE_004、RT_DESIGN_004 | §4.2.11 |
 | JK_NODE_API | 接口 | RT_IF_API | §4.3.2 |
 | JK_CODEC | 接口 | RT_CODEC、RT_IF_SYSFRAME、RT_DESIGN_006 | §4.3.3 |
-| JK_TRACE | 接口 | RT_TRACE_001/002 | §4.3.4 |
+| ~~JK_TRACE~~ | ~~接口~~ | ~~RT_TRACE_001/002~~ | **随 ADR-0014 撤销** |
 | JK_TRANSPORT | 接口 | RT_IN_INTERFACE_002、RT_TRANSPORT_008/009/010 | §4.3.5 |
 | JK_PROVIDER | 接口 | RT_IN_INTERFACE_003、RT_IF_DDS | §4.3.6 |
-| CSU_CORE | 详细设计 | RT_ERROR、RT_DATA_MESSAGE、RT_TRACE、RT_CORO_RUNTIME_005 | §5.1 |
+| CSU_CORE | 详细设计 | RT_ERROR、RT_DATA_MESSAGE、RT_CORO_RUNTIME_005（~~RT_TRACE 已撤销~~） | §5.1 |
 | CSU_DISPATCHER | 详细设计 | RT_REQUEST_001..004、RT_IN_INTERFACE_004、RT_DESIGN_008 | §5.2 |
 | ~~CSU_BOUNDEDQUEUE~~ | 已删除（ADR-0008 D8） | RT_DATA_BUFFER 的上界与归因**不再满足**；原 RT_HANDLER_004 已由 RT_INBOUND_003 承接（改由结构保证，不依赖队列上界） | §5.3 |
 | CSU_NODEBASE | 详细设计 | RT_LIFECYCLE、RT_NODE_003、RT_DESIGN_008 | §5.4 |
@@ -1117,7 +1116,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | RT_TCP_RECONNECT_001..005 | DD-11、DD-12、**DD-15** / CSU_IO、CSU_PROTOCOLNODE / JK_TRANSPORT / MS_LINK_DOWN、**MS_TCP_PUMP**（原 MS_CONNECTION，已撤销） |
 | RT_TCP_RECONFIG_001..006 | CSU_IO（`TcpTransport::ApplyConfig`）—— **本轮待定**（ADR-0011 **D11**），去留未裁决 |
 | RT_ERROR_001..003 | DD-5 / CSC_CORE / CSU_CORE |
-| RT_TRACE_001/002 | DD-10 / CSC_CORE / CSU_CORE / JK_TRACE |
+| ~~RT_TRACE_001/002~~ | **随 ADR-0014 撤销**（DD-10 / JK_TRACE 一并） |
 | RT_DATA_MESSAGE/STATE/CONFIG/BUFFER | CSC_CORE、CSC_NODE / CSU_CORE、CSU_DISPATCHER（**RT_DATA_BUFFER 的队列上界与观测计数已随 ADR-0008 D8/D10 回退**） |
 | RT_IN_INTERFACE_001..005 | DD-1 / JK_TRANSPORT、JK_CODEC、JK_PROVIDER、JK_NODE_API |
 | RT_IF_API/SYSFRAME/TCP/UDP/SERIAL/DDS | JK_NODE_API、JK_CODEC、JK_TRANSPORT / CSU_IO、CSU_CODEC |
