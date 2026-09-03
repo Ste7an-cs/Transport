@@ -15,8 +15,8 @@
 // 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
 // join)由基类 NodeBase 承载,本类只填三个钩子。
 //
-// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不再持有业务队列与
-// handler 消费者 fiber:入站业务由宿主 `Subscribe` 后在自己的 fiber 上消费。
+// 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不持有业务队列:入站
+// 业务由宿主 `Subscribe` 后在自己的 fiber 上消费。
 //
 // 本类**不触碰 transport 的生命周期**:不 Start、不 Close、不 WaitClosed,只借它的两条
 // 队列句柄。链路的绑定/超时/重连/退避全在传输内部,对本类不可见。
@@ -39,22 +39,21 @@ ProtocolNode::ProtocolNode(ITransport& transport, std::unique_ptr<ICodec> codec,
     : transport_(transport),
       codec_(std::move(codec)),
       config_(std::move(config)),
-      // 键提取函数:给出一条消息各匹配字段的具体值。部分匹配由 Dispatcher 实现,本类
-      // 不再需要把字段压成单一关联键,也不再需要为"响应命令码"做归一化。
+      // 键提取函数:给出一条消息各匹配字段的具体值。部分匹配由 Dispatcher 实现。
       dispatcher_([](const Message& msg) {
         return std::make_tuple(msg.session_id, msg.message_id, msg.frm_type);
       }) {}
 
 // 析构即关闭并汇合:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚。
-// Close 只发信号,WaitClosed 才 join,故两句缺一不可(旧形态的 Close 兼做了后者)。
+// Close 只发信号,WaitClosed 才 join,故两句缺一不可。
 ProtocolNode::~ProtocolNode() {
   (void)Close();
   WaitClosed();
 }
 
 Coro::Result<void> ProtocolNode::DoStart() {
-  // 本节点的配置面已无需校验项:时限逐次传参(SRS §3.1.4.4 / ADR-0010 D6),"不得永不
-  // 超时"由 `ValidateInteraction` 的参数校验直接拒绝非正值,不再依赖启动期的配置校验。
+  // 本节点的配置面无校验项:时限逐次传参(SRS §3.1.4.4 / ADR-0010 D6),“不得永不超时”
+  // 由 `ValidateInteraction` 的参数校验直接拒绝非正值。
   //
   // **不启动 transport**:宿主已经启过。读侧取自己的一路订阅——关它只终止本节点,
   // 各订阅者各得全量副本;写侧无句柄可取,直接调 transport_.Write()。
@@ -70,9 +69,8 @@ Coro::Result<void> ProtocolNode::DoClose() {
   // 残留数据一并丢弃:关闭即停止交付。
   //
   // **close 是整流传播的**(AsyncTask 417790c 起):它关闭 hub 表里全部消费者队列,
-  // 源 read_queue 与同一条传输上的其它订阅者**一并终结**。这是**有意为之**——
-  // 节点关闭即读侧终结,宿主随后关传输,两者一起关。
-  // 不用"析构句柄只退订自己"那条路径:它唤不醒此刻正阻塞在 await(rx_) 里的读循环。
+  // 源 read_queue 与同一条传输上的其它订阅者**一并终结**。节点关闭即读侧终结,宿主随后
+  // 关传输。不用“析构句柄只退订自己”那条路径:它唤不醒此刻正阻塞在 await(rx_) 里的读循环。
   if (rx_) {
     rx_->close(make_error_code(TransportErrc::kClosed));
     rx_->channel()->discard_pending();
@@ -108,7 +106,7 @@ void ProtocolNode::SpawnReadLoop() {
       DecodeAndDispatch(std::move(datagram).value());
     }
     // 无条件调**公开的** Close():我方 Close 所致时是幂等空操作,传输终结所致时即自终。
-    // Close 不含等待点,故在本 fiber 内调用安全(旧形态为此另设了 SignalClose)。
+    // Close 不含等待点,故在本 fiber 内调用安全。
     (void)Close();
   }));
 }
@@ -164,7 +162,7 @@ Coro::Result<Message> ProtocolNode::AwaitAccept(
     }
     // 超时 → 重发。
   }
-  // D12:本质不是"超时"而是"对端始终没有受理",与"已受理但执行慢"是两类事实。
+  // D12:本质不是“超时”而是“对端始终没有受理”,与“已受理但执行慢”是两类事实。
   return make_error_code(TransportErrc::kNotAccepted);
 }
 
@@ -206,7 +204,7 @@ Coro::Result<Message> ProtocolNode::RequestForResult(
     return accepted.error();
   }
   // D5:受理阶段一完成立即注销 ack 订阅——重发会引出重复 kResponse,不注销则它们继续落入
-  // 信箱;注销后它们成为无匹配终结帧,按 kUnmatchedOrLateResponse 归因丢弃。
+  // 信箱;注销后它们成为无匹配终结帧,被丢弃。
   ack.Reset();
 
   // D2:本阶段**不重发**——kResult 未达意味着对端正在执行,重发有使其重复执行的风险。
@@ -260,8 +258,7 @@ Coro::Result<Message> ProtocolNode::RequestForResultDirect(
     // 唯一的等待就是等结果,不重发则命令帧一旦丢失即彻底失败、无任何补救。
     // RT_NODE_002_c 的"等 kResult 不得重发"只约束外部系统协议,与本条并存不矛盾。
   }
-  // D12:返 kTimeout 而**非** kNotAccepted——后者的语义是"对端没有受理",而本交互根本
-  // 不存在受理这一步,"未受理"这一事实不存在。
+  // D12:返 kTimeout 而**非** kNotAccepted——本交互根本不存在受理这一步。
   return make_error_code(TransportErrc::kTimeout);
 }
 
@@ -285,8 +282,7 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
   const auto& bytes = datagram.bytes;
   auto decoded = codec_->Decode(bytes.data(), bytes.size());
   if (!decoded) {
-    // 坏帧 / codec 错误:**丢弃**(codec 内部 resync)。观测面撤销后不再归因、不再记录,
-    // 丢弃动作本身不变(ADR-0014 D1/D4)。
+    // 坏帧 / codec 错误:**丢弃**(codec 内部 resync),不归因、不记录(ADR-0014 D1/D4)。
     return;
   }
   for (const auto& msg : decoded.value()) {
@@ -300,26 +296,16 @@ void ProtocolNode::Dispatch(const Message& msg) {
     return;
   }
   // 无人认领。终结帧(kResponse / kResult)此时属于迟到、乱序或无对应请求——这是请求-响应
-  // 侧的异常;业务帧则是宿主"只订阅自己关心的帧"的正常选择(ADR-0009 D5)。**两者的处置
-  // 相同:丢弃。** 观测面随 ADR-0014 D1 撤销后框架已无处记录二者之别,故此处不再分支。
-  // 代价(ADR-0014 D4)是丢弃完全不可见——已明确接受。
+  // 侧的异常;业务帧则是宿主“只订阅自己关心的帧”的正常选择(ADR-0009 D5)。**两者的处置
+  // 相同:丢弃,且不作记录**(ADR-0014 D1/D4)。
 }
 
 Coro::Result<MessageDispatcher::Ticket> ProtocolNode::Subscribe(
     MessageDispatcher::Key key) {
-  // **相位判定**,判据与三个交互方法**同一个** `IsRunning()`——`kClosed` 一并覆盖"未启动 /
-  // 关闭中 / 已关闭",这是本类各 `@return` 早已写明的既有约定,本方法不单开一份。写法与
-  // `DdsNode::Subscribe` 逐字一致(ADR-0009 D1′ / ADR-0013 D8)。
-  //
-  // - **`Created` 也返 `kClosed`**:`Subscribe` **只在 `Running` 受理**,还没 `Start()` 就
-  //   订阅是**禁用法**,不是"早一点也行"。放行它有一处真实危害:`NodeBase::Close()` 从
-  //   `Created` 走时**不调 `DoClose()`**,`dispatcher_.CloseAll` 因此从不执行——而"信箱被
-  //   关"是订阅者**唯一**的协作取消信号(D4)。宿主若在此相位订阅并 spawn 了消费 fiber、
-  //   随后放弃启动,那条 fiber 的信箱**永远等不到关闭信号**,join 时挂住。
-  //   不是悬垂(`Ticket` 持 `weak_ptr`),是唤醒信号永远不发——静默挂起。
-  // - **`Closing` / `Closed` 同样 `kClosed`**:此时 `DoClose()` 已 `CloseAll`,再登记只能
-  //   得到一张信箱已关闭的凭据。让它**在返回处**就说清楚,而不是推迟到第一次 `Wait`——
-  //   D1′ 把本方法从裸 `Ticket` 改成 `Coro::Result<Ticket>` 的理由原样适用于相位。
+  // **相位判定**,判据与三个交互方法**同一个** `IsRunning()`——`kClosed` 一并覆盖“未启动 /
+  // 关闭中 / 已关闭”。`Subscribe` **只在 `Running` 受理**:还没 `Start()` 就订阅是**禁用
+  // 法**;`Closing` / `Closed` 期 `DoClose()` 已 `CloseAll`,再登记只能得到一张信箱已关闭
+  // 的凭据。写法与 `DdsNode::Subscribe` 逐字一致(ADR-0009 D1′ / ADR-0013 D8)。
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);  // 未启动 / 关闭中 / 已关闭。
   }
