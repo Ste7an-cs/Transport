@@ -39,7 +39,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,11 +52,8 @@
 #include "coro_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/DdsCodec.hpp"
-#include "transport/core/DropReason.hpp"
 #include "transport/core/Error.hpp"
-#include "transport/core/ITraceSink.hpp"
 #include "transport/core/Message.hpp"
-#include "transport/core/TraceCategories.hpp"
 #include "transport/io/dds/DdsConfig.hpp"
 #include "transport/io/dds/DdsProviderRegistry.hpp"
 #include "transport/io/dds/DdsTransport.hpp"
@@ -72,17 +68,13 @@ using transport::DdsNode;
 using transport::DdsNodeConfig;
 using transport::DdsProviderRegistry;
 using transport::DdsTransport;
-using transport::DropReason;
-using transport::DropReasonName;
 using transport::FakeDdsProvider;
 using transport::ICodec;
 using transport::IDdsProvider;
-using transport::ITraceSink;
 using transport::kAny;
 using transport::Message;
 using transport::MessageKind;
 using transport::RetryPolicy;
-using transport::TraceEvent;
 using transport::TransportErrc;
 using transport::make_error_code;
 
@@ -114,38 +106,16 @@ struct Fixture {
   }
 };
 
-/// 只数事件的 Trace 出口:本类没有观测计数器,丢弃归因**只经 sink 一条出口**。
-class CountingSink : public ITraceSink {
- public:
-  void OnTrace(const TraceEvent& ev) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (ev.category == transport::kTraceCategoryDrop) {
-      ++drops_[std::string(ev.message)];
-    }
-  }
-  [[nodiscard]] std::size_t Drops(DropReason reason) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = drops_.find(std::string(DropReasonName(reason)));
-    return found == drops_.end() ? 0 : found->second;
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::map<std::string, std::size_t> drops_;
-};
-
 /// 一个"节点 + 它借用的那条传输"的组合体。
 ///
 /// **传输归宿主**(ADR-0009 / ADR-0013 D15 的连带):本件模拟宿主——它建传输、`Start()`
 /// 它,把引用交给节点,并在析构里**先收敛节点、再关传输**(顺序不能反:节点借着它)。
 class Host {
  public:
-  explicit Host(const Fixture& fixture, std::string uuid = {},
-                ITraceSink* sink = nullptr)
+  explicit Host(const Fixture& fixture, std::string uuid = {})
       : transport_(fixture.Cfg()) {
     DdsNodeConfig config;
     config.uuid_override = std::move(uuid);
-    config.trace_sink = sink;
     node_ = std::make_unique<DdsNode>(transport_, std::make_unique<DdsCodec>(),
                                       std::move(config));
   }
@@ -890,11 +860,10 @@ TEST(DdsNode, ResentFramesAreByteIdenticalOnTheWire) {
 
 // **首个到达即成功,不回应**(**D7**):本模型没有受理阶段、也没有确认帧,拿到应答就完事。
 // 后半段是它的另一面——那条内部登记的订阅随调用返回而注销,故**迟到的第二份应答**无人
-// 认领,归因 `kUnmatchedOrLateResponse`(共用应答 topic 之下这条归因本来就会很吵,代价 8)。
-TEST(DdsNode, SuccessfulRequestSendsNothingBackAndTheLateDuplicateReplyIsUnmatched) {
+// 认领、被静默丢弃(ADR-0014 D1:框架不作任何记录,只能观察到"它不引起任何动作")。
+TEST(DdsNode, SuccessfulRequestSendsNothingBackAndTheLateDuplicateReplyIsDropped) {
   Fixture fixture;
-  CountingSink sink;
-  Host client(fixture, "node-a", &sink);
+  Host client(fixture, "node-a");
   Host server(fixture, "node-s");
   client.StartTransport();
   server.StartTransport();
@@ -923,12 +892,13 @@ TEST(DdsNode, SuccessfulRequestSendsNothingBackAndTheLateDuplicateReplyIsUnmatch
       << "成功之后客户端又往请求 topic 上发了帧";
   EXPECT_EQ(requests.Count(), 1u);
 
-  // 服务端补发一份**同 corr** 的应答:此刻客户端已无对应登记 ⇒ 落到"无人认领"。
+  // 服务端补发一份**同 corr** 的应答:此刻客户端已无对应登记 ⇒ 落到"无人认领"、被丢弃。
+  // 它不得让客户端有任何动作——那条已返回的交互不会被二次终结,线缆上也不会多出一帧。
   ASSERT_TRUE(static_cast<bool>(server.node().Reply(seen->front(), Payload("dup"))));
-  EXPECT_TRUE(pumpFiberUntil([&sink] {
-    return sink.Drops(DropReason::kUnmatchedOrLateResponse) >= 1;
-  }));
-  EXPECT_GE(sink.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
+  EXPECT_FALSE(pumpFiberUntil([&requests] { return requests.Count() > 1; }, 200))
+      << "迟到的重复应答不得引起客户端任何动作";
+  EXPECT_EQ(requests.Count(), 1u);
+  EXPECT_TRUE(client.node().IsRunning()) << "丢弃一条无人认领的应答不影响节点";
 }
 
 TEST(DdsNode, RetryExhaustionReturnsTimeoutNotNotAccepted) {
@@ -1042,10 +1012,8 @@ TEST(DdsNode, CorrelationIdsOfDistinctNodesNeverCollide) {
 
 TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   Fixture fixture;
-  CountingSink sink_a;
-  CountingSink sink_b;
-  Host client_a(fixture, "node-a", &sink_a);
-  Host client_b(fixture, "node-b", &sink_b);
+  Host client_a(fixture, "node-a");
+  Host client_b(fixture, "node-b");
   Host server(fixture, "node-s");
   client_a.StartTransport();
   client_b.StartTransport();
@@ -1102,16 +1070,9 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   EXPECT_EQ(Text(reply_b.value()), "from-b");
 
   // **读入放大是明确接受的代价**(代价 8):别人的那份应答确实一路进到了本节点、被解码,
-  // 然后才在 Dispatcher 处因 corr 不匹配而落空 —— 这里就是它留下的唯一痕迹。
-  //
-  // 两个方向都要等:B 的应答先发出、A 那边先落空,而 A 的应答后发出——`task_b.get()` 一
-  // 返回只说明 B 收到了**自己**那份,别人那份还可能没走完 B 的读循环。故两个计数一起等。
-  EXPECT_TRUE(pumpFiberUntil([&sink_a, &sink_b] {
-    return sink_a.Drops(DropReason::kUnmatchedOrLateResponse) >= 1 &&
-           sink_b.Drops(DropReason::kUnmatchedOrLateResponse) >= 1;
-  }));
-  EXPECT_GE(sink_a.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
-  EXPECT_GE(sink_b.Drops(DropReason::kUnmatchedOrLateResponse), 1u);
+  // 然后才在 Dispatcher 处因 corr 不匹配而落空、被静默丢弃。观测面随 ADR-0014 D1 撤销后
+  // 它**不再留下任何痕迹**——落空只体现为上面那两条"各拿各的"断言:若内部登记的是
+  // `kAny`,先到的别人那份就会当场终结 A 的等待,A 拿到的将是 "from-b"。
   svc.Join();
 }
 
@@ -1357,15 +1318,22 @@ TEST(DdsNode, TransportTerminationClosesTheNode) {
   node.WaitClosed();
 }
 
-// 坏样本归因 kBadFrame:codec 解不出来的字节被丢弃,读循环照常继续。
-TEST(DdsNode, UndecodableSampleIsDroppedAsBadFrame) {
+// 坏样本被**丢弃**,读循环照常继续:codec 解不出来的字节既不投递、也不带停节点。归因
+// 记录随 ADR-0014 D1 撤销后,"被丢弃"只能这样间接观察——其后的正常样本仍原样送达,而
+// 坏样本自始至终没有出现在信箱里。
+TEST(DdsNode, UndecodableSampleIsDroppedAndDoesNotStopTheReadLoop) {
   Fixture fixture;
-  CountingSink sink;
-  Host host(fixture, {}, &sink);
+  Host host(fixture);
   host.StartTransport();
   DdsNode& node = host.node();
+  // Publishers ∩ Subscribers:本地回环,合法(见上文回环自测用例)。
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"t"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"t"})));
   ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  auto seen = std::make_shared<std::vector<std::string>>();
+  Subscriber sub(MustSubscribe(node, std::string("t"), MessageKind::kNotify),
+                 [seen](const Message& msg) { seen->push_back(Text(msg)); });
 
   // 直接往总线上灌一条 kind 判别符非法的样本(0xFF > kNotify)。
   FakeDdsProvider peer(fixture.bus);
@@ -1373,8 +1341,11 @@ TEST(DdsNode, UndecodableSampleIsDroppedAsBadFrame) {
   ASSERT_TRUE(static_cast<bool>(peer.DeclareWriter("t")));
   ASSERT_TRUE(static_cast<bool>(peer.Publish("t", Bytes{0xFF, 0, 0, 0, 0})));
 
-  EXPECT_TRUE(pumpFiberUntil(
-      [&sink] { return sink.Drops(DropReason::kBadFrame) >= 1; }));
-  EXPECT_GE(sink.Drops(DropReason::kBadFrame), 1u);
+  // 坏样本之后的正常样本仍被解出并投递 ⇒ 前者只是被丢弃,没有带停读循环。
+  ASSERT_TRUE(static_cast<bool>(node.Publish("t", Payload("after"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
+  ASSERT_EQ(seen->size(), 1u);
+  EXPECT_EQ(seen->front(), "after") << "坏样本不得进入信箱";
+  EXPECT_TRUE(node.IsRunning());
   peer.Shutdown();
 }
