@@ -110,8 +110,8 @@ dds::Topic* FastDdsProvider::GetOrCreateTopic(const std::string& name) {
   return t;
 }
 
-// 写侧端点声明(ADR-0013 D13 补正)。**`DataWriter` 就在这里建**,不再等第一次 Publish
-// ——这样约 240ms 的发现窗口在启动时付掉,首帧(尤其服务端的第一次应答)才不会丢。
+// 写侧端点声明(ADR-0013 D13)。**`DataWriter` 就在这里建**——约 240ms 的发现窗口因此在
+// 启动时付掉,首帧(尤其服务端的第一次应答)才不会丢。
 Coro::Result<void> FastDdsProvider::DeclareWriter(const std::string& topic) {
   std::lock_guard<std::mutex> lk(mutex_);
   // 未 Init / 正在 Shutdown:调用序错误 → kInvalidState(与 Subscribe 一致)。
@@ -135,7 +135,7 @@ Coro::Result<void> FastDdsProvider::Publish(const std::string& topic,
     // 未 Init / 正在 Shutdown:调用序错误 → kInvalidState(与 FakeDdsProvider 一致)。
     if (!participant_ || closing_) return make_error_code(TransportErrc::kInvalidState);
     auto it = writers_.find(topic);
-    // **不惰性建**(D13 补正):没声明过就是配置/调用序的错,返 kConfiguration。惰性建
+    // **不惰性建**(D13):没声明过就是配置/调用序的错,返 kConfiguration。惰性建
     // 会让 DeclareWriter 形同虚设——首帧照样在 writer 刚建出、尚未 match 时发出去而丢掉。
     if (it == writers_.end()) return make_error_code(TransportErrc::kConfiguration);
     writer = it->second;
@@ -215,9 +215,8 @@ void FastDdsProvider::Shutdown() {
   if (!participant_) return;
   // 先拦住新的 Publish,再**等**在途的写跑完——Fast DDS 3.6.1 没有中断在途 write()
   // 的手段(DataWriter 上无 cancel/abort 之类),所以这里只能等,而这一等**没有上界**:
-  // 阻塞来自同进程订阅方的交付回调在发布线程上同步执行,`max_blocking_time` 不参与
-  // (实测它设 300ms 而 Publish 跑满 2000ms)。界由同进程内最慢的那个订阅回调决定
-  // (ADR-0013「明确接受的代价」7,2026-09-01 改判)。
+  // 阻塞来自同进程订阅方的交付回调在发布线程上同步执行,`max_blocking_time` 不参与。
+  // 界由同进程内最慢的那个订阅回调决定(ADR-0013「明确接受的代价」7)。
   closing_ = true;
   idle_cv_.wait(lk, [this] { return in_flight_ == 0; });
 

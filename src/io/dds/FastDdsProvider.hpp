@@ -2,7 +2,7 @@
 
 // FastDdsProvider.hpp — IDdsProvider 的 Fast DDS 3.x 实现(pub-sub only)。
 // participant + RawBytes 类型注册 + topic→writer/reader(**由 DeclareWriter / Subscribe
-// 显式建出,不惰性建**,ADR-0013 D13 补正)+ DdsQos 映射。
+// 显式建出,不惰性建**,ADR-0013 D13)+ DdsQos 映射。
 //
 // 3.x 相对 2.13.x 的断裂(ADR-0013 D14):CMake 包名 fastrtps → fastdds;
 // eprosima::fastrtps::rtps → eprosima::fastdds::rtps;fastrtps/types/TypesBase.h
@@ -37,7 +37,7 @@ class FastDdsProvider : public IDdsProvider {
 
   Coro::Result<void> Init(const DdsConfig& config) override;
   void         Shutdown() override;
-  /// 当场建出该 topic 的 `DataWriter`(D13 补正);幂等。
+  /// 当场建出该 topic 的 `DataWriter`(D13);幂等。
   Coro::Result<void> DeclareWriter(const std::string& topic) override;
   /// **可阻塞**:RELIABLE 准入满时 park 调用线程至多一个 `max_blocking_time`(D13)。
   /// topic 须已 `DeclareWriter`,否则返 `kConfiguration`(**不惰性建**)。
