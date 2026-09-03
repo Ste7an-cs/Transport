@@ -76,9 +76,9 @@ Coro::Result<void> TcpTransport::ValidateConfig() const {
   if (config_.host.empty() || config_.port == 0) {
     return make_error_code(TransportErrc::kConfiguration);
   }
-  // **须为正,没有"0 = 禁用"这一档**(与 UDP 的差异):合一之后它同时是等连上的时限与
-  // 重连退避间隔,零值直接退化为紧循环(端口未监听时内核立即回 RST,connect 微秒级失败,
-  // 烧 CPU 且向对端刷 SYN)。故不能照抄 UDP 的"非正回落默认值"。
+  // **须为正,没有“0 = 禁用”这一档**:合一之后它同时是等连上的时限与重连退避间隔,零值
+  // 直接退化为紧循环(端口未监听时内核立即回 RST,connect 微秒级失败,烧 CPU 且向对端
+  // 刷 SYN)。
   if (config_.silence_timeout <= std::chrono::milliseconds::zero()) {
     return make_error_code(TransportErrc::kConfiguration);
   }
@@ -102,10 +102,9 @@ Coro::Result<void> TcpTransport::Start() {
   socket_->setProxy(QNetworkProxy::NoProxy);  // #123:不继承环境级代理策略。
   lifecycle_ = LifecycleState::kRunning;
 
-  // **不就地 connect**(与 UDP 的一处差异):`UdpTransport::Start()` 就地 bind 一次是因为
-  // bind 同步且瞬时;TCP 的 connect 是异步的,就地等会把 `Start()` 变成一个最长一个
+  // **不就地 connect**:TCP 的 connect 是异步的,就地等会把 `Start()` 变成一个最长一个
   // silence_timeout 的阻塞调用。故 `Start()` 返回时 `CurrentLinkState()` 通常是
-  // kEstablishing,"首连未成不算启动失败"(ADR-0007 D2)——调用方可以 Start() 后立即
+  // kEstablishing,“首连未成不算启动失败”(ADR-0007 D2)——调用方可以 Start() 后立即
   // 发送,链路不可用时报文在写队列里等(RT_TCP_RECONNECT_003)。
   write_pump_ = std::make_shared<Coro::FiberTask<void>>(
       Coro::makeTask([this] { RunWritePump(); }));
@@ -132,11 +131,9 @@ Coro::Result<void> TcpTransport::Start() {
 // 三处的 timeout 是**同一个量**(D5):等连上 / 多久没数据算链路坏 / 多久重试一次。
 //
 // ★ **两处「建完即复查」是不变式,不是防御性冗余**(D15 补正,#200)。循环顶部的判据与
-//   等待器的创建之间**不是原子的**:`await_for(connect_waiter_, ...)` 是一个真实的挂起点,
-//   泵可能在那里被"连上"唤醒(runnable)却尚未被调度,而 `Close()` 恰在此间跑完——它置了
-//   kClosing、也 `close()` 了两个句柄,但那一刻 `read_stream_` 还是 null,**它关不到未来
-//   才出现的句柄**。此后泵接着往下跑、建出一个**没有任何人会唤醒**的读流,挂满一个
-//   `silence_timeout`(实测 3011ms),而读队列只在泵退出循环后才关。
+//   等待器的创建之间**不是原子的**:`Close()` 可能恰在其间跑完——它置了 kClosing、也
+//   `close()` 了两个句柄,但那一刻新句柄还是 null,**它关不到未来才出现的句柄**。此后
+//   泵接着建出一个**没有任何人会唤醒**的等待器,挂满一个 `silence_timeout`。
 //   **`corosocket::readAll()` 的出生守卫救不了这一格**:它只在 socket 处于
 //   `UnconnectedState` 时当场关流,而此处 socket 刚刚**连上**。
 void TcpTransport::RunSocketPump() {
@@ -168,9 +165,8 @@ void TcpTransport::RunSocketPump() {
       // 同样**存成成员**供 Close 打断(D15)。
       read_stream_ = Coro::coro(socket_).readAll();
       // 【建完即复查】(D15 补正,#200):**本循环的判据就是那次复查**——它在第一次
-      // `await_for` 之前求值,故"`Close()` 已跑完、关的是一个当时还是 null 的
-      // `read_stream_`"这一格在此当场终结,**不进 await**。判据每轮复查还顺带覆盖了
-      // "推完一片切片才轮到我被调度、而 `Close()` 在其间跑完"的同形窗口。
+      // `await_for` 之前求值,故“`Close()` 已跑完、关的是一个当时还是 null 的
+      // `read_stream_`”这一格在此当场终结,**不进 await**。
       while (lifecycle_ < LifecycleState::kClosing) {
         auto chunk = Coro::await_for(read_stream_, timeout);
         if (!chunk) {
@@ -226,9 +222,8 @@ void TcpTransport::RunSocketPump() {
 // 单消费者天然保证写入串行化(RT_TRANSPORT_004:两帧字节不交错)。
 //
 // 不变式:**取到 socket 到写出之间没有挂起点**——`write()` 交给 Qt 内部写缓冲即返回,而
-// 我们**不等刷出**(D13),故写泵 fiber 不可能在"判 Connected"与"write"之间被调度走、
-// 让管理泵把 socket abort 掉。`UdpTransport` 写泵注释里那条同名不变式写着"只对 UDP 成立
-// (串口/TCP 的写有挂起点)",D13 之后**对 TCP 同样成立**,两个写泵结构完全同构。
+// 我们**不等刷出**(D13),故写泵 fiber 不可能在“判 Connected”与“write”之间被调度走、
+// 让管理泵把 socket abort 掉。
 void TcpTransport::RunWritePump() {
   for (;;) {
     // ── 阻塞点①:等数据 ──(Close 关 write_queue 唤醒)
@@ -238,9 +233,8 @@ void TcpTransport::RunWritePump() {
     }
     const Datagram& unit = item.value();
     // `unit.peer` **被忽略**(D8):TCP 点对点,一律发往 config 里的固定对端。**不判
-    // kInvalidArgument**——那会让恒发 Endpoint::Default()(或填了别的目的地)的"传输无关
-    // 调用方"在 TCP 上跑不起来。**这与 UDP 相反**:UDP 解析不了目的地会丢该条并记
-    // LastError,因为它一次一报文、目的地是报文的一部分;TCP 的目的地是连接本身。
+    // kInvalidArgument**——那会让恒发 Endpoint::Default()(或填了别的目的地)的“传输无关
+    // 调用方”在 TCP 上跑不起来。
 
     // ── 阻塞点②:等连接就绪 ──(Close 关 socket_ready 唤醒)
     // 链路不可用时就停在这里,报文留在队列里等,**不丢弃、不回传错误**
@@ -263,8 +257,7 @@ void TcpTransport::RunWritePump() {
     // ── 写出 ──【同步,无挂起点】(D13)
     // `setWriteBufferSize` 全仓未设(Qt 默认 0 = 无上限),故 write() 接受全部数据后立即
     // 返回。**不等 bytesWritten、不等 bytesToWrite() == 0**:写本就是 fire-and-forget
-    // (ADR-0007 D3),等刷出不改变该语义、只让写泵多挂起一次。已接受的代价是 Qt 内部写
-    // 缓冲无上限——要给它设界会让 write() 真的开始短写,须连同 D13 与 D7 重新评审。
+    // (ADR-0007 D3),等刷出不改变该语义、只让写泵多挂起一次。
     const auto size = static_cast<qint64>(unit.bytes.size());
     const qint64 n =
         socket_->write(reinterpret_cast<const char*>(unit.bytes.data()), size);
@@ -294,8 +287,8 @@ std::shared_ptr<Coro::Awaitable<Datagram>> TcpTransport::AsyncRead() {
 // 结果(socket 写失败、短写)都在写泵里,只落 LastError(),不回传。
 //
 // **链路不可用时同样返回成功**(RT_TCP_RECONNECT_003):报文在队列里等,写泵停在阻塞点②。
-// 但队列有界 1024 且满时**静默丢最旧**(D6),故那句"不拒绝、不丢弃"的"不丢弃"只在未超界
-// 时成立——已知且已接受(#176),此处**不作归因**。
+// 但队列有界 1024 且满时**静默丢最旧**(D6),故那句“不拒绝、不丢弃”的“不丢弃”只在未超界
+// 时成立,此处**不作归因**。
 Coro::Result<void> TcpTransport::AsyncWrite(Datagram datagram) {
   if (lifecycle_ == LifecycleState::kCreated) {
     return make_error_code(TransportErrc::kInvalidState);
@@ -322,14 +315,13 @@ Coro::Result<void> TcpTransport::AsyncWrite(Datagram datagram) {
 // | ④ | 写泵:`await(write_queue_)` 等数据         | `write_queue_->close()` + `discard_pending()` |
 // | ⑤ | 写泵:`await(socket_ready_)` 等连接就绪    | `socket_ready_->close()`  |
 //
-// ②③ **不能用 `socket_->abort()` 代替**(D15,实测):Qt 的 abort() 在连接中的 socket 上
-// 不发 errorOccurred,而 corosocket 的 waitForSignal / readAll 都靠 socket error 或
-// disconnected 终结——实测 abort() 两处都唤不醒、挂满整个超时,持句柄 close() 则 1ms 内
-// 双双唤醒。UDP 没有"连接中"这个窗口,故其 `socket_->close()` 打断读流有效,**不可照搬**。
+// ②③ **不能用 `socket_->abort()` 代替**(D15):Qt 的 `abort()` 在连接中的 socket 上不发
+// `errorOccurred`,而 corosocket 的 waitForSignal / readAll 都靠 socket error 或
+// disconnected 终结,两处都唤不醒;持句柄 `close()` 才唤得醒。UDP 没有“连接中”这个
+// 窗口,故其 `socket_->close()` 打断读流有效,**不可照搬**。
 //
-// ★ ②③ 只能关到**此刻已经存在**的句柄。"泵在本函数跑完之后才建出来的那一个"由泵侧的
-//   **两处「建完即复查」**接住(D15 补正,#200),见 `RunSocketPump()`——两边合起来才是
-//   完整的不变式,**Close() 一侧单独看是对的、也仍然不够**。
+// ★ ②③ 只能关到**此刻已经存在**的句柄。“泵在本函数跑完之后才建出来的那一个”由泵侧的
+//   **两处「建完即复查」**接住(D15 补正,#200),见 `RunSocketPump()`。
 Coro::Result<void> TcpTransport::Close() {
   if (lifecycle_ >= LifecycleState::kClosing) {
     return Coro::Result<void>{};  // 幂等。
@@ -373,9 +365,8 @@ bool TcpTransport::IsRunning() const {
 
 std::error_code TcpTransport::LastError() const { return last_error_; }
 
-// **无状态成员,当场算出**(D12)。最后一支是与 UDP 的**真正分歧**:UDP 未绑定即报
-// kDown("UDP 无连接,故永不出现 kEstablishing"),TCP 在退避重连期间报 kEstablishing
-// ——泵仍会重试,链路是"正在建立",不是"没了"。
+// **无状态成员,当场算出**(D12)。**退避重连期间报 `kEstablishing`**——泵仍会重试,
+// 链路是“正在建立”,不是“没了”。
 LinkState TcpTransport::CurrentLinkState() const {
   if (lifecycle_ != LifecycleState::kRunning || !socket_) {
     return LinkState::kDown;

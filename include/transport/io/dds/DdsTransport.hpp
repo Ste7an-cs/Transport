@@ -54,8 +54,7 @@ namespace transport {
  *
  * `DataWriter::write()` 是纯同步接口,直接 **park 调用线程**;用 fiber 会卡死整条线程上的
  * 所有 fiber。且这段阻塞**没有上界**——Fast DDS 默认 `INTRAPROCESS_FULL`,**同进程订阅方的
- * `on_data_available` 就跑在发布线程上**(实测:订阅回调睡 2000ms → `Publish` 跑满
- * 2000ms,`max_blocking_time` 设 300ms 完全不参与)。
+ * `on_data_available` 就跑在发布线程上**。
  *
  * ### 由此:listener 必须快且不阻塞,这是硬约束而非建议
  *
@@ -67,15 +66,14 @@ namespace transport {
  * ### 关闭路径的最坏等待【无上界】
  *
  * `Close()` 只发信号;`WaitClosed()` join 专属写线程,而**在途的 `Publish` 打不断**
- * (Fast DDS 3.6.1 的 `DataWriter` 上没有任何中止 `write()` 的入口,已实测 5 轮全跑满)。
+ * (Fast DDS 3.6.1 的 `DataWriter` 上没有任何中止 `write()` 的入口)。
  * 故最坏等待 **= 那一次在途 `Publish` 自己跑完所需的时间**,它由**同进程内最慢的那个订阅
  * 回调**决定,**不是**一个 `max_blocking_time`(ADR-0013「明确接受的代价」7)。
  *
  * ### 线程模型
  *
  * - 七方法 + 两个 `Declare*` 只在**调用方的执行域**(起本对象的那个 fiber 线程)内调用;
- * - `read_queue_` 由 provider 的 listener 线程写、由调用方 fiber 读(跨线程 `push` 已实测
- *   安全:4 线程并发 20000 条无空洞,#190 Q1);
+ * - `read_queue_` 由 provider 的 listener 线程写、由调用方 fiber 读(跨线程 `push` 安全);
  * - `write_queue_` 由调用方 fiber 写、由专属线程读,以 `std::mutex` + `std::condition_variable`
  *   保护——**不能用 `Coro::Awaitable`**,它的 `pop` 在非协程线程上会 crash(**D3**);
  * - `last_error_` 两侧都写,故单设一把小锁。
@@ -122,7 +120,7 @@ class DdsTransport final : public ITransport {
   ///
   /// **有界 1024 + 满时静默丢最旧**(**D11**),与 UDP/TCP/串口逐字相同:**不加计数器、
   /// 不加归因**。由此 `RELIABLE` QoS 被本地队列架空——listener 一搬走样本 DDS 即认为已
-  /// 交付、背压解除,这是裁决明确接受的代价。
+  /// 交付、背压解除。
   ///
   /// @return `read_queue_` 句柄;未 `Start()` 时给出以 `kInvalidState` 关闭的句柄,
   ///         我方 `Close()` 后为以 `kClosed` 关闭的句柄。
@@ -172,13 +170,13 @@ class DdsTransport final : public ITransport {
   // ── DDS 专有:端点声明(D15,在 ITransport 七方法之外)────────────────
 
   /// @brief 声明本节点在该 topic 上**发**:落到 provider 就是 `DeclareWriter(topic)`,
-  ///        **当场建出 `DataWriter`**(**D13** 补正)。**幂等**。
+  ///        **当场建出 `DataWriter`**(**D13**)。**幂等**。
   ///
   /// **只由外部在启动时调用**(`DdsNode::DoStart()`,**D15**):运行期不再有建端点的路径。
   /// **必须幂等**,因为注册里可能重复(同一 topic 既是订阅项、又是某条 client 的应答 topic)。
   ///
-  /// 与读侧对称、且同样是**真建端点**:约 240ms 的发现窗口在这里付掉,首帧(尤其服务端
-  /// 的第一次应答)不再赶在 `DataWriter` 刚建出、与对端 reader 尚未 match 时发出去而丢掉。
+  /// 约 240ms 的发现窗口在这里付掉,首帧(尤其服务端的第一次应答)不会赶在 `DataWriter`
+  /// 与对端 reader 尚未 match 时发出而丢掉。
   /// 未经本方法声明的 topic,写线程上的 `Publish` 会返 `kConfiguration` 并落到 `LastError()`。
   ///
   /// @return 成功;topic 为空返 `kConfiguration`;未 `Start()` / 关闭中 / 已关闭返
