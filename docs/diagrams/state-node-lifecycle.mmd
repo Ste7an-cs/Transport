@@ -20,8 +20,6 @@ stateDiagram-v2
     note right of Closing
         Close 不含等待点 —— 读-分发循环与业务处理器
         均可直接调用公开的 Close()（ADR-0008 D2）。
-        旧形态的 SignalClose / ConvergeAfterReadLoop
-        与“内部工作单元不得调 Close”的使用契约已作废。
     end note
 
     note right of Closed

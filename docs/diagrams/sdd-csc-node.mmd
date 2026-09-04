@@ -5,16 +5,18 @@ classDiagram
         +RequestForResponse(Message, RetryPolicy)
         +RequestForResult(Message, RetryPolicy, mid, ms)
         +RequestForResultDirect(Message, RetryPolicy, mid)
-        +Subscribe(Key) Ticket
+        +Subscribe(Key) Coro::Result~Ticket~
         -AwaitAccept() / EncodeAndWrite()
         -DecodeAndDispatch() / Dispatch()
         -NextSession() uint8
     }
     class DdsNode {
-        <<未编译的历史代码 · 重设计之前 · 待复活重写>>
-        +Request(Message, target, options)
-        +Publish(Message, topic)
-        -Dispatch(kReply) / NextCorrelationId()
+        +RegisterPublishers / RegisterSubscribers(topics)
+        +RegisterClients / RegisterServices(service_names)
+        +Publish(topic, Message)
+        +Subscribe(TopicKey, KindKey) Coro::Result~Ticket~
+        +RequestForResultDirect(service, Message, RetryPolicy)
+        +ServeRequests(service) / Reply(request, result)
     }
     class NodeBase {
         +Start() Coro::Result~void~
@@ -24,22 +26,21 @@ classDiagram
         #DoStart()* / DoClose()* / DoJoin()*
     }
     class Dispatcher~T_Fields~ {
-        +Subscribe(Key) Ticket
+        +Subscribe(Key) Coro::Result~Ticket~
         +Dispatch(const T&) size_t
         +CloseAll(error)
         -unordered_map~Mask, map~Values, vector~Entry~~~
     }
-    class DdsHandlerContext {
-        <<未编译的历史代码 · 仅 DdsNode 用>>
-        +Send / RequestClose / cancellation
-    }
 
     NodeBase <|-- ProtocolNode : 继承
-    NodeBase <|-- DdsNode : 继承（历史代码）
+    NodeBase <|-- DdsNode : 继承
     ProtocolNode *-- Dispatcher : 组合
     ProtocolNode ..> ICodec : 组合（按引用）
-    DdsNode ..> DdsHandlerContext : 构造传入（历史代码）
     ProtocolNode ..> ITransport : 按引用借用（不拥有、不启停）
     note for Dispatcher "订阅时不参与匹配的字段填 kAny\n一条消息投给全部键匹配者，各得一份\n投递【不终结】订阅，只有 resolve、无 erase\n成本 O(在用 mask 种数 + 收件人数)"
     note for NodeBase "Close 只发信号、任何 fiber 可调；\nWaitClosed 无时限，语义即 join"
-    note for DdsNode "DdsNode / DdsHandlerContext 调用着 MarkRunning()、\ntransport_->Read()/Write()、SignalClose() 等已删除接口，\n且不在库源文件清单内——是重设计【之前】的代码，\n不是活着的使用者（ADR-0009 D2 核实）"
+    note for DdsNode "请求-响应只说服务名；两个 topic 由
+cfg.<名>.request / cfg.<名>.response 派生
+注册只在 Created、Subscribe 只在 Running"
+
+    DdsNode ..> ITransport : 按引用借用（不拥有、不启停）

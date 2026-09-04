@@ -2,10 +2,10 @@ flowchart TB
     subgraph HOST[" "]
       APP([宿主应用])
     end
-    NODE["CSC_NODE（交互层）<br/>NodeBase · ProtocolNode · DdsNode<br/>（三者均在编译面内；DdsHandlerContext 已随 ADR-0013 删除）"]
+    NODE["CSC_NODE（交互层）<br/>NodeBase · ProtocolNode · DdsNode"]
     CODEC["CSC_CODEC（编解码层）<br/>ICodec · SystemCodec · DatagramCodec<br/>LengthFieldCodec · DdsCodec"]
-    IO["CSC_IO（传输层）<br/>ITransport（唯一内部缝）<br/>Udp · Tcp · Serial · DdsTransport（四者均在编译面内）<br/>TcpServer（本轮不做，仍在面外）"]
-    CORE["CSC_CORE（核心原语）<br/>Message · Endpoint · Datagram · TransportErrc<br/>Dispatcher · DropReason · Observability · ITraceSink<br/>Cancellation（活代码无使用者，ADR-0006 遗留）"]
+    IO["CSC_IO（传输层）<br/>ITransport（唯一内部缝）<br/>Udp · Tcp · Serial · DdsTransport<br/>TcpServer（不在编译面内）"]
+    CORE["CSC_CORE（核心原语）<br/>Message · Endpoint · Datagram · TransportErrc<br/>Dispatcher"]
     RT([AsyncTask 运行时 · boost.fiber])
     QT([Qt Core/Network/SerialPort]):::opt
 

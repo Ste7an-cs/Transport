@@ -1,13 +1,12 @@
 sequenceDiagram
     autonumber
     participant PEER as 对端/介质
-    participant CL as TcpClientTransport<br/>connect-loop fiber
+    participant CL as TcpTransport<br/>socket 管理泵 fiber
     participant IN as 内层 TcpTransport
     participant CH as 对外字节通道
     participant RD as node 读-分发循环
     participant P as Dispatcher 订阅索引
 
-    Note over CL,IN: 【TCP 已按 ADR-0011 重构完毕并进入编译面】（#179/#180/#181）。<br/>本图画的是断链处置【决策】（DD-11），仍然成立；<br/>但图中的 TcpClientTransport/内层 TcpTransport 两层结构已随 D1 合并为一个 TcpTransport，<br/>泵形态见图 4-15。本图待随之重绘。
     Note over CL,IN: Connected（代际 N）：内层收字节 → 推对外通道
     RD->>CH: await(rx_) 等待下一段字节
 
@@ -16,8 +15,8 @@ sequenceDiagram
     Note over CL: 断链完全内于传输层：转入重连，<br/>固定间隔后建新代际（ADR-0004 D2/D7、ADR-0005 D3）
     Note over CL,RD: 不向交互层发任何断链信号（DD-11）：<br/>对外通道无新数据 → await(rx_) 自然挂起；<br/>node 读循环无断链分支，node 保持 Running
 
-    Note over P: 在途交互不被批量终结 —— 各自由【逐次传参】的<br/>阶段时限终结（ADR-0010 D6；节点级缺省超时已删除，#173），<br/>或由 CloseAll(error) 随节点关闭一并终结
-    Note over RD: 已排队未启动业务不被清空 ——<br/>原「连接代际隔离丢弃」归因项已撤销（#112），<br/>其后「无 handler」归因亦随 handler 通道废止而删除（#163）：<br/>丢弃归因七项 → 六项 → 【五项】
+    Note over P: 在途交互不被批量终结 —— 各自由【逐次传参】的<br/>阶段时限终结（ADR-0010 D6），<br/>或由 CloseAll(error) 随节点关闭一并终结
+    Note over RD: 已排队未启动业务不被清空 ——<br/>丢弃归因七项 → 六项 → 【五项】
 
     CL->>IN: 重连成功 → 新内层（代际 N+1）
     PEER-->>IN: 新链路首批字节

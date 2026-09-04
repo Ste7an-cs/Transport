@@ -22,7 +22,6 @@ sequenceDiagram
             S-->>P: 错误
             Note over P: await_for(close_signal, silence_timeout)——退避用的仍是【同一个量】（D5）；<br/>固定间隔，无倍率/上限/抖动/稳定重置。【必须用独立延时原语】：<br/>拿未连接的 socket 建读流当退避会紧转。close_signal 被 Close 关闭时立即返回。<br/>不自终、无限重试，唯一退出条件是我方 Close（ADR-0007 D2）
         else 连接成功
-            Note over P,S: 代际 +1（【纯内部记账】，Generation() 已随 D9 删除）——不驱动任何控制流：<br/>写侧不校验代际（D7）、不做代际隔离（DD-12 已撤销）；<br/>唯一用途是 Trace 事件归类与内部判重
             P->>S: readAll() 建流（一次，反复 await）
             rect rgba(220,255,220,0.25)
             loop 内层数据泵

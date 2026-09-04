@@ -22,16 +22,18 @@ classDiagram
         +RequestForResponse(Message, RetryPolicy)
         +RequestForResult(Message, RetryPolicy, mid, ms)
         +RequestForResultDirect(Message, RetryPolicy, mid)
-        +Subscribe(Key) Ticket
+        +Subscribe(Key) Coro::Result~Ticket~
         -AwaitAccept() / EncodeAndWrite()
         -DecodeAndDispatch() / Dispatch()
         -NextSession() uint8
     }
     class DdsNode {
-        <<未编译的历史代码 · 重设计之前>>
-        +Request(Message, target, options)
-        +Publish(Message, topic)
-        -Dispatch(kReply) / NextCorrelationId()
+        +RegisterPublishers / RegisterSubscribers(topics)
+        +RegisterClients / RegisterServices(service_names)
+        +Publish(topic, Message)
+        +Subscribe(TopicKey, KindKey) Coro::Result~Ticket~
+        +RequestForResultDirect(service, Message, RetryPolicy)
+        +ServeRequests(service) / Reply(request, result)
     }
     class NodeBase {
         <<生命周期基类>>
@@ -40,24 +42,14 @@ classDiagram
     }
     class Dispatcher~T,Fields~ {
         <<协议无关机制>>
-        +Subscribe(Key) Ticket
+        +Subscribe(Key) Coro::Result~Ticket~
         +Dispatch(const T&) size_t
         +CloseAll(error)
         +Ticket::Wait(timeout) Coro::Result~T~
     }
-    class DdsHandlerContext {
-        <<未编译的历史代码 · 仅 DdsNode 用>>
-        +Send()
-        +RequestClose() 转调公开的 Close()
-        +cancellation()
-    }
-    class ITraceSink {
-        <<interface>>
-        +OnTrace(TraceEvent)
-    }
 
     class TcpTransport {
-        <<编译面内 · ADR-0011 重构完毕>>
+        <<ADR-0011>>
         +socket 管理泵 + 读写双队列
         +连接管理内建（固定间隔重连、不自终）
     }
@@ -65,22 +57,20 @@ classDiagram
         <<编译面内 · ADR-0007 样板>>
     }
     class SerialTransport {
-        <<编译面内 · ADR-0012 重构完毕>>
+        <<ADR-0012>>
         +设备管理泵 + 读写双队列
         +静默超时唯一判活 · 自动重开、不自终
     }
     class DdsTransport {
-        <<待按新形态跟进 · 排除于编译面>>
+        +listener 直推读队列 · 写侧专属 OS 线程
     }
     class TcpServer {
-        <<待按新形态跟进 · 排除于编译面>>
+        <<不在编译面内>>
     }
     class SystemCodec
     class DatagramCodec
     class LengthFieldCodec
-    class DdsCodec {
-        <<排除于编译面>>
-    }
+    class DdsCodec
 
     ITransport <|.. TcpTransport
     ITransport <|.. UdpTransport
@@ -95,9 +85,7 @@ classDiagram
     ProtocolNode *-- ICodec : 组合
     ProtocolNode *-- Dispatcher : 组合
     NodeBase <|-- ProtocolNode : 继承
-    DdsNode *-- ITransport : 组合
+    DdsNode ..> DdsTransport : 借用（宿主启停）
     DdsNode *-- ICodec : 组合
     NodeBase <|-- DdsNode : 继承
-    DdsNode ..> DdsHandlerContext : 构造传入（历史代码）
     TcpServer ..> ProtocolNode : 每连接派生
-    ProtocolNode ..> ITraceSink : 可选出口
