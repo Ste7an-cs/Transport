@@ -1,134 +1,209 @@
-# transport — C++ 通信中间件（协程原生目标架构）
+# transport — C++ 通信中间件
 
-一个 C++17 通信中间件库,把**传输**、**编解码**、**交互**三层彻底解耦,以 **AsyncTask 协程运行时**为强制异步运行环境:
+C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻底解耦，以 **AsyncTask 协程运行时**（boost.fiber）为异步执行环境。
 
-- **Transport（纯字节管道）** —— 跨 TCP / UDP / 串口 / DDS 搬运原始字节或样本,不解释消息类型、请求关联或 payload 语义。介质无关的协程模型:内部一条管理泵负责 socket 的建立、重建与重试,对外只交出读队列的等待器句柄(`AsyncRead`)、收下待发数据(`AsyncWrite`)。
-- **ICodec（线缆格式）** —— 在收发边界把逻辑 `Message` ↔ 线缆字节(分帧 + 序列化 + 校验 + 重同步);流式跨切片拼帧、报文式保边界。**应用可提供并装配的公共扩展点。**
-- **node（交互层）** —— 在前两层之上组合请求关联、入站分发、超时、连接状态与协议交互。**薄壳组合,不共享交互引擎**:协议可观察语义由各 node 自实现,公共只复用协议无关的挂起-应答纪律与生命周期收敛。
+| 层 | 职责 |
+|---|---|
+| **Transport**（纯字节管道） | 跨 TCP / UDP / 串口 / DDS 搬运原始字节，不解释消息类型、请求关联或 payload 语义。内部一条管理泵负责链路的建立、重建与重试，对外只交出读队列的等待器句柄与写入口。 |
+| **ICodec**（线缆格式） | 在收发边界把逻辑 `Message` ↔ 线缆字节（分帧 + 序列化 + 校验 + 重同步）。流式跨切片拼帧、报文式保边界。**应用可自行提供并装配。** |
+| **node**（交互层） | 组合前两层，交付请求-响应与发布-订阅。协议语义内联各 node，不设共享交互引擎。 |
 
-> **非目标:** 不解析/解释 payload 业务语义,不是消息代理、通用路由守护进程,本版不内建加密/认证/访问控制。
-
----
-
-## 当前状态（诚实说明）
-
-本仓库正按 SDD 路线图做**协程原生清洁重建**。已交付 **P0–P5**(tag `v0.4.0`–`v0.4.5`)。
-
-> ### ⚠️ 接口重设计进行中（`redesign` 分支，ADR-0008）
->
-> P0–P5 的接口面正在被一次性重画,**下面 P0–P5 的描述反映的是重设计之前的形态**,其中
-> 若干条已被推翻:
->
-> - `ITransport` 收窄至七个方法(`Start`/`Close`/`WaitClosed` + `AsyncRead`/`AsyncWrite`
->   + `LastError`/`CurrentLinkState`);写改为**彻底的 fire-and-forget**(连"目的地非法"这类
->   参数错误也不再同步作答),`LastSendTime`/`LastReceiveTime` 删除;
-> - `NodeBase` 的 `Close()` 改为只发信号、`WaitClosed()` 单独 join;节点**不再启停传输**,
->   改为按引用借用;
-> - 请求关联由新的 `Dispatcher`(按键分配 + 部分匹配 + 多消费者)承担,`PendingTable`、
->   `CorrelationKeyStrategy`、`session_id` 空闲集与 `kResourceExhausted` 边界一并删除;
-> - `SharedCompletion` / `BoundedQueue` / `PendingTable` / `OperationOptions` /
->   `transport::Result` / `SendUnit` 六个手搓件删除,一律换用 AsyncTask 原语。
->
-> 该分支当前的编译面收窄为 **UDP + ProtocolNode**,112 tests 全绿;TCP / 串口 / DDS 及其
-> 节点、以及八个仍在旧接口上的用例暂排除,清单在 `CMakeLists.txt` 注释中。完整取舍与已知
-> 能力回退见 **`docs/adr/0008-interface-redesign-and-key-based-dispatch.md`**。
-
-逐条 RT_* 追溯见 SDD §7 追溯矩阵。
-
-- **P0 —— 目标骨架落位(`v0.4.0`):**
-  - `transport::TcpTransport`(已建立连接的 TCP 字节管道):发送完成语义(帧字节全部进内核发送缓冲才报成功 + 协程背压 —— RT_TRANSPORT_008)、并发写按节点执行域到达顺序串行化(RT_TRANSPORT_007)、复用 `readAll` 流的读路径。
-  - 统一的机器可判别错误模型 `transport::TransportErrc`(RT_ERROR_002/003),不靠解析字符串前缀分类;协作取消 `CancellationToken`、共享完成原语 `SharedCompletion`。
-  - 抢救沿用的线缆 **codec**(`transport::codec::`)与 **DDS provider 适配**(`transport::dds::`);命名空间统一 `transport::` 顶层,单一 `transport` 库 + 单一测试目标,AsyncTask 强制依赖。
-- **P1 —— TCP 最小请求-响应(`v0.4.1`):** 协议无关 `PendingTable<Key,T>` 挂起-应答薄基座(唯一登记/恰好一次完成/`FailAll`/取消纪律)、最小 `transport::ProtocolNode`(组合 transport+codec+PendingTable + 读-分发循环 + 可注入 `CorrelationKeyStrategy` + needresponse `Request`)、`TcpTransport` 读侧契约;真实 TCP 回环证实"无共享引擎、语义内联各 node"架构赌注(RT_DESIGN_003)。
-- **P2 —— 节点加厚(`v0.4.2`):** 协议无关 `BoundedQueue<T>`(双上界/tail-drop/命名归因)、入站业务处理器(组合注册/单消费者 fiber 串行/异常隔离 —— RT_HANDLER 全)、`noresponse` `Send`、256 并发在途 + `session_id` LRU 退休、生命周期硬化(并发幂等 Start/多等待者/三方汇合/重入自锁防护 —— RT_LIFECYCLE 全)。
-- **P3 —— 连接管理(`v0.4.3`):** `TcpClientTransport`(状态机 + 自动重连 + 连接代际,组合 P1 内层)、`Read` 透明跨重连、运行时重配置(`ApplyConfig` 单调版本/校验原子/端点切换 —— RT_TCP_RECONNECT/RECONFIG 全);真实 TCP 断连-重连回环。P3 当初的可选观察面接口 `IConnectionObservable` 与节点侧 reactor fiber 已随 ADR-0004 取消——链路可用性由 `ITransport::CurrentLinkState()` 对所有介质同形提供,连接诊断降级为 `TcpClientTransport` 的具体方法。
-- **P4 —— 其余介质(`v0.4.4`):** `UdpTransport`(报文+地址)/`SerialTransport`(串口字节流)/`DdsTransport`(provider 跨线程有界交接,复用 `Coro::Awaitable` 的有界 FIFO)、`DdsNode`(pub-sub + 多路请求-应答,correlation_id 键)、`TcpServer` accept(每连接一 node)、`NodeBase`(ProtocolNode/DdsNode 共享的生命周期基类)+ `HandlerLoop`(handler 消费者与有界业务队列)。统一寻址靠 `Endpoint`。**D10 复用证实**(DdsNode 复用 PendingTable 仅一行改动)、**跨线程交接闭合 ADR-0001 未决项**。
-- **P5 —— 观测 + 完整性归因(`v0.4.5`):** 可插拔结构化 Trace(`ITraceSink`,push,9 类 category)+ 命名计数(pull);`DropReason` **六项**(P5 交付时为七项,「连接代际隔离丢弃」随 ADR-0004 D3 移除)+ `RecordDrop`/`RecordEvent` 协议无关观测原语;I/O 事实(`LastSendTime`/`LastReceiveTime`/`LastError`)统一为 base `ITransport` 强制接口;补齐请求时延/处理器时长/重连/关闭时延指标。**loss=0 harness** 断言"无静默丢失"结构性可验证(`Σ命名=总丢弃`)。
-
-- **尚未实现(按路线图 P6 推进,勿当作已有):** 五种交互模式精确状态机与 `kFeedback`(TBD-001)、DDS 动态 Subscribe / 判活 QoS、串口自动重连(TBD-005)、性能/容量/两机验收与稳定性/时延基线固化(P6,TBD-004)。
-
-> **as-built 归档:** 0.3.0 的异步交互栈(`comm/` 引擎/执行器/策略、第二期 `coro::InteractionEngine`、回调式传输)及其文档已在 P0 从 master 删除,完整存档于 git tag **`v0.3.0`**。
+**非目标**：不解析 payload 业务语义；不是消息代理或通用路由守护进程；不内建加密、认证与访问控制。
 
 ---
 
-## 内部传输契约（`ITransport`,内部缝 —— 非用户 API）
+## 快速开始
 
-`ITransport` 是介质无关的内部缝(RT_IN_INTERFACE_002),七个方法分三组(ADR-0008 D1):
+编程主入口是**交互层 node**。传输由**宿主**创建、启动、关闭，节点按引用借用。
+
+### 外部协议：请求-响应（`ProtocolNode`）
+
+```cpp
+#include "transport/io/tcp/TcpTransport.hpp"
+#include "transport/node/ProtocolNode.hpp"
+#include "transport/codec/SystemCodec.hpp"
+
+using namespace transport;
+using namespace std::chrono_literals;
+
+TcpConfig cfg;
+cfg.host = "127.0.0.1";
+cfg.port = 9000;
+cfg.silence_timeout = 5000ms;          // 唯一的时间量：等连上 / 读静默 / 重连间隔
+
+TcpTransport transport(cfg);
+(void)transport.Start();               // 宿主启动传输
+
+ProtocolNode node(transport, std::make_unique<SystemCodec>(), ProtocolNodeConfig{});
+(void)node.Start();
+
+Message req;
+req.payload = {0x01, 0x02};
+auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
+if (rsp) { /* 用 rsp.value().payload */ }
+
+node.Close();        node.WaitClosed();      // 先关节点
+transport.Close();   transport.WaitClosed(); // 再关传输
+```
+
+四种交互模式：
+
+| 方法 | 语义 |
+|---|---|
+| `Send(msg)` | 单向，不等回应 |
+| `RequestForResponse(req, retry)` | 等一个回应帧 |
+| `RequestForResult(req, retry, result_mid, result_timeout)` | 两阶段：先等受理，再等结果 |
+| `RequestForResultDirect(req, retry, result_mid)` | 单阶段：直接等结果，超时即重发 |
+
+`RetryPolicy{timeout, max_attempts}` **逐次传参**，节点配置面上没有任何时限缺省值；`timeout` 须为正、`max_attempts` 须 ≥ 1（含首发）。
+
+### 订阅入站消息
+
+节点只交出**凭据**，消费在调用方自己的 fiber 上：
+
+```cpp
+auto sub = node.Subscribe(AnyOfType(FrameType::kCommand));   // 须在 Start() 之后
+if (!sub) { /* kClosed：未启动 / 已关闭 */ }
+auto ticket = std::move(sub).value();
+
+auto worker = Coro::makeTask([&] {
+  for (;;) {
+    auto m = Coro::await(ticket.mailbox());
+    if (!m) break;                    // 信箱被节点关闭 → 退出
+    try { Handle(m.value()); }
+    catch (...) { /* 自行隔离 */ }
+  }
+});
+...
+(void)worker.get();                   // 宿主自己 join，勿依赖 WaitClosed
+```
+
+订阅键的具名工厂：`ResponseTo(request)` / `FrameOf(session_id, message_id, type)` / `AnyOfType(type)`；不参与匹配的字段填 `kAny`。**一条消息投给全部键匹配的订阅者，各得一份副本。**
+
+### DDS：发布-订阅与请求-响应（`DdsNode`）
+
+topic 由**注册接口**给出，且只在 `Start()` 之前受理：
+
+```cpp
+DdsTransport transport(dds_config);
+(void)transport.Start();
+
+DdsNode node(transport, std::make_unique<DdsCodec>(), DdsNodeConfig{});
+
+(void)node.RegisterPublishers ({"telemetry"});   // 发布：topic
+(void)node.RegisterSubscribers({"telemetry"});   // 订阅：topic
+(void)node.RegisterClients    ({"get"});         // 请求-响应客户端：服务名
+(void)node.RegisterServices   ({"get"});         // 请求-响应服务端：服务名
+
+(void)node.Start();                              // 端点在此一次性建出
+```
+
+**请求-响应只说服务名**，两个 topic 由框架派生（`cfg.` 为固定前缀）：
+
+```
+请求 topic = cfg.<服务名>.request        应答 topic = cfg.<服务名>.response
+```
+
+两侧用同一个派生函数，故不可能配歪。客户端与服务端**传一模一样的服务名**。
+
+```cpp
+// 客户端
+auto result = node.RequestForResultDirect("get", req, RetryPolicy{2000ms, 3});
+
+// 服务端
+auto serving = node.ServeRequests("get");
+auto worker  = Coro::makeTask([&] {
+  for (;;) {
+    auto r = serving.value().Wait();
+    if (!r) break;
+    (void)node.Reply(r.value(), Handle(r.value()));
+  }
+});
+
+// 发布-订阅
+(void)node.Publish("telemetry", msg);
+auto notes = node.Subscribe(TopicKey{"telemetry"}, KindKey{MessageKind::kNotify});
+```
+
+**相位规则**：四个注册方法**只在 `Created`** 受理，`Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` **只在 `Running`** 受理。全流程即「注册 → `Start()` → 订阅/收发」。
+
+> ⚠ 框架占用 `cfg.*.request` / `cfg.*.response` 这一命名空间：它与 `RegisterPublishers` / `RegisterSubscribers` 收的普通 topic 处在同一平面，`RegisterSubscribers({"cfg.get.request"})` 与 `RegisterServices({"get"})` 指的是同一条 topic。框架不拦。
+
+---
+
+## 内部传输契约（`ITransport`）
+
+介质无关的内部缝，**非用户 API**——宿主只需创建、`Start()`、`Close()` / `WaitClosed()`。
 
 ```cpp
 class ITransport {
  public:
-  // 任务
-  virtual Coro::Result<void> Start()  = 0;   // 起内部管理泵后即返回
-  virtual Coro::Result<void> Close()  = 0;   // 只发信号，不等待收敛。幂等
+  virtual Coro::Result<void> Start()      = 0;   // 起内部管理泵后即返回
+  virtual Coro::Result<void> Close()      = 0;   // 只发信号，不等待收敛。幂等
   virtual void               WaitClosed() = 0;   // join 全部内部工作单元
 
-  // 数据
-  virtual std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead() = 0;
-  virtual Coro::Result<void> AsyncWrite(Datagram datagram) = 0;
+  virtual std::shared_ptr<Coro::Awaitable<Datagram>> AsyncRead()          = 0;
+  virtual Coro::Result<void>                        AsyncWrite(Datagram) = 0;
 
-  // 观测
   virtual std::error_code LastError()        const = 0;
   virtual LinkState       CurrentLinkState() const = 0;
 };
 ```
 
-**读写刻意不对称。** 读是"数据什么时候来",只能交出等待器句柄,由调用方自行决定超时、
-取消与是否 `shared()` 扇出——传输层不设单读守卫,多个消费者直接 await 同一句柄是抢占关系。
-写是"把这份数据发到那里去",调用方给完即返回,故写队列是**纯内部**的、调用方不感知。
+**读写刻意不对称。** 读是"数据什么时候来"，只能交出等待器句柄，超时、取消与是否 `shared()` 扇出由调用方自理——不设单读守卫，多个消费者直接 await 同一句柄是抢占关系。写是"把这份数据发到那里去"，调用方给完即返回。
 
-**写为彻底的 fire-and-forget**(ADR-0008 D4):`AsyncWrite` 只判生命周期与入队,返回成功
-仅表示已受理;目的地能否解析、socket 是否写成一律不回传,只落 `LastError()`。链路不可用时
-数据留在内部队列等待恢复,不拒绝、不丢弃。**由此不提供背压**。
+**写为彻底的 fire-and-forget**：`AsyncWrite` 只判生命周期与入队，返回成功仅表示已受理；目的地能否解析、socket 是否写成一律不回传，只落 `LastError()`。链路不可用时数据留在内部队列等待恢复，不拒绝、不丢弃。**由此不提供背压。**
 
-`Datagram{bytes, peer}` 读写共用:读到的 `peer` 是发送方,写出的 `peer` 是目的地
-(`Endpoint::Default()` 表示"发往本传输配置的默认对端",故传输无关的调用方恒可传它)。
+`Datagram{bytes, peer}` 读写共用：读到的 `peer` 是发送方，写出的 `peer` 是目的地（`Endpoint::Default()` 表示"发往本传输配置的默认对端"，故传输无关的调用方恒可传它）。
 
-`WaitClosed()` 不设时限也不返回结果:`Awaitable::close()` 只保证唤醒等待者,而"可安全释放"
-要求 fiber 已跑完,只有 `FiberTask::get()` 给得了——二者二选一。
+`WaitClosed()` 不设时限也不返回结果：`Awaitable::close()` 只保证唤醒等待者，而"可安全释放"要求 fiber 已跑完，只有 `FiberTask::get()` 给得了。
 
-> **用户面定位:** 编程主入口是**交互层 node**(组合装配),而非 `ITransport`;codec 是应用
-> 可提供的公共扩展点。**节点不管传输的生命周期**——宿主创建、启动并关闭传输,节点按引用
-> 借用(ADR-0008 D5)。一条传输**可**被多个节点共用、各得全量副本,但**任一节点关闭即终结整条
-> 读流**(`Awaitable::close()` 整流传播,有意为之),不支持独立关停——共用的诸节点须一起关。
+> **一条传输可被多个节点共用**，各得全量副本；但**任一节点关闭即终结整条读流**（`Awaitable::close()` 整流传播，有意为之），不支持独立关停——共用的诸节点须一起关。
 
 ---
 
 ## 构建
 
 ```bash
-git submodule update --init third_party/AsyncTask     # AsyncTask 为强制运行时(git 子模块)
-cmake -S . -B build -DTRANSPORT_BUILD_TESTS=ON
+git submodule update --init --recursive third_party/AsyncTask
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-**前置依赖:**
+**前置依赖：**
 
-- **Qt5**(5.12+;Core / Network / SerialPort,系统安装,如 `libqt5serialport5-dev`)。
-- **AsyncTask**(boost.fiber 协程运行时,`third_party/AsyncTask` 子模块)+ 已编译 boost `fiber/context/thread/chrono`;经缓存变量 `ASYNCTASK_DIR` / `BOOST_LOCAL_ROOT` 指定(当前为绝对路径默认,可 `-D` 覆盖)。子模块未初始化时 configure 直接 `FATAL_ERROR`。
-- **Fast DDS 2.13.x(唯一可选外部依赖)**:未装时 `find_package` 自动跳过 `FastDdsProvider`,其余能力照常构建;装后自动启用(编译带 `TRANSPORT_HAS_FASTDDS`)。
+- **Qt5**（5.12+；Core / Network / SerialPort，如 `libqt5serialport5-dev`）
+- **AsyncTask**（boost.fiber 协程运行时，`third_party/AsyncTask` 子模块）+ 已编译 boost `fiber/context/thread/chrono`。子模块未初始化时 configure 直接 `FATAL_ERROR`
+- **Fast DDS 3.6.1**（唯一可选外部依赖）：未装时 `find_package` 自动跳过 `FastDdsProvider`，其余能力照常构建可测；装后自动启用（带 `TRANSPORT_HAS_FASTDDS`）
 
-GoogleTest 仍 vendored 到 `third_party/`。整个仓库合并为**单一 `transport` 静态库**(链接 `asynctask` + Qt + 可选 fastrtps)与**单一 `transport_tests` 可执行文件**(全部 `tests/*` 在 AsyncTask fiber 调度器内跑)。C++17,目标平台 Linux。
+显式禁用 DDS：
+
+```bash
+cmake -S . -B build -DCMAKE_DISABLE_FIND_PACKAGE_fastdds=ON
+```
+
+GoogleTest vendored 在 `third_party/`。产物为**单一 `transport` 静态库**与**单一 `transport_tests` 可执行文件**（全部用例在 AsyncTask fiber 调度器内跑）。C++17，目标平台 Linux。
+
+---
+
+## 关键约束
+
+- **三层解耦**：传输不依赖逻辑消息或协议语义；codec 是公共扩展点；node 组合三者。〔RT_IN_INTERFACE_001/002〕
+- **AsyncTask 强制运行时**：不设独立业务调度体系；M:N 协作式，同一节点的状态与关联串行，不同节点可并行。〔RT_DESIGN_002、RT_CORO_RUNTIME〕
+- **无共享交互引擎**：协议语义归各 node，公共只复用协议无关的 `Dispatcher` 与生命周期基类。〔RT_DESIGN_003、RT_NODE_003〕
+- **不抛异常**：预期失败用 `Coro::Result<T>`（`[[nodiscard]]`）+ 机器可判别的 `TransportErrc`。〔RT_ERROR_001/002/003〕
+- **节点不管传输的生命周期**：宿主创建、启动、关闭传输，节点按引用借用。
+- **框架不提供可观测性**：内部丢弃（队列满丢最旧 / 坏帧 / 迟到·无匹配响应）完全静默，排障须由宿主在 codec 或订阅侧自行加日志。
+- **底层回调不碰节点状态**：Qt I/O 与 DDS listener 回调安全转交节点执行域，不在回调线程执行业务处理。〔RT_NODE_004〕
 
 ---
 
 ## 文档
 
-权威参考(目标架构):
-
-- **需求规格说明书(SRS)**:[`docs/需求规格说明书-协程原生.md`](docs/需求规格说明书-协程原生.md) —— 可观察/可验收行为,标识前缀 `RT_`。
-- **设计说明书 + 分期路线图(SDD)**:[`docs/设计说明书-协程原生.md`](docs/设计说明书-协程原生.md) —— 三层与缝、node 组合、线程/执行域模型、P0–P6 路线图。
-- **架构决策记录(ADR)**:[`docs/adr/`](docs/adr/) —— 0001 协程原生架构总纲、0002 发送/丢弃/生命周期、0003 SDD 与路线图。
-- **项目术语(单一权威)**:[`CONTEXT.md`](CONTEXT.md)。
-- **变更日志**:[`CHANGELOG.md`](CHANGELOG.md)。
-- **as-built 存档**:git tag [`v0.3.0`](https://github.com/Ste7an-cs/Transport/releases/tag/v0.3.0) —— 0.3.0 的 as-built SRS/SDD 与实现。
-
-### 关键约束（详见 SRS/SDD）
-
-- **三层解耦**:传输不依赖逻辑消息或协议语义;codec 是公共扩展点;node 组合三者。〔RT_IN_INTERFACE_001/002〕
-- **AsyncTask 强制运行时**:不设 `IExecutor`/`ThreadExecutor` 等独立业务调度体系;M:N 协作式,同一节点状态/关联/入站处理串行,不同节点可并行。〔RT_DESIGN_002、RT_CORO_RUNTIME〕
-- **无共享交互引擎**:不设独立 `InteractionEngine`/`InteractionPolicy` 层;协议语义归各 node。〔RT_DESIGN_003、RT_NODE_003〕
-- **不抛异常**:预期失败用 `Result<T>`/`Status`(`[[nodiscard]]`)+ 机器可判别的 `TransportErrc` 类别。〔RT_ERROR_001/002/003〕
-- **发送完成语义 + 背压**:一次发送在帧字节全部离开框架用户态缓冲(进内核)后才报成功,背压经协程等待自然传导;不采用 fire-and-forget。〔RT_TRANSPORT_008〕
-- **底层回调不碰节点状态**:Qt I/O / DDS listener 回调须安全转交节点所属执行域,不在回调线程执行业务处理器。〔RT_HANDLER_002、RT_NODE_004〕
+- **需求规格说明书（SRS）**：[`docs/需求规格说明书-协程原生.md`](docs/需求规格说明书-协程原生.md) —— 可观察/可验收行为，标识前缀 `RT_`
+- **软件设计说明（SDD, GJB438C）**：[`docs/软件设计说明-GJB438C.md`](docs/软件设计说明-GJB438C.md) —— 部件、接口、详细设计与追溯矩阵
+- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/) —— 每条决策的依据、否决的备选与明确接受的代价
+- **项目术语（单一权威）**：[`CONTEXT.md`](CONTEXT.md)
+- **编码规范**：[`CODING_STANDARDS.md`](CODING_STANDARDS.md)
+- **变更日志**：[`CHANGELOG.md`](CHANGELOG.md)

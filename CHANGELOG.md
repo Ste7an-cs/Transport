@@ -8,6 +8,72 @@
 
 ## [Unreleased]
 
+### 文档
+
+- **重审 SRS 与 SDD，只写当前现状**：清除全部变更叙述、划掉的旧文字、实况标注与含日期的过程括注；撤销的条目整条删除，被推翻的条目改写为当前规则。SRS 894 → 795 行，SDD 1182 → 1086 行。
+- **七张图**清除历史标注与已删组件（图 4-1 的 `CSC_CORE` 一格仍列着已删的 `DropReason` / `Observability` / `ITraceSink` / `Cancellation`）。
+- **README 重写**：去掉路线图与重设计过程记录，改为使用说明。
+- 补两条只存在于代码注释的设计依据进 ADR：服务名不限字符的单射性论证（ADR-0013 D6）、串口固定端点取 `Endpoint::Default()` 而不新增 `Endpoint::Kind` 的否决记录（ADR-0012 D9）。
+
+---
+
+## [0.5.0] - 2026-09-03
+
+### 💥 撤销观测/Trace 与 `Cancellation`，框架不再提供可观测性（ADR-0014，#226）
+
+- **💥 破坏性** 删除 `Observability.hpp`（`RecordDrop` / `RecordEvent`）、`ITraceSink.hpp`、`TraceCategories.hpp`、`DropReason.hpp`，以及 `TcpConfig` / `SerialConfig` / `ProtocolNodeConfig` / `DdsNodeConfig` 四处 `trace_sink` 字段、两个节点里的 8 处发射点。
+- **💥 破坏性** 删除 `Cancellation.hpp` / `.cpp`。取消语义由 `Awaitable::close()` 承载（产品代码本就零调用）。
+- **不留"以后再接"的钩子**（**D3**）：不保留空接口、不保留枚举、不留字段——无人实现、无人发射的接口比没有更糟。
+- **明确接受** 框架内部的丢弃（队列满丢最旧 / 坏帧 / 迟到·无匹配响应）**自此完全静默**。丢失的是"框架侧的第一手现场"：宿主看到的是"消息没来"，看不到"它到过、然后被丢了"，也看不到丢在哪一层。排障只能靠宿主在 codec 或订阅侧自行加日志。
+- **依据**：ADR-0003 D13 定的双面观测早已塌缩——pull 面随 ADR-0008 **D10** 删尽，队列丢弃随 **D8** 换 `FiberChannel` 后既无计数也无归因，#152 裁决"不加归因"，#212 把 `DropReason` 六项减为两项。要么留一个完整可信的观测面，要么删干净。
+- **撤销** SRS `RT_TRACE_001` / `RT_TRACE_002` 与 `RT_DATA_BUFFER` 的计量归因条款；SDD `DD-10` 与 `JK_TRACE` 整节；CONTEXT.md 的「丢弃归因」核心概念。
+
+### DDS 按双队列样板跟进，`DdsTransport` / `DdsNode` 回到编译面（ADR-0013，#201–#205 / #209）
+
+- **新增** `DdsTransport`：listener 在**外来线程**上直推 `read_queue_`（**读侧无泵 fiber**）；写侧 `write_queue_` 由**一条专属 OS 线程**消费。
+  - 写侧用线程而非 fiber 的依据：`DataWriter::write()` 的阻塞是**线程级**——Fast DDS 默认 `INTRAPROCESS_FULL`，**同进程订阅方的 `on_data_available` 直接跑在发布线程上**（实测回调睡 2000ms 则 `Publish` 跑满 2000ms，`max_blocking_time` 完全不参与）。该阻塞**没有上界**。
+  - `ASYNCHRONOUS_PUBLISH_MODE` 绕不过去（实测 178/200 超时）：它挪走的是网络发送，挡不住同进程同步交付。
+  - **连带硬约束**：专属写线程会顺带跑掉同进程内所有对端的交付回调，故"读侧 listener 必须快且不阻塞"是硬约束。我方 listener 只做 `push`；同进程内任何慢订阅回调都会卡住整条写队列。
+- **新增** `DdsNode`：四个**批量注册方法** + 五个交互方法。注册只在 `Created` 受理，端点在 `DoStart()` 一次性建出、**运行期恒定**。
+- **💥 破坏性** 请求-响应改为**服务名寻址**（#221）：两个 topic 由 `cfg.<服务名>.request` / `cfg.<服务名>.response` 派生，`cfg.` 为固定前缀。注册与调用**一律只说服务名**，两侧用同一个派生函数、不可能配歪。新增 `ServeRequests(服务名)`。
+- `correlation_id` 定为两段式 `"<uuid>#<request_seq>"`：uuid 由 `QUuid::createUuid()` 在节点初始化时生成一次（保证跨节点不撞），`request_seq` 为 `uint32` 自增（节点内不撞）。`uuid_override` 供测试注入。
+- **💥 破坏性** `FastDdsProvider` / `FastDdsRawType` 按 **Fast DDS 3.6.1** 重写（原按 2.13.x）：包名 `fastrtps` → `fastdds`、`TopicDataType` 签名改引用并增 `DataRepresentationId_t`、`getSerializedSizeProvider` → `calculate_serialized_size`、`getKey` → `compute_key`。`CMakeLists.txt` 的 `if(FALSE)` 硬禁用解除。
+- **修复** `FastDdsProvider::Publish` 的返回值判定在 3.x 下**语义完全反转**且零警告编译：`write()` 返回 `ReturnCode_t`（`RETCODE_OK == 0`），原 `if (!writer->write(...))` 把成功当失败。
+- **修复** `write()` 在锁外跑而 `Shutdown()` 直接 `delete_datawriter` 造成的 use-after-free（加在途计数）。
+- **新增** `IDdsProvider::DeclareWriter` 与 `MatchedCount()`；`Publish` 语义由"必成功"改为**可阻塞**。
+- **实测** `Shutdown()` **打不断**在途阻塞的 `Publish`（3.6.1 的 `DataWriter` 上无中止入口）；`Close()` 落在阻塞写上时的等待**无上界**，界由同进程内最慢的订阅回调决定。
+- **明确接受** 共用应答 topic 带来读入放大：同一服务的每个客户端都会收到该服务的**全部**应答，`N` 个并发客户端约 `N` 倍读入量，多余样本进 `read_queue_` 解码后才落空。
+
+### 💥 两个节点的 `Subscribe` 齐平：返 `Coro::Result<Ticket>`，只在 `Running` 受理（ADR-0009 D1′ / ADR-0013 D8，#214/#217）
+
+- **💥 破坏性** `ProtocolNode::Subscribe` 由裸 `Ticket` 改返 `Coro::Result<Ticket>`。裸凭据装不下错误码——"忘了注册"只能交出空凭据，其 `Wait` 返 `kInvalidState`，**错误码不对且推迟到首次等待才暴露**。
+- **💥 破坏性** 两个 `Subscribe` 一律**只在 `Running` 受理**，`Created` / `Closing` / `Closed` 返 `kClosed`。**`Created` 期订阅是禁用法。**
+- 依据：放行 `Created` 会踩到静默挂起——`NodeBase::Close()` 从 `Created` 走时不调 `DoClose()`，`Dispatcher::CloseAll` 因此从不执行，宿主在该相位订阅并 spawn 的消费 fiber **永远等不到关闭信号**。而它本要换来的"不漏收启动初期消息"是空的：DDS 的 `DataReader` 建于 `DoStart()`、发现约 ~240ms，`Start()` 返回后有充裕余量。
+
+### 💥 `DropReason` 六项减为两项（#201 / #212）
+
+- **💥 破坏性** 删 `kDdsHandoffOverflow`（DDS 接收队列与三介质同性质，三介质都不为它单设归因项）、`kBusinessQueueOverflow`、`kCloseDrop`。
+- 判据是**产生点在设计上被取消**，不是"现在没人用"：`BoundedQueue` 随 ADR-0008 D8 删除且 `FiberChannel` 溢出**不可观测**（无 `size()`、丢弃静默，连"何时该记"的时刻都取不到）；`kCloseDrop` 的归属组件"`NodeBase` 收敛 drain"随 ADR-0008 D2 删除，而 `CloseAll(kClosed)` 让在途请求**恰好一次返终结错误**——那是错误终结不是丢弃。
+- 余下两项随 ADR-0014 一并删除。
+
+### 修复：`Close()` 与 `Start()` 的两处竞态
+
+- **修复** `Close()` 未能当场打断读流（**#200**，ADR-0011 D15 补正）。**check-then-act 竞态**：`Close()` 关不到"它跑完之后才被创建"的等待器，泵在无人唤醒的 `connect_waiter_` 上挂满一个 `silence_timeout`（实测 3011ms），而读队列只在泵退出循环后才关。修法是**句柄一旦赋给成员即复查 `lifecycle_`**，已 `kClosing` 则就地终结、不进 `await`。串口同构处一并加固。
+- **修复** `NodeBase::Start()` 在 `DoStart()` 返回后**无条件写回 `kRunning`**（**#220**）：`Close()` 若在锁外窗口内进来，会把一个**已被关闭、调用方已收到成功返回**的节点复活，且那次关闭的收敛信号从未发出。修法是 `Close()` 见 `starting_` 只置 `close_pending_`，由 `Start()` 收尾裁决。跨 OS 线程可达。
+- **清理** 删除 `TcpTransport::generation_`（**#228**）：ADR-0011 D9 给它登记的两个用途（Trace 归类、内部判重）双双在设计上被取消，代际隔离由每轮末尾无条件 `abort()` 达成。
+
+### 串口：停摆用例逐条判定（#194）
+
+- 11 条旧串口用例逐条判定，迁移三条回编译面，其余按不再成立的前提删除。
+
+### 文档
+
+- **重审 SRS 与 SDD，只写当前现状**：清除全部变更叙述、划掉的旧文字、实况标注与含日期的过程括注；撤销的条目整条删除，被推翻的条目改写为当前规则。SRS 894 → 795 行，SDD 1182 → 1086 行。
+- **精简代码注释**（#230）：删设计历史与取舍论述，只留当前设计与调用方要知道的。全库注释 2709 → 2515 行，`git diff` 零代码变动。
+- **七张图**清除历史标注与已删组件。
+- **README 重写**：去掉路线图与重设计过程记录，改为使用说明。
+
+
 ### TCP 按 `UdpTransport` 样板重构,三件套收成一个 `TcpTransport`(ADR-0011,#177/#179/#180/#181)
 
 > **破坏性变更。** TCP 侧原有三件、共 2065 行,且 `TcpClientTransport.hpp:126` 引用着**已随 ADR-0008 D3 删除的 `OperationOptions`**——该头文件当时**根本编译不过**,三件均排除于编译面。本轮按 ADR-0007 的泵形态重写并恢复编译。全量 **128 → 153 tests**,`--gtest_repeat=5` 全绿、零警告。
@@ -265,6 +331,8 @@
 - **变更** `ITraceSink` 契约硬化:`OnTrace` 可能在库内锁临界区内被调——写明必须快速返回、不得阻塞、**不得回调本库任何 API**(否则同锁重入死锁)。
 - **修复** `NodeRuntime` `has_handler_` 读写挪进锁内(消除对 bring-up 无挂起点时序的隐式依赖);`ProtocolNode::Request` 的 session 归还改 RAII `SessionLease`(任一提前返回不再依赖手工 `ReleaseSession` 纪律)。
 - **清理** `NodeRuntime::Close` 两分支重复收敛段提取 `ConvergeToClosed()`;删 `PendingTable::Handle::finalized_` 死成员;去重头文件 include;`max_pending=256` 双重限流补"仅防自定义键策略绕过 session 预算"注释。
+
+---
 
 ## [0.4.5] - 2026-08-04
 
