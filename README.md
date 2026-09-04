@@ -46,16 +46,103 @@ node.Close();        node.WaitClosed();      // 先关节点
 transport.Close();   transport.WaitClosed(); // 再关传输
 ```
 
-四种交互模式：
+### 四种交互模式
 
-| 方法 | 语义 |
-|---|---|
-| `Send(msg)` | 单向，不等回应 |
-| `RequestForResponse(req, retry)` | 等一个回应帧 |
-| `RequestForResult(req, retry, result_mid, result_timeout)` | 两阶段：先等受理，再等结果 |
-| `RequestForResultDirect(req, retry, result_mid)` | 单阶段：直接等结果，超时即重发 |
+`RetryPolicy{timeout, max_attempts}` **逐次传参**，节点配置面上没有任何时限缺省值；`timeout` 须为正、`max_attempts` 须 ≥ 1（**含首发**），否则返 `kInvalidArgument`。
 
-`RetryPolicy{timeout, max_attempts}` **逐次传参**，节点配置面上没有任何时限缺省值；`timeout` 须为正、`max_attempts` 须 ≥ 1（含首发）。
+**盖章规则**：调用方填 `payload` 与 `message_id`，节点盖 `frm_type` / `protocol_id` / `session_id`。
+
+---
+
+#### ① `Send(msg)` —— noresponse，发了不管
+
+```cpp
+Message msg;
+msg.payload = {0x01, 0x02};
+auto ok = node.Send(std::move(msg));      // 不登记任何订阅
+```
+
+**返回成功只表示已入队，不表示已发出**——实际写出与失败归因都在传输的写泵里，框架不回传。
+
+---
+
+#### ② `RequestForResponse(req, retry)` —— needresponse，等受理
+
+```
+→ kCommand
+⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
+← kResponse                                ⇒ 成功（返回该帧）
+```
+
+```cpp
+auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
+```
+
+耗尽次数返 **`kNotAccepted`**（对端**始终没有受理**）而**不是** `kTimeout`。
+
+---
+
+#### ③ `RequestForResult(req, retry, result_mid, result_timeout)` —— withfeedback / needfeedback，两阶段
+
+```
+→ kCommand
+⏱ 等 kResponse ──超时──▶ 重发 ──次数耗尽──▶ kNotAccepted
+← kResponse（受理）
+⏱ 等 kResult   ──超时──▶ kTimeout（【不重发】）
+← kResult
+→ kResponse（回应结果）                     ⇒ 成功（返回 kResult 那一帧）
+```
+
+```cpp
+auto result = node.RequestForResult(std::move(req),
+                                    RetryPolicy{2000ms, 3},   // 仅【受理阶段】的重发策略
+                                    /*result_message_id=*/0x82,
+                                    /*result_timeout=*/30s);
+```
+
+三点要注意：
+
+- **`retry` 只管受理阶段**；等结果的时限是独立的 `result_timeout`。
+- **第二阶段不重发**：`kResult` 未达意味着对端**正在执行**，重发命令有使其重复执行的风险，故超时直接以 `kTimeout` 终结。
+- **末尾那帧回应是本模型固有的最后一步，不是可选项**——框架自动发出，完全由收到的 `kResult` 派生（payload 原样回显、`session_id`/`message_id` 沿用，仅把帧类型改为 `kResponse`）。调用方不参与，也不该自己再回一帧。
+
+`result_message_id` 是**结果帧的命令码**，与请求帧不同；其对应关系是协议知识，**框架不猜、不做映射**，须由调用方给出。
+
+---
+
+#### ④ `RequestForResultDirect(req, retry, result_mid)` —— 另一种协议，直取结果
+
+```
+→ kCommand
+⏱ 等 kResult ──超时──▶ 重发 ──次数耗尽──▶ kTimeout
+← kResult                                ⇒ 成功（返回该帧，【不回应】）
+```
+
+```cpp
+auto result = node.RequestForResultDirect(std::move(req),
+                                          RetryPolicy{2000ms, 3},   // 唯一的等待阶段
+                                          /*result_message_id=*/0x82);
+```
+
+> ⚠ **它不是外部系统协议的第五种交互。** `Send` / `RequestForResponse` / `RequestForResult` 属**外部系统协议**，本方法属**另一种协议**，二者并存于同一节点。**调用方须自行确保所用方法与对端协议匹配——框架对协议语义不透明，不校验。**
+
+**与 ③ 恰好相反的三条，勿混：**
+
+| | `RequestForResult`（③） | `RequestForResultDirect`（④） |
+|---|---|---|
+| 等结果阶段 | **不重发**（重发有使对端重复执行的风险） | **就在这一阶段重发**（没有受理阶段，不重发则命令帧一旦丢包即彻底失败、无任何补救） |
+| 耗尽返回 | `kNotAccepted` | **`kTimeout`**——本交互根本不存在"受理"这一步 |
+| 收到结果后 | **自动回一帧** `kResponse` | **不回应任何帧** |
+
+签名里**没有**独立的 `result_timeout`：本交互只有一个等待阶段，其时限即 `RetryPolicy::timeout`。
+
+---
+
+#### 重发的共同纪律（②④）
+
+重发的是**字节完全相同的原帧**、`session_id` 不变，故原订阅横跨全部重发继续有效，**最先到达的那一帧即终结本次交互**，框架不区分它对应第几次尝试。
+
+由此**要求对端能容忍重复命令**（幂等，或自行按 `session_id` 去重）。这是**协议层假设，框架不校验**。
 
 ### 订阅入站消息
 
@@ -107,23 +194,33 @@ DdsNode node(transport, std::make_unique<DdsCodec>(), DdsNodeConfig{});
 两侧用同一个派生函数，故不可能配歪。客户端与服务端**传一模一样的服务名**。
 
 ```cpp
-// 客户端
+// —— 客户端 ——
 auto result = node.RequestForResultDirect("get", req, RetryPolicy{2000ms, 3});
+if (result) { /* 用 result.value().payload */ }
 
-// 服务端
+// —— 服务端 ——
 auto serving = node.ServeRequests("get");
-auto worker  = Coro::makeTask([&] {
+if (!serving) { /* kConfiguration：未注册该服务名 */ }
+auto tickets = std::move(serving).value();
+
+auto worker = Coro::makeTask([&] {
   for (;;) {
-    auto r = serving.value().Wait();
-    if (!r) break;
-    (void)node.Reply(r.value(), Handle(r.value()));
+    auto req = tickets.Wait();            // 不设时限 = 一直等
+    if (!req) break;                      // 信箱被节点关闭 → 退出
+    (void)node.Reply(req.value(), Handle(req.value()));
   }
 });
+...
+(void)worker.get();                       // 宿主自己 join
 
-// 发布-订阅
+// —— 发布-订阅 ——
 (void)node.Publish("telemetry", msg);
-auto notes = node.Subscribe(TopicKey{"telemetry"}, KindKey{MessageKind::kNotify});
+
+auto sub = node.Subscribe(TopicKey{"telemetry"}, KindKey{MessageKind::kNotify});
+auto notes = std::move(sub).value();      // 消费同上：自己起 fiber 循环 Wait
 ```
+
+`Reply` 的应答目的地由**服务端自己注册的内容**决定，不取信于线缆；线缆上的 `reply_to` 只作一致性交叉校验，不等即返 `kInvalidArgument`。
 
 **相位规则**：四个注册方法**只在 `Created`** 受理，`Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` **只在 `Running`** 受理。全流程即「注册 → `Start()` → 订阅/收发」。
 
