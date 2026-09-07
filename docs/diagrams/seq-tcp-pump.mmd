@@ -53,7 +53,7 @@ sequenceDiagram
 
     Note over X,WQ: 【重连期间】两条队列不随连接重建而更换——这是"重连对调用方透明"的基础。<br/>读侧：无新数据入队，调用方的 await(rx_) 自然挂起，不返错、不感知断链（DD-11）。<br/>写侧：写泵停在阻塞点②；AsyncWrite 照常入队即返、返回成功<br/>（RT_TCP_RECONNECT_003"投入发送队列等待链路恢复"）。恢复后按序发出积压。
 
-    Note over T,RQ: ⚠ 两条队列均为默认有界 1024 + 静默丢最旧（D6）。<br/>丢中段会毁掉跨越丢弃点的那一帧，靠 codec 逐字节重同步 +<br/>交互层重发补救；Send 无重发，丢弃即永久丢失。丢弃当前无归因（#152/#176）
+    Note over T,RQ: ⚠ 两条队列均为默认有界 1024 + 静默丢最旧（D6）。<br/>丢中段会毁掉跨越丢弃点的那一帧，靠 codec 逐字节重同步 +<br/>交互层重发补救；Send 无重发，丢弃即永久丢失。丢弃无归因、不可观测（ADR-0014）
 
     Note over T,P: Close()：【五个动作，五个阻塞点，一一对应】(D15) —— close_signal.close()（退避）、<br/>connect_waiter.close()（等连上）、read_stream.close()（读等待）、<br/>write_queue.close()（等数据）、socket_ready.close()（等连接就绪）；<br/>另关 read_queue 并携终止原因，另加一次 abort()（清理，【不是打断手段】）。<br/>⚠ 实测：ConnectingState 下 abort() 对 waitForConnected 与 readAll 流【双双唤不醒】，<br/>均挂满超时；持句柄 close() 则 1ms 内唤醒。故 ②③ 必须各自持句柄打断，缺一不可。
     Note over T,P: WaitClosed()：join 管理泵（其内部已先 join 写泵）→ 返回即可安全释放

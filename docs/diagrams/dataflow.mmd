@@ -21,12 +21,11 @@ flowchart TB
     end
 
     DSP -->|命中 ≥1| RES["各订阅者信箱各得一份副本"]
-    DSP -->|0 份 · 终结帧| UM["kUnmatchedOrLateResponse 丢弃"]
-    DSP -->|0 份 · 业务帧| NH["静默丢弃 · 不归因<br/>（无订阅者是常态，ADR-0009 D5）"]
-    RES --> HD["宿主自有消费 fiber<br/>await 信箱 → 自行串行 · 自行隔离异常<br/>满则静默丢最旧（无归因，#152）"]
+    DSP -->|0 份| NH["静默丢弃 · 不作记录<br/>（终结帧与业务帧处置相同，ADR-0014 D1/D4）"]
+    RES --> HD["宿主自有消费 fiber<br/>await 信箱 → 自行串行 · 自行隔离异常<br/>满则静默丢最旧（不可观测）"]
     RES -. 唤醒 .-> WT
 
-    DEC -.->|坏帧| BF["kBadFrame 丢弃"]
+    DEC -.->|坏帧| BF["静默丢弃 · 不作记录"]
     WR -.->|目的地非法 / 报文超长 / 写失败| LE["只落 LastError()，不回传"]
 
     classDef greenC fill:#e8f3ea,stroke:#4a8c5a,color:#234;
@@ -36,4 +35,4 @@ flowchart TB
     class SUB,WT,RES,BQ greenC;
     class ENC,DEC goldC;
     class RQ,WR,RD,SK,DSP,HD blueC;
-    class NH,BF,UM,LE dropC;
+    class NH,BF,LE dropC;

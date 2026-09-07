@@ -9,7 +9,7 @@ flowchart TB
     P5["P5 生命周期<br/>Close 只发信号 · WaitClosed 才 join"]
 
     D1[("D1 订阅索引<br/>Dispatcher：mask → 值 → Entry")]
-    D2[("D2 订阅信箱<br/>Coro::Awaitable 有界 FIFO<br/>满则静默丢最旧（无归因，#152）")]
+    D2[("D2 订阅信箱<br/>Coro::Awaitable 有界 FIFO<br/>满则静默丢最旧（不可观测）")]
     D3[("D3 session_id 计数器<br/>uint8 自增回绕，取用不会失败")]
     D4[("D4 传输读/写双队列<br/>UdpTransport 泵持有（ADR-0007）")]
 
@@ -30,9 +30,8 @@ flowchart TB
     D2 -->|业务帧| P4
     P4 -->|交付| APP
 
-    P3 -->|"0 份 · 终结帧"| UM["kUnmatchedOrLateResponse 丢弃"]
-    P3 -->|"0 份 · 业务帧"| SD["静默丢弃 · 不归因<br/>（无订阅者是常态，ADR-0009 D5）"]
-    P2 -.->|坏帧| BF["kBadFrame 丢弃"]
+    P3 -->|"0 份"| SD["静默丢弃 · 不作记录<br/>（终结帧与业务帧处置相同，ADR-0014 D1/D4）"]
+    P2 -.->|坏帧| BF["静默丢弃 · 不作记录"]
     D4 -.->|"目的地非法 / 报文超长 / 写失败"| LE["只落 LastError()，不回传"]
 
     APP -->|Start / Close / WaitClosed| P5
@@ -46,4 +45,4 @@ flowchart TB
     class APP,MEDIA ext;
     class P1,P2,P3,P4,P5 proc;
     class D1,D2,D3,D4 store;
-    class UM,SD,BF,LE dropC;
+    class SD,BF,LE dropC;

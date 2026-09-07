@@ -59,7 +59,7 @@
 - **DD-15 字节流介质沿用同一套队列丢弃策略，不另设（满足 RT_TRANSPORT_003/010、RT_TCP_RECONNECT_003；ADR-0011 D6）：** `read_queue`/`write_queue` 在**所有介质**上一律沿用 AsyncTask 默认的「**有界 1024 + 静默丢弃队首最旧值**」，**不为 TCP/串口另设策略**。
   **依据是丢弃后果已有两层现成补救**：① **codec 自带重同步**——`ScanSystemFrames`（`SystemCodec.cpp:71`）逐字节扫 4 字节帧头，CRC 不匹配即右移一字节继续扫，未消费的尾巴留在 `buffer_` 与下批字节拼接，故**丢弃只毁掉跨越丢弃点的那一帧，其后的帧照常解出**；② **交互层重发**——三个 `RequestFor*` 均带重发（ADR-0010），被毁的那帧由重发补回。
   **另一半依据是"另定策略"在当前原语上做不到**：经核实 `FiberChannel` 的 `push` **只有非阻塞 drop-oldest 一种模式**、**无公开 `size()`**、且丢弃时 `push` 仍返 `success`——**溢出本身不可观测**。故"大容量 + 溢出即判链路不可用"无从实现（检测不到溢出），"有界 + 满时阻塞生产者"则须先改 AsyncTask（加 `size()` 令泵自行节流，或加阻塞 push）。两者均被推迟，非否决。
-  **两条代价须随本决策一并记住**：① **`Send`（noresponse）不在第二层补救内**——它无重试，丢弃即永久丢失，故队列丢弃对四种交互的后果**不均等**；② **丢弃当前无归因**，`push` 返 `success`、外部观测不到，SRS §3.6 的 `Σ命名原因 == 总丢弃` 恒等式在此路径上**不成立**（#152/#176 同源）。
+  **两条代价须随本决策一并记住**：① **`Send`（noresponse）不在第二层补救内**——它无重试，丢弃即永久丢失，故队列丢弃对四种交互的后果**不均等**；② **丢弃无归因**，`push` 返 `success`、外部完全观测不到（ADR-0014 D1/D4——框架不提供任何归因出口，排障须由宿主在 codec 或订阅侧自理）。
   详见 §4.2.13（图 4-15）与 ADR-0011「明确接受的代价」。
 - **DD-16 判活判据按介质分歧，三者互不照搬（满足 RT_TRANSPORT_009、RT_NODE_006；ADR-0007 / ADR-0011 D4 / ADR-0012 D4）：** "链路坏了"这一判断在三个介质上**依据不同的信号**，且**照抄会错**：
 
@@ -180,14 +180,14 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **图例说明**：一条请求-响应/业务帧的完整走向——**P1 出站**（跑在**调用方 fiber** 上）盖章、在 D1 登记订阅、取用 D3 的 session_id，Encode 后 `AsyncWrite` 入 D4 的写队列即返（**fire-and-forget**）；**P2 入站读循环**（节点自有 fiber）从 D4 的读队列 `await(rx_)` 取 `Datagram` 并 Decode；**P3 按键分配**查 D1，投给全部键匹配的订阅者、**各得一份副本**进入 D2 的信箱。命中即唤醒 P1 的 `Ticket.Wait` 交回结果；业务帧则由 **P4**——**宿主自有 fiber**，非节点内置——`await` 信箱取出消费。**P5 生命周期**：`Close()` 只发信号，`WaitClosed()` 才 join；对 D1 施以 `CloseAll(error)` 唤醒全部在等的订阅者。
 
-**投递份数为 0** 时才分流：终结帧归因 `kUnmatchedOrLateResponse`，其余业务帧**静默丢弃、不归因**（无订阅者是常态，ADR-0009 D5）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
+**投递份数为 0** 时**不再分流**：终结帧（迟到 / 无匹配）与无人认领的业务帧**处置相同——一律静默丢弃、不作记录**（ADR-0009 D5 + ADR-0014 D1/D4）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
 
 **数据存储说明：**
 
 | 存储 | 实现 | 读者 ← 写者 | 一致性保护 |
 |---|---|---|---|
 | D1 订阅索引 | `Dispatcher`：`map<Mask, map<Values, vector<Entry{Awaitable<T> mailbox}>>>` | P3 分配时查 ← P1 Subscribe / P5 CloseAll | 无锁（单线程 fiber 协作，ADR-0008 D9）；凭据生存期即仲裁 |
-| D2 订阅信箱 | `Coro::Awaitable<Message>` + `setCapacity`（每个 `Ticket` 一个） | P1 等待者 / P4 宿主消费 fiber ← P3 投递 | `FiberChannel` 自守；满则**静默丢最旧**（无归因，#152） |
+| D2 订阅信箱 | `Coro::Awaitable<Message>` + `setCapacity`（每个 `Ticket` 一个） | P1 等待者 / P4 宿主消费 fiber ← P3 投递 | `FiberChannel` 自守；满则**静默丢最旧**（无归因、不可观测） |
 | D3 session_id 计数器 | `std::uint8_t` 自增回绕 | P1 各交互方法 | 无——单线程 fiber 协作，取用不会失败 |
 | D4 传输读/写双队列 | `UdpTransport` 的泵持有（ADR-0007 D1） | P2 `await(rx_)` / socket 写泵 ← socket 读泵 / P1 `AsyncWrite` | `FiberChannel` 自守；有界，满则丢最旧 |
 
@@ -198,7 +198,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 ![请求-响应节点数据流图](diagrams/dataflow.svg)
 
-**图例说明**：出站（调用方 fiber）与入站（读-分发循环 fiber）两条独立流，经 `Dispatcher` 的 Dispatch→Wait 唤醒闭环。**投递份数为 0** 时才分流：终结帧归因 `unmatched-or-late-response`，其余业务帧**静默丢弃、不归因**（无订阅者是常态，ADR-0009 D5）；坏帧由 codec 判定。命中的订阅者各得一份副本，业务帧的消费由**宿主自有 fiber** 承担（ADR-0009 D2，节点不再内置 handler 通道）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
+**图例说明**：出站（调用方 fiber）与入站（读-分发循环 fiber）两条独立流，经 `Dispatcher` 的 Dispatch→Wait 唤醒闭环。**投递份数为 0** 时**不再分流**：终结帧（迟到 / 无匹配）与无人认领的业务帧**一律静默丢弃、不作记录**（ADR-0009 D5 + ADR-0014 D1/D4）；坏帧由 codec 判定，同样静默丢弃。命中的订阅者各得一份副本，业务帧的消费由**宿主自有 fiber** 承担（ADR-0009 D2，节点不再内置 handler 通道）。写出的一切结果（目的地非法 / 报文超长 / socket 写失败）**不回传**，只落 `LastError()`。
 
 
 #### 4.2.4 请求-响应时序（MS_REQ_RESP）
@@ -255,8 +255,8 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 ![传输层 socket 管理泵与读写双队列](diagrams/seq-transport-pump.svg)
 
 **图例说明（ADR-0007 + ADR-0008，UDP 先行）**：`Start()` 起**管理泵**与**写泵**两条 fiber 后即返回——首次 bind/connect 未成**不算启动失败**。管理泵为双层循环：**外层**按配置绑定/连接，失败则 `await_for(close_signal, timeout)` 退避后重试（**无限重试**，唯一退出条件是我方 `Close`，故 UDP **不自终**）；**内层**反复 `await_for(stream, timeout)` 并把数据投入 `read_queue`。**读数据与超时判断同在管理泵这一条 fiber 内**，且两处 `timeout` 是同一个量（`UdpConfig::silence_timeout`，默认 5s）——有链路时它是"多久没数据算坏"，没链路时它是"多久试一次"。静默超时 / 流终止 / 我方 `Close` 三者在内层**不作区分**，一律 break 回外层重建，区别只落在 `LastError()` 的归因上；每轮末尾无条件解绑，下轮从确定状态重建。
-数据面与 socket 生命周期由此**彻底解耦**:重建不波及正在等待的读者。`Read()` **只交出 `read_queue` 句柄**，deadline/取消与是否 `shared()` 扇出全由调用方决定（传输层不设单读守卫）；`Write()` **只入队即返**（fire-and-forget，失败只进 `LastError()`/Trace），链路不可用时数据留在 `write_queue` 等待恢复，恢复后按序全部发出。终止表现为 **`read_queue` 被 `close()` 并携带终止原因**。
-**待定（TBD-009）**：两条队列的容量上限与超限处置；硬约束是"丢弃必归因、字节流不得丢弃"。
+数据面与 socket 生命周期由此**彻底解耦**:重建不波及正在等待的读者。`Read()` **只交出 `read_queue` 句柄**，deadline/取消与是否 `shared()` 扇出全由调用方决定（传输层不设单读守卫）；`Write()` **只入队即返**（fire-and-forget，失败只进 `LastError()`），链路不可用时数据留在 `write_queue` 等待恢复，恢复后按序全部发出。终止表现为 **`read_queue` 被 `close()` 并携带终止原因**。
+**队列容量与超限处置（ADR-0011 D6，TBD-009 已关闭）**：两条队列一律取 AsyncTask 默认的「有界 1024 + 静默丢弃队首最旧值」，不为字节流介质另设策略。原先立作硬约束的"丢弃必归因"随 ADR-0014 撤销，"字节流不得丢中段"则由 codec 逐字节重同步与交互层重发两层补救取代。
 
 #### 4.2.11 对象/线程/协程的动态创建与删除（MS_DYNAMIC_LIFECYCLE）
 
@@ -525,7 +525,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 **软件逻辑**：见 `core/Dispatcher.hpp`。
 - 索引为两层：`unordered_map<Mask, unordered_map<Values, vector<Entry>>>`。`Mask` 是"哪些字段被约束"的位图，`Values` 是按该 mask 投影后的键值（未约束的字段置同一占位值）。**外层只保留存在订阅的 mask**，故探测次数随订阅情况自动收敛，既不枚举 2ⁿ 种字段组合，也不逐个求值谓词。
 - `Subscribe(Key)`：推导 mask 与投影键值 → 建信箱 → 入索引 → 返回 `Ticket`。已 `CloseAll` 时返回一张信箱已关闭的凭据。
-- `Dispatch(const T&)`：跑键提取函数得完整键 → 遍历在用 mask、逐个投影查表 → 命中桶内每个订阅者各 `resolve` 一份 → 返回投递份数。**返回 0 表示无匹配订阅，此时入参未被修改**，调用方可自行处置（转交处理器、归因丢弃）。
+- `Dispatch(const T&)`：跑键提取函数得完整键 → 遍历在用 mask、逐个投影查表 → 命中桶内每个订阅者各 `resolve` 一份 → 返回投递份数。**返回 0 表示无匹配订阅，此时入参未被修改**，调用方可自行处置（两个节点的处置都是"静默丢弃"）。
 - `CloseAll(error)`：关闭全部信箱并置终止标记，令在途 `Wait` 恰好终结一次。
 - `Ticket`：持一个信箱 + 析构注销，仅可移动；内部以**弱引用**持有索引，故允许在 `Dispatcher` 析构之后再析构。`Wait(timeout)` 让出式等待，信箱为队列语义——**同一凭据可多次等待**，一次交互需分段等待多条报文时，各段各自登记、各自设定时限。
 
@@ -587,12 +587,12 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - **读-分发循环**（ADR-0006 D5 起为 node 的实现细节）：私有 `SpawnReadLoop()` 起一条长寿 fiber，`await(rx_)`（`AsyncRead()->shared()` 取得的本节点读订阅）→ 错误分类（仅 `kClosed` 退出、其余瞬时错误继续）→ 本类 `DecodeAndDispatch()``；退出后调基类 `ConvergeAfterReadLoop()` 兼任收敛者。两个 node 各持一份逐字相同的 13 行——D5 明确接受该重复（"不构成需要共享的机制"）；第三个 node 出现前不宜再抽共享件。
 - **键派生**：无独立策略件——`Dispatcher` 的键提取函数在 `ProtocolNode` 构造期以一行 lambda 给出：`make_tuple(session_id, message_id, frm_type)`。
 - **session_id**：`std::uint8_t next_session_` 自增计数器，`NextSession()` 取用后自增、越过 255 自然回绕。**在途超过 256 时标识重复**，两个订阅落入同一桶、一条响应同时投给二者（SRS RT_REQUEST_MOT_2 已记该边界）。
-- **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。`kResponse`/`kResult`=响应帧未命中时仍归因 `kUnmatchedOrLateResponse`；**业务帧无人认领则静默丢弃、不归因**（订阅模型下无订阅者是常态而非异常，见 SRS §3.1.5.4）。
+- **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。未命中时**一律静默丢弃、不作记录**——响应帧（`kResponse`/`kResult`）的迟到·无匹配与业务帧的无人认领**处置相同**（ADR-0009 D5 + ADR-0014 D1/D4，见 SRS §3.6）。
 - **交互模式（ADR-0010，RT_NODE_002_a..g）**：四个方法，其中三个属**外部系统协议**（`Send` / `RequestForResponse` / `RequestForResult`——后者对应协议里的 `withfeedback` 与 `needfeedback`，二者经核实为**同一个通信模型**），一个属**另一种协议**（`RequestForResultDirect`）。**模式不作参数、不入节点状态**——状态机的阶段、已发送次数与原始命令帧全是该方法的局部变量，活在**调用方 fiber 的栈**上，故节点无"在途交互表"、`Dispatcher` 不认识模式。各方法的公共骨架：
   1. 取 `session_id` → 盖章；
   2. **发命令之前**同时登记两个订阅 `{sid, mid, kResponse}` 与（③④）`{sid, result_mid, kResult}`——`kResult` 可能先于 `kResponse` 到达，等收到受理再登记会丢帧（**D4**）；
   3. 第一阶段：发帧 → 等 `kResponse`，超时则**重发字节完全相同的原帧**（`session_id` 不变，**D3**），至多 `max_attempts` 次；耗尽返 **`kNotAccepted`**（**D12**）；
-  4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，按 `kUnmatchedOrLateResponse` 归因；
+  4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，被静默丢弃；
   5. ③④ 第二阶段：等 `kResult`，超时返 `kTimeout`，**不重发**（**D2/D5**：`kResult` 未达意味着对端正在执行）；
   6. `RequestForResult` 收到 `kResult` 后回一帧回应（**该模型固有的最后一步**），该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**不得走 `Send()`**（它会强制盖新 `session_id` 与 `kCommand`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
 
@@ -619,7 +619,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 ### 5.6 传输层详细设计（CSU_IO）
 
-**单元设计决策（ADR-0007 D1 / 0011 / 0012 / 0013）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**本轮仅 `UdpTransport` 落地该形态**，`TcpTransport` 已是其前身（#109 的连接泵 + 对外通道），`TcpTransport`/`SerialTransport` 待跟进（队列策略差异见 TBD-009）。
+**单元设计决策（ADR-0007 D1 / 0011 / 0012 / 0013）**：各介质实现**唯一**的 `ITransport` 契约（含链路可用性，DD-7），并统一为「**socket 管理泵 + 读写双队列**」形态——外层循环负责按配置创建/重建 socket 与失败重试，内层循环把 I/O 数据投入 `read_queue`；写侧由消费者从 `write_queue` 取出发出。socket 的生命周期与数据面由此**彻底解耦**：重建不波及正在等待的读者。**UDP / TCP / 串口三个介质均已落地该形态**；三者的队列策略一致（有界 1024 + 静默丢最旧，见 §4.2.10 与 ADR-0011 **D6**），差异只在管理泵外层如何建立链路（bind / connect / open）与何种事件触发内层 break。
 连接管理（TCP 客户端）与纯管道分离并**维持两层**（ADR-0004 D8：合并只会复制收发语义）；TCP 客户端内部改为**连接泵 + 对外通道**（ADR-0004 D6）；DDS 跨线程有界交接闭合 ADR-0001 未决项。
 
 **设计约束**：并发写串行化保留（RT_TRANSPORT_004）；`AsyncRead()` 交出等待器句柄、是否共享由调用方 `shared()` 决定；**发送不提供完成语义与背压**（DD-6）；UDP/DDS 单次一报文/样本，过大发送前失败；**读取终止语义**（DD-11）：不可重连介质致命错误返 `kClosed`，可重连介质链路中断**对调用方透明**（`Read` 挂起至新链路就绪，不返回任何断链错误）；socket/串口在节点执行域 fiber 内创建（亲和纪律）。
@@ -804,16 +804,11 @@ Coro::await_for(close_signal_, config_.silence_timeout);   // 唯一的时间量
 
 **`socket_ready_` 的"先清后发"**：每轮外层都是一次真实的 down→up 跃迁，而写泵停在"等数据"（阻塞点①）时没人来取就绪信号，不清就会一直堆积。写泵若正停在阻塞点②，队列本就是空的，清是空操作、随后的 `resolve()` 照常叫醒它——**信号因此恒定只有 0 或 1 个 token**。
 
-###### 代际（`generation_`）：只用于记账，不参与任何判定
+###### 代际：不存在
 
-每次 `Connect()` 成功 `+1`。**它不驱动任何控制流**：
+**框架不持有任何连接代际计数**（ADR-0011 **D9** / ADR-0014 **D1**）。
 
-- **不对外暴露**（`Generation()` 已随 **D9** 删除）；
-- **写侧不校验代际**（**D7**）——断链时半条即半条；
-- **不做代际隔离**——交互层不再于断链时批量终结在途请求（**DD-12**）；
-- 唯一用途是 **Trace 事件的归类**与内部判重。
-
-**为什么仍然保留**：断链重连若在诊断时无法分辨"哪一次连接"，Trace 事件将无法归组。这是纯观测需求，成本是一个 `std::uint32_t`。
+代际不参与任何判定：**写侧不校验代际**（**D7**）——断链时半条即半条；**不做代际隔离**——交互层不在断链时批量终结在途请求（**DD-12**）。轮次隔离由每轮末尾无条件 `abort()` 这一**物理事实**达成：socket 回到 `UnconnectedState`，挂起的信号与缓冲一并清除。
 
 ###### 与节点层的关系：完全不通知（DD-11）
 
@@ -1017,7 +1012,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 | RT_TRANSPORT_001..009 | DD-6、DD-11 / CSC_IO / CSU_IO / JK_TRANSPORT / MS_DFD_TOPLEVEL |
 | RT_CODEC_001..006 | CSC_CODEC / CSU_CODEC / JK_CODEC |
 | RT_REQUEST_001..006 | DD-8 / CSC_NODE / CSU_DISPATCHER、CSU_PROTOCOLNODE / MS_REQ_RESP、MS_TICKET |
-| RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 TBD-009** |
+| RT_INBOUND_001..005 | CSC_NODE / CSU_PROTOCOLNODE、`Dispatcher` / MS_NODE_DATAFLOW（RT_INBOUND_003"不阻断解复用"由**结构**保证：投递非阻塞、消费在宿主 fiber）。**RT_INBOUND_004 的信箱容量与丢弃语义见 §4.2.2**（有界 1024 + 静默丢最旧、不归因） |
 | RT_LIFECYCLE_001..007 | DD-7、DD-13 / CSU_NODEBASE / JK_TRANSPORT / MS_CLOSE、MS_NODE_LIFECYCLE、**MS_TCP_PUMP** |
 | RT_NODE_001..007 | DD-3 / CSC_NODE / CSU_PROTOCOLNODE、CSU_DDSNODE / MS_NODE_DATAFLOW |
 | RT_NODE_002_a..g（四种交互模式，ADR-0010；`repeating` 已废止，无遗留 TBD） | **DD-14** / CSU_PROTOCOLNODE §5.5「交互模式」/ **MS_INTERACTION_MODES**（§4.2 图 `seq-interaction-modes`）。`repeating` 仍为 TBD，无设计落点 |

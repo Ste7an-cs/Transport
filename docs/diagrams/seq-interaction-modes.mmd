@@ -42,7 +42,7 @@ sequenceDiagram
         P-->>D: kResponse（受理）
         D-->>N: 阶段一完成
         N->>D: Reset 受理凭据（D5）
-        Note over N,D: 不注销则重发引出的重复受理帧会继续入信箱；<br/>注销后它们成为无匹配终结帧 → kUnmatchedOrLateResponse
+        Note over N,D: 不注销则重发引出的重复受理帧会继续入信箱；<br/>注销后它们成为无匹配终结帧 → 静默丢弃
         N->>N: 等 kResult（result_timeout，【不重发】D2）
         P-->>D: kResult
         D-->>N: 阶段二完成

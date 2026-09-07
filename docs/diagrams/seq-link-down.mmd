@@ -16,7 +16,7 @@ sequenceDiagram
     Note over CL,RD: 不向交互层发任何断链信号（DD-11）：<br/>对外通道无新数据 → await(rx_) 自然挂起；<br/>node 读循环无断链分支，node 保持 Running
 
     Note over P: 在途交互不被批量终结 —— 各自由【逐次传参】的<br/>阶段时限终结（ADR-0010 D6），<br/>或由 CloseAll(error) 随节点关闭一并终结
-    Note over RD: 已排队未启动业务不被清空 ——<br/>丢弃归因七项 → 六项 → 【五项】
+    Note over RD: 已排队未启动业务不被清空 ——<br/>队列满时静默丢最旧，不归因
 
     CL->>IN: 重连成功 → 新内层（代际 N+1）
     PEER-->>IN: 新链路首批字节
