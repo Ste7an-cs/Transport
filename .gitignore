@@ -12,3 +12,19 @@ compile_commands.json
 /.agents/
 /.codex/
 *.user
+
+# qmake 构建产物(推荐 shadow build 到 build-qmake/;in-source 时下面几条兜底)
+/build-qmake*/
+Makefile
+Makefile.*
+.qmake.stash
+*.pro.user*
+moc_*.cpp
+moc_*.h
+moc_predefs.h
+qrc_*.cpp
+ui_*.h
+.obj/
+.moc/
+.rcc/
+.ui/
