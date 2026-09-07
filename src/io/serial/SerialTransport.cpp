@@ -246,10 +246,7 @@ void SerialTransport::RunDevicePump() {
 
       // 每代重建读流(旧流已随上一轮 close 死掉);建流时会 drain 订阅前已到的字节,
       // 不丢首片。**存成成员**供 `Close()` 打断(D6)。
-      // `coroiodevice::readAll()` **按值**返回 `Awaitable`(与 `corosocket::readAll()`
-      // 返回 `shared_ptr` 不同),故此处自行装箱——句柄要持为成员供 `Close()` 打断(D6)。
-      read_stream_ = std::make_shared<Coro::Awaitable<QByteArray>>(
-          Coro::coro(static_cast<QIODevice*>(port_)).readAll());
+      read_stream_ = Coro::coro(static_cast<QIODevice*>(port_)).readAll();
       // 【建完即复查】(ADR-0011 D15 补正,#200):**本循环的判据就是那次复查**——它在第
       // 一次 `await_for` 之前求值,故"`Close()` 已跑完、关的是一个当时还是 null 的
       // `read_stream_`"这一格当场终结,**不进 await**。
@@ -267,11 +264,10 @@ void SerialTransport::RunDevicePump() {
         // 设备错误只作为诊断事实吸收,**不改控制流**(D11)。
         AbsorbDeviceError();
         const QByteArray& bytes = chunk.value();
-        // ★★ 【D5,串口独有的一行】`coroiodevice::readAll()` 的 push **不判空**
-        // (`ch->push(dev->readAll())`),而 `corosocket::readAll()` 有
-        // `if(!bytes.isEmpty())` 守卫、其初次 drain 亦有 `bytesAvailable() > 0` 检查。
-        // 少了这一行,调用方就可能在 `read_queue` 上取到空 `Datagram`——UDP/TCP 都不
-        // 需要它,这是“照抄样板就会漏”的典型。
+        // 【D5】空切片守卫。`coroiodevice::readAll()` 自 AsyncTask `6f42255` 起已在
+        // 上游判空(`if(!bytes.isEmpty())` + 初次 drain 的 `bytesAvailable() > 0`),
+        // 与 `corosocket::readAll()` 一致,故本行现为**契约断言**:守住"调用方不得在
+        // `read_queue` 上取到空 `Datagram`"这条,不依赖上游持续满足它。
         if (bytes.isEmpty()) {
           continue;
         }
