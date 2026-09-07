@@ -21,7 +21,7 @@
 // 单线程 fiber 协作,成员不加锁(见 .hpp 的"单线程,不加锁")。
 //
 // 与 `UdpTransport` / `TcpTransport` 逐段同构;三处**串口独有**的差异都在下面就地标出:
-//   ① 读泵显式跳过空切片(D5)——`coroiodevice` 的 push 不判空;
+//   ① 读泵显式跳过空切片(D5)——上游已判空,本行现为契约断言;
 //   ② 判活只认静默超时(D4)——串口没有断开事件;
 //   ③ 设备错误一律只落 LastError(D11 + D4)——`errorOccurred` 是噪声而非事件。
 
@@ -255,7 +255,7 @@ void SerialTransport::RunDevicePump() {
         if (!chunk) {
           // 三条成因**不作区分**,一律 break 回外层重开:
           //   ① 静默超时 —— **唯一的主动判据**(D4,反转 ADR-0011 D4):串口没有断开
-          //      事件,`coroiodevice::readAll()` 只订阅 readyRead 与 aboutToClose;
+          //      事件,`coroiodevice::readAll()` 无错误信号也无 disconnected;
           //   ② 读流被 `aboutToClose` 终结 —— 设备被关(含我方 Close 的 port->close());
           //   ③ 我方 `Close` 关了 read_stream_ —— 由 while 判据接住,不记归因。
           Attribute(chunk.error(), last_error_);

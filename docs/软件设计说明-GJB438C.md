@@ -69,7 +69,7 @@
   | **TCP** | **对端断开事件**（主）+ `silence_timeout`（辅，半开检测） | **有**——经 `corosocket::readAll()` 订阅的 `disconnected` / socket error 到达 | ADR-0011 **D4** |
   | **串口** | `silence_timeout`（**唯一**，**反转回 UDP 形态**） | **无**——见下 | ADR-0012 **D4** |
 
-  **串口"无断开事件"是源码级事实，不是配置问题**：`coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**，而 `corosocket::readAll()` 订阅五个（含 socket error 与 `disconnected`）。实测：关掉 pty master 后 `readAll()` 流**完全不终止**（挂满 1500ms 报 `timed_out`），`isOpen()` 仍为 `true`。
+  **串口"无断开事件"是源码级事实，不是配置问题**：`coroiodevice::readAll()` 订阅 `readyRead` / `aboutToClose` / `destroyed`（设备与 app）/ `aboutToQuit` 四类，**没有任何错误信号、也没有 `disconnected`**，而 `corosocket::readAll()` 订阅五类，其中 socket error 与 `disconnected` 正是 TCP 断链的到达途径；设备消失时串口那四类**一个都不发**。实测：关掉 pty master 后 `readAll()` 流**完全不终止**（挂满 1500ms 报 `timed_out`），`isOpen()` 仍为 `true`。
 
   **这条分歧决定了一件更大的事**——串口**不能自终**（ADR-0012 **D1**，TBD-005 关闭）。"致命错误 → 自终"要求一个"致命错误"判据，而串口在流层面拿不到；唯一可得的是静默超时，用它判自终会把"对端暂时不发数据"误判为设备死亡。故串口改为**重开、不自终**，与 UDP/TCP 同构。
 
@@ -318,7 +318,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 |---|---|---|---|
 | 外层动作 | `bind` —— 同步瞬时 | `connectToHost` —— **异步**，等待用同一个量 | `open` —— **同步**，故**无"等连上"这一处** |
 | 判活主判据 | `silence_timeout`（**唯一**） | **对端断开事件**（主）+ 静默超时（辅） | `silence_timeout`（**唯一**，**反转回 UDP 形态**） |
-| 空切片 | 不会出现 | 不会出现（`corosocket` 判空） | **必须显式跳过**（`coroiodevice` **不判空**） |
+| 空切片 | 不会出现 | 不会出现（`corosocket` 判空） | 不会出现（`coroiodevice` 自 AsyncTask `6f42255` 起亦判空）；读泵仍显式跳过,作**契约断言** |
 
 **时间量比 TCP 少一处用途**：串口的 `silence_timeout` 只承担**读静默判活**与**重开退避**两处（TCP 是三处，多一个"等连上"）——因为 `open()` 同步。这一点上串口回到 **UDP 的形态**。
 
@@ -634,10 +634,9 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 | UdpTransport | **socket 管理泵 + 读写双队列**（ADR-0007，样板实现）。外层循环：按配置 bind → 失败**按 `silence_timeout` 所定间隔（默认 5 s）重试、无限重试**，唯一退出条件是我方 `Close`（**不自终**，RT_LIFECYCLE_008 的介质清单已去掉 UDP）。内层循环：`await` 报文流（带**静默超时**，可配、`0` 禁用、默认禁用）→ 投入 `read_queue`；流终止或静默超时 → 退出内层回外层重建。`Read()` 交出 `read_queue` 句柄;`Write()` 投入 `write_queue` 即返（fire-and-forget，链路不可用时排队等待恢复，恢复后按序全部发出）。寻址 kDefault→config 默认 / kNet→ip:port |
 | **SerialTransport**（ADR-0012 重构后，**已实现**，#193/#194） | **设备管理泵 + 读写双队列**，与 `Udp`/`TcpTransport` 同构。外层泵：`open()`（**同步**，故无"等连上"这一处）→ 成功则建 `readAll` 流、`await_for(read_stream_, silence_timeout)` 取切片入 `read_queue`；失败则 `await_for(close_signal_, silence_timeout)` 退避。每轮末尾 `port->close()`，下轮在**同一对象**上重开。**唯一时间量** `silence_timeout` 两处共用（读静默 / 退避），比 TCP 少一处。**静默超时是唯一主动判据**（**D4 反转**：串口无断开事件）。**读泵须显式跳过空切片**（**D5**，串口独有）。**不自终**——TBD-005 已关闭，串口自动重开、与 TCP 同构。 |
 
-> **三处"照抄样板就会漏"的串口独有点**（ADR-0012）：
-> 1. **跳空切片**（**D5**）——`coroiodevice::readAll()` 的 `readyRead` 处理器是 `ch->push(dev->readAll())`，**无 `bytesAvailable()` 判断、无 `isEmpty()` 守卫**；其初次 drain 处**有**该检查，`corosocket::readAll()` 两处都有。**这是 `coroiodevice` 独有的结构性缺口**，UDP/TCP 都不需要这一行。
->    **注（#193 实测）**：该空切片在 Qt 5.15 / Linux PTY 上**未复现**——去掉 `continue` 后用例仍通过，计数探针亦未观测到。守卫缺失是事实，是否触发依 Qt 版本与设备驱动而异，故该用例定位为**契约断言**而非故障回归。
-> 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**（对照 `corosocket::readAll()` 订阅五个，含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
+> **三处串口独有点**（ADR-0012）：
+> 1. **跳空切片**（**D5**）——现为**契约断言**。`coroiodevice::readAll()` 自 AsyncTask `6f42255` 起已带 `if(!bytes.isEmpty())` 与初次 drain 的 `bytesAvailable() > 0`，与 `corosocket` 一致，**原先那个"`coroiodevice` 独有的结构性缺口"已由上游补上**；该空切片在 Qt 5.15 / Linux PTY 上本也**从未复现**（#193 的计数探针未观测到）。这一行留着只为守住"调用方不得在 `read_queue` 上取到空 `Datagram`"，**不把正确性押在上游实现细节上**。
+> 2. **判活判据反转**（**D4**）——实测：设备消失后 `readAll()` 流**完全不终止**（挂满 1500ms，`isOpen()` 仍为 true），因 `coroiodevice::readAll()` **无错误信号、无 `disconnected`**，其订阅的 `readyRead` / `aboutToClose` / `destroyed` / `aboutToQuit` 四类在设备消失时一个都不发（对照 `corosocket::readAll()` 的五类含 socket error 与 `disconnected`）。故 TCP 的"断开事件为主判据"在串口上**没有信号可依**。
 > 3. **`errorOccurred` 是噪声而非事件**（**D11**）——实测拔线后以 **~950 次/秒**风暴式连发；`port->close()` 实测 0ms 止住。线路噪声类（`Parity`/`Framing`/`Break`）**只落 `LastError()`、不触发重建**，重建只由静默超时驱动。
 | **DdsTransport**（ADR-0013） | **读写双队列，完整实现 `ITransport`**，与三介质同形。**读侧无泵 fiber**——provider 的 listener 在**外来线程**上 `take()` 后直接 `push` 进 `read_queue`（跨线程 `push` 已实测安全）；`AsyncRead()` 交出该句柄。**写侧 `AsyncWrite` 入队即返**（fire-and-forget 照旧），由**一条专属 OS 线程**从 `write_queue` 取出并 `Publish`——因 `DataWriter::write()` 的阻塞是**线程级**（实测同进程订阅方回调睡 2000ms 时 `Publish` 跑满 2000ms，且回调就在发布线程上），用 fiber 会卡死整条线程上的所有 fiber。**QoS 统一一套**（**D4**）。链路可用性由 `matched` + `Liveliness` 提供（**D9**）。 |
 

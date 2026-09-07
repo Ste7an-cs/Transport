@@ -20,6 +20,10 @@
 - `readAll()` 流**完全不终止**（挂满 1500ms 报 `timed_out`），`isOpen()` 仍为 `true`；
 - 成因是源码级的：`coroiodevice::readAll()` **只连 `readyRead` 与 `aboutToClose`**——没有 `errorOccurred`、没有 `destroyed`、没有 `aboutToQuit`。对照 `corosocket::readAll()` 连了五个（含 socket error 与 `disconnected`），TCP 的断链正是靠它们到达。
 
+  > **订阅集的更新（AsyncTask `6f42255`，#197 的上游修复）**：`coroiodevice` 迁到 `AutoDisconnect` scope 后，订阅集扩为 **`readyRead` / `aboutToClose` / `destroyed`（设备与 app）/ `aboutToQuit`** 四类，上文"没有 `destroyed`、没有 `aboutToQuit`"两句**已过时**。
+  >
+  > **但本背景的结论不变**：新增的两类只在**对象销毁或应用退出**时发，仍**没有 `errorOccurred`、没有 `disconnected`**——设备消失时四类信号一个都不发，流照样不终止。**D4 因此继续成立**（用例 `NeverSelfTerminatesWhileDeviceIsMissing` 守着这条）。
+
 **② 拔线后 `errorOccurred` 风暴。** 以 **~950 次/秒**连发（1500ms 内 1416 次）；`port->close()` 实测 **0ms** 止住。
 
 ## 决策（Decision）
@@ -72,6 +76,10 @@
   > **依据的校准（2026-08-28，#193 实测）**：本条初稿写"实测：设备重开后读流**立刻吐一个 0 字节切片**"（源自 #186）。**#193 的实现复核未能复现**——去掉那一行 `continue` 后用例仍通过，且加计数探针跑完整个串口用例集（含拔线后）**一次空切片都没观测到**（Qt 5.15 / Linux PTY）。
   >
   > **本决策不变，但依据改为结构性的那一条**：守卫确实缺失，空推送在 `readyRead` 携零字节时必然发生；是否触发依 Qt 版本与设备驱动而异。相应地，`tests/serial_transport_test.cpp` 中该用例的定位是**契约断言**，而非已复现故障的回归——测试注释已写明。
+
+  > **依据的再次校准（AsyncTask `6f42255`，#197 的上游修复）**：**本条赖以立论的"结构性缺口"已在上游补上**——新版 `readyRead` 处理器带 `if(!bytes.isEmpty())`，初次 drain 带 `bytesAvailable() > 0`，与 `corosocket` 就此**两处都有**。上文"空切片是 `coroiodevice` 独有的结构性缺口"**已不再成立**。
+  >
+  > **守卫保留、定位再降一级**：既未复现故障（上一条校准），缺口也已补上，这一行现在**纯粹是契约断言**——守住"调用方不得在 `read_queue` 上取到空 `Datagram`"，且不依赖上游持续满足它。**留着的理由只剩"不把正确性押在上游实现细节上"**，不再是补缺口。#196（实机验证空切片是否真实存在）的前提随之落空，其去留待用户裁决。
 
   故串口读泵须显式 `if (chunk->isEmpty()) continue;`。**UDP/TCP 都不需要这一行**——这是串口独有的一处，且是"照抄样板就会漏"的典型。
 

@@ -38,8 +38,9 @@ namespace transport {
  * - **不自终**(**D1**):`open()` 失败、读流终止与静默超时一律回外层重开、无限重试,
  *   唯一的退出条件是我方 `Close`;底层故障降为诊断事实留在 `LastError()`。
  * - **判活:`silence_timeout` 是唯一主动判据**(**D4**):串口**没有断开事件**——
- *   `coroiodevice::readAll()` **只订阅 `readyRead` 与 `aboutToClose`**(`corosocket::readAll()`
- *   订阅五个,含 socket error 与 `disconnected`,TCP 的断链正是靠它们到达)。写路径
+ *   `coroiodevice::readAll()` 订阅 `readyRead` / `aboutToClose` / `destroyed` / `aboutToQuit`
+ *   四类,**无错误信号、无 `disconnected`**(`corosocket::readAll()` 有这两类,TCP 的断链
+ *   正是靠它们到达);设备消失时那四类一个都不发。写路径
  *   **连判活都做不了**(设备消失后 `write()` 照样成功、`bytesToWrite()` 永不下降),
  *   故判活只能落在读侧。
  * - **`errorOccurred` 是噪声而非事件**(**D11**):拔线后它风暴式连发,故**不订阅它当
