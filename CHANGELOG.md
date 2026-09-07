@@ -8,12 +8,47 @@
 
 ## [Unreleased]
 
+---
+
+## [0.5.1] - 2026-09-07
+
+### 新增：qmake 构建，与 CMake 并存（#232）
+
+- 新增 `transport.pro` 与 `qmake/`（`common.pri` / `fastdds.pri` / `lib` / `gtest` / `tests`），`qmake && make` 产出与 CMake 等价的 `libtransport.a` 与 `transport_tests`。**不改动 `CMakeLists.txt`。**
+- **Fast DDS 同样优雅降级**：`exists()` 探 `FASTDDS_ROOT`（默认 `/usr/local`，可 `qmake FASTDDS_ROOT=...` 覆盖，`CONFIG+=no_fastdds` 强制关闭）；缺席时只丢 `FastDdsProvider`，其余照常构建可测。
+- **AsyncTask 复用上游自带的 `AsyncTask.pri`**，文件清单不重抄；transport 自身零 `Q_OBJECT`，无需 moc。
+- **实测**：两种配置零告警，`--gtest_list_tests` 与 CMake 逐条一致（236 条）；`no_fastdds` 为 225 条，差额 11 条即 `FastDdsProvider`（9）+ `DdsNodeFastDds`（2）两个 suite。
+- **明确接受的代价**：源文件清单从此有两份，须手工同步。两边清单的顺序与注释逐字一致，以便肉眼 diff 发现漂移。
+- **一处需注意**：`common.pri` 清空了 `QMAKE_CXXFLAGS_WARN_ON`，以对齐 `CMakeLists.txt` 不加任何 `-W` 开关的口径。日后若要开 `-Wall -Wextra`，`tests/serial_transport_test.cpp` 中一处 `EXPECT_EQ(unsigned, int)` 的 `-Wsign-compare` 会浮出来。
+
+### 修复：AsyncTask 升至 `6f42255`，串口按代累积的连接泄漏（#197）
+
+- 上游把 `coroiodevice` 迁到 `AutoDisconnect` scope，`untilExpired(awaitable)` 使整组连接随句柄失效而断开。**此前 `aboutToClose` 那条连接既未存入变量也未交给 `bind_close`，永不断开**，且按值捕获 channel 的 `shared_ptr`——`SerialTransport` 每轮设备重开都重建读流，故泄漏随重开次数线性增长。
+- **实测（探针 + 反证）**：以 `QObject::receivers()` 数设备对象上的槽，升级前 `aboutToClose` 槽数按代为 1/2/3/4/6/8/10，`readyRead` 恒为 0（它由 `c1` 追踪、正常断开）；升级后两者恒为 0。仅把 `coroiodevice.hpp` 换回旧版即可复现。
+- **💥 上游 API 变更** `coroiodevice::readAll()` 的返回类型由 `Awaitable<QByteArray>`（按值）改为 `std::shared_ptr<Awaitable<QByteArray>>`，与 `corosocket::readAll()` 就此一致。`SerialTransport` 里那处自行装箱随之删除——**这是本仓库唯一的代码改动**。
+
+### 变更：ADR-0012 D5 的依据消失，守卫降为契约断言
+
+- 新版 `readAll()` 的 `readyRead` 处理器带 `if(!bytes.isEmpty())`、初次 drain 带 `bytesAvailable() > 0`，**D5 赖以立论的"`coroiodevice` 独有的结构性缺口"已由上游补上**；加之 #193 本就未能复现该空切片，读泵里那一行 `continue` 遂由"补上游缺口"降为纯**契约断言**。
+- **守卫保留不动**（#196 由用户明确推迟，待实机验证）；ADR-0012 D5 加补正区块记录前提变化。
+- **D4 不受影响**：新版订阅集扩为 `readyRead` / `aboutToClose` / `destroyed` / `aboutToQuit` 四类，但**仍无错误信号、无 `disconnected`**，设备消失时四类都不发，故"静默超时是串口唯一主动判据"继续成立。
+
+### 修正
+
+- **`version.hpp` 的版本号自 0.4.5 起就没跟着发布走**——`v0.5.0` 那个 tag 上写的也是 `0.4.5`。本次一并修正为 `0.5.1`，`version_test` 同步。
+
 ### 文档
 
 - **重审 SRS 与 SDD，只写当前现状**：清除全部变更叙述、划掉的旧文字、实况标注与含日期的过程括注；撤销的条目整条删除，被推翻的条目改写为当前规则。SRS 894 → 795 行，SDD 1182 → 1086 行。
-- **七张图**清除历史标注与已删组件（图 4-1 的 `CSC_CORE` 一格仍列着已删的 `DropReason` / `Observability` / `ITraceSink` / `Cancellation`）。
-- **README 重写**：去掉路线图与重设计过程记录，改为使用说明。
+- **README 重写**：去掉路线图与重设计过程记录，改为使用说明；`ProtocolNode` 四种交互模式各配时序图与可编译示例。
 - 补两条只存在于代码注释的设计依据进 ADR：服务名不限字符的单射性论证（ADR-0013 D6）、串口固定端点取 `Endpoint::Default()` 而不新增 `Endpoint::Kind` 的否决记录（ADR-0012 D9）。
+- **补完 ADR-0014 的收尾**：上一轮删代码删干净了，文档只清了一部分。本轮清除 SRS §3.1.10（"错误与可观测能力"→"错误处理"，输出面不再承诺计数器与 Trace 事件）、§3.6 完整性整节（原建立在"部分丢弃有归因"的前提上）、§3.6.3（原要求"通过命名丢弃原因计数器验证"）、§3.4.4（标题去掉"计量"，两条孤儿句删除）等九处；**SDD 四处"终结帧归因 `kUnmatchedOrLateResponse`"是事实错误**（该枚举已删，实际行为是终结帧与业务帧处置相同、一律静默丢弃）；SDD 讲 `generation_` 的整节撤销（该成员已删，且原以"Trace 事件归组"为其辩护）；CONTEXT.md 的 `HandlerLoop` 条目删除（该组件随 ADR-0009 D2 已删）。
+- **九张图**清除 `kUnmatchedOrLateResponse` / `kBadFrame` / `Trace 事件` / "归因七项→六项→五项"等残留；`dataflow` 与 `dfd-toplevel` 中原本分叉的两个丢弃节点合并为一个（两者处置已相同）。
+- **修复 `seq-dds-dual-queue.mmd` 自 2026-09-02 起无法渲染**：该次改动引入 `Result&lt;Ticket&gt;`（全仓唯一使用 HTML 实体处），mermaid 解析失败，其 `.svg` 一直停在 09-01。改用仓库通行的 `Result~Ticket~` 写法；18 张图全部重渲染以对齐 mermaid-cli 版本。
+
+### 移除
+
+- 删除 `tests/trace_wiring_test.cpp` 与 `tests/loss_accounting_test.cpp`：二者测的能力本身已随 ADR-0014 撤销（**D3** 明确不留"以后再接"的钩子），且都 `#include` 了已删的头文件，**永远不可能复活**。两者本就不在编译面内，删除不影响构建。
 
 ---
 
