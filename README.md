@@ -12,11 +12,67 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 
 ---
 
+## 目录
+
+- [运行时：一切都在 fiber 里跑](#运行时一切都在-fiber-里跑) —— **先读这一节**
+- [快速开始](#快速开始)
+- [装配三件套](#装配三件套)：[选传输](#1-选传输) · [选 codec](#2-选-codec) · [选 node](#3-选-node)
+- [`ProtocolNode`：四种交互模式](#protocolnode四种交互模式)
+- [订阅入站消息](#订阅入站消息)
+- [`DdsNode`：发布-订阅与请求-响应](#ddsnode发布-订阅与请求-响应)
+- [`Message` 的字段归属](#message-的字段归属)
+- [生命周期与相位规则](#生命周期与相位规则)
+- [错误码](#错误码)
+- [扩展：自定义 codec](#扩展自定义-codec)
+- [内部传输契约（`ITransport`）](#内部传输契约itransport)
+- [构建](#构建)
+- [关键约束](#关键约束)
+
+---
+
+## 运行时：一切都在 fiber 里跑
+
+**这是最容易踩的一步。** 本库的全部等待语义（`RequestFor*`、`await`、`Ticket::Wait`）都建立在 **AsyncTask 的 boost.fiber 协程**之上。它们**必须在 fiber 上下文里调用**——在裸线程上调用 `Coro::await` 会直接崩，不是返回错误。
+
+所以宿主的 `main` 长这样：
+
+```cpp
+#include <QCoreApplication>
+#include "task/fiberapplication.h"   // Coro::installFiberApplication / exec / quit
+#include "task/fibertask.h"          // Coro::makeTask
+
+int main(int argc, char** argv) {
+  QCoreApplication app(argc, argv);     // ① Qt 事件循环（TCP/UDP/串口都靠它）
+
+  Coro::installFiberApplication();      // ② 在主线程装 fiber 调度器
+
+  auto task = Coro::makeTask([&] {      // ③ 业务代码写在 fiber 里
+    RunApplication();                   //    —— 创建传输/节点、收发、关闭都在这里面
+    Coro::quit();                       // ④ 干完让 exec() 返回
+  });
+
+  Coro::exec();                         // ⑤ 跑起来（内部即 app.exec()）
+  (void)task;
+  return 0;
+}
+```
+
+| 记号 | 含义 |
+|---|---|
+| `installFiberApplication()` | 把当前线程变成 fiber 调度器宿主。**在任何 `makeTask` 之前调用一次。** |
+| `makeTask(fn)` | 起一条 fiber 跑 `fn`，返回 `FiberTask<T>` 句柄。**不阻塞。** |
+| `FiberTask::get()` | 让出式 join：等这条 fiber 真正跑完。**这是"可安全析构"的唯一充分条件。** |
+| `Coro::exec()` / `Coro::quit()` | 启动 / 退出事件循环，对应 `QCoreApplication::exec/quit`。 |
+
+**下文所有代码片段都默认身处 ③ 那个 fiber 内。**
+
+> 已有 Qt 事件循环的宿主（GUI 程序等）同样调 `installFiberApplication()`，之后用 `makeTask` 起 fiber 即可；`Coro::exec()` 换成你原本的 `app.exec()`。
+
+---
+
 ## 快速开始
 
 编程主入口是**交互层 node**。传输由**宿主**创建、启动、关闭，节点按引用借用。
-
-### 外部协议：请求-响应（`ProtocolNode`）
 
 ```cpp
 #include "transport/io/tcp/TcpTransport.hpp"
@@ -26,27 +82,156 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 using namespace transport;
 using namespace std::chrono_literals;
 
-TcpConfig cfg;
-cfg.host = "127.0.0.1";
-cfg.port = 9000;
-cfg.silence_timeout = 5000ms;          // 唯一的时间量：等连上 / 读静默 / 重连间隔
+void RunApplication() {                // ← 身处 fiber 内（见上一节）
+  TcpConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 9000;
+  cfg.silence_timeout = 5000ms;        // 唯一的时间量：等连上 / 读静默 / 重连间隔
 
-TcpTransport transport(cfg);
-(void)transport.Start();               // 宿主启动传输
+  TcpTransport transport(cfg);
+  if (!transport.Start()) return;      // 宿主启动传输；配置非法在此返 kConfiguration
 
-ProtocolNode node(transport, std::make_unique<SystemCodec>(), ProtocolNodeConfig{});
-(void)node.Start();
+  ProtocolNode node(transport, std::make_unique<SystemCodec>(), ProtocolNodeConfig{});
+  if (!node.Start()) return;
 
-Message req;
-req.payload = {0x01, 0x02};
-auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
-if (rsp) { /* 用 rsp.value().payload */ }
+  Message req;
+  req.payload    = {0x01, 0x02};
+  req.message_id = 0x10;               // 命令码由调用方给
+  auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
+  if (rsp) { /* 用 rsp.value().payload */ }
 
-node.Close();        node.WaitClosed();      // 先关节点
-transport.Close();   transport.WaitClosed(); // 再关传输
+  node.Close();        node.WaitClosed();      // 先关节点
+  transport.Close();   transport.WaitClosed(); // 再关传输
+}
 ```
 
-### 四种交互模式
+**关闭顺序是有讲究的**：节点借用传输的读流，先关节点再关传输；反过来节点的读循环会先看到流终止而自行收敛，虽然也能收干净，但错误码会变成"传输终止"而非"我方关闭"。
+
+---
+
+## 装配三件套
+
+一个可用的通信端 = **传输** + **codec** + **node**。三者独立选，但有匹配约束。
+
+### 1. 选传输
+
+四种介质，全部实现同一个 `ITransport`。**共性**：`Start()` 起内部泵后即返回（首次连不上/绑不上/打不开**不算启动失败**，泵会无限重试）；**都不自终**，唯一的退出条件是宿主 `Close()`。
+
+#### `TcpTransport` —— 流式，客户端，自动重连
+
+```cpp
+#include "transport/io/tcp/TcpTransport.hpp"
+
+TcpConfig cfg;
+cfg.host            = "192.168.1.10";  // 非空，否则 Start() 返 kConfiguration
+cfg.port            = 9000;            // 非 0，否则 kConfiguration
+cfg.silence_timeout = 5000ms;          // 须为正，否则 kConfiguration
+TcpTransport transport(cfg);
+```
+
+`silence_timeout` **一个量三处用**：等连上 / 读静默判链路坏 / 连不上时的重连退避。重连对上层**完全透明**——节点保持 `Running`，读循环没有断链分支，在途交互不被批量终结。
+
+> **服务端**见 `TcpServer`（`include/transport/io/tcp/TcpServer.hpp`）：每条接受的连接派生一个独立节点。
+
+#### `UdpTransport` —— 报文式，单播 / 组播 / 广播
+
+```cpp
+#include "transport/io/udp/UdpTransport.hpp"
+
+UdpConfig cfg;
+cfg.mode        = UdpMode::kUnicast;   // kUnicast / kMulticast / kBroadcast
+cfg.local_addr  = "0.0.0.0";
+cfg.local_port  = 8000;                // 0 = 由 OS 分配临时端口
+cfg.remote_addr = "192.168.1.255";     // Send() 的默认目的地（单播/广播）
+cfg.remote_port = 9000;
+// cfg.multicast_group = "239.0.0.1";  // 仅 kMulticast：Send() 的默认目的地
+// cfg.ttl             = 1;            // 组播 TTL（hops）
+cfg.silence_timeout = 5000ms;
+UdpTransport transport(cfg);
+```
+
+**保报文边界**，`Datagram::peer` 是**可变**的：读到的是发送方地址，写出的是目的地——故一条 UDP 传输可对多个对端收发。
+
+> ⚠ **UDP 是唯一不校验配置的传输**：它没有 `kConfiguration` 这条路径，`silence_timeout` 非正时**静默兜底为 5s**。TCP 与串口则在 `Start()` 直接拒绝并停在 `Created`。
+
+#### `SerialTransport` —— 流式，单设备，自动重开
+
+```cpp
+#include "transport/io/serial/SerialTransport.hpp"
+
+SerialConfig cfg;
+cfg.device          = "/dev/ttyUSB0";  // 非空，否则 kConfiguration
+cfg.baud_rate       = 115200;          // 非 0
+cfg.data_bits       = 8;               // 5 / 6 / 7 / 8
+cfg.stop_bits       = 1;               // 1 或 2
+cfg.parity          = 'N';             // 'N' / 'E' / 'O'（大小写均可）
+cfg.silence_timeout = 5000ms;          // 须为正
+SerialTransport transport(cfg);
+```
+
+> ⚠ **`silence_timeout` 必须按协议特征配**。串口**没有断开事件**，读静默超时是判"链路坏了"的**唯一**主动判据。缺省 5s 适合"周期性上报"类协议；**"长时间静默、偶发指令"类协议必须调大**，否则会周期性地无谓重开设备。
+
+`peer` **恒为固定设备端点**（`Endpoint::Default()`），写侧忽略调用方填的 `peer`。
+
+#### `DdsTransport` —— 按 topic 收发
+
+```cpp
+#include "transport/io/dds/DdsTransport.hpp"
+
+DdsConfig cfg;
+cfg.domain_id = 0;                     // [0, 232]
+cfg.provider  = "fastdds";             // "fake"（进程内，恒可用）/ "fastdds"（需装 Fast DDS）
+cfg.qos.reliability      = DdsQos::Reliability::kReliable;
+cfg.qos.durability       = DdsQos::Durability::kVolatile;
+cfg.qos.history_depth    = 10;
+cfg.qos.max_blocking_time = 100ms;     // 须为正
+cfg.qos.liveliness_lease  = 2000ms;    // 须为正；不可省，否则对端被硬杀要等 20s 才检出
+DdsTransport transport(cfg);
+```
+
+**QoS 统一一套**，声明端点时不再带 QoS 参数。测试里把 `provider` 换成 `"fake"` 即可全程离线跑，不需要装 Fast DDS。
+
+> ⚠ **`max_blocking_time` 不是关闭路径的最坏等待。** `Publish` 的阻塞主要来自**同进程订阅方的交付回调在发布线程上同步执行**（Fast DDS 默认 `INTRAPROCESS_FULL`），该项根本不参与。关闭时的最坏等待**没有上界**，由同进程内最慢的那个订阅回调决定。
+
+### 2. 选 codec
+
+**codec 必须和介质的分帧特性匹配**——把流式 codec 装到 UDP 上会出错。
+
+| codec | 形态 | 配哪种介质 | 干什么 |
+|---|---|---|---|
+| `SystemCodec` | **有状态·流式** | TCP / 串口 | 外部协议完整帧：头标志 + 帧类型 + CRC + 长度。跨切片拼帧，坏帧逐字节重同步。 |
+| `SystemDatagramCodec` | 无状态·报文 | UDP | 同一套帧格式的**报文版**：只解本报文内的整帧，残留直接丢弃，**零跨报文状态**（多对端安全）。 |
+| `LengthFieldCodec` | 有状态·流式 | TCP / 串口 | 通用「固定 header + 长度字段」分帧，`payload` 透传。不解释帧内语义。 |
+| `DatagramCodec` | 无状态·报文 | UDP | 直通：整段字节即一条 `kOneway` 消息。 |
+| `DdsCodec` | 无状态 | DDS | 每 sample 一条完整消息，携带 `kind` / `correlation_id` / `reply_to`。 |
+
+**选择规则**：字节流介质（TCP / 串口）→ 流式 codec；报文介质（UDP / DDS）→ 无状态 codec。**把有状态的 `SystemCodec` 装到 UDP 上，跨报文残留会污染下一个对端的解码。**
+
+```cpp
+// 外部协议 over TCP
+ProtocolNode node(tcp,  std::make_unique<SystemCodec>(),         ProtocolNodeConfig{});
+// 外部协议 over UDP
+ProtocolNode node(udp,  std::make_unique<SystemDatagramCodec>(), ProtocolNodeConfig{});
+```
+
+`SystemCodec` / `SystemDatagramCodec` 的 CRC 算法经构造注入（`CrcFn`），**默认是占位的 CRC16-CCITT**；真实对接时须替换成外部协议规定的算法，两端一致。`FrameType` 的枚举值同样是**占位字节值**，须改成协议规定的真实值。
+
+### 3. 选 node
+
+| node | 交互 | 配哪种传输 |
+|---|---|---|
+| `ProtocolNode` | 外部协议：`Send` + 三种请求-响应 | TCP / UDP / 串口 |
+| `DdsNode` | 发布-订阅 + 按服务名的请求-响应 | DDS |
+
+```cpp
+ProtocolNodeConfig ncfg;
+ncfg.protocol_id = 0x01;               // 节点盖在每一帧上的外部系统 id
+ProtocolNode node(transport, std::make_unique<SystemCodec>(), ncfg);
+```
+
+---
+
+## `ProtocolNode`：四种交互模式
 
 `RetryPolicy{timeout, max_attempts}` **逐次传参**，节点配置面上没有任何时限缺省值；`timeout` 须为正、`max_attempts` 须 ≥ 1（**含首发**），否则返 `kInvalidArgument`。
 
@@ -144,7 +329,9 @@ auto result = node.RequestForResultDirect(std::move(req),
 
 由此**要求对端能容忍重复命令**（幂等，或自行按 `session_id` 去重）。这是**协议层假设，框架不校验**。
 
-### 订阅入站消息
+---
+
+## 订阅入站消息
 
 节点只交出**凭据**，消费在调用方自己的 fiber 上：
 
@@ -165,9 +352,25 @@ auto worker = Coro::makeTask([&] {
 (void)worker.get();                   // 宿主自己 join，勿依赖 WaitClosed
 ```
 
-订阅键的具名工厂：`ResponseTo(request)` / `FrameOf(session_id, message_id, type)` / `AnyOfType(type)`；不参与匹配的字段填 `kAny`。**一条消息投给全部键匹配的订阅者，各得一份副本。**
+订阅键的具名工厂：
 
-### DDS：发布-订阅与请求-响应（`DdsNode`）
+| 工厂 | 匹配 |
+|---|---|
+| `ResponseTo(request)` | 该请求的应答帧（`session_id` + `message_id` + `kResponse`） |
+| `FrameOf(session_id, message_id, type)` | 三字段精确匹配；任一字段可填 `kAny` |
+| `AnyOfType(type)` | 只按帧类型，另两字段通配 |
+
+不参与匹配的字段填 **`kAny`**——它以 `std::optional` 的空状态表达，**不占用字段值域**，故 `session_id` 这种 0..255 全用满的字段照样能通配；`kAny` 与"该字段须等于 0"是两种不同的约束。
+
+**一条消息投给全部键匹配的订阅者，各得一份副本**——故支持多消费者与旁路监听。投递份数为 0 时静默丢弃。
+
+`Ticket` 是 **move-only 的 RAII 句柄**：析构即注销订阅。同一凭据可多次 `Wait()`，故一次交互需分段等待多条报文时，各段各自设定时限。
+
+> ⚠ **信箱满时静默丢弃队首最旧值**，且**不可观测**。消费 fiber 要跟得上投递速度。
+
+---
+
+## `DdsNode`：发布-订阅与请求-响应
 
 topic 由**注册接口**给出，且只在 `Start()` 之前受理：
 
@@ -216,7 +419,8 @@ auto worker = Coro::makeTask([&] {
 // —— 发布-订阅 ——
 (void)node.Publish("telemetry", msg);
 
-auto sub = node.Subscribe(TopicKey{"telemetry"}, KindKey{MessageKind::kNotify});
+auto sub = node.Subscribe(DdsNode::TopicKey{"telemetry"},   // 两个键都是 DdsNode 的嵌套别名
+                          DdsNode::KindKey{MessageKind::kNotify});
 auto notes = std::move(sub).value();      // 消费同上：自己起 fiber 循环 Wait
 ```
 
@@ -225,6 +429,153 @@ auto notes = std::move(sub).value();      // 消费同上：自己起 fiber 循�
 **相位规则**：四个注册方法**只在 `Created`** 受理，`Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` **只在 `Running`** 受理。全流程即「注册 → `Start()` → 订阅/收发」。
 
 > ⚠ 框架占用 `cfg.*.request` / `cfg.*.response` 这一命名空间：它与 `RegisterPublishers` / `RegisterSubscribers` 收的普通 topic 处在同一平面，`RegisterSubscribers({"cfg.get.request"})` 与 `RegisterServices({"get"})` 指的是同一条 topic。框架不拦。
+
+**同一个服务名不能同时注册为 client 和 service**（两个方向都会被拒），否则节点会自己收自己的请求。
+
+`DdsNodeConfig::uuid_override` 只为**测试**而设：`correlation_id = "<uuid>#<序号>"`，生产留空即每节点随机一个 uuid；测试填固定值才能断言具体的 `correlation_id`。
+
+### 换 provider
+
+```cpp
+#include "transport/io/dds/DdsProviderRegistry.hpp"
+
+// 内建两个："fake"（进程内总线，恒可用）与 "fastdds"（仅在装了 Fast DDS 时存在）
+DdsProviderRegistry::RegisterProvider("mine", []{ return std::make_unique<MyProvider>(); });
+cfg.provider = "mine";
+```
+
+单元测试用 `"fake"` 可全程离线跑，且**同一进程内的多个 `DdsNode` 通过共享总线互通**——不需要真实 DDS 也能测完整的请求-响应链路。
+
+---
+
+## `Message` 的字段归属
+
+一条 `Message` 同时携带 payload 与交互元数据。**元数据分两套，按路径取用，互不干扰**——用错路径的字段不会报错，只会不起作用。
+
+```cpp
+struct Message {
+  std::vector<uint8_t> payload;   // 应用字节，框架不解读其语义
+  std::string topic;              // 操作/通道名（DDS = topic）
+  std::string source;             // 来源标识，【由框架填】：UDP = "ip:port"、DDS = topic
+  int64_t     timestamp = 0;      // 预留，本库未用
+
+  // ── DDS 路径（DdsCodec 上线缆）──
+  MessageKind kind = MessageKind::kOneway;
+  std::string correlation_id;     // 配对请求↔应答；【框架盖】
+  std::string reply_to;           // 应答回送目的 topic；【框架盖】
+
+  // ── 外部协议路径（SystemCodec 上线缆）──
+  FrameType frm_type    = FrameType::kUnknown;  // 【框架盖】
+  uint8_t   protocol_id = 0;                    // 【框架盖】取自 ProtocolNodeConfig
+  uint8_t   session_id  = 0;                    // 【框架盖】滚动 0–255
+  uint16_t  message_id  = 0;                    // 【调用方填】命令码
+};
+```
+
+**调用方只需要填 `payload` 与 `message_id`**（DDS 路径则是 `payload`）；标了【框架盖】的字段由节点填，手填会被覆盖。
+
+`MessageKind`（DDS）：`kOneway` / `kRequest` / `kReply` / `kFeedback` / `kNotify`。
+`FrameType`（外部协议）：`kCommand` / `kResponse` / `kResult` / `kState` / `kHeartbeat`——**枚举值是占位的**，真实对接时改成协议规定的字节值。
+
+> ⚠ `session_id` 是 `uint8`，**滚动复用、不做冲突检测**。在途交互超过 256 条时标识会重复，一条应答将同时投给两个订阅者。协议若有此量级并发，须在关联键里引入更宽的区分字段。
+
+---
+
+## 生命周期与相位规则
+
+传输与节点共用同一套三段式：
+
+```cpp
+Start();        // 起内部 fiber 后【即返回】，不等首次连上
+Close();        // 【只发信号，不等待】。幂等，任何 fiber 都可调（含节点自己的读循环）
+WaitClosed();   // join 全部内部 fiber。返回即【可安全析构】
+```
+
+- **`Start()` 不等连上**：首次 connect/bind/open 失败**不算启动失败**，泵会退避后无限重试。真正的启动失败只有"配置非法"（TCP/串口/DDS 返 `kConfiguration` 并**停在 `Created`**，允许改配重试）。
+- **`Close()` 不含等待点**，故订阅消费 fiber 可以直接调它关掉自己所属的节点。
+- **`WaitClosed()` 不设时限也不返回结果**：`Awaitable::close()` 只保证唤醒等待者，而"可安全释放"要求 fiber 已跑完，只有 `FiberTask::get()` 给得了。
+- **`WaitClosed()` 不保证你自己的消费 fiber 已退出**——它只 join 框架内部的 fiber。宿主起的 worker 须自己 `get()`。
+
+**方法的相位要求**：
+
+| 方法 | 只在此相位受理 | 否则返回 |
+|---|---|---|
+| `DdsNode::RegisterPublishers` / `Subscribers` / `Clients` / `Services` | `Created`（即 `Start()` **之前**） | `kInvalidState` |
+| `ProtocolNode::Subscribe` / 三个 `RequestFor*` / `Send` | `Running` | `kClosed` |
+| `DdsNode::Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` | `Running` | `kClosed` |
+
+`kClosed` 一码覆盖**未启动 / 关闭中 / 已关闭**三种情形——对调用方而言事实相同：这个节点现在不接活。
+
+> **一条传输可被多个节点共用**，各得全量副本；但**任一节点关闭即终结整条读流**（`Awaitable::close()` 整流传播，有意为之），不支持独立关停——共用的诸节点须一起关。
+
+---
+
+## 错误码
+
+预期失败一律走 `Coro::Result<T>`（`[[nodiscard]]`）**不抛异常**。`Result` 转 `bool` 即成败，`.value()` 取值，`.error()` 取 `std::error_code`。
+
+```cpp
+auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
+if (!rsp) {
+  if (rsp.error() == make_error_code(TransportErrc::kNotAccepted)) { /* 对端没受理 */ }
+  else if (rsp.error() == make_error_code(TransportErrc::kTimeout)) { /* 受理了但没出结果 */ }
+}
+```
+
+| 错误码 | 调用方该怎么理解 |
+|---|---|
+| `kInvalidArgument` | 参数不合法（`timeout` 非正、`max_attempts` < 1、`reply_to` 交叉校验不符）。**改参数重试。** |
+| `kInvalidState` | 相位不对（如 `Start()` 之后再注册 topic）。 |
+| `kConfiguration` | 配置非法，或用了未注册的 topic / 服务名。传输**停在 `Created`**，改配可重试。 |
+| `kConnection` | 链路层失败。**通常不用处理**——泵会自己重连/重开，这只是诊断事实。 |
+| `kClosed` | 节点或传输已关闭 / 未启动。 |
+| `kTimeout` | **已受理但没等到结果**；或链路读静默超时。 |
+| `kNotAccepted` | **对端始终没有受理**：重发次数耗尽仍无受理帧。与 `kTimeout` 语义相对。 |
+| `kFrame` / `kCodec` | 分帧或编解码失败。 |
+| `kIo` | 读写故障、线路噪声。 |
+| `kResourceExhausted` / `kUnsupported` / `kCancelled` / `kInternal` | 分别为资源耗尽、不支持的操作、已取消、内部不变量破坏。 |
+
+**`kNotAccepted` 与 `kTimeout` 的分野是本库最要紧的一对**：前者说明命令根本没被对端接住（可以安全重发），后者说明对端**正在执行或已执行**（重发有重复执行的风险）。
+
+---
+
+## 扩展：自定义 codec
+
+codec 是**公共扩展点**。实现两个方法即可：
+
+```cpp
+#include "transport/codec/ICodec.hpp"
+
+class MyCodec : public transport::ICodec {
+ public:
+  // 一条 Message → 一帧线缆字节
+  Coro::Result<std::vector<uint8_t>> Encode(const transport::Message& msg) override {
+    std::vector<uint8_t> out = BuildFrame(msg);
+    if (out.empty()) return transport::make_error_code(transport::TransportErrc::kCodec);
+    return out;
+  }
+
+  // 一段收到的字节 → 0..N 条完整 Message
+  Coro::Result<std::vector<transport::Message>> Decode(const uint8_t* data,
+                                                       std::size_t len) override {
+    buffer_.insert(buffer_.end(), data, data + len);   // 流式：自行维护滚动缓冲
+    std::vector<transport::Message> out;
+    ScanCompleteFrames(buffer_, out);                  // 扫出整帧，残留留在 buffer_
+    return out;                                        // 【扫不出整帧就返回空成功】
+  }
+
+ private:
+  std::vector<uint8_t> buffer_;
+};
+```
+
+三条纪律：
+
+1. **`Decode` 扫不出完整帧时返回空成功，不是错误**——字节流本来就会切在半帧处。
+2. **返回错误意味着"这段字节坏了"**，节点会静默丢弃并继续读；坏帧的重同步（前移重扫）由 codec 自己负责。
+3. **报文式介质（UDP）的 codec 不得跨报文保留状态**——多对端场景下，上一个对端的残留会污染下一个对端的解码。
+
+装配时 `std::make_unique<MyCodec>()` 传给节点构造函数，节点取得所有权。
 
 ---
 
@@ -253,34 +604,65 @@ class ITransport {
 
 `Datagram{bytes, peer}` 读写共用：读到的 `peer` 是发送方，写出的 `peer` 是目的地（`Endpoint::Default()` 表示"发往本传输配置的默认对端"，故传输无关的调用方恒可传它）。
 
-`WaitClosed()` 不设时限也不返回结果：`Awaitable::close()` 只保证唤醒等待者，而"可安全释放"要求 fiber 已跑完，只有 `FiberTask::get()` 给得了。
-
-> **一条传输可被多个节点共用**，各得全量副本；但**任一节点关闭即终结整条读流**（`Awaitable::close()` 整流传播，有意为之），不支持独立关停——共用的诸节点须一起关。
+`Datagram` 的读写不对称与 fire-and-forget 语义见上；生命周期三段式见[生命周期与相位规则](#生命周期与相位规则)。
 
 ---
 
 ## 构建
 
+**两套构建并存，产物等价**：单一 `transport` 静态库 + 单一 `transport_tests` 可执行文件。C++17，目标平台 Linux。
+
 ```bash
 git submodule update --init --recursive third_party/AsyncTask
+```
+
+### CMake
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-**前置依赖：**
+显式禁用 DDS：`cmake -S . -B build -DCMAKE_DISABLE_FIND_PACKAGE_fastdds=ON`
 
-- **Qt5**（5.12+；Core / Network / SerialPort，如 `libqt5serialport5-dev`）
-- **AsyncTask**（boost.fiber 协程运行时，`third_party/AsyncTask` 子模块）+ 已编译 boost `fiber/context/thread/chrono`。子模块未初始化时 configure 直接 `FATAL_ERROR`
-- **Fast DDS 3.6.1**（唯一可选外部依赖）：未装时 `find_package` 自动跳过 `FastDdsProvider`，其余能力照常构建可测；装后自动启用（带 `TRANSPORT_HAS_FASTDDS`）
+### qmake
 
-显式禁用 DDS：
+推荐 shadow build（qmake 默认 in-source，会把中间产物撒进源码树）：
 
 ```bash
-cmake -S . -B build -DCMAKE_DISABLE_FIND_PACKAGE_fastdds=ON
+mkdir build-qmake && cd build-qmake
+qmake ../transport.pro && make -j$(nproc)
+./bin/transport_tests
 ```
 
-GoogleTest vendored 在 `third_party/`。产物为**单一 `transport` 静态库**与**单一 `transport_tests` 可执行文件**（全部用例在 AsyncTask fiber 调度器内跑）。C++17，目标平台 Linux。
+可选开关：
+
+```bash
+qmake FASTDDS_ROOT=/opt/fastdds ../transport.pro   # 换 Fast DDS 探测前缀（默认 /usr/local）
+qmake CONFIG+=no_fastdds ../transport.pro          # 强制不编 FastDdsProvider
+qmake CONFIG+=debug ../transport.pro               # Debug（qmake 默认 release）
+```
+
+工程文件收在 `qmake/` 下，根 `transport.pro` 是 Qt Creator 的入口。
+
+> ⚠ **源文件清单有两份**（`CMakeLists.txt` 与 `qmake/*/*.pro`），增删 `.cpp` 须同时改。两边的清单顺序与注释逐字一致，便于肉眼 diff 发现漂移。
+
+### 前置依赖
+
+- **Qt5**（5.12+；Core / Network / SerialPort，如 `libqt5serialport5-dev`）
+- **AsyncTask**（boost.fiber 协程运行时，`third_party/AsyncTask` 子模块）+ 已编译 boost `fiber` / `context` / `thread` / `chrono`。子模块未初始化时构建直接报错
+- **Fast DDS 3.6.1**（**唯一可选**外部依赖）：未装时自动跳过 `FastDdsProvider`，其余能力照常构建可测（用例数 236 → 225）；装后自动启用并定义 `TRANSPORT_HAS_FASTDDS`
+- **GoogleTest** 已 vendored 在 `third_party/`，无需自备
+
+### 链接到你的工程
+
+```cmake
+add_subdirectory(path/to/transport)
+target_link_libraries(your_app PRIVATE transport)
+```
+
+`transport` 已 PUBLIC 传递 AsyncTask、Qt5 与 boost 的用法要求，无需重复声明。
 
 ---
 

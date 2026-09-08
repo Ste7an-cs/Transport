@@ -26,8 +26,9 @@ struct TcpConfig {
   /// 唯一的时间量,三处共用:等连上 / 读静默判链路坏 / 连不上时的重连间隔。
   ///
   /// **须为正**(D14)——它同时是退避间隔,零值退化为紧循环(对端主机在而端口未监听时
-  /// 内核立即回 RST,`connect` 微秒级失败,烧 CPU 且向对端刷 SYN)。故 TCP **不设**
-  /// UDP 那档"0 = 禁用静默判活",非正值由 `Start()` 直接拒绝。
+  /// 内核立即回 RST,`connect` 微秒级失败,烧 CPU 且向对端刷 SYN)。非正值由 `Start()` 直接拒绝
+  /// (返 `kConfiguration` 并停在 `Created`)。**这一点与 UDP 不同**——`UdpTransport`
+  /// 不校验配置,非正值静默兜底为 5s。
   std::chrono::milliseconds silence_timeout{5000};
 };
 
