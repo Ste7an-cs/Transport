@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+### 文档
+
+- **README 补完使用说明**（306 → 689 行）。补的都是"照着原 README 写不出能跑的程序"的缺口：
+  - **新增「运行时：一切都在 fiber 里跑」并置于首节**——原快速开始直接调 `node.RequestForResponse(...)`，**照抄会崩**（本库全部等待语义建立在 boost.fiber 上，必须在 fiber 上下文里调用），而全文未提运行时如何装配。现给出 `QCoreApplication` + `installFiberApplication` + `makeTask` + `exec`/`quit` 的完整 `main` 骨架。
+  - **四种传输的完整配置**（原文只有 `TcpConfig` 三个字段，UDP 与串口完全缺席）；记下一条真实差异：**UDP 是唯一不校验配置的传输**，`silence_timeout` 非正时静默兜底 5s，而 TCP/串口在 `Start()` 返 `kConfiguration` 并停在 `Created`。
+  - **codec 选型表**（原文未说如何选）：五个 codec 按流式/报文分类与匹配规则，点明"把有状态的 `SystemCodec` 装到 UDP 上，跨报文残留会污染下一个对端的解码"。
+  - **`Message` 字段归属**、**生命周期与相位规则**（含 `WaitClosed()` 不 join 宿主自建 worker）、**14 个 `TransportErrc` 的调用方语义**（重点标 `kNotAccepted` 与 `kTimeout` 这一对：能否安全重发的分界）、**自定义 `ICodec` 的三条纪律**、**qmake 构建**与"链接到你的工程"。
+
+### 修正
+
+- **README 既有的示例编译不过**：`node.Subscribe(TopicKey{...}, KindKey{...})` —— 两者是 `DdsNode` 的**嵌套**别名，须写 `DdsNode::TopicKey`。
+- **`TcpConfig` 与 `SerialConfig` 的注释写反**：二者都称"不设 `UdpConfig` 那档 `0 = 禁用静默判活`"，但 `UdpConfig` 根本没有这一档（`UdpTransport` 不校验配置，非正值兜底 5s，见 `UdpTransport.cpp:131`）。两处改为陈述真实差异。
+
+> 上述两处错误由**把 README 全部代码片段原样搬进校验 TU 编译**（`-fsyntax-only`，含 FastDDS 开关）查出；该校验现已通过，文中每个类型、字段与方法签名都与代码对得上。
+
 ---
 
 ## [0.5.1] - 2026-09-07
