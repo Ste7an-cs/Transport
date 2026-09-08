@@ -24,6 +24,7 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 - [生命周期与相位规则](#生命周期与相位规则)
 - [错误码](#错误码)
 - [扩展：自定义 codec](#扩展自定义-codec)
+- [扩展：新建一个 node](#扩展新建一个-node) —— 交互方式变了的时候
 - [内部传输契约（`ITransport`）](#内部传输契约itransport)
 - [构建](#构建)
 - [关键约束](#关键约束)
@@ -576,6 +577,162 @@ class MyCodec : public transport::ICodec {
 3. **报文式介质（UDP）的 codec 不得跨报文保留状态**——多对端场景下，上一个对端的残留会污染下一个对端的解码。
 
 装配时 `std::make_unique<MyCodec>()` 传给节点构造函数，节点取得所有权。
+
+---
+
+## 扩展：新建一个 node
+
+### 先判断：你真的需要新 node 吗？
+
+| 你的情况 | 该做什么 |
+|---|---|
+| 线缆格式不同，但交互仍是"发命令 → 等受理 → 等结果" | **只写 codec**，复用 `ProtocolNode` |
+| 换了介质（TCP → 串口 → UDP） | **什么都不用写**，换个传输实例即可 |
+| 关联键不同（不是 `session_id`+`message_id`+`frm_type`） | **新建 node** |
+| 交互步数/终结条件不同（如三段式、需中间反馈、需显式 ACK 才算完成） | **新建 node** |
+| 寻址方式不同（如按服务名派生 topic） | **新建 node**（`DdsNode` 即这一类） |
+
+判据是**交互语义**，不是线缆格式，也不是介质。
+
+### 三个基座直接复用，不要重写
+
+| 基座 | 给你什么 | 你不用再操心 |
+|---|---|---|
+| `NodeBase` | 幂等 `Start()` / 只发信号的 `Close()` / join 式 `WaitClosed()` / `IsRunning()` | 相位机、启动与关闭的竞态（含 `DoStart()` 期间 `Close()` 到来这一格）、幂等性 |
+| `Dispatcher<T, Fields...>` | 按键的多字段部分匹配、`kAny` 通配、一条消息投给全部匹配者、move-only `Ticket` | 挂起表、恰好一次完成、关闭时唤醒全部等待者 |
+| `ITransport` | 四种介质同一个契约 | 连接管理、重连/重开、读写队列 |
+
+**这三样都是协议无关的**，新协议不需要、也不应该改动它们。`NodeBase` 本身不 include 任何协议或消息类型。
+
+### 你要写的四件
+
+#### ① 关联键：字段 + 提取函数
+
+选出"哪几个字段决定一条入站消息该投给谁"，实例化 `Dispatcher`：
+
+```cpp
+// 例：某协议按 (设备地址, 事务号, 操作码) 关联
+using MyDispatcher = Dispatcher<Message, std::uint16_t, std::uint32_t, std::uint8_t>;
+
+MyDispatcher dispatcher{[](const Message& m) {           // KeyOf：给出各字段的具体值
+  return std::make_tuple(DeviceOf(m), TxnOf(m), OpOf(m));
+}};
+```
+
+字段顺序即键的顺序；订阅时不参与匹配的字段填 `std::nullopt`（即 `kAny`）。
+
+#### ② 具名键工厂
+
+别让调用方手拼 `std::optional`，给出语义化的工厂（对照 `ResponseTo` / `FrameOf` / `AnyOfType`）：
+
+```cpp
+MyDispatcher::Key ReplyTo(const Message& req) {
+  return {DeviceOf(req), TxnOf(req), kReplyOp};
+}
+MyDispatcher::Key AnyFrom(std::uint16_t device) {
+  return {device, std::nullopt, std::nullopt};   // 后两字段通配
+}
+```
+
+#### ③ 三个生命周期钩子
+
+照抄这个形状即可——**协议无关的部分它们已经替你处理了**：
+
+```cpp
+Coro::Result<void> MyNode::DoStart() {
+  // 配置校验放在【本钩子开头】，不单设 ValidateConfig()。
+  if (!ConfigOk(config_)) return make_error_code(TransportErrc::kConfiguration);
+
+  rx_ = transport_.AsyncRead()->shared();   // 取本节点自己的读订阅
+  SpawnReadLoop();                          // spawn 读-分发循环
+  return {};                                // 返回成功后由【基类】置 Running
+}
+
+Coro::Result<void> MyNode::DoClose() {      // 【只发信号，一个等待点都不许有】
+  if (rx_) {
+    rx_->close(make_error_code(TransportErrc::kClosed));
+    rx_->channel()->discard_pending();
+  }
+  dispatcher_.CloseAll(make_error_code(TransportErrc::kClosed));
+  return {};
+}
+
+void MyNode::DoJoin() {                     // 等自己 spawn 的每一条 fiber 真正退出
+  if (read_task_) (void)read_task_->get();
+}
+```
+
+**`DoStart()` 失败时必须保证一条 fiber 都没 spawn**——基类会退回 `Created` 让宿主改配重试。
+
+#### ④ 读-分发循环 + 交互方法
+
+读循环是固定形状，跟着抄：
+
+```cpp
+void MyNode::SpawnReadLoop() {
+  read_task_ = std::make_shared<Coro::FiberTask<void>>(Coro::makeTask([this] {
+    while (true) {
+      auto datagram = Coro::await(rx_);
+      if (!datagram) break;                 // 我方 Close，或传输终结 —— 都该收敛
+      DecodeAndDispatch(std::move(datagram).value());
+    }
+    (void)Close();   // 【无条件】调公开的 Close()：我方关闭时是幂等空操作，
+                     // 传输终结时即自终。Close 不含等待点，故在本 fiber 内调用安全。
+  }));
+}
+
+void MyNode::DecodeAndDispatch(Datagram d) {
+  auto decoded = codec_->Decode(d.bytes.data(), d.bytes.size());
+  if (!decoded) return;                     // 坏帧：静默丢弃，继续读
+  for (const auto& m : decoded.value()) {
+    (void)dispatcher_.Dispatch(m);          // 返 0 = 无人认领 → 静默丢弃
+  }
+}
+```
+
+交互方法则是你的协议语义所在。以"发命令 → 等回执"为例：
+
+```cpp
+Coro::Result<Message> MyNode::Invoke(Message req, RetryPolicy retry) {
+  if (!IsRunning()) return make_error_code(TransportErrc::kClosed);      // 相位判定
+  if (retry.timeout <= 0ms || retry.max_attempts < 1)
+    return make_error_code(TransportErrc::kInvalidArgument);
+
+  Stamp(req);                                          // 盖上协议字段
+  auto ticket = dispatcher_.Subscribe(ReplyTo(req));   // 【先登记订阅、再发出请求】
+
+  for (int attempt = 0; attempt < retry.max_attempts; ++attempt) {
+    if (auto sent = EncodeAndWrite(req); !sent) return sent.error();
+    auto reply = ticket.Wait(retry.timeout);
+    if (reply) return reply;                           // 命中即终结
+    if (reply.error() == make_error_code(TransportErrc::kClosed))
+      return reply.error();                            // 节点关闭：立刻退出，别再重发
+  }
+  return make_error_code(TransportErrc::kNotAccepted);
+}
+```
+
+### 必须守住的纪律
+
+这几条是踩过的坑，新 node 一条都不能漏：
+
+1. **先登记订阅，再发出请求。** 反过来则回应可能先于订阅到达而被丢弃。
+2. **`DoClose()` 里不许有任何等待点。** 它可能在节点**自己的读循环 fiber** 内被调用（读循环末尾那句 `Close()`），有等待点就会自己等自己。等待属于 `DoJoin()`。
+3. **析构函数必须在「本类」函数体内 `Close()` + `WaitClosed()`。**
+   ```cpp
+   MyNode::~MyNode() { (void)Close(); WaitClosed(); }
+   ```
+   不能指望 `NodeBase` 的析构——那时子类已析构完毕、虚派发已退回基类（纯虚 ⇒ UB）。
+4. **读循环结束后无条件调公开的 `Close()`**，让"传输终结"能自动收敛节点。
+5. **相位判定用 `IsRunning()`**，未启动/关闭中/已关闭一律返 `kClosed`（三者对调用方是同一件事：这个节点现在不接活）。需要区分 `Created` 与 `Closed` 时（如"只在 `Start()` 之前受理"的注册接口）才用 protected 的 `CurrentLifecycle()`。
+6. **节点不管传输的生命周期**：`transport_` 是**借用**的引用，宿主创建、`Start()`、`Close()`，节点绝不碰。宿主须保证传输寿命长于节点。
+7. **不要往 `NodeBase` 里加协议类型。** 协议语义内联在你自己的 node 里，不下沉为框架级共享 policy——这是本库刻意不设"共享交互引擎"的原因。
+
+### 装到框架里
+
+新 node 只需继承 `NodeBase`，无需注册到任何地方；宿主直接构造使用。测试可用 `FakeDdsProvider` 那种进程内替身，或直接拿两个节点对接同一条 loopback 传输。
+
+`ProtocolNode`（`src/node/ProtocolNode.cpp`，~400 行）与 `DdsNode`（`src/node/DdsNode.cpp`）是两个完整样板：前者是"外部协议 + 三段交互"，后者是"服务名派生 topic + 两段式 `correlation_id`"。**两者共用的只有 `NodeBase` 与 `Dispatcher`，协议语义各自内联**——这正是新增协议时该复制的关系，而不是去抽一个公共交互层。
 
 ---
 

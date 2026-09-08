@@ -15,6 +15,7 @@
   - **四种传输的完整配置**（原文只有 `TcpConfig` 三个字段，UDP 与串口完全缺席）；记下一条真实差异：**UDP 是唯一不校验配置的传输**，`silence_timeout` 非正时静默兜底 5s，而 TCP/串口在 `Start()` 返 `kConfiguration` 并停在 `Created`。
   - **codec 选型表**（原文未说如何选）：五个 codec 按流式/报文分类与匹配规则，点明"把有状态的 `SystemCodec` 装到 UDP 上，跨报文残留会污染下一个对端的解码"。
   - **`Message` 字段归属**、**生命周期与相位规则**（含 `WaitClosed()` 不 join 宿主自建 worker）、**14 个 `TransportErrc` 的调用方语义**（重点标 `kNotAccepted` 与 `kTimeout` 这一对：能否安全重发的分界）、**自定义 `ICodec` 的三条纪律**、**qmake 构建**与"链接到你的工程"。
+  - **新增「扩展：新建一个 node」**（落地 SRS `RT_DESIGN_008` 的可扩展性要求）：先给"要不要新建 node"的判据表——**判据是交互语义，不是线缆格式也不是介质**（只换格式写 codec 即可，换介质什么都不用写）；再列三个直接复用的基座（`NodeBase` / `Dispatcher` / `ITransport`）与要自己写的四件（关联键与提取函数、具名键工厂、三个生命周期钩子、读-分发循环与交互方法），附完整骨架代码；最后是七条必须守住的纪律（先订阅后发送、`DoClose()` 不许有等待点、析构须在本类体内 `Close()`+`WaitClosed()`、读循环末尾无条件 `Close()` 等）。
 
 ### 修正
 
