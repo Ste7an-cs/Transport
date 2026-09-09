@@ -39,6 +39,9 @@ class FastDdsProvider : public IDdsProvider {
   void         Shutdown() override;
   /// 当场建出该 topic 的 `DataWriter`(D13);幂等。
   Coro::Result<void> DeclareWriter(const std::string& topic) override;
+  /// 删掉该 topic 的 `DataWriter`(ADR-0015 D4);幂等。**会等在途 `Publish` 跑完**
+  /// ——`write()` 在锁外阻塞,不等就是 use-after-free(与 `Shutdown` 同一处理)。
+  Coro::Result<void> UndeclareWriter(const std::string& topic) override;
   /// **可阻塞**:RELIABLE 准入满时 park 调用线程至多一个 `max_blocking_time`(D13)。
   /// topic 须已 `DeclareWriter`,否则返 `kConfiguration`(**不惰性建**)。
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;

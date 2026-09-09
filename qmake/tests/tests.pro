@@ -76,7 +76,8 @@ SOURCES += \
     $$TRANSPORT_ROOT/tests/dds/fake_dds_provider_test.cpp \
     $$TRANSPORT_ROOT/tests/dds/dds_registry_test.cpp \
     $$TRANSPORT_ROOT/tests/dds/dds_transport_test.cpp \
-    $$TRANSPORT_ROOT/tests/dds/dds_node_test.cpp
+    $$TRANSPORT_ROOT/tests/dds/dds_node_test.cpp \
+    $$TRANSPORT_ROOT/tests/dds/dds_node_dynamic_registration_test.cpp
 
 # 1) 先本项目的静态库。
 LIBS += -L$$TRANSPORT_LIB_DIR -ltransport -L$$TRANSPORT_LIB_DIR -lgtest

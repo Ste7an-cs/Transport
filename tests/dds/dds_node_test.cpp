@@ -240,36 +240,55 @@ constexpr auto kCaseTimeout = 300ms;
 
 // ── 1. 注册接口:相位、累加、幂等、整批生效(D16)───────────────────────
 
-TEST(DdsNode, RegistrationIsAcceptedOnlyInCreated) {
+// 相位由 `Created` 放开到 `Created ∪ Running`(ADR-0015 **D1/D2**),`Closing` / `Closed`
+// 返 **kClosed**。**原用例 `RegistrationIsAcceptedOnlyInCreated` 断言的正是被放开的那条**
+// (Running 期返 kInvalidState),故按新语义改写。
+TEST(DdsNode, RegistrationAndUnregistrationAreAcceptedInCreatedAndRunning) {
   Fixture fixture;
   Host host(fixture);
   host.StartTransport();
   DdsNode& node = host.node();
 
-  // Created:四个方法都受理。后两个**只收服务名**(D6)。
+  // Created:八个方法都受理。后两组**只收服务名**(D6)。
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"pub"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"sub"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"svc"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterServices({"own"})));
+  ASSERT_TRUE(static_cast<bool>(node.UnregisterPublishers({"pub"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"pub"})));
 
   ASSERT_TRUE(static_cast<bool>(node.Start()));
 
-  // Running:一律 kInvalidState——端点集合"启动即定型、运行期恒定",本设计不引入运行期
-  // 动态端点。
-  EXPECT_EQ(node.RegisterPublishers({"late"}).error(),
-            make_error_code(TransportErrc::kInvalidState));
-  EXPECT_EQ(node.RegisterSubscribers({"late"}).error(),
-            make_error_code(TransportErrc::kInvalidState));
-  EXPECT_EQ(node.RegisterClients({"late"}).error(),
-            make_error_code(TransportErrc::kInvalidState));
-  EXPECT_EQ(node.RegisterServices({"late"}).error(),
-            make_error_code(TransportErrc::kInvalidState));
+  // Running:**一律受理**——端点随注册当场建出 / 拆掉。
+  EXPECT_TRUE(static_cast<bool>(node.RegisterPublishers({"late"})));
+  EXPECT_TRUE(static_cast<bool>(node.RegisterSubscribers({"late-sub"})));
+  EXPECT_TRUE(static_cast<bool>(node.RegisterClients({"late-cli"})));
+  EXPECT_TRUE(static_cast<bool>(node.RegisterServices({"late-svc"})));
+  EXPECT_TRUE(static_cast<bool>(node.UnregisterPublishers({"late"})));
+  EXPECT_TRUE(static_cast<bool>(node.UnregisterSubscribers({"late-sub"})));
+  EXPECT_TRUE(static_cast<bool>(node.UnregisterClients({"late-cli"})));
+  EXPECT_TRUE(static_cast<bool>(node.UnregisterServices({"late-svc"})));
 
   ASSERT_TRUE(static_cast<bool>(node.Close()));
   node.WaitClosed();
-  // Closing / Closed 同理。
+  // Closing / Closed:八个方法一律 **kClosed**(不是 kInvalidState——与五个交互方法同一
+  // 口径:已关闭的节点上做什么都是"关了")。
   EXPECT_EQ(node.RegisterPublishers({"later"}).error(),
-            make_error_code(TransportErrc::kInvalidState));
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.RegisterSubscribers({"later"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.RegisterClients({"later"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.RegisterServices({"later"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.UnregisterPublishers({"pub"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.UnregisterSubscribers({"sub"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.UnregisterClients({"svc"}).error(),
+            make_error_code(TransportErrc::kClosed));
+  EXPECT_EQ(node.UnregisterServices({"own"}).error(),
+            make_error_code(TransportErrc::kClosed));
 }
 
 TEST(DdsNode, RegistrationAccumulatesAcrossCallsAndDeduplicates) {
@@ -307,8 +326,61 @@ TEST(DdsNode, InvalidItemRollsBackTheWholeBatch) {
   EXPECT_EQ(node.RegisterClients({"ok", ""}).error(),
             make_error_code(TransportErrc::kInvalidArgument));
 
-  // 三批都没落下任何一项 ⇒ 四组仍全空 ⇒ Start 返 kConfiguration(D12)。
-  EXPECT_EQ(node.Start().error(), make_error_code(TransportErrc::kConfiguration));
+  // 三批都没落下任何一项。**全空 Start 现在是成功的**(ADR-0015 D5 撤销了 D12 那条判据),
+  // 故"一项都没落"改由启动之后的调用面反推:合法项若落下了,`Publish` 就不该报
+  // kConfiguration。
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  EXPECT_EQ(node.Publish("good", Payload("x")).error(),
+            make_error_code(TransportErrc::kConfiguration));
+  EXPECT_EQ(node.Subscribe(std::string("good"), MessageKind::kNotify).error(),
+            make_error_code(TransportErrc::kConfiguration));
+  EXPECT_EQ(node.RequestForResultDirect("ok", Payload("x"), {kCaseTimeout, 1}).error(),
+            make_error_code(TransportErrc::kConfiguration));
+}
+
+// ⭐ **D3**:`RegisterPublishers` / `RegisterSubscribers` 的 topic **不得以 `cfg.` 开头**。
+//
+// 这一条是「注销可以直接拆端点、不必重算"这条端点还有别人要吗"」的**全部依据**:拦掉它
+// 之后,端点重叠的唯一来源就没了,「一条端点恰有一个注册项负责」成为可证的结构性质。
+//
+// **有意的破坏性变更**:此前 `RegisterSubscribers({"cfg.get.request"})` 是合法的
+// (ADR-0013 D16 只在文档里标注该命名空间被占用、框架不拦)。
+TEST(DdsNode, PlainTopicsMayNotStartWithTheCfgPrefixButServiceNamesMay) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+
+  // 两个普通注册方法上一律拒——**派生 topic 的形状**与**随便一个 `cfg.` 开头的串**同样拒:
+  // 判据是前缀本身,不是"它长得像不像派生出来的"。
+  for (const char* topic : {"cfg.get.request", "cfg.get.response", "cfg.", "cfg.x"}) {
+    EXPECT_EQ(node.RegisterPublishers({topic}).error(),
+              make_error_code(TransportErrc::kInvalidArgument)) << topic;
+    EXPECT_EQ(node.RegisterSubscribers({topic}).error(),
+              make_error_code(TransportErrc::kInvalidArgument)) << topic;
+  }
+  // 整批拒:同批的合法项也不落。
+  EXPECT_EQ(node.RegisterPublishers({"fine", "cfg.bad"}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  // 只差一点就撞上的那些**照收**:判据是"以 `cfg.` 开头",不是"含有 cfg"。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"cfg", "cfgx", "a.cfg.b"})));
+
+  // ★ **服务名不受此限**:`cfg.x` 派生出的是 `cfg.cfg.x.request`,与任何普通 topic 都
+  //   撞不上(拼接单射,D6)。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"cfg.x"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterServices({"cfg.y"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+  EXPECT_TRUE(static_cast<bool>(node.Publish("cfg", Payload("x"))));
+  // 派生结果写死字面量,不复用被测的派生函数。
+  EXPECT_TRUE(static_cast<bool>(
+      node.Subscribe(std::string("cfg.cfg.x.response"), kAny)));
+  EXPECT_TRUE(static_cast<bool>(node.Subscribe(
+      std::string("cfg.cfg.y.request"), MessageKind::kRequest)));
+
+  // 运行期同样拒(D1 只放开相位,不放松校验)。
+  EXPECT_EQ(node.RegisterSubscribers({"cfg.late"}).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
 }
 
 // 上一条测的是"从空注册表开始,非法批一项都不落";本条测的是**回滚的另一半**——非法批
@@ -437,10 +509,10 @@ TEST(DdsNode, OtherWriterReaderOverlapsAreNotRejected) {
   // Publishers ∩ Subscribers:本地回环自测,合法。
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
-  // Publishers ∩ 某客户端的应答 topic:往 `cfg.svc.response` 发布、同时又是 `svc` 的
-  // 客户端,合法。**派生化之后这种重叠只能这样写出来**——得直接把派生 topic 当普通
-  // topic 注册,这正是"框架侵占 cfg.* 命名空间"那条代价的具体形状(D6 明确接受,不拦)。
-  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"cfg.svc.response"})));
+  // ★ 原用例这里还注册了 `RegisterPublishers({"cfg.svc.response"})`(“Publishers ∩ 某
+  //   客户端的应答 topic”),**随 ADR-0015 D3 删除**:普通 topic 现在不得以 `cfg.` 开头,
+  //   那种重叠**根本表达不出来**了——这正是 D3 要买的东西(见
+  //   `PlainTopicsMayNotStartWithTheCfgPrefixButServiceNamesMay`)。剩下的重叠照旧不拦。
   ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"svc"})));
   ASSERT_TRUE(static_cast<bool>(node.Start()));
 
@@ -454,26 +526,29 @@ TEST(DdsNode, OtherWriterReaderOverlapsAreNotRejected) {
   EXPECT_EQ(seen->front(), "echo");
 }
 
-// ── 2. 启动:四组全空 → kConfiguration,且**失败不清空注册表**(D12/D16)──
+// ── 2. 启动:全空注册**照样成功**(ADR-0015 D5),且失败不清空注册表(D16)──
 
-TEST(DdsNode, StartWithNoRegistrationIsConfigurationAndKeepsRegistry) {
+// **原用例 `StartWithNoRegistrationIsConfigurationAndKeepsRegistry` 断言的正是被撤销的那条
+// 判据**(ADR-0013 D12「四组全空即 kConfiguration」),故按新语义改写:它当初的依据是"一个
+// 什么都不收不发的节点必是漏了注册",而注册可以在启动之后补上之后该依据不再成立——
+// **"启动时还不知道有哪些 topic"正是动态注册要支持的主要场景**。
+TEST(DdsNode, StartWithNoRegistrationSucceedsAndRegistrationCanFollow) {
   Fixture fixture;
   Host host(fixture);
   host.StartTransport();
   DdsNode& node = host.node();
 
-  // 一个什么都不收不发的节点必是漏了注册。
-  auto empty = node.Start();
-  ASSERT_FALSE(static_cast<bool>(empty));
-  EXPECT_EQ(empty.error(), make_error_code(TransportErrc::kConfiguration));
-  EXPECT_FALSE(node.IsRunning());
-
-  // **停在 Created ⇒ 还能接着注册**——补上漏项再 Start 一次即可,不必把全部注册重做一遍。
-  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a"})));
-  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"b"})));
+  // 一个注册项都没有,`Start()` 照样成功。
   ASSERT_TRUE(static_cast<bool>(node.Start()));
   EXPECT_TRUE(node.IsRunning());
-  // 两批分别注册、跨调用累加,启动后都生效。
+
+  // 此刻确实什么都收发不了——注册面是空的。
+  EXPECT_EQ(node.Publish("a", Payload("x")).error(),
+            make_error_code(TransportErrc::kConfiguration));
+
+  // 启动之后补注册,端点当场建出,随即就能收发。
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"b"})));
   EXPECT_TRUE(static_cast<bool>(node.Publish("a", Payload("x"))));
   EXPECT_TRUE(static_cast<bool>(
       node.Subscribe(std::string("b"), MessageKind::kNotify)));

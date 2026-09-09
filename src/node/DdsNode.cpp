@@ -42,20 +42,6 @@ std::string MakeUuid(const std::string& uuid_override) {
   return QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
 }
 
-/// 单值型注册批(`Publishers` / `Subscribers`)的校验:**只有"topic 非空"一条**。
-///
-/// **先整批校验、再整批落地**——"整批生效或整批不生效"(**D16**)由这个顺序天然保证,
-/// 不需要回滚代码:校验没过就一个字节都没写进注册表。
-[[nodiscard]] Coro::Result<void> ValidatePlainBatch(
-    const std::vector<std::string>& batch) {
-  for (const auto& topic : batch) {
-    if (topic.empty()) {
-      return make_error_code(TransportErrc::kInvalidArgument);
-    }
-  }
-  return Coro::Result<void>{};
-}
-
 /// 服务名派生出的两个 topic(**D6**)。
 struct ServiceTopics {
   std::string request;  ///< `cfg.<服务名>.request`
@@ -66,6 +52,36 @@ struct ServiceTopics {
 constexpr char kServicePrefix[] = "cfg.";
 constexpr char kRequestSuffix[] = ".request";
 constexpr char kReplySuffix[] = ".response";
+
+/// 单值型注册批(`Publishers` / `Subscribers`)的校验:**topic 非空**,且**不得以 `cfg.`
+/// 开头**(ADR-0015 **D3**)。
+///
+/// ★ 后一条是「注销可以直接拆端点、不必重算」的**全部依据**。派生项之间不可能相撞(**D6**
+///   的单射性论证:`.request` / `.response` 后缀天然分开两侧,同侧同后缀则服务名不同即不同,
+///   同名既 client 又 service 已被 `ValidateServiceNameBatch` 拒),故端点重叠的**唯一**
+///   来源就是调用方往这两个方法里手写一个 `cfg.` 开头的字符串。拦掉它,「一条端点恰有一个
+///   注册项负责」就从"靠调用方守约定"变成**可证的结构性质**——不是"约定它不会发生所以省掉
+///   重算",而是"它不可能发生所以不需要重算"。
+///
+/// **这是破坏性变更**:`RegisterSubscribers({"cfg.get.request"})` 此前合法(ADR-0013 D16
+/// 只在文档里标注该命名空间被占用、框架不拦),现在返 `kInvalidArgument`。代价见 ADR-0015
+/// 「明确接受的代价」④。**服务名不受此限**——`RegisterClients({"cfg.x"})` 仍合法,它派生出
+/// 的是 `cfg.cfg.x.request`,与任何普通 topic 都撞不上。
+///
+/// **先整批校验、再整批落地**——"整批生效或整批不生效"(**D16**)由这个顺序保证。
+[[nodiscard]] Coro::Result<void> ValidatePlainBatch(
+    const std::vector<std::string>& batch) {
+  const std::string prefix = kServicePrefix;
+  for (const auto& topic : batch) {
+    if (topic.empty()) {
+      return make_error_code(TransportErrc::kInvalidArgument);
+    }
+    if (topic.compare(0, prefix.size(), prefix) == 0) {
+      return make_error_code(TransportErrc::kInvalidArgument);  // D3。
+    }
+  }
+  return Coro::Result<void>{};
+}
 
 /// 服务名 → 两个 topic 的**唯一**派生实现(**D6**)。
 ///
@@ -118,6 +134,140 @@ constexpr char kReplySuffix[] = ".response";
   return Coro::Result<void>{};
 }
 
+// ── 端点派生:**唯一**一份实现,`DoStart()` 与运行期动态路径共用(ADR-0015 D1)────
+//
+// D1 要求"不写两份派生逻辑":`DoStart()` 里原来那四段 `for` 的循环体就是下面这个
+// `DeclareEndpointsFor`,`DoStart()` 现在只负责遍历,动态注册直接对单项调它。
+
+/// 四组注册各自代表的角色——决定该项派生出哪个方向的端点。
+enum class RegistrationKind {
+  kPublisher,   ///< topic → Writer。
+  kSubscriber,  ///< topic → Reader。
+  kClient,      ///< 服务名 → request 的 Writer(发请求)+ response 的 Reader(收应答)。
+  kService,     ///< 服务名 → request 的 Reader(收请求)+ response 的 Writer(发应答)。
+};
+
+/// 拆掉某个注册项派生出的全部端点(**幂等**,故也可以拿来清理建了一半的项)。
+///
+/// **不做任何"是否仍被需要"的重算**(**D3**):端点归属唯一是可证性质,该项负责的端点
+/// 只有该项要。
+void UndeclareEndpointsFor(DdsTransport& transport, RegistrationKind kind,
+                           const std::string& item) {
+  switch (kind) {
+    case RegistrationKind::kPublisher:
+      (void)transport.UndeclareWriter(item);
+      break;
+    case RegistrationKind::kSubscriber:
+      (void)transport.UndeclareReader(item);
+      break;
+    case RegistrationKind::kClient: {
+      const ServiceTopics topics = DeriveServiceTopics(item);
+      (void)transport.UndeclareWriter(topics.request);
+      (void)transport.UndeclareReader(topics.reply);
+      break;
+    }
+    case RegistrationKind::kService: {
+      const ServiceTopics topics = DeriveServiceTopics(item);
+      (void)transport.UndeclareReader(topics.request);
+      (void)transport.UndeclareWriter(topics.reply);
+      break;
+    }
+  }
+}
+
+/// 建出某个注册项对应方向的端点。**端点方向的派生规则一字不改**(ADR-0013 D15/D6)。
+///
+/// 失败时**先拆掉本项已建的那半边**再返错:一个注册项要么整项在、要么整项不在,免得留下
+/// 一条谁也不负责的端点。`Declare*` 幂等,故重试无副作用。
+[[nodiscard]] Coro::Result<void> DeclareEndpointsFor(DdsTransport& transport,
+                                                     RegistrationKind kind,
+                                                     const std::string& item) {
+  switch (kind) {
+    case RegistrationKind::kPublisher:
+      return transport.DeclareWriter(item);
+    case RegistrationKind::kSubscriber:
+      return transport.DeclareReader(item);
+    case RegistrationKind::kClient: {
+      // 请求-响应两组存的是**服务名**,两个 topic 由**同一个派生函数**算出(D6)。
+      const ServiceTopics topics = DeriveServiceTopics(item);
+      if (auto declared = transport.DeclareWriter(topics.request); !declared) {
+        return declared;  // cfg.<名>.request → Writer(发请求)。
+      }
+      if (auto declared = transport.DeclareReader(topics.reply); !declared) {
+        UndeclareEndpointsFor(transport, kind, item);  // 半边不留。
+        return declared;  // cfg.<名>.response → Reader(收应答)。
+      }
+      return Coro::Result<void>{};
+    }
+    case RegistrationKind::kService: {
+      const ServiceTopics topics = DeriveServiceTopics(item);
+      if (auto declared = transport.DeclareReader(topics.request); !declared) {
+        return declared;  // cfg.<名>.request → Reader(收请求)。
+      }
+      if (auto declared = transport.DeclareWriter(topics.reply); !declared) {
+        UndeclareEndpointsFor(transport, kind, item);
+        return declared;  // cfg.<名>.response → Writer(发应答)。
+      }
+      return Coro::Result<void>{};
+    }
+  }
+  return Coro::Result<void>{};  // 不可达:枚举已穷举。
+}
+
+/// 一批**已通过校验**的注册项落地(**D7**)。
+///
+/// | 相位 | 做什么 |
+/// |---|---|
+/// | `Created` | 只往 `target` 里插——端点仍由 `DoStart()` 统一建(与 ADR-0015 之前逐字相同) |
+/// | `Running` | **逐项建端点 → 提交集合**;中途失败**拆掉本批已建的**并返错,`target` 一项不落 |
+///
+/// **回滚清单只记"本批真正新建的项"**:批里那些早已在册的项,其端点是先前建的、且此刻仍被
+/// 那份注册需要,拆掉就是误伤。
+[[nodiscard]] Coro::Result<void> CommitBatch(DdsTransport& transport,
+                                             bool running,
+                                             RegistrationKind kind,
+                                             const std::vector<std::string>& batch,
+                                             std::set<std::string>* target) {
+  if (!running) {
+    target->insert(batch.begin(), batch.end());  // Created 期:只落表。
+    return Coro::Result<void>{};
+  }
+  std::set<std::string> created;  // 本批新建了端点的项 —— 回滚只拆这些。
+  for (const auto& item : batch) {
+    if (target->count(item) != 0 || created.count(item) != 0) {
+      continue;  // 已在册 / 批内重复:端点已经有了,不重复建、更不进回滚清单。
+    }
+    if (auto declared = DeclareEndpointsFor(transport, kind, item); !declared) {
+      for (const auto& done : created) {
+        UndeclareEndpointsFor(transport, kind, done);
+      }
+      return declared;  // 注册表一项不落——`target` 到这一步还没被动过。
+    }
+    created.insert(item);
+  }
+  target->insert(batch.begin(), batch.end());  // 全部建成了才提交集合。
+  return Coro::Result<void>{};
+}
+
+/// 一批注销项落地:从集合摘除,`Running` 期同时拆端点(**D2**)。
+///
+/// **不在册的项是幂等空操作**,不报错——注销的语义是"确保它不在",而不是"它此刻必须在"。
+/// **不检测在途交互**(**D6**):已发出的 `Ticket` 挂在 `Dispatcher` 上、与注册表无关,继续
+/// 有效;新请求不再到达;此后对该服务的 `Reply` / `RequestForResultDirect` 返
+/// `kConfiguration`(那两处本就查注册表)。
+void ApplyUnregister(DdsTransport& transport, bool running,
+                     RegistrationKind kind, const std::vector<std::string>& batch,
+                     std::set<std::string>* target) {
+  for (const auto& item : batch) {
+    if (target->erase(item) == 0) {
+      continue;  // 本就不在册:什么都不做(端点也不是本节点这一项建的)。
+    }
+    if (running) {
+      UndeclareEndpointsFor(transport, kind, item);
+    }
+  }
+}
+
 }  // namespace
 
 DdsNode::DdsNode(DdsTransport& transport, std::unique_ptr<ICodec> codec,
@@ -141,104 +291,175 @@ DdsNode::~DdsNode() {
   WaitClosed();
 }
 
-// ── 注册接口(D16)────────────────────────────────────────────────────────
+// ── 注册 / 注销接口(D16 + ADR-0015 D1/D2)────────────────────────────────
 //
-// 四个方法同一副骨架:**判相位 → 整批校验 → 整批落地**。
+// 八个方法同一副骨架:**判相位 → 整批校验 → 整批落地**。
 //
-// - **只允许 `Start()` 之前注册**:端点集合"启动即定型、运行期恒定",本设计**不引入
-//   运行期动态端点**。故非 `Created` 一律 `kInvalidState`,不分"正在启动"与"已关闭"。
-// - **可多次调用累加、重复项幂等去重**:落地用的是 `set`/`map` 的 insert,天然如此。
-// - **整批生效或整批不生效**:校验在落地之前整批做完,故失败时一项都没落。
+// - **相位是 `Created ∪ Running`**(ADR-0015 **D1**):`Created` 期只落表(端点仍由
+//   `DoStart()` 统一建,与放开之前逐字相同),`Running` 期落表**并当场建端点**;
+//   `Closing` / `Closed` 返 **`kClosed`**(注意:不是 `kInvalidState`——已关闭的节点上
+//   注册是"关了"而不是"时候不对",与五个交互方法同一口径)。
+// - **可多次调用累加、重复项幂等去重**:落地用的是 `set` 的 insert,天然如此。
+// - **整批生效或整批不生效**:`Created` 期由"校验先于落地"保证;`Running` 期还多一步
+//   **拆掉本批已建端点**的回滚(**D7**,见 `CommitBatch`)。
+
+/// 八个方法共用的相位判据(**D1**):`Created` / `Running` 放行并告知是不是 `Running`,
+/// `Closing` / `Closed` 返 `kClosed`。
+Coro::Result<bool> DdsNode::RegistrationPhase() const {
+  switch (CurrentLifecycle()) {
+    case LifecycleState::kCreated:
+      return Coro::Result<bool>{false};
+    case LifecycleState::kRunning:
+      return Coro::Result<bool>{true};
+    default:
+      return make_error_code(TransportErrc::kClosed);
+  }
+}
 
 Coro::Result<void> DdsNode::RegisterPublishers(std::vector<std::string> topics) {
-  if (CurrentLifecycle() != LifecycleState::kCreated) {
-    return make_error_code(TransportErrc::kInvalidState);
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
   }
   if (auto valid = ValidatePlainBatch(topics); !valid) {
     return valid;
   }
-  publishers_.insert(topics.begin(), topics.end());
-  return Coro::Result<void>{};
+  return CommitBatch(transport_, running.value(), RegistrationKind::kPublisher,
+                     topics, &publishers_);
 }
 
 Coro::Result<void> DdsNode::RegisterSubscribers(std::vector<std::string> topics) {
-  if (CurrentLifecycle() != LifecycleState::kCreated) {
-    return make_error_code(TransportErrc::kInvalidState);
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
   }
   if (auto valid = ValidatePlainBatch(topics); !valid) {
     return valid;
   }
-  subscribers_.insert(topics.begin(), topics.end());
-  return Coro::Result<void>{};
+  return CommitBatch(transport_, running.value(), RegistrationKind::kSubscriber,
+                     topics, &subscribers_);
 }
 
 Coro::Result<void> DdsNode::RegisterClients(
     std::vector<std::string> service_names) {
-  if (CurrentLifecycle() != LifecycleState::kCreated) {
-    return make_error_code(TransportErrc::kInvalidState);
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
   }
   // 反向角色是 `services_`:同一服务名既注册为 Clients 又注册为 Services = 自己请求自己。
   if (auto valid = ValidateServiceNameBatch(service_names, services_); !valid) {
     return valid;
   }
-  clients_.insert(service_names.begin(), service_names.end());
-  return Coro::Result<void>{};
+  return CommitBatch(transport_, running.value(), RegistrationKind::kClient,
+                     service_names, &clients_);
 }
 
 Coro::Result<void> DdsNode::RegisterServices(
     std::vector<std::string> service_names) {
-  if (CurrentLifecycle() != LifecycleState::kCreated) {
-    return make_error_code(TransportErrc::kInvalidState);
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
   }
   if (auto valid = ValidateServiceNameBatch(service_names, clients_); !valid) {
     return valid;
   }
-  services_.insert(service_names.begin(), service_names.end());
+  return CommitBatch(transport_, running.value(), RegistrationKind::kService,
+                     service_names, &services_);
+}
+
+// 四个注销方法(**D2**)。与对应的注册方法同形、同相位;**没有校验**——不在册即幂等空
+// 操作,故也没有"整批不生效"可言(摘除不会失败)。
+//
+// **不检测在途交互**(**D6**):不拒绝、不等待。见 `ApplyUnregister` 的注释。
+
+Coro::Result<void> DdsNode::UnregisterPublishers(std::vector<std::string> topics) {
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
+  }
+  ApplyUnregister(transport_, running.value(), RegistrationKind::kPublisher,
+                  topics, &publishers_);
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::UnregisterSubscribers(
+    std::vector<std::string> topics) {
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
+  }
+  ApplyUnregister(transport_, running.value(), RegistrationKind::kSubscriber,
+                  topics, &subscribers_);
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::UnregisterClients(
+    std::vector<std::string> service_names) {
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
+  }
+  ApplyUnregister(transport_, running.value(), RegistrationKind::kClient,
+                  service_names, &clients_);
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsNode::UnregisterServices(
+    std::vector<std::string> service_names) {
+  auto running = RegistrationPhase();
+  if (!running) {
+    return running.error();
+  }
+  ApplyUnregister(transport_, running.value(), RegistrationKind::kService,
+                  service_names, &services_);
   return Coro::Result<void>{};
 }
 
 // ── NodeBase 钩子 ────────────────────────────────────────────────────────
 
 Coro::Result<void> DdsNode::DoStart() {
-  // **四组全空由 `Start()` 判**(D12):topic 的合法性在注册那一刻就判完了,只剩这一条要
-  // 等注册全部结束才知道——一个什么都不收不发的节点必是漏了注册。
-  if (publishers_.empty() && subscribers_.empty() && clients_.empty() &&
-      services_.empty()) {
-    return make_error_code(TransportErrc::kConfiguration);
-  }
-  // **唯一建端点的地方**(D15)。按四组注册逐项建**对应方向**的端点:一个 topic 上通常
-  // 只需要一侧,建成对是浪费、还会招来自收。`Declare*` 幂等,故这里不必先去重
-  // (同一 topic 可能既是订阅项、又是某条 client 的应答 topic)。
+  // **不再有"四组全空即 kConfiguration"这条判据**(ADR-0015 **D5** 撤销 ADR-0013 D12):
+  // 它当初的依据是"一个什么都不收不发的节点必是漏了注册",而注册可以在启动之后补上之后
+  // 该依据不再成立——"启动时还不知道有哪些 topic"正是动态注册要支持的主要场景。
+  //
+  // 按四组注册逐项建**对应方向**的端点:一个 topic 上通常只需要一侧,建成对是浪费、还会
+  // 招来自收。`Declare*` 幂等,故这里不必先去重。
+  //
+  // ★ **与运行期动态注册共用同一个 `DeclareEndpointsFor`**(**D1**):本函数只负责遍历,
+  //   方向派生一份实现,两条路径不可能走歪到两处去。
   //
   // **不启动 transport**:宿主已经启过。它若还没 Running,`Declare*` 会返 kInvalidState,
   // 本次 Start 随之失败并停在 Created ——注册表原样保留,启好传输再来一次即可。
   for (const auto& topic : publishers_) {
-    if (auto declared = transport_.DeclareWriter(topic); !declared) {
+    if (auto declared = DeclareEndpointsFor(transport_,
+                                            RegistrationKind::kPublisher, topic);
+        !declared) {
       return declared;
     }
   }
   for (const auto& topic : subscribers_) {
-    if (auto declared = transport_.DeclareReader(topic); !declared) {
+    if (auto declared = DeclareEndpointsFor(transport_,
+                                            RegistrationKind::kSubscriber, topic);
+        !declared) {
       return declared;
     }
   }
-  // 请求-响应两组存的是**服务名**,两个 topic 在此由**同一个派生函数**算出(D6)。
+  // 请求-响应两组存的是**服务名**,两个 topic 由**同一个派生函数**算出(D6)。
   for (const auto& service_name : clients_) {
-    const ServiceTopics topics = DeriveServiceTopics(service_name);
-    if (auto declared = transport_.DeclareWriter(topics.request); !declared) {
-      return declared;  // cfg.<名>.request → Writer(发请求)。
-    }
-    if (auto declared = transport_.DeclareReader(topics.reply); !declared) {
-      return declared;  // cfg.<名>.response → Reader(收应答)。
+    if (auto declared = DeclareEndpointsFor(transport_, RegistrationKind::kClient,
+                                            service_name);
+        !declared) {
+      return declared;
     }
   }
   for (const auto& service_name : services_) {
-    const ServiceTopics topics = DeriveServiceTopics(service_name);
-    if (auto declared = transport_.DeclareReader(topics.request); !declared) {
-      return declared;  // cfg.<名>.request → Reader(收请求)。
-    }
-    if (auto declared = transport_.DeclareWriter(topics.reply); !declared) {
-      return declared;  // cfg.<名>.response → Writer(发应答)。**首次应答不会丢**靠这一行。
+    // `cfg.<名>.response` 的 Writer 也在这里建出——**启动时就注册了的服务,其第一次应答
+    // 不会丢**(D15 的那条实测事实)。动态注册出来的服务没有这条保障,见 ADR-0015
+    // 「明确接受的代价」①:风险由宿主自行评估处置。
+    if (auto declared = DeclareEndpointsFor(transport_,
+                                            RegistrationKind::kService, service_name);
+        !declared) {
+      return declared;
     }
   }
 

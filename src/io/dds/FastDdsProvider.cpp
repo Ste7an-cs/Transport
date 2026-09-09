@@ -127,6 +127,30 @@ Coro::Result<void> FastDdsProvider::DeclareWriter(const std::string& topic) {
   return Coro::Result<void>{};
 }
 
+// 写侧端点拆除(ADR-0015 D4)——与 `DeclareWriter` 对称,**幂等**(没建过直接成功)。
+//
+// ⚠ **必须等在途 `Publish` 归零**:`write()` 在锁外阻塞,而它手里握着的正是这个
+//   `DataWriter` 指针,不等就删是 use-after-free。这与 `Shutdown()` 是同一处理,连带
+//   代价也相同——这一等**没有上界**(界由同进程内最慢的那个订阅回调决定)。
+//   `in_flight_` 是**全部 writer** 的合计,故这里可能白等一次与本 topic 无关的写。
+//
+// `topics_` 里的 `Topic` 对象**不删**:reader 可能还挂在同一条 topic 上,且
+// `GetOrCreateTopic` 本就复用它;它随 `Shutdown()` 一并销毁。
+Coro::Result<void> FastDdsProvider::UndeclareWriter(const std::string& topic) {
+  std::unique_lock<std::mutex> lk(mutex_);
+  // 未 Init:调用序错误 → kInvalidState(与 Unsubscribe 一致)。
+  if (!participant_) return make_error_code(TransportErrc::kInvalidState);
+  auto it = writers_.find(topic);
+  if (it == writers_.end()) return Coro::Result<void>{};  // 幂等:没建过即成功。
+  idle_cv_.wait(lk, [this] { return in_flight_ == 0; });
+  // 等待期间锁被让出过,迭代器可能已失效(另一路也在拆同一条),故重查一次。
+  it = writers_.find(topic);
+  if (it == writers_.end()) return Coro::Result<void>{};
+  publisher_->delete_datawriter(it->second);
+  writers_.erase(it);
+  return Coro::Result<void>{};
+}
+
 Coro::Result<void> FastDdsProvider::Publish(const std::string& topic,
                                       const std::vector<uint8_t>& bytes) {
   dds::DataWriter* writer = nullptr;

@@ -40,8 +40,9 @@ namespace transport {
  * ```
  *
  * `ITransport` 七方法**签名不变、语义不变、不分叉**(**D1**);公开面在七方法之外另有
- * `DeclareWriter` / `DeclareReader` 两个 DDS 专有的端点声明方法(**D15**)——它们是 DDS
- * 端点模型的必需品,三介质没有对应物,但**不改动 `ITransport` 本身**。
+ * `DeclareWriter` / `DeclareReader` 两个 DDS 专有的端点声明方法(**D15**)、以及与之对称的
+ * `UndeclareWriter` / `UndeclareReader`(ADR-0015 **D4**)——它们是 DDS 端点模型的必需品,
+ * 三介质没有对应物,但**不改动 `ITransport` 本身**(七方法照旧)。
  *
  * **与三介质的两处实质差异**:
  *
@@ -196,6 +197,25 @@ class DdsTransport final : public ITransport {
   ///         `kInvalidState`;provider 建 reader 失败原样返其错误。
   [[nodiscard]] Coro::Result<void> DeclareReader(const std::string& topic);
 
+  /// @brief 拆除该 topic 的写侧端点:落到 provider 就是 `IDdsProvider::UndeclareWriter`
+  ///        (ADR-0015 **D4**)。**幂等**——没声明过的 topic 直接成功。
+  ///
+  /// 与 `DeclareWriter` 对称。**运行期动态注销的必需品**(**D2**):端点集合不再"启动即
+  /// 定型",`DdsNode::UnregisterPublishers` / `UnregisterClients` / `UnregisterServices`
+  /// 经由本方法把 writer 拆掉。拆掉之后往该 topic 写会在写线程上得到 `kConfiguration`
+  /// 并落到 `LastError()`。
+  ///
+  /// @return 成功;topic 为空返 `kConfiguration`;未 `Start()` / 关闭中 / 已关闭返
+  ///         `kInvalidState`;provider 拆除失败原样返其错误。
+  [[nodiscard]] Coro::Result<void> UndeclareWriter(const std::string& topic);
+
+  /// @brief 拆除该 topic 的读侧端点:落到 provider 就是 `Unsubscribe(topic)`。**幂等**。
+  ///        与 `DeclareReader` 对称,返回值与 `UndeclareWriter` 逐条相同。
+  ///
+  /// 拆除之后该 topic 的样本不再进读队列;**已在队列里的样本仍会被读到**——本方法只摘
+  /// 端点,不回收在途字节。
+  [[nodiscard]] Coro::Result<void> UndeclareReader(const std::string& topic);
+
   /// @brief 是否处于 Running(写线程在跑;链路是否可用另见 `CurrentLinkState()`)。
   [[nodiscard]] bool IsRunning() const;
 
@@ -216,7 +236,7 @@ class DdsTransport final : public ITransport {
   mutable std::mutex error_mutex_;
   std::error_code last_error_;
 
-  /// 已声明的端点(**D15** 的幂等闩)。只在调用方执行域内访问,不加锁。
+  /// 已声明的端点(**D15** 的幂等闩;`Undeclare*` 从中摘除)。只在调用方执行域内访问,不加锁。
   std::set<std::string> declared_writers_;
   std::set<std::string> declared_readers_;
 

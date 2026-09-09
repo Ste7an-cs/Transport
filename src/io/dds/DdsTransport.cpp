@@ -272,6 +272,51 @@ Coro::Result<void> DdsTransport::DeclareReader(const std::string& topic) {
   return Coro::Result<void>{};
 }
 
+// 端点拆除(ADR-0015 D4)。与上面两个 `Declare*` 逐条对称,**同样幂等**:没声明过的 topic
+// 直接成功——注销路径因此不必先问"这条建过没有"。
+//
+// **不做任何"是否仍被需要"的重算**(ADR-0015 D3):`DdsNode` 侧禁掉了普通 topic 的 `cfg.`
+// 前缀之后,「一条端点恰有一个注册项负责」是可证的结构性质,故调用方要拆就是真的该拆。
+Coro::Result<void> DdsTransport::UndeclareWriter(const std::string& topic) {
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (topic.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (declared_writers_.count(topic) == 0) {
+    return Coro::Result<void>{};  // 幂等:没声明过直接成功。
+  }
+  auto undeclared = provider_->UndeclareWriter(topic);
+  if (!undeclared) {
+    SetLastError(undeclared.error());
+    return undeclared.error();
+  }
+  declared_writers_.erase(topic);
+  return Coro::Result<void>{};
+}
+
+Coro::Result<void> DdsTransport::UndeclareReader(const std::string& topic) {
+  if (lifecycle_ != LifecycleState::kRunning) {
+    return make_error_code(TransportErrc::kInvalidState);
+  }
+  if (topic.empty()) {
+    return make_error_code(TransportErrc::kConfiguration);
+  }
+  if (declared_readers_.count(topic) == 0) {
+    return Coro::Result<void>{};  // 幂等。
+  }
+  // 摘掉 listener 即止住新样本。**已经推进读队列的字节照旧会被读到**——本方法只拆端点,
+  // 不回收在途数据(读队列是 `Coro::Awaitable`,没有"按 topic 撤回"这种操作)。
+  auto unsubscribed = provider_->Unsubscribe(topic);
+  if (!unsubscribed) {
+    SetLastError(unsubscribed.error());
+    return unsubscribed.error();
+  }
+  declared_readers_.erase(topic);
+  return Coro::Result<void>{};
+}
+
 bool DdsTransport::IsRunning() const {
   return lifecycle_ == LifecycleState::kRunning;
 }

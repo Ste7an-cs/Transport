@@ -19,6 +19,10 @@ class StubProvider : public IDdsProvider {
   Coro::Result<void> DeclareWriter(const std::string&) override {
     return Coro::Result<void>{};
   }
+  // ADR-0015 D4 新增的纯虚方法——第三方 provider 都得跟着实现,这个桩就是那份成本的样本。
+  Coro::Result<void> UndeclareWriter(const std::string&) override {
+    return Coro::Result<void>{};
+  }
   Coro::Result<void> Publish(const std::string&, const std::vector<uint8_t>&) override {
     return Coro::Result<void>{};
   }
