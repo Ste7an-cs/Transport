@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/fiber/channel_op_status.hpp>
+
 #include "transport/core/Endpoint.hpp"
 #include "transport/core/Error.hpp"
 #include "transport/io/dds/DdsProviderRegistry.hpp"
@@ -26,7 +28,11 @@ constexpr int kMaxDomainId = 232;
 
 }  // namespace
 
-DdsTransport::DdsTransport(DdsConfig config) : config_(std::move(config)) {}
+DdsTransport::DdsTransport(DdsConfig config) : config_(std::move(config)) {
+  // 容量与"满时静默丢最旧"整个复用 `FiberChannel::push` 的内建语义(ADR-0017 D1),
+  // 与三介质的队列**逐字相同**——不再手写容量循环。
+  write_queue_.setCapacity(static_cast<std::uint32_t>(kWriteQueueCapacity));
+}
 
 DdsTransport::~DdsTransport() {
   (void)Close();
@@ -93,18 +99,16 @@ Coro::Result<void> DdsTransport::Start() {
 //
 // 由此本线程实际**兼跑同进程内所有对端的交付回调**;我方 listener 只做一次 push 故满足
 // "快且不阻塞",但同进程内非本框架的慢订阅方会卡住整条写队列——那是部署面的约束。
+//
+// 本线程在 `write_queue_.pop()` 上等数据。`pop` 用的是 `boost::fibers::mutex` /
+// `condition_variable`,而 boost.fiber 把每条线程的主上下文也当作一条 fiber,故这里挂起
+// 的是**本线程自己的主 fiber**——行为即"阻塞本线程",正合所需,且不空转(ADR-0017)。
+// `Close()` 的 `close()` 唤醒它,`pop` 返回非 `success` 即退出。
 void DdsTransport::RunWriteThread() {
   for (;;) {
     Datagram item;
-    {
-      std::unique_lock<std::mutex> lock(write_mutex_);
-      write_cv_.wait(lock,
-                     [this] { return write_stop_ || !write_queue_.empty(); });
-      if (write_stop_) {
-        return;  // Close 已置位并清空残留(不等刷出,同三介质)。
-      }
-      item = std::move(write_queue_.front());
-      write_queue_.pop_front();
+    if (write_queue_.pop(item) != boost::fibers::channel_op_status::success) {
+      return;  // Close 已 close() + discard_pending():残留全丢,不等刷出(同三介质)。
     }
     // 目的地只能是 topic:DDS 的寻址维度就是它,而配置里**没有默认 topic**(D16),
     // 故 `Endpoint::Default()` / `kNet` 在本介质上无从解析。**丢该条并只落 LastError**
@@ -134,8 +138,9 @@ std::shared_ptr<Coro::Awaitable<Datagram>> DdsTransport::AsyncRead() {
 // 入队即返(ADR-0007 D3):**只判生命周期与入队**。目的地是否可解析由写线程判——契约只
 // 允许本方法判这两件事,提前判会让"传输无关的调用方"拿到一个三介质都不会给的错误码。
 //
-// 队列**有界 1024 且满时静默丢最旧**(与三介质的 `write_queue_` 逐字相同)。写侧尤其需要
-// 这个界:在途 `Publish` 的阻塞无上界,不设界则积压无上界。
+// 队列**有界 1024 且满时静默丢最旧**(与三介质的 `write_queue_` 逐字相同,由
+// `FiberChannel::push` 内建:满时丢队首最旧,不阻塞生产者也不返回失败,DD-15 的"不计数、
+// 不归因")。写侧尤其需要这个界:在途 `Publish` 的阻塞无上界,不设界则积压无上界。
 Coro::Result<void> DdsTransport::AsyncWrite(Datagram datagram) {
   if (lifecycle_ == LifecycleState::kCreated) {
     return make_error_code(TransportErrc::kInvalidState);
@@ -143,17 +148,11 @@ Coro::Result<void> DdsTransport::AsyncWrite(Datagram datagram) {
   if (lifecycle_ != LifecycleState::kRunning) {
     return make_error_code(TransportErrc::kClosed);
   }
-  {
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    if (write_stop_) {
-      return make_error_code(TransportErrc::kClosed);
-    }
-    write_queue_.push_back(std::move(datagram));
-    while (write_queue_.size() > kWriteQueueCapacity) {
-      write_queue_.pop_front();  // 丢最旧,静默(DD-15):不计数、不归因。
-    }
+  // `push` 在锁内自判关闭状态,"判关闭 + 入队"本就是一步原子(ADR-0017 D1)。
+  if (write_queue_.push(std::move(datagram)) !=
+      boost::fibers::channel_op_status::success) {
+    return make_error_code(TransportErrc::kClosed);  // 队列已关闭 = 传输终结。
   }
-  write_cv_.notify_one();
   return Coro::Result<void>{};
 }
 
@@ -162,7 +161,15 @@ Coro::Result<void> DdsTransport::AsyncWrite(Datagram datagram) {
 // | # | 停止的东西                    | 手段                                   |
 // |---|-------------------------------|----------------------------------------|
 // | ① | 交付(listener → read_queue_) | `CloseQueue` —— 此后 push 返 closed    |
-// | ② | 写线程(停在 cv 上等数据)      | `write_stop_ = true` + `notify_all`     |
+// | ② | 写线程(停在 `pop` 上等数据)   | `write_queue_.close()` + `discard_pending()` |
+//
+// ★ ② 的**两步缺一不可**(ADR-0017 D2,本次改动唯一必须写对的地方):`FiberChannel::pop`
+//   在 `close()` 之后**仍会把队列排干**才返回 `closed`(它先判 `!queue_.empty()`,非空即
+//   照常取值)。只 `close()` 的话,写线程会在关闭时把残留的至多 1024 条**逐条 `Publish`**,
+//   而每次 `Publish` 的阻塞没有上界。次序取**先 `close()` 后 `discard_pending()`**,与
+//   `ProtocolNode::DoClose()` 对读侧的既有写法逐字一致;两步之间那个极窄的窗口最坏让写
+//   线程多取走一条(= 最坏多一次 `Publish`),与本就无上界的在途 `Publish` 相比可忽略,
+//   **不为它加锁**。
 //
 // **不在这里 `Shutdown()` provider**:它要等在途 `Publish` 跑完(无上界),而本方法契约是
 // 受理即返。收敛整个落在 `WaitClosed()`。
@@ -181,12 +188,8 @@ Coro::Result<void> DdsTransport::Close() {
   // ① 停止交付。迟到的 listener 回调只会 push 进一条已关闭的队列(返 closed),它捕获的
   //    是分发端而**不是 `this`**,故不触碰已销毁的对象。
   CloseQueue(read_queue_, closed);
-  {
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    write_stop_ = true;    // ② 唤醒写线程的唯一阻塞点(等数据)。
-    write_queue_.clear();  // 未发出的残留随之丢弃——同三介质,不等刷出。
-  }
-  write_cv_.notify_all();
+  write_queue_.close(closed);      // ② 唤醒写线程的唯一阻塞点(等数据)。
+  write_queue_.discard_pending();  // 未发出的残留随之丢弃——同三介质,不等刷出(D2)。
   return Coro::Result<void>{};
 }
 

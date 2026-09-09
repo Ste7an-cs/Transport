@@ -5,9 +5,7 @@
  * @brief 协程原生 DDS 传输——listener 直推读队列 + 一条专属写线程(ADR-0013)。
  */
 
-#include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -16,6 +14,7 @@
 #include <thread>
 
 #include "await/awaitable.hpp"  // Coro::Awaitable —— 读队列。
+#include "detail/fiberchannel.hpp"  // Coro::FiberChannel —— 写队列(ADR-0017 D1)。
 
 #include "transport/core/TransportTypes.hpp"
 #include "transport/io/ITransport.hpp"
@@ -31,7 +30,7 @@ namespace transport {
  *         read_queue_ (Coro::Awaitable, 有界 1024, 静默丢最旧)
  *              ▲
  *              │ push(【外来线程】上直推,无泵 fiber)
- *         ┌────┴─────┐        write_queue_ (mutex + condition_variable + deque)
+ *         ┌────┴─────┐        write_queue_ (Coro::FiberChannel, 有界 1024, 静默丢最旧)
  *         │ listener │              │
  *         └────▲─────┘              ▼
  *              │             ┌──────────────┐
@@ -75,8 +74,10 @@ namespace transport {
  *
  * - 七方法 + 两个 `Declare*` 只在**调用方的执行域**(起本对象的那个 fiber 线程)内调用;
  * - `read_queue_` 由 provider 的 listener 线程写、由调用方 fiber 读(跨线程 `push` 安全);
- * - `write_queue_` 由调用方 fiber 写、由专属线程读,以 `std::mutex` + `std::condition_variable`
- *   保护——**不能用 `Coro::Awaitable`**,它的 `pop` 在非协程线程上会 crash(**D3**);
+ * - `write_queue_` 由调用方 fiber `push`、由专属线程 `pop`,原语是 `Coro::FiberChannel`
+ *   (ADR-0017 **D1**)——它**跨线程/跨协程安全**,在普通线程上 `pop` 挂起的是该线程自己的
+ *   主 fiber,行为即"阻塞该线程",正合所需(ADR-0013 D3 那句"非协程线程 pop 会 crash"
+ *   说的是被 `FiberChannel` 取代的 `boost::fibers::unbuffered_channel`,已实测证伪);
  * - `last_error_` 两侧都写,故单设一把小锁。
  *
  * 析构 `Close()` + `WaitClosed()`,故写线程不可能活过本对象。
@@ -86,8 +87,9 @@ class DdsTransport final : public ITransport {
   /// @brief `write_queue_` 的容量上限:与三介质的队列**逐字相同**(1024,满时静默丢最旧)。
   ///
   /// `read_queue_` 用的是 `Coro::Awaitable` 的默认容量,恰好也是 1024(**D11**、SDD DD-15);
-  /// 本常量只管写侧那条自建的 deque,使两侧口径一致。**写侧尤其需要它**:在途 `Publish`
-  /// 的阻塞无上界,不设界则积压无上界。
+  /// 本常量经 `write_queue_.setCapacity()` 落到 `FiberChannel` 上,使两侧口径一致
+  /// (ADR-0017 **D1**:容量与丢最旧不再手写,复用 `FiberChannel::push` 的内建语义)。
+  /// **写侧尤其需要它**:在途 `Publish` 的阻塞无上界,不设界则积压无上界。
   static constexpr std::size_t kWriteQueueCapacity = 1024;
 
   /// @brief 以 `DdsConfig` 构造——**尚未建 provider**,它在 `Start()` 里按名从
@@ -137,8 +139,12 @@ class DdsTransport final : public ITransport {
   ///         `kClosed`。写出的一切结果(含 `RETCODE_TIMEOUT`)只落 `LastError()`、不回传。
   [[nodiscard]] Coro::Result<void> AsyncWrite(Datagram datagram) override;
 
-  /// @brief 请求关闭(幂等,**只发信号不等收敛**):关读队列停止交付、置写线程停止位并
-  ///        清空写队列残留、唤醒写线程。
+  /// @brief 请求关闭(幂等,**只发信号不等收敛**):关读队列停止交付、`close()` 写队列
+  ///        唤醒写线程,再 `discard_pending()` 丢掉未发出的残留。
+  ///
+  /// **两步缺一不可**(ADR-0017 **D2**):`FiberChannel::pop` 在 `close()` 之后**仍会把
+  /// 队列排干**才返回 `closed`,只 `close()` 会让写线程在关闭时把至多 1024 条残留**逐条
+  /// `Publish`**,而 `Publish` 的阻塞没有上界。
   ///
   /// **不在这里 `Shutdown()` provider**:那会等在途 `Publish` 跑完(无上界),而本方法
   /// 契约是受理即返。收敛落在 `WaitClosed()`。
@@ -245,12 +251,10 @@ class DdsTransport final : public ITransport {
   std::shared_ptr<Coro::Awaitable<Datagram>> read_queue_{
       std::make_shared<Coro::Awaitable<Datagram>>()};
 
-  /// 内部写队列——**普通线程件**,不是 `Coro::Awaitable`(**D3**:消费方是普通线程,而
-  /// `Coro::Awaitable` 的 `pop` 在非协程线程上会 crash)。
-  mutable std::mutex write_mutex_;
-  std::condition_variable write_cv_;
-  std::deque<Datagram> write_queue_;
-  bool write_stop_{false};  ///< `Close()` 置位:写线程排空判据 + 退出判据。
+  /// 内部写队列:调用方 fiber `push`、专属 OS 线程 `pop`(ADR-0017 **D1**)。容量与
+  /// "满时静默丢最旧"由 `FiberChannel` 内建,与三介质的队列**逐字相同**;`Close()` 的
+  /// `close()` 是写线程唯一阻塞点(等数据)的唤醒者。
+  Coro::FiberChannel<Datagram> write_queue_;
   std::thread write_thread_;
 };
 
