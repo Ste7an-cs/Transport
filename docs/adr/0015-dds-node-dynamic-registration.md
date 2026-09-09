@@ -44,15 +44,30 @@ p.tx.Publish("first-frame", kFirst);         // 这一帧才可靠到达
 
 - **D2（配套四个注销方法）：** `UnregisterPublishers` / `UnregisterSubscribers` / `UnregisterClients` / `UnregisterServices`，签名与对应的注册方法同形，相位同为 `Created ∪ Running`。`Created` 期只从集合移除（本就没建端点）。
 
-- **D3（拆端点必须重算需求，不得盲拆）：** **一条 topic 可被多个注册项同时需要**——例如 `cfg.get.request` 既是某条 `Services` 的请求 topic，也可能被显式注册进 `Subscribers`。故注销的顺序是：
+- **D3（普通 topic 禁用 `cfg.` 前缀，使端点归属唯一；注销直接拆，不必重算）：** 注销要拆端点，就必须回答"这条 topic 还有别的注册项需要吗"。**本决策的处置是让这个问题在结构上不成立**——每条端点恒由**恰好一个**注册项负责，故注销时直接拆，不做任何重算。
+
+  **依据是一次穷举。** 两侧的端点集合为：
 
   ```
-  从集合移除 → 重新判定该 topic 是否仍被【任一】注册项需要 → 确已无人需要才拆
+  读侧 = Subscribers ∪ {cfg.S.request : S ∈ Services} ∪ {cfg.C.response : C ∈ Clients}
+  写侧 = Publishers  ∪ {cfg.C.request : C ∈ Clients}  ∪ {cfg.S.response : S ∈ Services}
   ```
 
-  读侧沿用现成的 `IsReaderSideTopic()`（`Subscribers ∪ 各 Services 的 request ∪ 各 Clients 的 reply`）；写侧新增对称的 `IsWriterSideTopic()`（`Publishers ∪ 各 Clients 的 request ∪ 各 Services 的 reply`）。
+  **派生项之间不可能相撞**（沿用 ADR-0013 **D6** 的单射性论证）：
 
-  **盲拆的后果是静默的**：拆掉一条仍被需要的 reader，该 topic 上的消息从此不再到达，而框架没有任何归因出口（ADR-0014），排障只能从"消息没来"倒推。
+  | 配对 | 为什么不可能相等 |
+  |---|---|
+  | `cfg.S.request` vs `cfg.C.response` | 一个以 `.request` 结尾、一个以 `.response` 结尾——**与服务名的内容无关**，恒不相等 |
+  | 同侧两个同后缀派生项 | 服务名不同即不同（`std::set` 已去重） |
+  | 同一服务名既 client 又 service | **已被现有校验拒绝**（`SameServiceNameAsBothClientAndServiceIsRejectedBothOrders`） |
+
+  **故重叠只剩唯一来源**：调用方往 `RegisterPublishers` / `RegisterSubscribers` 里手写一个 `cfg.` 开头的字符串。ADR-0013 **D16** 时期对此的处置是"框架不拦"（只在 README 标注该命名空间被占用）。
+
+  **本决策改为在注册时拒绝**：`ValidatePlainBatch` 增加一条——普通 topic **不得以 `cfg.` 开头**，违者返 `kInvalidArgument`。
+
+  由此「一条端点恰有一个注册项负责」成为**可证的结构性质**，而不是靠调用方守约定。这正是不做重算的依据：**不是"约定它不会发生所以省掉"，而是"它不可能发生所以不需要"。**
+
+  > **为什么不选"只写进文档、靠调用方保证"**：违反时的后果是**静默**的——盲拆掉一条仍被需要的 reader 后，该 topic 上的消息从此不再到达，而框架没有任何归因出口（ADR-0014），排障只能从"消息没来"倒推。一条 `starts_with("cfg.")` 判断就能把它变成注册当场的 `kInvalidArgument`，这个价格显然该付。
 
 - **D4（`IDdsProvider` 补上 `UndeclareWriter`）：** 读侧拆除已有 `Unsubscribe(topic)`，写侧**此前根本无法表达**。补一个与 `DeclareWriter` 对称的 `UndeclareWriter(topic)`，同样要求幂等（拆一个不存在的 topic 直接成功）。
 
@@ -93,16 +108,23 @@ p.tx.Publish("first-frame", kFirst);         // 这一帧才可靠到达
 
 3. **`IDdsProvider` 的扩展对第三方 provider 是破坏性的。** 新增纯虚 `UndeclareWriter` 意味着任何自建 provider 都必须跟着实现。SRS **RT_DESIGN_006**「应支持替换 provider」仍成立，但**替换的成本上升了一个方法**。
 
-4. **注销的正确性依赖 D3 那次重算。** 这是本 ADR 引入的**唯一一处需要全局推理**的逻辑：判断错了会静默拆掉仍被需要的端点。它由 `IsReaderSideTopic` / `IsWriterSideTopic` 两个函数独占承担，测试须覆盖"多注册项共用一条 topic 时逐个注销"的全部组合。
+4. **`cfg.` 前缀从"框架不拦"变成注册期硬拒（D3），这是破坏性变更。** 两处影响：
+
+   | 影响 | 说明 |
+   |---|---|
+   | 此前合法的写法变成错误 | `RegisterSubscribers({"cfg.get.request"})` 现在返 `kInvalidArgument`。它是 ADR-0013 D16 明知而未拦的陷阱，本不该有人依赖 |
+   | 业务 topic 碰巧以 `cfg.` 开头的会被误拒 | 该命名空间自 ADR-0013 **D6** 起即由框架占用，只是此前未强制。宿主须改名 |
+
+   **换来的是「一条端点恰有一个注册项负责」成为可证性质**，注销路径因此没有任何需要全局推理的逻辑——这是本 ADR 里最容易写错、且写错后完全静默的那一处，被整个消掉了。
 
 ## 影响（Consequences）
 
 - **正面：** ① 启动时不必知道全部 topic；② 增删订阅/服务不再需要重启节点，在途交互不被打断；③ 写侧拆除首次成为可表达的操作。
 - **负面（明确接受）：** 见上四条。
-- **对 ADR-0013：** **D15** 的相位约束（"运行期不再有任何建端点的路径"）与 **D16** 的"只在 `Created` 受理"被本 ADR 放开；**D12** 的四组全空判据被撤销。三条决策的其余部分（端点方向派生、`reply_to` 降为交叉校验、服务名派生规则）**全部沿用**。
+- **对 ADR-0013：** **D15** 的相位约束（"运行期不再有任何建端点的路径"）与 **D16** 的"只在 `Created` 受理"被本 ADR 放开；**D12** 的四组全空判据被撤销；**D16** 对 `cfg.*` 命名空间"框架不拦"的处置改为**注册期硬拒**（**D3**）。四条决策的其余部分（端点方向派生、`reply_to` 降为交叉校验、服务名派生规则、**D6** 的单射性论证——本 ADR 正是靠它证出端点归属唯一）**全部沿用**。
 - **对 SRS：** `RT_IF_DDS` 的注册相位描述放宽；追溯矩阵相应更新。
-- **对 SDD：** `DdsNode` 的相位表与端点生命周期一节改写；新增 `IsWriterSideTopic` 与注销路径的详细设计。
-- **对 README：** 「相位规则」表与 DDS 一节补动态注册与注销的用法，并**显式写出首帧丢失这条代价**。
+- **对 SDD：** `DdsNode` 的相位表与端点生命周期一节改写；补注销路径与「端点归属唯一」那次穷举论证的详细设计。
+- **对 README：** 「相位规则」表与 DDS 一节补动态注册与注销的用法，**显式写出首帧丢失这条代价**；并改写现有那条「框架占用 `cfg.*` 命名空间…**框架不拦**」的警示——它现在拦了。
 
 ## 备选方案（Alternatives considered）
 
