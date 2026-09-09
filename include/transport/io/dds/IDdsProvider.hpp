@@ -45,11 +45,21 @@ class IDdsProvider {
   /// 与 `Subscribe` 对称的写侧钩子。有它,发现窗口(约 240ms)才能在**启动时**付掉,
   /// 而不是压在第一帧上——否则**该服务的第一次应答会丢**(**D15/D16**)。
   ///
-  /// **不设 `UndeclareWriter`**:端点集合启动即定型、运行期恒定(**D16**),只在
-  /// `Shutdown()` 时整体拆除。
-  ///
   /// @return 成功空 `Result`;端点建不出返 `kIo`;未 `Init` / 关闭中返 `kInvalidState`。
   virtual Coro::Result<void> DeclareWriter(const std::string& topic) = 0;
+
+  /// @brief 拆除该 topic 的写侧端点——`DeclareWriter` 的对称面(ADR-0015 **D4**)。**幂等**。
+  ///
+  /// 读侧的拆除一直有 `Unsubscribe(topic)`,写侧此前**根本无法表达**;端点随注册动态增删
+  /// (**D1/D2**)之后它成了必需品。
+  ///
+  /// **幂等的含义**:拆一个从未声明过的 topic **直接成功**——注销路径不必先查"建过没有"。
+  ///
+  /// @warning **新增的纯虚方法对第三方 provider 是破坏性的**(ADR-0015「明确接受的代价」③):
+  ///          任何自建 provider 都必须跟着实现。
+  ///
+  /// @return 成功空 `Result`;未 `Init` / 关闭中返 `kInvalidState`。
+  virtual Coro::Result<void> UndeclareWriter(const std::string& topic) = 0;
 
   /// @brief 向 topic 发一份字节。**该 topic 须已 `DeclareWriter`**。
   ///

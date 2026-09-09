@@ -24,7 +24,7 @@ void FakeDdsProvider::Shutdown() {
   {
     std::lock_guard<std::mutex> lk(mine_m_);
     mine.swap(mine_);
-    declared_writers_.clear();  // 端点集合在这一刻整体拆除(D16)。
+    declared_writers_.clear();  // 剩下的写侧端点在这一刻整体拆除。
   }
   if (bus_)
     for (auto& kv : mine)
@@ -39,6 +39,17 @@ Coro::Result<void> FakeDdsProvider::DeclareWriter(const std::string& topic) {
   if (!bus_) return make_error_code(TransportErrc::kInvalidState);
   std::lock_guard<std::mutex> lk(mine_m_);
   declared_writers_.insert(topic);  // 幂等:set 天然去重。
+  return Coro::Result<void>{};
+}
+
+// 写侧端点拆除(ADR-0015 D4)。与 `DeclareWriter` 逐条对称:Fake 只销记,但**判据与真实
+// provider 一致**——拆掉之后 `Publish` 该 topic 返 kConfiguration,注销确实生效在 Fake 上
+// 也观测得到。**幂等**:拆一个没声明过的 topic 直接成功。
+Coro::Result<void> FakeDdsProvider::UndeclareWriter(const std::string& topic) {
+  // 未 Init(无总线)即拆:调用序错误 → kInvalidState(与 DeclareWriter 一致)。
+  if (!bus_) return make_error_code(TransportErrc::kInvalidState);
+  std::lock_guard<std::mutex> lk(mine_m_);
+  declared_writers_.erase(topic);  // 幂等:erase 不存在的键是空操作。
   return Coro::Result<void>{};
 }
 

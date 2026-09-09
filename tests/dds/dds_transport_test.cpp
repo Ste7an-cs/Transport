@@ -173,6 +173,10 @@ class BlockingPublishProvider : public IDdsProvider {
     state_->declared.fetch_add(1);
     return Coro::Result<void>{};
   }
+  Coro::Result<void> UndeclareWriter(const std::string&) override {
+    state_->declared.fetch_sub(1);
+    return Coro::Result<void>{};
+  }
   Coro::Result<void> Publish(const std::string&, const Bytes&) override {
     state_->entered.fetch_add(1);
     std::this_thread::sleep_for(state_->delay);  // 打不断的一段(同真实 write())。

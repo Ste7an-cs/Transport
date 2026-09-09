@@ -33,30 +33,42 @@
  * 两侧算的是同一个派生函数(`DdsNode.cpp` 的 `DeriveServiceTopics`)。**服务名的唯一约束
  * 是非空**,不限制字符集。
  *
- * @warning 派生出的 `cfg.*.request` / `cfg.*.response` 与 `RegisterPublishers` /
- *          `RegisterSubscribers` 收的普通 topic **处在同一平面**:
- *          `RegisterSubscribers({"cfg.get.request"})` 与 `RegisterServices({"get"})`
- *          指的是**同一条 topic**。**框架不拦**。
+ * @warning `cfg.` 这个命名空间**由框架占用**:`RegisterPublishers` / `RegisterSubscribers`
+ *          的普通 topic **不得以 `cfg.` 开头**,违者返 `kInvalidArgument`
+ *          (ADR-0015 **D3**;此前框架不拦,这是**破坏性变更**)。拦掉它,「一条端点恰有
+ *          一个注册项负责」才是可证的结构性质,注销才能直接拆端点、不必重算。
+ *          **服务名不受此限**——`RegisterClients({"cfg.x"})` 派生出的是
+ *          `cfg.cfg.x.request`,撞不上任何普通 topic。
  *
- * ## topic 由注册接口给出,不进配置(**D16**)
+ * ## topic 由注册接口给出,不进配置(**D16**);注册可在运行期增删(ADR-0015)
  *
  * ```cpp
  * DdsNode node(transport, std::make_unique<DdsCodec>());
  * (void)node.RegisterPublishers({"telemetry"});   // 发布者:topic
  * (void)node.RegisterServices({"get"});           // 服务端:服务名
- * (void)node.Start();                             // 端点在此一次性建出
+ * (void)node.Start();                             // 已注册项的端点在此一次性建出
+ * (void)node.RegisterSubscribers({"late"});       // 运行期补注册:端点【当场】建出
+ * (void)node.UnregisterServices({"get"});         // 运行期注销:端点【当场】拆掉
  * ```
  *
- * **四个注册方法一律只在 `Created` 相位受理**,`Running` / `Closing` / `Closed` 返
- * `kInvalidState`。端点集合"**启动即定型、运行期恒定**",无运行期动态端点(**D9**)。
+ * **八个注册 / 注销方法的相位是 `Created ∪ Running`**(ADR-0015 **D1/D2**):`Created` 期
+ * 只落注册表(端点由 `DoStart()` 统一建),`Running` 期落表**并当场建 / 拆端点**;
+ * `Closing` / `Closed` 返 `kClosed`。端点集合**不再"启动即定型"**。
  *
- * `Subscribe` 与之**互不重叠**:它**只在 `Running` 受理**,`Created` 期订阅是禁用法、返
- * `kClosed`(与另外三个交互方法同一个判据,见该方法的注释)。全流程即
- * 「注册 → `Start()` → 订阅」。
+ * @warning **动态注册出来的写侧端点,其首帧会静默丢失**(ADR-0015「明确接受的代价」①):
+ *          新建的 `DataWriter` 在与对端 `DataReader` 匹配上之前(约 240ms 发现窗口),
+ *          写出的帧丢掉而 `Publish` 照样返回成功。**框架不提供任何"何时安全"的判据**
+ *          ——`MatchedCount()` 是参与者级聚合、不带 topic 参数,对新注册的那条 topic
+ *          一无所知。**风险由宿主自行评估处置**:周期上报丢一帧下次就补上;一次性通知
+ *          请自己压一个延时,或改用有重发兜底的 `RequestForResultDirect`。
+ *          启动前就注册好的端点没有这个问题——那一个发现窗口在 `Start()` 里付掉了。
+ *
+ * `Subscribe` 只在 `Running` 受理,`Created` 期订阅是禁用法、返 `kClosed`(与另外三个交互
+ * 方法同一个判据,见该方法的注释)。典型流程仍是「注册 → `Start()` → 订阅」。
  *
  * ## 角色由"注册了什么"表达,不设 role 枚举(**D16**)
  *
- * | 注册方法 | 收什么 | 该节点就是 | `DoStart()` 建的端点 |
+ * | 注册方法 | 收什么 | 该节点就是 | 建出的端点 |
  * |---|---|---|---|
  * | `RegisterPublishers` | **topic** | 发布者 | 每个 topic 的 **Writer** |
  * | `RegisterSubscribers` | **topic** | 订阅者 | 每个 topic 的 **Reader** |
@@ -103,9 +115,10 @@
  * ## 不管 transport 的生命周期
  *
  * 传输由**宿主**创建、`Start()`、`Close()`、`WaitClosed()`,本节点只按引用借用它
- * (与 `ProtocolNode` 同,ADR-0009)。`DoStart()` 只在其上逐项 `DeclareWriter` /
- * `DeclareReader`(**D15**:这是**唯一**建端点的地方),故**调用 `Start()` 之前宿主必须先
- * 把传输启起来**,否则声明一律返 `kInvalidState`。
+ * (与 `ProtocolNode` 同,ADR-0009)。本节点只在其上逐项 `DeclareWriter` / `DeclareReader`
+ * (`DoStart()` 与运行期注册**共用同一个建端点函数**,ADR-0015 **D1**)与
+ * `UndeclareWriter` / `UndeclareReader`,故**调用 `Start()` 之前宿主必须先把传输启起来**,
+ * 否则声明一律返 `kInvalidState`。
  *
  * @warning `close()` 是**整流传播**的(AsyncTask `417790c` 起):`DoClose()` 关闭本节点这一路
  *          读订阅时,源读队列与同一条传输上的其它订阅者**一并终结**。节点关闭即读侧终结,
@@ -194,35 +207,42 @@ class DdsNode : public NodeBase {
   DdsNode(const DdsNode&) = delete;
   DdsNode& operator=(const DdsNode&) = delete;
 
-  // ── 注册接口(D16)——【须在 Start() 之前调用】 ──────────────────────────
+  // ── 注册 / 注销接口(D16 + ADR-0015 D1/D2)──────────────────────────────
 
   /**
-   * @brief 注册**发布者** topic:每个 topic 在 `DoStart()` 建一个 **Writer**。
+   * @brief 注册**发布者** topic:每个 topic 建一个 **Writer**。
    *
    * **批量**——一次给一组,不必一个 topic 调一次;**可多次调用累加**(便于按模块分别注册);
    * **重复项幂等去重**,不报错。
    *
    * **整批生效或整批不生效**:一批里只要有一项非法,**整批回滚、一项都不落**,返对应错误。
-   * 半生效的注册会让调用方难以判断该重试哪些。
+   * 半生效的注册会让调用方难以判断该重试哪些。`Running` 期还多一步——某项**建端点**失败时
+   * **拆掉本批已建的端点**再返错(ADR-0015 **D7**)。
+   *
+   * @warning **topic 不得以 `cfg.` 开头**(ADR-0015 **D3**),违者 `kInvalidArgument`。该
+   *          命名空间自 ADR-0013 D6 起即由请求-响应的派生 topic 占用,此前只在文档里标注、
+   *          框架不拦,**现在拦了**。拦掉它,「一条端点恰有一个注册项负责」才成为可证的结构
+   *          性质,注销路径才能直接拆端点而不必重算(论证见 ADR-0015 D3)。
+   *          **服务名不受此限**:`RegisterClients({"cfg.x"})` 仍合法。
    *
    * @param topics 待注册的 topic 集合。
-   * @return 成功;不在 `Created` 相位返 `kInvalidState`;任一 topic 为空串返
-   *         `kInvalidArgument`(此时整批未落)。
+   * @return 成功;`Closing` / `Closed` 相位返 `kClosed`;任一 topic 为空串或以 `cfg.`
+   *         开头返 `kInvalidArgument`(此时整批未落);`Running` 期建端点失败原样返传输的
+   *         错误(整批未落、本批已建端点已拆)。
    */
   [[nodiscard]] Coro::Result<void> RegisterPublishers(
       std::vector<std::string> topics);
 
-  /// @brief 注册**订阅者** topic:每个 topic 在 `DoStart()` 建一个 **Reader**。
-  ///        批量 / 累加 / 幂等去重 / 整批生效,返回值同 `RegisterPublishers`。
+  /// @brief 注册**订阅者** topic:每个 topic 建一个 **Reader**。
+  ///        批量 / 累加 / 幂等去重 / 整批生效、`cfg.` 前缀禁用,返回值同 `RegisterPublishers`。
   [[nodiscard]] Coro::Result<void> RegisterSubscribers(
       std::vector<std::string> topics);
 
   /**
    * @brief 注册**请求-响应客户端**——**只收服务名**,两个 topic 由框架派生(**D6**)。
    *
-   * `cfg.<名>.request` 在 `DoStart()` 建 **Writer**(发请求)、`cfg.<名>.response` 建
-   * **Reader**(收应答)。与服务端 `RegisterServices` **传一模一样的服务名**,各自按角色建
-   * 各自那一侧(**D16**)。
+   * `cfg.<名>.request` 建 **Writer**(发请求)、`cfg.<名>.response` 建 **Reader**(收应答)。
+   * 与服务端 `RegisterServices` **传一模一样的服务名**,各自按角色建各自那一侧(**D16**)。
    *
    * **应答 topic 是每服务一个、该服务的全体客户端共用的**(**D6**);不同服务的应答落在
    * 各自派生出的 topic 上,互不相扰。
@@ -230,7 +250,7 @@ class DdsNode : public NodeBase {
    * 批量 / 累加 / 幂等去重 / 整批生效,同 `RegisterPublishers`。
    *
    * @param service_names 待注册的服务名集合。
-   * @return 成功;不在 `Created` 相位返 `kInvalidState`;下列任一非法返 `kInvalidArgument`
+   * @return 成功;`Closing` / `Closed` 相位返 `kClosed`;下列任一非法返 `kInvalidArgument`
    *         (整批不落):
    *         - **服务名为空串**;
    *         - 某个服务名**已注册为 `Services`**——**自己请求自己**,且 `corr` 由自己生成、
@@ -246,6 +266,53 @@ class DdsNode : public NodeBase {
   ///        (收请求)、`cfg.<名>.response` 建 **Writer**(发应答)。校验与返回值与
   ///        `RegisterClients` 逐条对称(方向冲突查的是 `Clients`)。
   [[nodiscard]] Coro::Result<void> RegisterServices(
+      std::vector<std::string> service_names);
+
+  /**
+   * @brief 注销**发布者** topic:从注册表摘除,`Running` 期**当场拆掉该 topic 的 Writer**
+   *        (ADR-0015 **D2**)。
+   *
+   * 与 `RegisterPublishers` 同形、同相位(`Created ∪ Running`)。`Created` 期只从集合移除
+   * ——彼时本就没建过端点。
+   *
+   * **不在册的项是幂等空操作**,不报错:本方法的语义是"确保它不在",而不是"它此刻必须在"。
+   * 故也没有"整批不生效"可言——摘除不会失败。
+   *
+   * **直接拆端点,不做任何"是否仍被需要"的重算**(**D3**):普通 topic 禁用 `cfg.` 前缀之后
+   * 「一条端点恰有一个注册项负责」是可证的结构性质,该项负责的端点只有该项要。
+   *
+   * 注销之后 `Publish(topic, …)` 返 `kConfiguration`——与"从没注册过"完全一样。
+   *
+   * @param topics 待注销的 topic 集合。
+   * @return 成功;`Closing` / `Closed` 相位返 `kClosed`。
+   */
+  [[nodiscard]] Coro::Result<void> UnregisterPublishers(
+      std::vector<std::string> topics);
+
+  /// @brief 注销**订阅者** topic:摘除注册,`Running` 期拆掉该 topic 的 Reader。
+  ///        语义与返回值同 `UnregisterPublishers`。
+  ///
+  /// @note 拆掉 Reader 只止住**新样本**;拆除之前已经进了读队列的样本仍会被分发出去。
+  [[nodiscard]] Coro::Result<void> UnregisterSubscribers(
+      std::vector<std::string> topics);
+
+  /// @brief 注销**请求-响应客户端**(收服务名):拆掉 `cfg.<名>.request` 的 Writer 与
+  ///        `cfg.<名>.response` 的 Reader。语义与返回值同 `UnregisterPublishers`。
+  ///
+  /// **在途交互不检测、不等待**(**D6**):已发出的 `RequestForResultDirect` 挂在
+  /// `Dispatcher` 上,不受影响地跑完它自己的重发与超时;此后对该服务名调
+  /// `RequestForResultDirect` 返 `kConfiguration`。
+  [[nodiscard]] Coro::Result<void> UnregisterClients(
+      std::vector<std::string> service_names);
+
+  /// @brief 注销**请求-响应服务端**(收服务名):拆掉 `cfg.<名>.request` 的 Reader 与
+  ///        `cfg.<名>.response` 的 Writer。语义与返回值同 `UnregisterPublishers`。
+  ///
+  /// **在途交互不检测、不等待**(**D6**):`ServeRequests` 交出的 `Ticket` **继续有效**
+  /// (它挂在 `Dispatcher` 上,与注册表无关),只是不会再有新请求到达;对已注销服务的
+  /// `Reply()` 返 `kConfiguration`——**已经收在手里的那条请求应答不回去了**,这是本决策
+  /// 明确接受的形状,客户端侧由其重发与超时兜底。
+  [[nodiscard]] Coro::Result<void> UnregisterServices(
       std::vector<std::string> service_names);
 
   // ── 公开面:两种交互模式(D8)────────────────────────────────────────────
@@ -369,8 +436,12 @@ class DdsNode : public NodeBase {
    *
    * 它由 `request.topic`(即派生出的 `cfg.<名>.request`)**反查自己注册的服务**,再派生出
    * 该服务的 `cfg.<名>.response`(走的是**同一个派生函数**,不另写解析器)。**不取信于
-   * 线缆、不建端点**(**D15**):该应答 topic 的 writer 早在 `DoStart()` 就建好了,故服务
-   * 的**第一次应答也不会丢**。
+   * 线缆、不建端点**(**D15**):该应答 topic 的 writer 在注册那一刻就建好了。启动前注册的
+   * 服务,其**第一次应答不会丢**;**运行期动态注册的服务则会丢一次**(ADR-0015「明确接受
+   * 的代价」①,客户端的重发兜底它)。
+   *
+   * 服务名**已被 `UnregisterServices` 注销**时返 `kConfiguration`——反查落空,与"从没注册
+   * 过"完全一样(**D6**:注销不检测在途,已收在手里的请求就应答不回去了)。
    *
    * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与派生出的应答 topic 不等即返
    * `kInvalidArgument`——对**版本不一致的对端**,它是唯一能当场发现偏差的手段。
@@ -389,11 +460,13 @@ class DdsNode : public NodeBase {
  protected:
   // ── NodeBase 生命周期钩子 ──────────────────────────────────────────────
 
-  /// @brief 启动的 DDS 特有实事:**四组注册全空即 `kConfiguration`**(**D12**:一个什么都
-  ///        不收不发的节点必是漏了注册)→ 按四组注册逐项在传输上建**对应方向**的端点
-  ///        (**D15**:**唯一**建端点的地方)→ 取读订阅 → spawn 读-分发循环。
-  ///        **不启动 transport**(那是宿主的事)。任一步失败即返错,基类退回 `Created`
+  /// @brief 启动的 DDS 特有实事:按四组注册逐项在传输上建**对应方向**的端点(与运行期
+  ///        动态注册**共用同一个建端点函数**,ADR-0015 **D1**)→ 取读订阅 → spawn 读-分发
+  ///        循环。**不启动 transport**(那是宿主的事)。任一步失败即返错,基类退回 `Created`
   ///        且**注册表原样保留**——补上漏的那几项再 `Start()` 一次即可(**D16**)。
+  ///
+  ///        **四组全空不再是错误**(ADR-0015 **D5** 撤销 ADR-0013 D12):启动时还不知道有
+  ///        哪些 topic,正是动态注册要支持的主要场景。
   Coro::Result<void> DoStart() override;
 
   /// @brief 关闭汇合信号(只发信号、不等待):close 本节点的读订阅(读循环据此退出)→
@@ -406,6 +479,10 @@ class DdsNode : public NodeBase {
   void DoJoin() override;
 
  private:
+  /// @brief 八个注册 / 注销方法共用的相位判据(ADR-0015 **D1**)。
+  /// @return `false` = `Created`(只落表)、`true` = `Running`(落表并当场建 / 拆端点);
+  ///         `Closing` / `Closed` 返 `kClosed`。
+  [[nodiscard]] Coro::Result<bool> RegistrationPhase() const;
   /// @brief spawn 读-分发循环 fiber:`await(rx_) → 成功 → DecodeAndDispatch;错误 → Close()`。
   void SpawnReadLoop();
   /// @brief 读循环体内的 DDS 特有处理:Decode 一条样本 → 按来源 topic 填 `topic`/`source`
@@ -441,7 +518,10 @@ class DdsNode : public NodeBase {
   /// **外部协议**的匹配键,DDS 路径留缺省 `0`。
   std::uint32_t request_seq_{0};
 
-  // —— 四组注册表(**D16**)。`Start()` 之前填,此后只读;`Start()` 失败**不清空**。
+  // —— 四组注册表(**D16**)。`Created` 与 `Running` 期均可增删(ADR-0015 D1/D2);
+  //    `Start()` 失败**不清空**。**不加锁**:读路径(`DecodeAndDispatch` / `Dispatch`)
+  //    完全不触碰这四个集合,读它们的 `Publish` / `RequestForResultDirect` / `Reply` /
+  //    `Subscribe` 全在业务 fiber 上,而节点各 fiber 同线程固定亲和(ADR-0015 背景)。
   //    请求-响应两组存的是**服务名**,两个 topic 一律由 `DeriveServiceTopics` 现算
   //    (**D6**)——不缓存派生结果,免得同一事实存两份、将来改派生规则时漏改一处。——
   std::set<std::string> publishers_;   ///< topic → Writer。

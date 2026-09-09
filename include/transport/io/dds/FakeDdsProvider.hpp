@@ -66,6 +66,11 @@ class FakeDdsProvider : public IDdsProvider {
   ///        Fake 无端点可建,只登记——`Publish` 据此判"未声明"。未 `Init` 返 `kInvalidState`。
   Coro::Result<void> DeclareWriter(const std::string& topic) override;
 
+  /// @brief 抹掉该 topic 的写侧登记(幂等,ADR-0015 **D4**)。真实 provider 在这一步删
+  ///        `DataWriter`;Fake 无端点可拆,只销记——此后 `Publish` 该 topic 返
+  ///        `kConfiguration`,与真实 provider 的可观测行为一致。未 `Init` 返 `kInvalidState`。
+  Coro::Result<void> UndeclareWriter(const std::string& topic) override;
+
   /// @brief 向 topic 同步分发。**该 topic 须已 `DeclareWriter`**,否则返 `kConfiguration`
   ///        (**D13**:不惰性建,两个实现一致)。
   Coro::Result<void> Publish(const std::string& topic, const std::vector<uint8_t>& bytes) override;
@@ -87,8 +92,7 @@ class FakeDdsProvider : public IDdsProvider {
   std::shared_ptr<Bus> bus_;
   mutable std::mutex mine_m_;
   std::map<std::string, std::vector<uint64_t>> mine_;  // 本 provider 的订阅 id
-  /// 已声明的写侧 topic(与 `mine_` 同锁)。`Shutdown()` 整体清掉——端点集合只在那一刻
-  /// 拆除,没有单独撤销一个 writer 的时机(**D16**,故不设 `UndeclareWriter`)。
+  /// 已声明的写侧 topic(与 `mine_` 同锁)。`UndeclareWriter` 单项拆、`Shutdown()` 整体清。
   std::set<std::string> declared_writers_;
 };
 
