@@ -3,7 +3,7 @@ sequenceDiagram
     participant N as DdsNode
     participant T as DdsTransport（ITransport 七方法）
     participant RQ as read_queue（Coro::Awaitable）
-    participant WQ as write_queue（mutex+condvar，【不是 FiberChannel】）
+    participant WQ as write_queue（mutex+condvar+deque）
     participant W as 专属 OS 线程
     participant P as IDdsProvider
     participant PEER as 对端
@@ -26,7 +26,7 @@ sequenceDiagram
     rect rgba(255,235,220,0.25)
     Note over N,PEER: 写侧 —— 【专属 OS 线程】，不是写泵 fiber
     N->>T: AsyncWrite({bytes, peer=kTopic})
-    T->>WQ: push（fiber → 普通线程，【不能用 FiberChannel】：<br/>其 pop 在非协程线程上会 crash，故用 mutex+condvar+deque）
+    T->>WQ: push（fiber → 普通线程；用 mutex+condvar+deque 而非 FiberChannel，<br/>因消费方是普通 OS 线程，不必为它引入 fiber 运行时上下文）
     T-->>N: Coro::Result~void~{}　※【入队即返】，fire-and-forget 契约照旧
     WQ-->>W: 取出一条
     W->>P: Publish()　※ 同步，可能 park【本线程】至多 max_blocking_time

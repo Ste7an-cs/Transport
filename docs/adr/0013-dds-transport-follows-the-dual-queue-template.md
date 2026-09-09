@@ -49,6 +49,16 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 
   **`write_queue_` 不能是 `FiberChannel`**：消费方是**普通线程**，而 `FiberChannel` 的文档明载"**非协程线程上 `pop` 会 crash**"。须用 `std::mutex` + `std::condition_variable` + `std::deque`。
 
+  > **⚠ 上面这半句依据是误读，2026-09-08 实测证伪，记此以免再被引用。**
+  >
+  > `fiberchannel.hpp` 的原话是：「跨线程/跨协程安全的通用队列……**代替 `boost::fibers::unbuffered_channel`——原生的 unbuffered_channel 在非协程线程上 pop 时会 crash**」。**那句 crash 警告的主语是被取代的 `boost::fibers::unbuffered_channel`，不是 `FiberChannel`**——后者写出来正是为了解决这个问题，其自述为"跨线程/跨协程安全"。
+  >
+  > **实测**（照本节的形态：fiber 里 `push`、普通 `std::thread` 上 `pop`）：不崩，1001/1001 全收到、顺序严格保持、单条唤醒时延 131µs、`close()` 1ms 内唤醒阻塞中的普通线程；空等 3 秒时该线程**自身**的 CPU 时间为 70µs（对照 `std::condition_variable` 13µs），**不空转**。机理：`pop` 用的是 `boost::fibers::mutex` / `condition_variable`，boost.fiber 把每条线程的主上下文也当作一条 fiber，故在普通线程上挂起的是该线程的主 fiber，行为即"阻塞该线程"，正合专属写线程之需。
+  >
+  > **本决策的结论完全不受影响**：写侧仍须一条专属 OS 线程——那条依据是**另一件事**（`DataWriter::write()` park 调用线程，见本节背景的实测表），且始终成立。塌掉的只是"所以队列不能用 `FiberChannel`"这半句。
+  >
+  > **现状代码保持不变**（2026-09-08 裁决）。若日后要换成 `FiberChannel`，顺带的好处是四个介质的队列语义真正统一，并可删掉 `DdsTransport.cpp` 里手写的容量+丢最旧逻辑（那正是 `FiberChannel::push` 的内建语义）；代价是须重验关闭时序。**维持现状的理由改为**：专属写线程是一条普通 OS 线程，不必为它引入 fiber 运行时上下文——这个理由比原来的弱得多，是"没必要"而非"不能用"。
+
   **为什么是"专属线程"而不是三介质的"写泵 fiber"**：见背景——`Publish` 会 park 调用线程，用 fiber 会卡死整条线程上的所有 fiber。**这是 DDS 与三介质唯一的实质结构差异**。
 
   **由此写侧的阻塞对调用方完全不可见**：阻塞发生在专属线程上，业务 fiber 早已返回。写出的一切结果（含 `RETCODE_TIMEOUT`）**不回传，只落 `LastError()`**——与三介质逐字相同。
@@ -643,7 +653,9 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
 **第一版留下的两处判断在本版中仍然成立、已被吸收**：
 
 1. **写阻塞是线程级** → 本版 **D3** 的专属 OS 线程。第一版的这一实测（含 `ASYNCHRONOUS_PUBLISH_MODE` 绕不过去）是本版写侧形态的直接依据。
-2. **跨线程 `push` 安全、`pop` 不安全** → 本版 **D2**（listener 直推 `read_queue_`）与 **D3**（`write_queue_` 不能用 `FiberChannel`）。
+2. **跨线程 `push` 安全** → 本版 **D2**（listener 直推 `read_queue_`）。
+
+   > **⚠ 原文此处还写着"`pop` 不安全 → D3（`write_queue_` 不能用 `FiberChannel`）"，该半句已于 2026-09-08 实测证伪**（详见 **D3** 的补正）：`FiberChannel::pop` 在普通线程上工作正常，那句 crash 警告的主语是被它取代的 `boost::fibers::unbuffered_channel`。**D3 的结论不受影响**——专属写线程的依据是上一条（写阻塞是线程级），不是这一条。
 
 **第一版声称、本版明确放弃的**：把流控交回 DDS QoS。本版接受 `RELIABLE` 被架空（代价 ①）。
 

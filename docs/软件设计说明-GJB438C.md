@@ -83,8 +83,9 @@
 
   **两处都建立在实测之上：**
 
-  1. **外来线程 → fiber 的 `FiberChannel::push` 安全**（4 线程并发 8000/8000、20000 条严格连续无空洞、唤醒时延 avg 28µs / max 70µs）。机理已核到源码——`push` 只做 `lock` + `push_back` + `notify_all`，**无等待路径**；其文档那句 crash 警告**只针对 `pop`**。故 listener 可直推，读侧**连泵 fiber 都省了**。
-  2. **反方向不能用 `FiberChannel`**——`write_queue` 的消费方是普通线程，而 `pop` 在非协程线程上会 crash。故 `write_queue` 用 `std::mutex` + `condition_variable` + `std::deque`，**不是 `Coro::Awaitable`**。
+  1. **外来线程 → fiber 的 `FiberChannel::push` 安全**（4 线程并发 8000/8000、20000 条严格连续无空洞、唤醒时延 avg 28µs / max 70µs）。机理已核到源码——`push` 只做 `lock` + `push_back` + `notify_all`，**无等待路径**。故 listener 可直推，读侧**连泵 fiber 都省了**。
+  2. **`write_queue` 用 `std::mutex` + `condition_variable` + `std::deque`，不是 `Coro::Awaitable`**——消费方是一条普通 OS 线程（见下条），不必为它引入 fiber 运行时上下文。
+     > **不是因为“`FiberChannel::pop` 在非协程线程上会 crash”**——该说法系误读 `fiberchannel.hpp`（那句 crash 警告的主语是被它取代的 `boost::fibers::unbuffered_channel`），2026-09-08 实测证伪：fiber 里 push、普通线程上 pop，1001/1001 全收到、顺序保持、`close()` 1ms 内唤醒、空等 3s 的线程自身 CPU 仅 70µs。详见 ADR-0013 **D3** 的补正。
 
   **`ASYNCHRONOUS_PUBLISH_MODE` 绕不过写阻塞**（实测 178/200 超时）：该模式挪走的是**网络发送**，而 `write()` 仍须先把样本**放进 writer 的 history**；`RELIABLE` + 满时卡住的是**准入**，与发布模式无关。故专属线程不可省。
 
@@ -345,7 +346,7 @@ transport 作为单一 CSCI，外接四个实体：宿主应用、通信介质�
 
 **由此多一条硬约束**：专属写线程**会顺带跑掉同进程内所有对端的交付回调**，故「读侧 listener 必须快且不阻塞」**是硬约束不是建议**。我方 listener 满足（只做 `push`，无等待路径）；但**同进程内任何非本框架的慢订阅方都会卡住我方整条写队列**——这是部署面约束，框架无法强制，须写进使用文档。
 
-**两处最容易做错的**：① **`write_queue` 不能是 `FiberChannel`** —— 消费方是普通线程，而 `pop` 在非协程线程上会 crash；② **不得用写泵 fiber 代替专属线程** —— `Publish` 会 park 调用线程，fiber 会卡死整条线程上的所有 fiber，且 `ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（实测 178/200 超时，它挪走的是网络发送而非准入）。
+**一处最容易做错的**：**不得用写泵 fiber 代替专属线程** —— `Publish` 会 park 调用线程，fiber 会卡死整条线程上的所有 fiber，且 `ASYNCHRONOUS_PUBLISH_MODE` **绕不过去**（实测 178/200 超时，它挪走的是网络发送而非准入）。
 
 **请求-响应照 `RequestForResultDirect`**（ADR-0010 **D13**）：`kRequest` → 等 `kReply`，**超时即重发**（同 `correlation_id`、字节相同的原帧），至多 `max_attempts` 次；**收到即成功、不回应**；耗尽返 **`kTimeout`**（不是 `kNotAccepted`——本模型根本没有受理这一步）。
 
