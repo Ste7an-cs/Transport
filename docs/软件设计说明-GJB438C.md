@@ -84,8 +84,8 @@
   **两处都建立在实测之上：**
 
   1. **外来线程 → fiber 的 `FiberChannel::push` 安全**（4 线程并发 8000/8000、20000 条严格连续无空洞、唤醒时延 avg 28µs / max 70µs）。机理已核到源码——`push` 只做 `lock` + `push_back` + `notify_all`，**无等待路径**。故 listener 可直推，读侧**连泵 fiber 都省了**。
-  2. **`write_queue` 用 `std::mutex` + `condition_variable` + `std::deque`，不是 `Coro::Awaitable`**——消费方是一条普通 OS 线程（见下条），不必为它引入 fiber 运行时上下文。
-     > **不是因为“`FiberChannel::pop` 在非协程线程上会 crash”**——该说法系误读 `fiberchannel.hpp`（那句 crash 警告的主语是被它取代的 `boost::fibers::unbuffered_channel`），2026-09-08 实测证伪：fiber 里 push、普通线程上 pop，1001/1001 全收到、顺序保持、`close()` 1ms 内唤醒、空等 3s 的线程自身 CPU 仅 70µs。详见 ADR-0013 **D3** 的补正。
+  2. **`write_queue` 与三介质同为 `Coro::FiberChannel`**（ADR-0017），`setCapacity(1024)`，容量与丢最旧策略**直接复用其内建语义**、不再手写。消费方虽是一条普通 OS 线程，但 `FiberChannel::pop` 在普通线程上工作正常（实测：1001/1001 全收到、顺序保持、`close()` 1ms 内唤醒、空等 3s 线程自身 CPU 仅 70µs，不空转）——boost.fiber 把每条线程的主上下文也当作一条 fiber，故挂起即"阻塞该线程"，正合专属写线程之需。
+     > **⚠ 关闭必须 `close()` 后再 `discard_pending()`**（ADR-0017 **D2**）：`FiberChannel::pop` 在 `close()` 之后**仍会把队列排干**才返回 `closed`，只 `close()` 会让写线程把残留的至多 1024 条逐条 `Publish`，而 `Publish` 的阻塞**无上界**。实测 500 条残留、每条 2ms：只 `close()` 需 995ms 退出、`close()`+`discard_pending()` 为 0ms。用例 `CloseDiscardsPendingWritesInsteadOfFlushingThem` 守着这条（漏了即红）。
 
   **`ASYNCHRONOUS_PUBLISH_MODE` 绕不过写阻塞**（实测 178/200 超时）：该模式挪走的是**网络发送**，而 `write()` 仍须先把样本**放进 writer 的 history**；`RELIABLE` + 满时卡住的是**准入**，与发布模式无关。故专属线程不可省。
 

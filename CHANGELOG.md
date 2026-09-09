@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+### 变更：DDS 写侧队列改用 `FiberChannel`，四介质队列语义统一（ADR-0017，#240）
+
+- `DdsTransport::write_queue_` 由 `std::mutex` + `std::condition_variable` + `std::deque` 改为 **`Coro::FiberChannel<Datagram>`** + `setCapacity(1024)`，与三介质**逐字相同**。**纯内部实现替换**：`AsyncWrite` 的签名与 fire-and-forget 语义、`Close()` / `WaitClosed()`、`LastError()` 归因、`ITransport` 七方法**全部不变**。
+- **删掉手写的容量策略**（`push_back` 后 `while (size > 1024) pop_front()`）——那正是 `FiberChannel::push` 的内建语义；连同 `write_mutex_` / `write_cv_` / `write_stop_` 三个成员一并消失。DDS 写侧此前是四个介质里**唯一一份手抄件**，手抄件与正本一旦漂移会静默地不跟随。
+- `AsyncWrite` 变为一次 `push`，返回 `closed` 即映射 `kClosed` —— **比此前更严密**：判关闭与入队由 `push` 一步原子完成，不再是"先查标志位再入队"两步。
+- **关闭必须 `close()` 后再 `discard_pending()`**：`FiberChannel::pop` 在 `close()` 之后**仍会把队列排干**才返回 `closed`，只 `close()` 会让写线程把残留的至多 1024 条逐条 `Publish`，而 `Publish` 的阻塞**无上界**。实测 500 条残留、每条 2ms：只 `close()` 需 **995ms** 退出，`close()` + `discard_pending()` 为 **0ms**。
+  - 新增用例 `CloseDiscardsPendingWritesInsteadOfFlushingThem` 守这条。**它不可省**——漏掉 `discard_pending()` 时功能测试不会失败（消息反而都发出去了），只有关闭时延爆炸。变异验证：删掉该行后 `WaitClosed()` 由 <500ms 变为 **4011ms**、关闭时把 200 条全刷出，该用例与既有的 `CloseReturnsAtOnceAndWaitClosedOutlastsInFlightPublish` 双双变红。
+- **专属 OS 写线程不变**：其依据是 `DataWriter::write()` park 调用线程，与队列用什么原语无关。
+- **明确接受** 这条本来纯粹的 OS 线程从此依赖 fiber 运行时（`FiberChannel::pop` 用 `boost::fibers::mutex` / `condition_variable`）。实测不空转——空等 3 秒该线程自身 CPU 仅 70µs；代价是耦合而非性能。
+
+### 修正：`FiberChannel::pop` 不能用于普通线程系误读
+
+- ADR-0013 **D3** 原称「`FiberChannel` 的文档明载"非协程线程上 `pop` 会 crash"」。**该说法的主语搞反了**——`fiberchannel.hpp` 那句 crash 警告说的是**被 `FiberChannel` 取代的** `boost::fibers::unbuffered_channel`；`FiberChannel` 自述"跨线程/跨协程安全"。
+- 实测（fiber 里 push、普通 `std::thread` 上 pop）：不崩、1001/1001 全收到、顺序严格保持、单条唤醒时延 131µs、`close()` 1ms 内唤醒阻塞中的普通线程、空等 3 秒该线程自身 CPU 仅 70µs。
+- **D3 的结论不受影响**——写侧仍须专属 OS 线程，那条依据是 `DataWriter::write()` park 调用线程，始终有效。塌掉的只是"所以队列不能用 `FiberChannel`"这半句，而它正是本轮 ADR-0017 的起因。
+- ADR-0013 按惯例加补正（原文保留）；SDD 三处、SRS 一处、图两处直接改正。
+
 ### 新增：`DdsNode` 的注册可动态增删（ADR-0015，#236）
 
 - **四个 `Register*` 的相位由 `Created` 放宽到 `Created ∪ Running`**，并新增四个对称的 `Unregister*`。`Created` 期只落注册表（端点仍由 `Start()` 统一建）；`Running` 期落表**并当场建/拆端点**；`Closing` / `Closed` 一律返 `kClosed`。`DoStart()` 与动态路径**共用同一个建端点函数**。

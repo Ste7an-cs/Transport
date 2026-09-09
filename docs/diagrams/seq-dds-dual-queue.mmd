@@ -3,7 +3,7 @@ sequenceDiagram
     participant N as DdsNode
     participant T as DdsTransport（ITransport 七方法）
     participant RQ as read_queue（Coro::Awaitable）
-    participant WQ as write_queue（mutex+condvar+deque）
+    participant WQ as write_queue（FiberChannel，有界 1024 丢最旧）
     participant W as 专属 OS 线程
     participant P as IDdsProvider
     participant PEER as 对端
@@ -26,7 +26,7 @@ sequenceDiagram
     rect rgba(255,235,220,0.25)
     Note over N,PEER: 写侧 —— 【专属 OS 线程】，不是写泵 fiber
     N->>T: AsyncWrite({bytes, peer=kTopic})
-    T->>WQ: push（fiber → 普通线程；用 mutex+condvar+deque 而非 FiberChannel，<br/>因消费方是普通 OS 线程，不必为它引入 fiber 运行时上下文）
+    T->>WQ: push（fiber → 普通线程；与三介质同为 FiberChannel，ADR-0017）<br/>容量与丢最旧【复用其内建语义】，不再手写。<br/>⚠ 关闭须 close() 后再 discard_pending()：只 close() 会把残留逐条 Publish 完才退出，<br/>而 Publish 阻塞无上界（实测 500 条残留：995ms vs 0ms）。
     T-->>N: Coro::Result~void~{}　※【入队即返】，fire-and-forget 契约照旧
     WQ-->>W: 取出一条
     W->>P: Publish()　※ 同步，可能 park【本线程】至多 max_blocking_time

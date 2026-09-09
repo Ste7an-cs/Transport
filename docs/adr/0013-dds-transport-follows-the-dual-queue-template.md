@@ -57,7 +57,9 @@ UDP（ADR-0007）、TCP（ADR-0011）、串口（ADR-0012）已按「读写双�
   >
   > **本决策的结论完全不受影响**：写侧仍须一条专属 OS 线程——那条依据是**另一件事**（`DataWriter::write()` park 调用线程，见本节背景的实测表），且始终成立。塌掉的只是"所以队列不能用 `FiberChannel`"这半句。
   >
-  > **现状代码保持不变**（2026-09-08 裁决）。若日后要换成 `FiberChannel`，顺带的好处是四个介质的队列语义真正统一，并可删掉 `DdsTransport.cpp` 里手写的容量+丢最旧逻辑（那正是 `FiberChannel::push` 的内建语义）；代价是须重验关闭时序。**维持现状的理由改为**：专属写线程是一条普通 OS 线程，不必为它引入 fiber 运行时上下文——这个理由比原来的弱得多，是"没必要"而非"不能用"。
+  > **已于 2026-09-10 换成 `FiberChannel`（ADR-0017）。** 四个介质的队列语义就此真正统一，`DdsTransport.cpp` 里手写的容量+丢最旧逻辑随之删除（那正是 `FiberChannel::push` 的内建语义），`write_mutex_` / `write_cv_` / `write_stop_` 三个成员一并消失。
+  >
+  > **关闭时序确实要重验，且踩到了一处**：`FiberChannel::pop` 在 `close()` 之后**仍会把队列排干**才返回 `closed`，故关闭必须 `close()` 后再 `discard_pending()`（ADR-0017 **D2**）——只 `close()` 会把残留的至多 1024 条逐条 `Publish`，而 `Publish` 的阻塞无上界。**D3 的专属 OS 写线程结论仍不受影响。**
 
   **为什么是"专属线程"而不是三介质的"写泵 fiber"**：见背景——`Publish` 会 park 调用线程，用 fiber 会卡死整条线程上的所有 fiber。**这是 DDS 与三介质唯一的实质结构差异**。
 
