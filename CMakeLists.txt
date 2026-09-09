@@ -108,6 +108,7 @@ if(TRANSPORT_BUILD_TESTS)
     tests/version_test.cpp
     tests/error_test.cpp
     tests/dispatcher_test.cpp
+    tests/dispatcher_concurrency_test.cpp
     tests/coro_harness_test.cpp
     tests/udp_transport_test.cpp
     tests/tcp_transport_test.cpp

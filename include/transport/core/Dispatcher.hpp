@@ -46,12 +46,26 @@
  * 被约束"(mask)分层索引,投递时仅探测存在订阅的 mask,既不枚举 2ⁿ 种字段组合,也不逐个
  * 求值谓词。在用 mask 的种数由订阅行为决定,无需声明。
  *
+ * ## 线程安全(ADR-0016)
+ *
+ * 本件**跨线程、跨 fiber 安全**:`Subscribe` / `Dispatch` / `CloseAll` / `~Ticket` 可从任意
+ * 线程、任意 fiber 并发调用。索引由 `State` 内的 `boost::fibers::mutex` 保护——取的是 fiber
+ * 版互斥量而非 `std::mutex`:等待时让出 fiber 而不阻塞线程,故同线程的其他 fiber 不受牵连。
+ *
+ * **临界区内不投递**:`Dispatch` 与 `CloseAll` 在锁内只做索引快照(纯内存操作、无挂起点),
+ * `resolve` / `close` 一律在锁外执行——二者会取信箱内部的 fiber 互斥量、可能让出,放在锁内
+ * 既拖长索引的持锁期,又会在被唤醒方回调本件时自锁(`fibers::mutex` 不可重入)。
+ *
+ * 由此带来一个**刻意的窗口**:快照与投递之间注销的凭据,仍可能收到最后一条消息。快照持
+ * `shared_ptr<Awaitable>`,信箱必然存活,故不构成悬垂——只是投进了无人再读的信箱。
+ *
  * ## 约束
  *
  * - `T` 须可拷贝(多订阅者各得一份副本);`Fields...` 须可默认构造、可哈希、可相等比较。
- * - 本件面向**单线程 fiber 协作**模型,不加锁:`Subscribe`、`Dispatch` 与 `~Ticket` 内均
- *   无挂起点,故互不交错。`Dispatch` 中的 `resolve` 仅入队并标记等待者就绪,不引发 fiber
- *   切换,因此索引在遍历期间保持稳定;键提取函数内不得回调本件。
+ * - **键提取函数内不得回调本件**:它在锁外求值,但重入路径会撞上同一把不可重入的互斥量。
+ * - `~Ticket` / `Ticket::Reset()` 会取锁,故**可能让出 fiber**(此前无挂起点)。持锁期只有
+ *   一次索引摘除,不含挂起点,故等待必然有界;但析构期间让出意味着别的 fiber 可能观察到
+ *   半析构的宿主对象,宿主须自行留意。
  */
 
 #include <chrono>
@@ -59,12 +73,15 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <system_error>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <boost/fiber/mutex.hpp>
 
 #include "await/awaitable.hpp"
 #include "detail/result.hpp"
@@ -157,19 +174,34 @@ class Dispatcher {
                                     detail::TupleHash<Values>>;
 
   struct State {
-    KeyOf key_of;
+    explicit State(KeyOf key) : key_of(std::move(key)) {}
+
+    /// 构造后只读,故不受 `mutex` 保护;其内不得回调本件(锁不可重入)。
+    const KeyOf key_of;
+
+    /// 守以下三项。fiber 版互斥量:等待时让出 fiber 而不阻塞线程。持锁期内**无挂起点**
+    /// ——投递与关闭信箱一律在锁外做,见文件头「线程安全」。
+    boost::fibers::mutex mutex;
+
     /// 仅保留存在订阅的 mask,使 `Dispatch` 的探测次数随订阅情况自动收敛。
     std::unordered_map<Mask, Bucket> by_mask;
     std::uint64_t next_id{1};
     std::error_code closed;  ///< 非空表示已 CloseAll,此后订阅直接返回已关闭的信箱。
   };
 
+  /// 投递/关闭用的信箱快照:在锁内采集,在锁外逐个 resolve/close。
+  using Mailboxes = std::vector<std::shared_ptr<Coro::Awaitable<T>>>;
+
  public:
   /**
    * @brief 订阅凭据:持有一个信箱,并在析构时注销该订阅。仅可移动。
    *
    * 析构即从索引中摘除对应条目。内部以弱引用持有索引,故本类允许在 `Dispatcher` 析构
-   * 之后再析构。
+   * 之后再析构;索引锁也在 `State` 内,`weak_ptr::lock()` 成功即为其续命,故与 `~Dispatcher`
+   * 并发亦安全。
+   *
+   * 本类**不是**线程安全的容器:同一张凭据不得被两个线程同时使用(移动、`Reset`、`Wait`);
+   * 不同凭据之间、以及凭据与 `Dispatcher` 之间的并发则是安全的。
    */
   class Ticket {
    public:
@@ -224,7 +256,10 @@ class Dispatcher {
       return mailbox_;
     }
 
-    /// @brief 提前注销;析构时亦会执行。注销后本凭据不再接收消息。
+    /// @brief 提前注销;析构时亦会执行。注销后本凭据不再接收消息——但与 `Dispatch` 并发
+    ///        时,已进入投递快照的那一条仍会送达信箱(见文件头「线程安全」)。
+    ///
+    /// 取索引锁,故**可能让出 fiber**;持锁期只有一次索引摘除,等待有界。
     void Reset() {
       if (id_ == 0) {
         return;
@@ -252,7 +287,7 @@ class Dispatcher {
 
   /// @param key_of 键提取函数:给出一条消息各匹配字段的具体值;其内不得回调本件。
   explicit Dispatcher(KeyOf key_of)
-      : state_(std::make_shared<State>(State{std::move(key_of), {}, 1, {}})) {}
+      : state_(std::make_shared<State>(std::move(key_of))) {}
 
   Dispatcher(const Dispatcher&) = delete;
   Dispatcher& operator=(const Dispatcher&) = delete;
@@ -265,17 +300,27 @@ class Dispatcher {
   [[nodiscard]] Ticket Subscribe(Key key) {
     Ticket ticket;
     ticket.mailbox_ = std::make_shared<Coro::Awaitable<T>>();
-    if (state_->closed) {
-      ticket.mailbox_->close(state_->closed);
-      return ticket;  // id_ 保持 0，表示未进入索引，无需注销
+    // 键的推导与信箱的构造都不碰共享索引，放在锁外，压缩持锁期。
+    const Mask mask = MaskOf(key, std::make_index_sequence<kFieldCount>{});
+    Values values = ValuesOf(key, std::make_index_sequence<kFieldCount>{});
+
+    std::error_code closed;
+    {
+      std::lock_guard<boost::fibers::mutex> lock(state_->mutex);
+      if (!state_->closed) {
+        ticket.state_ = state_;
+        ticket.mask_ = mask;
+        ticket.values_ = std::move(values);
+        ticket.id_ = state_->next_id++;
+        state_->by_mask[mask][ticket.values_].push_back(
+            Entry{ticket.id_, ticket.mailbox_});
+        return ticket;
+      }
+      closed = state_->closed;
     }
-    ticket.state_ = state_;
-    ticket.mask_ = MaskOf(key, std::make_index_sequence<kFieldCount>{});
-    ticket.values_ = ValuesOf(key, std::make_index_sequence<kFieldCount>{});
-    ticket.id_ = state_->next_id++;
-    state_->by_mask[ticket.mask_][ticket.values_].push_back(
-        Entry{ticket.id_, ticket.mailbox_});
-    return ticket;
+    // close 会取信箱内部的 fiber 互斥量、可能让出，故在锁外做。
+    ticket.mailbox_->close(closed);
+    return ticket;  // id_ 保持 0，表示未进入索引，无需注销
   }
 
   /**
@@ -285,19 +330,30 @@ class Dispatcher {
    *         处置(转交处理器、归因丢弃等)。
    */
   std::size_t Dispatch(const T& value) {
+    // key_of 构造后只读且约定不回调本件，故在锁外求值。
     const Values full = state_->key_of(value);
-    std::size_t delivered = 0;
-    for (auto& [mask, bucket] : state_->by_mask) {
-      auto found =
-          bucket.find(Project(full, mask, std::make_index_sequence<kFieldCount>{}));
-      if (found == bucket.end()) {
-        continue;
-      }
-      for (auto& entry : found->second) {
-        // resolve 仅入队并标记等待者就绪，不引发 fiber 切换，故遍历期间索引保持稳定
-        if (entry.mailbox->resolve(value)) {
-          ++delivered;
+
+    Mailboxes recipients;
+    {
+      std::lock_guard<boost::fibers::mutex> lock(state_->mutex);
+      for (auto& [mask, bucket] : state_->by_mask) {
+        auto found = bucket.find(
+            Project(full, mask, std::make_index_sequence<kFieldCount>{}));
+        if (found == bucket.end()) {
+          continue;
         }
+        for (auto& entry : found->second) {
+          recipients.push_back(entry.mailbox);
+        }
+      }
+    }
+
+    // 锁外投递：resolve 会取信箱内部的 fiber 互斥量、可能让出。快照持 shared_ptr，信箱
+    // 必然存活；期间被注销的凭据仍可能收到这一条，见文件头「线程安全」。
+    std::size_t delivered = 0;
+    for (auto& mailbox : recipients) {
+      if (mailbox->resolve(value)) {
+        ++delivered;
       }
     }
     return delivered;
@@ -309,22 +365,33 @@ class Dispatcher {
    * 在途的 `Wait` 因此恰好终结一次;此后的 `Subscribe` 一律返回信箱已关闭的凭据。
    */
   void CloseAll(std::error_code error) {
-    if (state_->closed) {
-      return;  // 幂等：首次终止原因不被覆盖
-    }
-    state_->closed = error;
-    for (auto& [mask, bucket] : state_->by_mask) {
-      for (auto& [values, entries] : bucket) {
-        for (auto& entry : entries) {
-          entry.mailbox->close(error);
+    Mailboxes mailboxes;
+    {
+      std::lock_guard<boost::fibers::mutex> lock(state_->mutex);
+      if (state_->closed) {
+        return;  // 幂等：首次终止原因不被覆盖
+      }
+      state_->closed = error;
+      for (auto& [mask, bucket] : state_->by_mask) {
+        for (auto& [values, entries] : bucket) {
+          for (auto& entry : entries) {
+            mailboxes.push_back(entry.mailbox);
+          }
         }
       }
+      state_->by_mask.clear();
     }
-    state_->by_mask.clear();
+    // 锁外关闭：close 会取信箱内部的 fiber 互斥量、可能让出。
+    for (auto& mailbox : mailboxes) {
+      mailbox->close(error);
+    }
   }
 
   /// @brief 当前在册的订阅数,供诊断与测试使用。
   [[nodiscard]] std::size_t Size() const {
+    // shared_ptr 的 operator-> 给出非 const 的 State&，故 const 成员函数里可直接取锁，
+    // 无需把 mutex 标 mutable。
+    std::lock_guard<boost::fibers::mutex> lock(state_->mutex);
     std::size_t total = 0;
     for (const auto& [mask, bucket] : state_->by_mask) {
       for (const auto& [values, entries] : bucket) {
@@ -335,7 +402,10 @@ class Dispatcher {
   }
 
   /// @brief 当前在用的 mask 种数,即单条消息的探测次数,供诊断与测试使用。
-  [[nodiscard]] std::size_t ProbeCount() const { return state_->by_mask.size(); }
+  [[nodiscard]] std::size_t ProbeCount() const {
+    std::lock_guard<boost::fibers::mutex> lock(state_->mutex);
+    return state_->by_mask.size();
+  }
 
  private:
   /// 由订阅模式推导 mask:标记哪些字段被约束。
@@ -370,6 +440,7 @@ class Dispatcher {
 
   static void Unsubscribe(State& state, Mask mask, const Values& values,
                           std::uint64_t id) {
+    std::lock_guard<boost::fibers::mutex> lock(state.mutex);
     auto bucket = state.by_mask.find(mask);
     if (bucket == state.by_mask.end()) {
       return;

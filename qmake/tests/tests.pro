@@ -47,6 +47,7 @@ SOURCES += \
     $$TRANSPORT_ROOT/tests/version_test.cpp \
     $$TRANSPORT_ROOT/tests/error_test.cpp \
     $$TRANSPORT_ROOT/tests/dispatcher_test.cpp \
+    $$TRANSPORT_ROOT/tests/dispatcher_concurrency_test.cpp \
     $$TRANSPORT_ROOT/tests/coro_harness_test.cpp \
     $$TRANSPORT_ROOT/tests/udp_transport_test.cpp \
     $$TRANSPORT_ROOT/tests/tcp_transport_test.cpp \

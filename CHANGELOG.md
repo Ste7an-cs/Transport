@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 修复：`Dispatcher` 并发 `Subscribe` / `Unsubscribe` 崩溃，索引改由 fiber 互斥量保护（ADR-0016）
+
+- **现象**：宿主从普通工作线程 `Subscribe` 或析构 `Ticket` 时，与读-分发循环的 `Dispatch` 撞车 —— `Dispatch` 正遍历 `by_mask`，注销侧 `erase` 掉条目，失效迭代器；并发 `Subscribe` 则 rehash 撕裂哈希桶，`next_id++` 撞车还会让两张凭据拿到同一个 id、注销时误删他人条目。
+- **成因**：ADR-0008 **D9** 的「`Subscribe` / `Dispatch` / `~Ticket` 内无挂起点，故互不交错」只在同一执行域内成立；跨线程调用时前提不存在。
+- **修复**：索引由 `State` 内的 `boost::fibers::mutex` 保护。取 fiber 版而非 `std::mutex`——`std::mutex` 会阻塞整个线程，而持锁方可能在同线程上让出（多线程下 `resolve` 会取信箱内部的 fiber 互斥量，**是**一个挂起点，D9 原文这一句只在单线程下成立），必自锁。锁放在 `State` 而非 `Dispatcher`，故 `~Ticket` 与 `~Dispatcher` 并发亦安全。
+- **临界区内不投递**：`Dispatch` / `CloseAll` 锁内只做信箱快照，`resolve` / `close` 一律锁外执行 —— 否则持锁跨挂起点，且被唤醒方一旦回调本件即撞上同一把不可重入的锁。
+- **两处语义变化**（已写进头文件）：
+  - **注销与投递之间有一个窗口**：已进入快照的凭据即使随后 `Reset()` 仍会收到那一条。快照持 `shared_ptr<Awaitable>`，信箱必然存活，**不构成悬垂**。
+  - **`~Ticket` / `Reset()` 从「无挂起点」变为「可能让出 fiber」**：持锁期只有一次索引摘除，等待有界。
+- **例外只及于 `Dispatcher`**：`ProtocolNode` / `DdsNode` / 各传输的其余成员仍按 D9 不加锁，交互方法仍须在节点所属执行域内调用。`Subscribe()` 取回的凭据则可交给普通工作线程。
+- **新增 `tests/dispatcher_concurrency_test.cpp`（5 个用例）**，守并发登记/注销的精确终态、边投递边增删、`CloseAll` 对撞三条不变量。**负控已验证**：把 `Dispatcher.hpp` 退回加锁前，该组用例三轮全部 core dump 且在册数少于登记数（784 / 794 / 798，应为 800）；加锁后全库 241 个用例 ×3 轮通过。
+
 ### 文档
 
 - **README 补完使用说明**（306 → 689 行）。补的都是"照着原 README 写不出能跑的程序"的缺口：
