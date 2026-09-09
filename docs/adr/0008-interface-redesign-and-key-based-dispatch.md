@@ -91,6 +91,8 @@ ADR-0004 至 0007 逐票推进了传输语义统一、生命周期收敛与泵�
 
 - **D9（单线程 fiber 协作模型显式化，普通成员不加锁）：** 两条泵与节点的各条 fiber 均以 `Coro::makeTask` 起，默认亲和为 `fixed(调用线程)`，与公开方法同线程、仅在挂起点交错；而 `Subscribe` / `Dispatch` / session 取用 / socket 状态判定路径内均无挂起点，故互不交错。队列自身（`Coro::Awaitable`）另有其内部同步。
 
+  > **2026-09-09 修订（ADR-0016）：`Dispatcher` 已不在此列。** 宿主从普通工作线程调 `Subscribe` / 析构 `Ticket` 是合理用法，而本条的「无挂起点故互不交错」在跨线程下不成立（实测 core dump），故 `Dispatcher` 的索引改由 `State` 内的 `boost::fibers::mutex` 保护，成为**跨线程安全**件。例外**只及于 `Dispatcher`**：两条泵、`ProtocolNode` / `DdsNode` 的其余成员仍按本条不加锁。同时更正本条的一处事实——`Dispatch` 中的 `resolve` 只在**单线程下**不引发切换；多线程下它会取信箱内部的 fiber 互斥量，是一个挂起点。
+
   代价是**公开方法必须在起它的那个执行域内调用**——这本就是 Qt 对象亲和的既有要求（socket 建在该线程上），本 ADR 只是把这条隐含前提显式化，并停止用互斥量假装支持跨线程。
 
 - **D10（删除全部观测计数接口，观测只经 trace）：** `NodeBase` 的 `CloseDropCount` / `LastCloseLatency`、`ProtocolNode` 的 8 个计数与时延 getter、`HandlerLoop` 的 3 个计数、传输的两个时间戳一律删除。丢弃改为只经 `ITraceSink` 上报（`RecordEvent(category="drop")`），一个事实一条出口。要统计就在 sink 里统计。
