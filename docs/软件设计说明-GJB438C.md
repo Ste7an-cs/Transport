@@ -377,7 +377,8 @@ Coro::Result<void> RegisterServices(std::vector<std::string> service_names);    
 
 > 派生化之前它们收的是 `std::map<请求 topic, 应答 topic>`，当时的理由是「天然去重，且排除同一请求 topic 配了两个不同应答 topic」——**该理由连同那两条校验一并失效**：派生是确定的、同名必同值，**连能配歪的入口都没有了**。
 
-**只允许 `Start()` 之前注册**：端点集合仍"启动即定型、运行期恒定"，本步只把填结构体换成调四个函数，**没有引入运行期动态端点**——故各路径上都不会突然冒出 ~240ms 发现窗口，`DoStart()` 仍是唯一建端点的地方。
+**`Created` 与 `Running` 都受理注册**（ADR-0015 **D1**）：`Created` 期只落注册表，端点由 `DoStart()` 统一建；`Running` 期落表并**当场建出**端点。端点集合**不再"启动即定型、运行期恒定"**——配有四个 `Unregister*` 故增长可控，但运行期新建的写侧端点会吃一个 ~240ms 发现窗口，**其首帧静默丢失**（明确接受，见 ADR-0015 代价 ①）。
+`DoStart()` 与动态路径**共用同一个建端点函数** `DeclareEndpointsFor`，不写两份派生逻辑。
 
 **批量、可多次调用（累加）、重复项幂等去重、整批生效或整批不生效**——半生效的注册会让调用方难判该重试哪些。
 
@@ -387,7 +388,7 @@ Coro::Result<void> RegisterServices(std::vector<std::string> service_names);    
 
 **`DeclareTopic` 随之拆为 `DeclareWriter` / `DeclareReader` 两个方法**（**D15**）：一个 topic 上本节点通常只需要一侧，建成对是浪费且会招来自收（代价 9）。**这两个方法在 `ITransport` 七方法【之外】**——它们是 DDS 端点模型的必需品、三介质没有对应物，但**不改动 `ITransport` 本身**，故"换传输即可运行"的调用方不受影响（**D1**）。
 
-**`IDdsProvider` 增两项**（**D13**）：`MatchedCount()`（判活）与 **`DeclareWriter(topic)`**（写侧端点声明钩子）。后者是 2026-09-01 的补正——初稿只增了 `MatchedCount`，读侧因 `Subscribe(topic, cb)` 碰巧已存在而成立，**写侧则无对应物**，`DeclareWriter` 只能登记意图、`DataWriter` 仍在首次 `Publish` 时惰性建，等于把「首次应答会丢」原样放回。补上后两侧对称：`DeclareReader` → `Subscribe`，`DeclareWriter` → `DeclareWriter`。**不设 `UndeclareWriter`**（端点启动即定型、只在 `Shutdown()` 整体拆除）。**`Publish` 遇未声明 topic 返 `kConfiguration`、不惰性建**——惰性建会让该钩子形同虚设（首帧照样在尚未 `matched` 时发出而丢掉）；且写侧端点启动即定型，运行期冒出未声明的 topic 必然是漏注册而非 I/O 故障，返 `kIo` 会把"配错了"伪装成"网络抖了一下"。已 `Shutdown` 时优先判 `kInvalidState`；该错误在 `DdsTransport` 层按写侧契约不回传、只落 `LastError()`。
+**`IDdsProvider` 增两项**（**D13**）：`MatchedCount()`（判活）与 **`DeclareWriter(topic)`**（写侧端点声明钩子）。后者是 2026-09-01 的补正——初稿只增了 `MatchedCount`，读侧因 `Subscribe(topic, cb)` 碰巧已存在而成立，**写侧则无对应物**，`DeclareWriter` 只能登记意图、`DataWriter` 仍在首次 `Publish` 时惰性建，等于把「首次应答会丢」原样放回。补上后两侧对称：`DeclareReader` → `Subscribe`，`DeclareWriter` → `DeclareWriter`。**`UndeclareWriter(topic)`**（幂等）随 ADR-0015 **D4** 补上，与 `DeclareWriter` 对称——动态注销需要撤销单个 writer，写侧拆除此前无法表达。**该新增纯虚方法对第三方 provider 是破坏性变更。****`Publish` 遇未声明 topic 返 `kConfiguration`、不惰性建**——惰性建会让该钩子形同虚设（首帧照样在尚未 `matched` 时发出而丢掉）；且写侧端点只能经注册建出，运行期冒出未声明的 topic 必然是漏注册（或已注销）而非 I/O 故障，返 `kIo` 会把"配错了"伪装成"网络抖了一下"。已 `Shutdown` 时优先判 `kInvalidState`；该错误在 `DdsTransport` 层按写侧契约不回传、只落 `LastError()`。
 
 **不新增 provider 侧的数据观察者接口**（**D13**）：既有的 `IDdsProvider::Subscribe(topic, cb)`（`cb` 收 `std::vector<uint8_t>`）已经是所需的钩子，`DeclareReader` 落到 provider 就是调它，闭包捕获 `topic` 即可填 `Datagram.peer`。**曾拟新增的 `SetDataObserver(std::function<void(Message)>)` 已否决**——`Message` 是 codec **之后**的产物而 provider 在 codec **之下**（跨层），且它与既有 `Subscribe` 是同一钩子的两种写法（重复）。
 
@@ -403,7 +404,8 @@ Coro::Result<void> RegisterServices(std::vector<std::string> service_names);    
 
 **`Subscribe(kAny, kind)` 建不了任何 DataReader**（**D16**）：DDS 的 reader 按 topic 建，`kAny` 只是分发键的通配符。"订阅所有 topic"的实际语义是「**已声明 topic 的全部**」，**不是**本 domain 上的全部——未列进 `topics` 的消息根本不会到达本进程。**接口文档须明写**，这是确定会被理解反的一处。
 
-**`Reply()` 不做懒声明，运行期没有任何建端点的路径**（**D15**）：`DeclareWriter` / `DeclareReader` 只由 `DoStart()` 调用，端点集合**完全由启动前的注册决定、启动即定型、运行期恒定**。服务端的应答目的地随之改由**自己注册的 `Services` 表查出**，**不再取信于线缆**；查不到返 `kConfiguration`。
+**`Reply()` 不做懒声明**（**D15**）：服务端的应答目的地由**自己注册的 `Services` 表查出**，**不再取信于线缆**；查不到返 `kConfiguration`。
+> 「运行期没有任何建端点的路径、端点集合启动即定型」这一条**已被 ADR-0015 放开**——建端点的路径现在有两条（`DoStart()` 与运行期注册），但两者**共用同一个派生函数**。`Reply()` 本身仍不做懒声明。
 
 **`reply_to` 仍上线缆，但降为一致性交叉校验**：与查出的应答 topic 不等即返 `kInvalidArgument`。保留它不是冗余——两侧注册实参写歪时（客户端在 `cfg.get.reply` 上等、服务端注册成 `cfg.reply` 往外发），**若不带 `reply_to` 这种偏差完全不可见**，客户端只会一路超时，看起来像对端没响应；带上它服务端当场就能报出偏差。
 
@@ -606,7 +608,11 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 
 **软件逻辑（CSU_DDSNODE）**：见 `node/DdsNode.cpp`。**本节已按 ADR-0013 整体重写**（`DdsNode` 与 `DdsTransport` 自此均在编译面内）：
 
-- **四个批量注册方法**（**D16**）：`RegisterPublishers` / `RegisterSubscribers` / `RegisterClients` / `RegisterServices`，**只在 `Created` 受理**（其后返 `kInvalidState`），累加 + 幂等去重 + **整批生效或整批不生效**；`Start()` 失败不清空注册表。
+- **四个批量注册方法 + 四个对称的注销方法**（**D16** + ADR-0015 **D1/D2**）：`Register*` / `Unregister*`，**`Created` 与 `Running` 都受理**（`Closing`/`Closed` 返 `kClosed`），累加 + 幂等去重 + **整批生效或整批不生效**；`Start()` 失败不清空注册表。
+  - `Running` 期的"整批不生效"多一步回滚：**拆掉本批已建的端点**（**D7**）。
+  - 注销**不重算"该 topic 是否仍被需要"**：普通 topic 禁用 `cfg.` 前缀（**D3**）使端点归属唯一，直接拆即可。
+  - 注销**不检测在途交互**（**D6**）：已发出的 `Ticket` 继续有效（挂在 `Dispatcher` 上，与注册表无关），新请求不再到达，对已注销服务的 `Reply()` / `RequestForResultDirect()` 返 `kConfiguration`。
+  - **`DoStart()` 不再拒绝四组全空**（**D5**，撤销 ADR-0013 D12 的该判据）——"启动时还不知道有哪些 topic"正是动态注册要支持的场景。
 - **四个交互方法**（**D8**）：`Subscribe`（返 `Coro::Result<Ticket>`）/ `Publish` / `RequestForResultDirect`（**单阶段**，等结果时重发，耗尽 `kTimeout`）/ `Reply`（查自己的 `Services` 表，`reply_to` 作一致性交叉校验）。
 - **关联**（**D6**）：`Dispatcher<Message, topic, correlation_id, kind>`；`correlation_id` 为两段式 `"<uuid>#<request_seq>"`。**`Subscribe` 交出的订阅其 `corr` 位恒 `kAny`，而 `RequestForResultDirect` 内部登记的那一条用【具体值】**——共用应答 topic 之所以能区分客户端全靠这一点。
 - **`Subscribe` 的相位**（**D8**，#214 定、2026-09-01 改判）：**只许 `Running`**——`Created` / `Closing` / `Closed` **一律返 `kClosed`**，不区分"没启动"与"已关闭"：这是本项目**既有的、写进公开文档的约定**（`ProtocolNode.hpp` 的 `@return` 两处均为 `kClosed（未启动 / 已关闭）`），四个交互方法在两个节点类型上一律齐平。曾拟让 `Created` 返 `kInvalidState`，**已否决**——那会让 `Subscribe` 成为唯一不守该约定的方法；"区分二者"的诊断价值真实存在，但须四个方法、两个节点一起改，另行裁决。

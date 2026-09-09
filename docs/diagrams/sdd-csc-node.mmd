@@ -13,6 +13,8 @@ classDiagram
     class DdsNode {
         +RegisterPublishers / RegisterSubscribers(topics)
         +RegisterClients / RegisterServices(service_names)
+        +UnregisterPublishers / UnregisterSubscribers(topics)
+        +UnregisterClients / UnregisterServices(service_names)
         +Publish(topic, Message)
         +Subscribe(TopicKey, KindKey) Coro::Result~Ticket~
         +RequestForResultDirect(service, Message, RetryPolicy)
@@ -41,6 +43,7 @@ classDiagram
     note for NodeBase "Close 只发信号、任何 fiber 可调；\nWaitClosed 无时限，语义即 join"
     note for DdsNode "请求-响应只说服务名；两个 topic 由
 cfg.<名>.request / cfg.<名>.response 派生
-注册只在 Created、Subscribe 只在 Running"
+注册/注销在 Created 与 Running 都受理（Running 期当场建/拆端点）
+Subscribe 只在 Running"
 
     DdsNode ..> ITransport : 按引用借用（不拥有、不启停）

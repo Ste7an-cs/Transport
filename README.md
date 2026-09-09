@@ -19,7 +19,7 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 - [装配三件套](#装配三件套)：[选传输](#1-选传输) · [选 codec](#2-选-codec) · [选 node](#3-选-node)
 - [`ProtocolNode`：四种交互模式](#protocolnode四种交互模式)
 - [订阅入站消息](#订阅入站消息)
-- [`DdsNode`：发布-订阅与请求-响应](#ddsnode发布-订阅与请求-响应)
+- [`DdsNode`：发布-订阅与请求-响应](#ddsnode发布-订阅与请求-响应) · [动态增删注册](#动态增删注册)
 - [`Message` 的字段归属](#message-的字段归属)
 - [生命周期与相位规则](#生命周期与相位规则)
 - [错误码](#错误码)
@@ -373,7 +373,7 @@ auto worker = Coro::makeTask([&] {
 
 ## `DdsNode`：发布-订阅与请求-响应
 
-topic 由**注册接口**给出，且只在 `Start()` 之前受理：
+topic 由**注册接口**给出，`Start()` 之前与运行期**都可以**注册（运行期注册见[动态增删](#动态增删注册)）：
 
 ```cpp
 DdsTransport transport(dds_config);
@@ -427,9 +427,41 @@ auto notes = std::move(sub).value();      // 消费同上：自己起 fiber 循�
 
 `Reply` 的应答目的地由**服务端自己注册的内容**决定，不取信于线缆；线缆上的 `reply_to` 只作一致性交叉校验，不等即返 `kInvalidArgument`。
 
-**相位规则**：四个注册方法**只在 `Created`** 受理，`Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` **只在 `Running`** 受理。全流程即「注册 → `Start()` → 订阅/收发」。
+**相位规则**：八个注册/注销方法在 **`Created` 与 `Running`** 都受理，`Closing` / `Closed` 返 `kClosed`；`Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` **只在 `Running`** 受理。典型流程仍是「注册 → `Start()` → 订阅/收发」，但注册不必在启动前一次配齐。
 
-> ⚠ 框架占用 `cfg.*.request` / `cfg.*.response` 这一命名空间：它与 `RegisterPublishers` / `RegisterSubscribers` 收的普通 topic 处在同一平面，`RegisterSubscribers({"cfg.get.request"})` 与 `RegisterServices({"get"})` 指的是同一条 topic。框架不拦。
+> ⚠ **`cfg.` 是框架保留前缀。** 请求-响应的两个 topic 由服务名派生成 `cfg.<名>.request` / `cfg.<名>.response`，故 `RegisterPublishers` / `RegisterSubscribers` 的 topic **不得以 `cfg.` 开头**，违者返 `kInvalidArgument`。**服务名本身不受此限**——`RegisterClients({"cfg.x"})` 合法，它派生出的是 `cfg.cfg.x.request`。
+>
+> 这条限制换来的是「一条端点恰有一个注册项负责」，注销时才能直接拆、不必回头判"这条 topic 还有别人要吗"。
+
+### 动态增删注册
+
+四个注册方法在 `Running` 期同样受理，**落表并当场建出端点**；另有四个对称的注销方法：
+
+```cpp
+(void)node.Start();                              // 启动时可以一项都没注册
+
+// —— 运行期增 ——
+(void)node.RegisterSubscribers({"telemetry-2"}); // 立即建出 reader
+(void)node.RegisterServices   ({"reload"});      // 立即建出 request R + response W
+
+// —— 运行期删 ——
+(void)node.UnregisterSubscribers({"telemetry-2"});   // 拆掉 reader，此后不再收到
+(void)node.UnregisterServices   ({"reload"});        // 拆掉该服务的两个端点
+```
+
+- **整批生效或整批不生效**：`Running` 期若某项建端点失败，**本批已建的端点会被拆掉**、注册表一项不落。
+- **注销是幂等的**：不在册的项直接成功。
+- **注销不检测在途交互**：已持有的 `Ticket`（含 `ServeRequests` 的）**继续有效**——它挂在 `Dispatcher` 上，与注册表无关；但新请求不再到达，且对已注销服务的 `Reply()` / `RequestForResultDirect()` 返 `kConfiguration`。
+
+> ⚠⚠ **运行期新建的写侧端点，第一帧可能被静默丢弃。** DDS 的 writer 与对端 reader 之间有一个约 **240ms 的发现窗口**，窗口内写出的帧**直接丢失，而 `Publish` 照样返回成功**。框架**不提供**"何时可安全发送"的判据。
+>
+> | 用法 | 首帧丢了的后果 |
+> |---|---|
+> | `RequestForResultDirect` | 有重发兜底，第二次尝试即补上——基本无感 |
+> | `Reply` | 应答丢一次，客户端重发再问一遍——可恢复 |
+> | **`Publish`** | **无重发，永久丢失** |
+>
+> **该风险由宿主自行评估处置**：周期上报类丢一帧无所谓（下一帧就补上）；一次性通知则须自己压一个延时，或改用带重发的交互。**最差的处置就是不处置、接受这一帧丢失。** 启动前注册的端点不受此影响——它们的发现窗口在 `Start()` 时已一次付清。
 
 **同一个服务名不能同时注册为 client 和 service**（两个方向都会被拒），否则节点会自己收自己的请求。
 
@@ -501,11 +533,13 @@ WaitClosed();   // join 全部内部 fiber。返回即【可安全析构】
 
 | 方法 | 只在此相位受理 | 否则返回 |
 |---|---|---|
-| `DdsNode::RegisterPublishers` / `Subscribers` / `Clients` / `Services` | `Created`（即 `Start()` **之前**） | `kInvalidState` |
+| `DdsNode` 的四个 `Register*` 与四个 `Unregister*` | `Created` **或** `Running` | `kClosed` |
 | `ProtocolNode::Subscribe` / 三个 `RequestFor*` / `Send` | `Running` | `kClosed` |
 | `DdsNode::Subscribe` / `Publish` / `RequestForResultDirect` / `ServeRequests` / `Reply` | `Running` | `kClosed` |
 
 `kClosed` 一码覆盖**未启动 / 关闭中 / 已关闭**三种情形——对调用方而言事实相同：这个节点现在不接活。
+
+注册/注销八个方法在 `Created` 与 `Running` 都受理：`Created` 期只落注册表（端点由 `Start()` 统一建），`Running` 期落表**并当场建/拆端点**。详见 [`DdsNode` 的动态增删](#动态增删注册)。
 
 > **一条传输可被多个节点共用**，各得全量副本；但**任一节点关闭即终结整条读流**（`Awaitable::close()` 整流传播，有意为之），不支持独立关停——共用的诸节点须一起关。
 
@@ -724,7 +758,7 @@ Coro::Result<Message> MyNode::Invoke(Message req, RetryPolicy retry) {
    ```
    不能指望 `NodeBase` 的析构——那时子类已析构完毕、虚派发已退回基类（纯虚 ⇒ UB）。
 4. **读循环结束后无条件调公开的 `Close()`**，让"传输终结"能自动收敛节点。
-5. **相位判定用 `IsRunning()`**，未启动/关闭中/已关闭一律返 `kClosed`（三者对调用方是同一件事：这个节点现在不接活）。需要区分 `Created` 与 `Closed` 时（如"只在 `Start()` 之前受理"的注册接口）才用 protected 的 `CurrentLifecycle()`。
+5. **相位判定用 `IsRunning()`**，未启动/关闭中/已关闭一律返 `kClosed`（三者对调用方是同一件事：这个节点现在不接活）。需要区分 `Created` 与 `Running`（而不只是"在不在跑"）时才用 protected 的 `CurrentLifecycle()`——`DdsNode` 的注册方法即如此：两个相位都受理，但只有 `Running` 期才当场建端点。
 6. **节点不管传输的生命周期**：`transport_` 是**借用**的引用，宿主创建、`Start()`、`Close()`，节点绝不碰。宿主须保证传输寿命长于节点。
 7. **不要往 `NodeBase` 里加协议类型。** 协议语义内联在你自己的 node 里，不下沉为框架级共享 policy——这是本库刻意不设"共享交互引擎"的原因。
 

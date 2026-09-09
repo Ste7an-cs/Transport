@@ -30,6 +30,8 @@ classDiagram
     class DdsNode {
         +RegisterPublishers / RegisterSubscribers(topics)
         +RegisterClients / RegisterServices(service_names)
+        +UnregisterPublishers / UnregisterSubscribers(topics)
+        +UnregisterClients / UnregisterServices(service_names)
         +Publish(topic, Message)
         +Subscribe(TopicKey, KindKey) Coro::Result~Ticket~
         +RequestForResultDirect(service, Message, RetryPolicy)

@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 新增：`DdsNode` 的注册可动态增删（ADR-0015，#236）
+
+- **四个 `Register*` 的相位由 `Created` 放宽到 `Created ∪ Running`**，并新增四个对称的 `Unregister*`。`Created` 期只落注册表（端点仍由 `Start()` 统一建）；`Running` 期落表**并当场建/拆端点**；`Closing` / `Closed` 一律返 `kClosed`。`DoStart()` 与动态路径**共用同一个建端点函数**。
+- **💥 破坏性** `RegisterPublishers` / `RegisterSubscribers` 的 topic **不得以 `cfg.` 开头**（该前缀由请求-响应的派生 topic 占用），违者返 `kInvalidArgument`；**服务名不受此限**。此前 ADR-0013 D16 对该重叠的处置是"框架不拦"。
+  - 换来的是「**一条端点恰有一个注册项负责**」成为**可证的结构性质**——派生项之间不可能相撞（`cfg.S.request` 与 `cfg.C.response` 一个以 `.request` 结尾、一个以 `.response` 结尾，与服务名内容无关恒不相等），故重叠只剩"手写 `cfg.` 前缀"这一个来源。注销因此**直接拆端点、不必重算"是否仍被需要"**。
+- **💥 破坏性** `IDdsProvider` 新增纯虚 `UndeclareWriter(topic)`（幂等）——写侧拆除此前无法表达。**任何自建 provider 都须跟着实现。** `DdsTransport` 相应补 `UndeclareWriter` / `UndeclareReader`；**`ITransport` 七方法不变**。
+- **💥 破坏性** 注册相位不符时的错误码由 `kInvalidState` 改为 **`kClosed`**，与五个交互方法同一口径。
+- **撤销**「四组注册全空即 `kConfiguration`」（ADR-0013 **D12**）：其依据是"什么都不收不发必是漏注册"，而注册可在启动后补上之后该依据不再成立——"启动时还不知道有哪些 topic"正是本轮要支持的主要场景。
+- **明确接受** **运行期新建的写侧端点，首帧会静默丢失**（DDS 发现窗口约 240ms，`Publish` 仍返回成功）。框架**不提供**"何时可安全发送"的判据——`MatchedCount()` 是参与者级聚合、不带 topic 参数。**该风险由宿主自行评估处置，最差即不处置、接受丢失**；`RequestForResultDirect` / `Reply` 有重发兜底，`Publish` 则是永久丢失。启动前注册的端点不受影响。
+- 注销**不检测在途交互**：已持有的 `Ticket`（含 `ServeRequests` 的）继续有效，新请求不再到达，对已注销服务的 `Reply()` / `RequestForResultDirect()` 返 `kConfiguration`。
+- `Running` 期批量注册保持「整批生效或整批不生效」，中途失败会**拆掉本批已建的端点**。
+
 ### 修复：`Dispatcher` 并发 `Subscribe` / `Unsubscribe` 崩溃，索引改由 fiber 互斥量保护（ADR-0016）
 
 - **现象**：宿主从普通工作线程 `Subscribe` 或析构 `Ticket` 时，与读-分发循环的 `Dispatch` 撞车 —— `Dispatch` 正遍历 `by_mask`，注销侧 `erase` 掉条目，失效迭代器；并发 `Subscribe` 则 rehash 撕裂哈希桶，`next_id++` 撞车还会让两张凭据拿到同一个 id、注销时误删他人条目。
