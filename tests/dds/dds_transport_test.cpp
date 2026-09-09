@@ -20,14 +20,18 @@
 //   7. `CurrentLinkState()` **三态**(**D9**):kDown / kEstablishing / kUp 逐条;
 //   8. ⭐ 关闭路径(「明确接受的代价」7):`Close()` **打不断**在途 `Publish`,
 //      `WaitClosed()` 得等它自己跑完——最坏等待由**那次回调多慢**决定,不是 max_blocking_time;
-//   9. 生命周期:未 Start / 已 Close 的读写、`Close()` 与 `WaitClosed()` 幂等。
+//   9. 生命周期:未 Start / 已 Close 的读写、`Close()` 与 `WaitClosed()` 幂等;
+//  10. ⭐ 写队列换成 `Coro::FiberChannel` 之后的两条(ADR-0017):关闭**不刷残留**
+//      (**D2**,漏 `discard_pending()` 即红),以及写侧有界 1024 + 静默丢最旧且
+//      `push` 从不失败(**D1**)。
 //
-// 第 3 与第 8 组是本文件的核心。
+// 第 3、第 8 与第 10 组是本文件的核心。
 // -----------------------------------------------------------------------------
 #include "transport/io/dds/DdsTransport.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -204,6 +208,63 @@ std::pair<DdsConfig, std::shared_ptr<BlockingState>> MakeBlockingConfig() {
   config.provider = "blocking-publish-" + std::to_string(NextFixtureId());
   DdsProviderRegistry::RegisterProvider(config.provider, [state] {
     return std::unique_ptr<IDdsProvider>(new BlockingPublishProvider(state));
+  });
+  return {config, state};
+}
+
+// 会把发布线程**卡在闸门上**直到用例放行的 provider——用来在写线程被 park 期间把
+// `write_queue_` 灌满,从而观测写队列的容量语义(ADR-0017 D1)。发布的字节按序全记下来,
+// 放行后即可核对"留下的是哪 1024 条"。
+struct GateState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool open{false};             ///< 闸门:false 时 Publish 卡住不返回。
+  std::atomic<int> entered{0};  ///< 已进入 Publish 的次数。
+  std::vector<Bytes> published;  ///< 进入 Publish 的字节,按序(同 mutex 保护)。
+};
+
+class GatedPublishProvider : public IDdsProvider {
+ public:
+  explicit GatedPublishProvider(std::shared_ptr<GateState> state)
+      : state_(std::move(state)) {}
+
+  Coro::Result<void> Init(const DdsConfig&) override {
+    return Coro::Result<void>{};
+  }
+  void Shutdown() override {}
+  Coro::Result<void> DeclareWriter(const std::string&) override {
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> UndeclareWriter(const std::string&) override {
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> Publish(const std::string&, const Bytes& bytes) override {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    state_->published.push_back(bytes);
+    state_->entered.fetch_add(1);
+    state_->cv.wait(lock, [this] { return state_->open; });  // 闸门。
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> Subscribe(const std::string&,
+                               std::function<void(const Bytes&)>) override {
+    return Coro::Result<void>{};
+  }
+  Coro::Result<void> Unsubscribe(const std::string&) override {
+    return Coro::Result<void>{};
+  }
+  [[nodiscard]] DdsMatchedCount MatchedCount() const override { return {}; }
+  std::string Name() const override { return "gated-publish"; }
+
+ private:
+  std::shared_ptr<GateState> state_;
+};
+
+std::pair<DdsConfig, std::shared_ptr<GateState>> MakeGatedConfig() {
+  auto state = std::make_shared<GateState>();
+  DdsConfig config;
+  config.provider = "gated-publish-" + std::to_string(NextFixtureId());
+  DdsProviderRegistry::RegisterProvider(config.provider, [state] {
+    return std::unique_ptr<IDdsProvider>(new GatedPublishProvider(state));
   });
   return {config, state};
 }
@@ -619,6 +680,98 @@ TEST(DdsTransport, CloseReturnsAtOnceAndWaitClosedOutlastsInFlightPublish) {
   EXPECT_EQ(raw_state->entered.load(), 1);
   // 等待时长下界:至少是这次 Publish 剩余的那一段(留足调度余量,只断言"确实等了")。
   EXPECT_GE(wait_elapsed.count(), 100) << "WaitClosed 没有等在途写";
+}
+
+// ⭐ ADR-0017 **D2** 的守门用例:**关闭不刷残留**。
+//
+// `FiberChannel::pop` 在 `close()` 之后仍会把队列**排干**才返回 `closed`,故关闭路径必须
+// `close()` **加** `discard_pending()`。漏了后一步,**功能测试一条都不会红**(消息反而全
+// 发出去了),只有关闭时延爆炸——至多 1024 条逐条 `Publish`,而每次 `Publish` 的阻塞没有
+// 上界。这条用例就是唯一守着它的东西:删掉 `discard_pending()` 它必红。
+TEST(DdsTransport, CloseDiscardsPendingWritesInsteadOfFlushingThem) {
+  auto [config, state] = MakeBlockingConfig();
+  auto* raw_state = state.get();
+  raw_state->delay = 20ms;  // 200 条若被逐条刷出 ⇒ 4s 起步。
+  DdsTransport transport(config);
+  ASSERT_TRUE(static_cast<bool>(transport.Start()));
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
+
+  // 灌一批待发数据:第一条把写线程 park 住,其余全积在队列里。
+  constexpr int kQueued = 200;
+  for (int i = 0; i < kQueued; ++i) {
+    ASSERT_TRUE(static_cast<bool>(
+        transport.AsyncWrite(Datagram{Enc(i), Endpoint::Topic("t")})));
+  }
+  ASSERT_TRUE(pumpFiberUntil([raw_state] { return raw_state->entered.load() >= 1; }));
+
+  (void)transport.Close();
+  const auto wait_start = Clock::now();
+  transport.WaitClosed();
+  const auto wait_elapsed = ElapsedSince(wait_start);
+
+  // ① 收敛只等**在途的那一次** `Publish`,不等残留刷出。
+  EXPECT_LT(wait_elapsed.count(), 500)
+      << "WaitClosed 等了 " << wait_elapsed.count()
+      << "ms:关闭时把残留刷出去了(漏了 discard_pending?)";
+  // ② provider 侧收到的条数**远少于**入队条数:关闭时最多再多走一条(close 与
+  //    discard_pending 之间那个极窄的窗口,ADR-0017 D2 明确接受)。
+  EXPECT_LE(raw_state->entered.load(), 5)
+      << "关闭时又发出了 " << raw_state->entered.load() << " 条(入队 " << kQueued
+      << " 条):残留被逐条 Publish 了";
+}
+
+// 写队列的容量语义(ADR-0017 D1):有界 1024、**满时静默丢最旧**,且 `push` **从不失败**
+// ——这不再是 DdsTransport 手写的循环,而是 `FiberChannel::push` 的内建语义,与三介质
+// 逐字相同。写线程卡在闸门上期间灌满队列,放行后核对"留下的是最新的 1024 条"。
+TEST(DdsTransport, WriteQueueOverflowSilentlyDropsOldestAndNeverFailsPush) {
+  auto [config, state] = MakeGatedConfig();
+  auto* raw_state = state.get();
+  DdsTransport transport(config);
+  ASSERT_TRUE(static_cast<bool>(transport.Start()));
+  ASSERT_TRUE(static_cast<bool>(transport.DeclareWriter("t")));
+
+  // 先发一条把写线程钉在闸门里:此后没人再从队列取值,队列行为可确定观测。
+  constexpr int kPrimer = 9000;
+  ASSERT_TRUE(static_cast<bool>(
+      transport.AsyncWrite(Datagram{Enc(kPrimer), Endpoint::Topic("t")})));
+  ASSERT_TRUE(pumpFiberUntil([raw_state] { return raw_state->entered.load() == 1; }));
+
+  constexpr int kSent = 1200;  // > 1024。
+  for (int i = 0; i < kSent; ++i) {
+    // 满了也**不返回失败、不阻塞生产者**(丢的是队首最旧的那条)。
+    ASSERT_TRUE(static_cast<bool>(
+        transport.AsyncWrite(Datagram{Enc(i), Endpoint::Topic("t")})))
+        << "第 " << i << " 条 push 失败了:队列满不该失败";
+  }
+
+  {  // 放行闸门,让写线程把队列里剩下的全发出来。
+    std::lock_guard<std::mutex> lock(raw_state->mutex);
+    raw_state->open = true;
+  }
+  raw_state->cv.notify_all();
+  const int kExpected = 1 + static_cast<int>(DdsTransport::kWriteQueueCapacity);
+  ASSERT_TRUE(pumpFiberUntil(
+      [raw_state, kExpected] { return raw_state->entered.load() >= kExpected; }))
+      << "只发出了 " << raw_state->entered.load() << " 条,期望 " << kExpected;
+
+  std::vector<Bytes> published;
+  {
+    std::lock_guard<std::mutex> lock(raw_state->mutex);
+    published = raw_state->published;
+  }
+  ASSERT_EQ(published.size(), static_cast<std::size_t>(kExpected))
+      << "write_queue_ 的界不是 " << DdsTransport::kWriteQueueCapacity;
+  EXPECT_EQ(Dec(published.front()), kPrimer);  // 钉住写线程的那一条。
+  // 保留的是**最新**的 1024 条:首条是 176 号,不是 0 号(丢最旧,且静默)。
+  EXPECT_EQ(Dec(published[1]), kSent - static_cast<int>(DdsTransport::kWriteQueueCapacity));
+  EXPECT_EQ(Dec(published.back()), kSent - 1);
+  for (std::size_t i = 2; i < published.size(); ++i) {
+    EXPECT_EQ(Dec(published[i]), Dec(published[i - 1]) + 1);  // 保留段内部严格连续。
+  }
+  EXPECT_FALSE(transport.LastError());  // 丢弃**不落 LastError**,与三介质逐字相同。
+
+  (void)transport.Close();
+  transport.WaitClosed();
 }
 
 TEST(DdsTransport, CloseAndWaitClosedAreIdempotent) {
