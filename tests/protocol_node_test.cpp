@@ -1206,6 +1206,15 @@ TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
                        replied = server.node->Send(std::move(reply));
                      });
 
+  // **先把客户端的会话计数器推进到非 0**:两个节点的计数器都从 0 起,若正式请求恰好用
+  // 0 号会话,那么"`Send` 盖一个自增的 0"与"`Send` 原样透传 0"在线上无从区分,本用例会
+  // 被这个巧合蒙混过关。这两帧不搬到服务端,对端从未见过它们。
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(client.node->RequestForResponse(Command(0x0001), Retry(1ms, 1)));
+  }
+  const std::size_t kWarmupFrames = client.transport.sent().size();
+  ASSERT_EQ(kWarmupFrames, 3u);
+
   Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask([&] {
     outcome = client.node->RequestForResponse(Command(0x0044), Retry(500ms, 1));
@@ -1213,8 +1222,9 @@ TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
 
   // 线缆搬运(两个假传输之间手工接线):客户端出站 → 服务端入站。
   ASSERT_TRUE(testutil::pumpFiberUntil(
-      [&] { return !client.transport.sent().empty(); }, 500));
-  ASSERT_TRUE(server.transport.Deliver(client.transport.sent()[0].bytes));
+      [&] { return client.transport.sent().size() > kWarmupFrames; }, 500));
+  ASSERT_TRUE(
+      server.transport.Deliver(client.transport.sent()[kWarmupFrames].bytes));
 
   // 服务端出站 → 客户端入站。
   ASSERT_TRUE(testutil::pumpFiberUntil(
@@ -1229,10 +1239,13 @@ TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
   EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0xC0, 0xDE}));
 
-  ASSERT_EQ(client.transport.sent().size(), 1u) << "一发即中,不该有重发";
+  ASSERT_EQ(client.transport.sent().size(), kWarmupFrames + 1)
+      << "一发即中,不该有重发";
   ASSERT_EQ(server.transport.sent().size(), 1u);
-  const Message command = DecodeSent(client.transport, 0);
+  const Message command = DecodeSent(client.transport, kWarmupFrames);
   const Message reply = DecodeSent(server.transport, 0);
+  EXPECT_NE(command.session_id, 0)
+      << "预热后会话号须非 0,本用例才不会被'两边都从 0 起'的巧合蒙混";
   EXPECT_EQ(reply.session_id, command.session_id)
       << "Send 原样透传调用方填的 session_id——回帧因此才与请求匹配";
   EXPECT_EQ(reply.message_id, command.message_id);
