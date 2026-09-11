@@ -18,7 +18,7 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 - [快速开始](#快速开始)
 - [装配三件套](#装配三件套)：[选传输](#1-选传输) · [选 codec](#2-选-codec) · [选 node](#3-选-node)
 - [`ProtocolNode`：四种交互模式](#protocolnode四种交互模式)
-- [订阅入站消息](#订阅入站消息)
+- [订阅入站消息](#订阅入站消息) · [写一个外部协议服务端](#写一个外部协议服务端)
 - [`DdsNode`：发布-订阅与请求-响应](#ddsnode发布-订阅与请求-响应) · [动态增删注册](#动态增删注册)
 - [`Message` 的字段归属](#message-的字段归属)
 - [生命周期与相位规则](#生命周期与相位规则)
@@ -236,7 +236,16 @@ ProtocolNode node(transport, std::make_unique<SystemCodec>(), ncfg);
 
 `RetryPolicy{timeout, max_attempts}` **逐次传参**，节点配置面上没有任何时限缺省值；`timeout` 须为正、`max_attempts` 须 ≥ 1（**含首发**），否则返 `kInvalidArgument`。
 
-**盖章规则**：调用方填 `payload` 与 `message_id`，节点盖 `frm_type` / `protocol_id` / `session_id`。
+**盖章规则按方法分两档**（ADR-0019）：
+
+| 方法 | 节点盖 | 调用方填 |
+|---|---|---|
+| 三个 `RequestFor*` | `frm_type` / `protocol_id` / **`session_id`**（自增、越 255 回绕） | `payload` / `message_id` |
+| **`Send`** | `protocol_id` / `frm_type`（仅当留 `kUnknown` 时补 `kCommand`） | `payload` / `message_id` / **`session_id`** |
+
+`Send` 不登记订阅、不参与关联，故不替调用方决定关联键。**由此它能发出合法的应答帧**——外部协议的服务端只用公开面即可写出（见下）。
+
+> ⚠ **`Send` 不填 `session_id` 即恒为 0**（`Message` 的默认值）。框架**不校验**——0 是合法值。对端若按 `session_id` 区分帧，必须自己填。
 
 ---
 
@@ -321,6 +330,43 @@ auto result = node.RequestForResultDirect(std::move(req),
 | 收到结果后 | **自动回一帧** `kResponse` | **不回应任何帧** |
 
 签名里**没有**独立的 `result_timeout`：本交互只有一个等待阶段，其时限即 `RetryPolicy::timeout`。
+
+---
+
+### 写一个外部协议服务端
+
+`Send` 原样透传 `session_id`（ADR-0019），故服务端只用公开面就能回出合法应答帧——**应答必须回带请求的 `session_id` 与 `message_id`**，否则客户端的 `Dispatcher` 匹配不上（键是 `session_id` + `message_id` + `frm_type`）。
+
+```cpp
+auto sub = node.Subscribe(AnyOfType(FrameType::kCommand));
+auto ticket = std::move(sub).value();
+
+auto serving = Coro::makeTask([&] {
+  for (;;) {
+    auto req = ticket.Wait();
+    if (!req) break;                       // 信箱被节点关闭 → 退出
+
+    Message rsp;
+    rsp.frm_type   = FrameType::kResponse;
+    rsp.session_id = req.value().session_id;   // ★ 必须回带
+    rsp.message_id = req.value().message_id;   // ★ 必须回带
+    rsp.payload    = Handle(req.value());
+    (void)node.Send(std::move(rsp));
+  }
+});
+...
+(void)serving.get();                       // 宿主自己 join
+```
+
+三种请求-响应模式的应答形态不同，对端须按客户端所用的模式回：
+
+| 客户端用 | 服务端回 |
+|---|---|
+| `RequestForResponse` | 一帧 `kResponse` |
+| `RequestForResult` | 先 `kResponse`（受理），后 `kResult`（带结果的 `message_id`）。**末尾那帧 `kResponse` 由框架自动补发，服务端不管** |
+| `RequestForResultDirect` | 只回 `kResult` |
+
+**框架对协议语义不透明、不校验**——服务端回错形态不会报错，只会让客户端一路超时。
 
 ---
 
@@ -500,12 +546,12 @@ struct Message {
   // ── 外部协议路径（SystemCodec 上线缆）──
   FrameType frm_type    = FrameType::kUnknown;  // 【框架盖】
   uint8_t   protocol_id = 0;                    // 【框架盖】取自 ProtocolNodeConfig
-  uint8_t   session_id  = 0;                    // 【框架盖】滚动 0–255
+  uint8_t   session_id  = 0;                    // 三个 RequestFor* 【框架盖】；Send 【调用方填】
   uint16_t  message_id  = 0;                    // 【调用方填】命令码
 };
 ```
 
-**调用方只需要填 `payload` 与 `message_id`**（DDS 路径则是 `payload`）；标了【框架盖】的字段由节点填，手填会被覆盖。
+**调用方只需要填 `payload` 与 `message_id`**（DDS 路径则是 `payload`）；标了【框架盖】的字段由节点填，手填会被覆盖。**唯一的例外是 `Send` 的 `session_id`**——它原样透传（ADR-0019），这正是服务端能回应答帧的依据。
 
 `MessageKind`（DDS）：`kOneway` / `kRequest` / `kReply` / `kFeedback` / `kNotify`。
 `FrameType`（外部协议）：`kCommand` / `kResponse` / `kResult` / `kState` / `kHeartbeat`——**枚举值是占位的**，真实对接时改成协议规定的字节值。

@@ -592,12 +592,13 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - **session_id**：`std::uint8_t next_session_` 自增计数器，`NextSession()` 取用后自增、越过 255 自然回绕。**在途超过 256 时标识重复**，两个订阅落入同一桶、一条响应同时投给二者（SRS RT_REQUEST_MOT_2 已记该边界）。
 - **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。未命中时**一律静默丢弃、不作记录**——响应帧（`kResponse`/`kResult`）的迟到·无匹配与业务帧的无人认领**处置相同**（ADR-0009 D5 + ADR-0014 D1/D4，见 SRS §3.6）。
 - **交互模式（ADR-0010，RT_NODE_002_a..g）**：四个方法，其中三个属**外部系统协议**（`Send` / `RequestForResponse` / `RequestForResult`——后者对应协议里的 `withfeedback` 与 `needfeedback`，二者经核实为**同一个通信模型**），一个属**另一种协议**（`RequestForResultDirect`）。**模式不作参数、不入节点状态**——状态机的阶段、已发送次数与原始命令帧全是该方法的局部变量，活在**调用方 fiber 的栈**上，故节点无"在途交互表"、`Dispatcher` 不认识模式。各方法的公共骨架：
-  1. 取 `session_id` → 盖章；
+  1. 取 `session_id` → 盖章（**仅三个 `RequestFor*`**；`Send` 原样透传调用方所填，ADR-0019 **D1/D2**）；
   2. **发命令之前**同时登记两个订阅 `{sid, mid, kResponse}` 与（③④）`{sid, result_mid, kResult}`——`kResult` 可能先于 `kResponse` 到达，等收到受理再登记会丢帧（**D4**）；
   3. 第一阶段：发帧 → 等 `kResponse`，超时则**重发字节完全相同的原帧**（`session_id` 不变，**D3**），至多 `max_attempts` 次；耗尽返 **`kNotAccepted`**（**D12**）；
   4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，被静默丢弃；
   5. ③④ 第二阶段：等 `kResult`，超时返 `kTimeout`，**不重发**（**D2/D5**：`kResult` 未达意味着对端正在执行）；
-  6. `RequestForResult` 收到 `kResult` 后回一帧回应（**该模型固有的最后一步**），该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**不得走 `Send()`**（它会强制盖新 `session_id` 与 `kCommand`），走不盖章的私有 `EncodeAndWrite()`（**D8**）。
+  6. `RequestForResult` 收到 `kResult` 后回一帧回应（**该模型固有的最后一步**），该帧**完全由收到的 `kResult` 派生**：payload 原样回显、`session_id`/`message_id` 沿用不变、**仅**把 `frm_type` 改为 `kResponse`，CRC 由 `ICodec::Encode` 重算（`ProtocolNode` 不碰）。**不接受任何调用方参数**，故 ④ 与 ③ **签名相同**。该帧**走公开的 `Send()`**（ADR-0019 **D4**）：`Send` 不再盖 `session_id`，而 `frm_type` 已在此显式设为 `kResponse`（`Send` 只在 `kUnknown` 时才补 `kCommand`），故两条原先的绕行理由均不成立。
+     > **这同时是对 ADR-0019 D1 的自检**：框架自己的应答路径若能走公开面，宿主的服务端就也能。副作用：`protocol_id` 由沿用对端值改为取本节点配置——两侧配置一致时相同，且 `Dispatcher` 键与 `SystemCodec` 解码均不涉及该字段（**D3** 明确接受）。
 
   7. **`RequestForResultDirect`（另一种协议）**：无受理阶段——登记 `{sid, result_mid, kResult}` 一个订阅，发命令后**直接等结果**，超时即**重发**（与 3 同法），耗尽返 `kTimeout`；收到即成功，**不回应**。其"等结果可重发"与 `RequestForResult` 的"等结果不重发"并存——后者是**外部系统协议**的约束，非框架普遍规则（**D13**）。
 

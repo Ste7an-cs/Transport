@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 💥 破坏性：`ProtocolNode::Send` 不再盖 `session_id`，改由调用方填（ADR-0019，#244）
+
+- **`Send` 保留的盖章只剩两项**：`protocol_id`（取自节点配置）与 `frm_type`（仅当调用方留 `kUnknown` 时补 `kCommand`）。`session_id` **原样透传**。
+- **三个 `RequestFor*` 一个字不改**：它们必须自己分配 `session_id`——要用它登记订阅、作唯一关联键。自增与越过 255 回绕的语义不变，变的只是使用者由四个减为三个。
+- **起因：`ProtocolNode` 的公开面此前写不出应答。** 没有 `Reply`，而应答帧必须回带请求的 `session_id` 才会被 `Dispatcher` 匹配（键是 `session_id` + `message_id` + `frm_type`）。想做外部协议**服务端**的宿主只能绕到节点下面，自己 `ICodec::Encode` + `ITransport::AsyncWrite`。
+  - **框架自己也早已为同一原因绕开了 `Send`**：`RequestForResult` 末尾自动补发应答那处写着「不走 Send()：它会强制盖新 session_id 与 kCommand」。**一个连自己都要绕开的接口，说明盖章规则定错了地方。**
+- **该内部绕行随之改回走 `Send`**（D4）。这既是简化，也是对新语义的自检——框架自己的应答路径若能走公开面，宿主就也能。副作用：自动补发帧的 `protocol_id` 由沿用对端值改为取本节点配置；两侧配置一致时相同，且 `Dispatcher` 键与 `SystemCodec` 解码均不涉及该字段（**D3** 明确接受）。
+- **⚠ `Send` 不填 `session_id` 即恒为 0**（`Message` 的默认值），框架**不校验也无从校验**——0 是合法值。对端若按 `session_id` 区分帧、或协议要求会话号递增，**宿主必须自己填**。
+- **不加 `Reply(request, response)`**（已裁决关闭）：它要替调用方决定"应答该长什么样"，而外部协议的应答形态各异。放开 `session_id` 是更小更通用的解——`Reply` 能做的，填字段 + `Send` 都能做。
+- 测试：`SessionIdIncrementsAndWrapsAround` **改指向三个 `RequestFor*`**（语义仍成立，只是换了载体，不是删掉）；新增 `Send` 透传与不自增两条；新增 `PublicApiServerRepliesWithSendAndTerminatesClientRequest` —— 用公开面写服务端并终结客户端的 `RequestForResponse`，**这条证明本次改动买到了什么**。
+- README 新增「写一个外部协议服务端」一节；盖章规则在 README / SRS / SDD 三处按方法分两档改写。
+
 ### 变更：DDS 写侧队列改用 `FiberChannel`，四介质队列语义统一（ADR-0017，#240）
 
 - `DdsTransport::write_queue_` 由 `std::mutex` + `std::condition_variable` + `std::deque` 改为 **`Coro::FiberChannel<Datagram>`** + `setCapacity(1024)`，与三介质**逐字相同**。**纯内部实现替换**：`AsyncWrite` 的签名与 fire-and-forget 语义、`Close()` / `WaitClosed()`、`LastError()` 归因、`ITransport` 七方法**全部不变**。
