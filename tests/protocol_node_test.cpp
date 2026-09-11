@@ -172,6 +172,14 @@ class Subscriber {
   std::size_t exceptions_ = 0;
 };
 
+/// 受理阶段的重发策略,写法收口以免各用例散落字面量。
+transport::RetryPolicy Retry(std::chrono::milliseconds timeout, int attempts) {
+  transport::RetryPolicy retry;
+  retry.timeout = timeout;
+  retry.max_attempts = attempts;
+  return retry;
+}
+
 /// 已 Start 的节点;传输由**测试**(即宿主)启停,节点只借用。
 struct Fixture {
   FakeTransport transport;
@@ -214,17 +222,79 @@ TEST(ProtocolNode, SendKeepsCallerSuppliedFrameType) {
 }
 
 // session_id 是自增计数器:逐次递增,越过 255 回绕到 0。
+//
+// **载体是三个 `RequestFor*`,不是 `Send`**(ADR-0019 D2):只有它们分配 session_id——要拿
+// 它登记订阅、作唯一关联键。三个方法轮流调用,证明它们共用同一个计数器。
+// 每次交互都让其自然耗尽(对端一帧不回),故每次**恰好**发出一条命令帧。
 TEST(ProtocolNode, SessionIdIncrementsAndWrapsAround) {
   Fixture fx;
+  constexpr std::uint16_t kResultId = 0x03F2;
+  constexpr auto kTick = 1ms;  // 只要求"必然耗尽",取最小正值以免 258 次累积过久。
   for (int i = 0; i < 258; ++i) {
-    ASSERT_TRUE(fx.node->Send(Command(0x0001))) << "第 " << i << " 次";
+    switch (i % 3) {
+      case 0:
+        EXPECT_FALSE(fx.node->RequestForResponse(Command(0x0001), Retry(kTick, 1)))
+            << "第 " << i << " 次";
+        break;
+      case 1:
+        EXPECT_FALSE(fx.node->RequestForResult(Command(0x0001), Retry(kTick, 1),
+                                               kResultId, kTick))
+            << "第 " << i << " 次";
+        break;
+      default:
+        EXPECT_FALSE(fx.node->RequestForResultDirect(Command(0x0001),
+                                                     Retry(kTick, 1), kResultId))
+            << "第 " << i << " 次";
+        break;
+    }
   }
-  ASSERT_EQ(fx.transport.sent().size(), 258u);
+  ASSERT_EQ(fx.transport.sent().size(), 258u) << "每次交互恰好发出一条命令帧";
   EXPECT_EQ(DecodeSent(fx.transport, 0).session_id, 0);
   EXPECT_EQ(DecodeSent(fx.transport, 1).session_id, 1);
   EXPECT_EQ(DecodeSent(fx.transport, 255).session_id, 255);
   EXPECT_EQ(DecodeSent(fx.transport, 256).session_id, 0) << "越过 255 应回绕";
   EXPECT_EQ(DecodeSent(fx.transport, 257).session_id, 1);
+}
+
+// ADR-0019 D1:`Send` **原样透传**调用方填的 session_id——0 / 255 / 任意值都不被改写。
+// 0 是合法值(不是"没填"),故它也必须原样上线。
+TEST(ProtocolNode, SendPassesCallerSuppliedSessionIdThrough) {
+  Fixture fx;
+  for (const std::uint8_t session : {std::uint8_t{0}, std::uint8_t{255},
+                                     std::uint8_t{0x5A}, std::uint8_t{1}}) {
+    Message msg = Command(0x0001);
+    msg.session_id = session;
+    ASSERT_TRUE(fx.node->Send(std::move(msg))) << "session=" << int(session);
+  }
+  ASSERT_EQ(fx.transport.sent().size(), 4u);
+  EXPECT_EQ(DecodeSent(fx.transport, 0).session_id, 0);
+  EXPECT_EQ(DecodeSent(fx.transport, 1).session_id, 255);
+  EXPECT_EQ(DecodeSent(fx.transport, 2).session_id, 0x5A);
+  EXPECT_EQ(DecodeSent(fx.transport, 3).session_id, 1);
+}
+
+// ADR-0019 D1 的反面:`Send` 连发多次**不自增**,也不消耗那个计数器。
+// 不填即为 `Message::session_id` 的默认值 0(代价 2:这是个安静的坑,框架不校验)。
+TEST(ProtocolNode, SendDoesNotIncrementSessionId) {
+  Fixture fx;
+  Message stamped = Command(0x0001);
+  stamped.session_id = 7;
+  ASSERT_TRUE(fx.node->Send(stamped));
+  ASSERT_TRUE(fx.node->Send(stamped));
+  ASSERT_TRUE(fx.node->Send(stamped));
+  ASSERT_TRUE(fx.node->Send(Command(0x0001)));  // 不填 → 默认 0。
+
+  ASSERT_EQ(fx.transport.sent().size(), 4u);
+  EXPECT_EQ(DecodeSent(fx.transport, 0).session_id, 7);
+  EXPECT_EQ(DecodeSent(fx.transport, 1).session_id, 7) << "第二帧不该自增";
+  EXPECT_EQ(DecodeSent(fx.transport, 2).session_id, 7) << "第三帧不该自增";
+  EXPECT_EQ(DecodeSent(fx.transport, 3).session_id, 0) << "不填即默认 0";
+
+  // 计数器也未被 `Send` 消耗:随后的请求方法仍从 0 起。
+  EXPECT_FALSE(fx.node->RequestForResponse(Command(0x0002), Retry(1ms, 1)));
+  ASSERT_EQ(fx.transport.sent().size(), 5u);
+  EXPECT_EQ(DecodeSent(fx.transport, 4).session_id, 0)
+      << "四次 Send 没有取用计数器,请求方法仍拿第 0 号";
 }
 
 // —— 2. 请求-响应关联 ————————————————————————————————————————————————
@@ -716,18 +786,6 @@ TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
 // 两个方法的状态机全部活在**调用方 fiber 的局部变量**里(D1):节点不新增成员、不持有
 // 在途交互表,Dispatcher 也不认识"模式"。以下用例逐条验证 ADR-0010 的可观察后果。
 
-namespace {
-
-/// 受理阶段的重发策略,写法收口以免各用例散落字面量。
-transport::RetryPolicy Retry(std::chrono::milliseconds timeout, int attempts) {
-  transport::RetryPolicy retry;
-  retry.timeout = timeout;
-  retry.max_attempts = attempts;
-  return retry;
-}
-
-}  // namespace
-
 // ① 一次成功:发命令 → 回 kResponse → 返回该帧。
 TEST(ProtocolNode, RequestForResponseSucceedsOnFirstAttempt) {
   Fixture fx;
@@ -1119,4 +1177,78 @@ TEST(ProtocolNode, RequestForResultDirectRejectsInvalidPolicyAndClosedNode) {
   ASSERT_FALSE(after_close);
   EXPECT_EQ(after_close.error(), make_error_code(TransportErrc::kClosed));
   (void)fake.Close();
+}
+
+// —— 7. 用公开面写外部协议的服务端(ADR-0019 D1 的核心价值)——————————————
+
+// 服务端节点 `Subscribe` 全部 kCommand,收到后用**公开的 `Send`** 回一帧 kResponse
+// (回带请求的 session_id 与 message_id),客户端的 `RequestForResponse` 被它终结。
+//
+// 这是本 ADR 的核心价值:**外部协议的服务端首次可以只用公开面写出来**——取入站靠
+// `Subscribe`,回出站靠 `Send`,不必绕到 codec + transport 层自行 Encode / AsyncWrite。
+//
+// 本用例正是 D1 的行为证据:`Send` 若仍强制盖自增 session_id,回帧的关联键(ADR-0009 D1
+// 的三字段)就对不上客户端登记的订阅,该帧会被当作无人认领而丢弃,客户端只能耗尽返
+// kNotAccepted——本用例必然变红。
+TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
+  Fixture client;
+  Fixture server;
+
+  // —— 服务端:一条自有消费 fiber,收到命令即用 Send 回应(ADR-0009 D2 的宿主样板)。
+  Coro::Result<void> replied = make_error_code(TransportErrc::kInternal);
+  Subscriber servant(*server.node, transport::AnyOfType(FrameType::kCommand),
+                     [&](const Message& request) {
+                       Message reply;
+                       reply.frm_type = FrameType::kResponse;
+                       reply.session_id = request.session_id;  // ★ 回带请求的会话号
+                       reply.message_id = request.message_id;
+                       reply.payload = {0xC0, 0xDE};
+                       replied = server.node->Send(std::move(reply));
+                     });
+
+  // **先把客户端的会话计数器推进到非 0**:两个节点的计数器都从 0 起,若正式请求恰好用
+  // 0 号会话,那么"`Send` 盖一个自增的 0"与"`Send` 原样透传 0"在线上无从区分,本用例会
+  // 被这个巧合蒙混过关。这两帧不搬到服务端,对端从未见过它们。
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(client.node->RequestForResponse(Command(0x0001), Retry(1ms, 1)));
+  }
+  const std::size_t kWarmupFrames = client.transport.sent().size();
+  ASSERT_EQ(kWarmupFrames, 3u);
+
+  Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
+  auto caller = Coro::makeTask([&] {
+    outcome = client.node->RequestForResponse(Command(0x0044), Retry(500ms, 1));
+  });
+
+  // 线缆搬运(两个假传输之间手工接线):客户端出站 → 服务端入站。
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return client.transport.sent().size() > kWarmupFrames; }, 500));
+  ASSERT_TRUE(
+      server.transport.Deliver(client.transport.sent()[kWarmupFrames].bytes));
+
+  // 服务端出站 → 客户端入站。
+  ASSERT_TRUE(testutil::pumpFiberUntil(
+      [&] { return !server.transport.sent().empty(); }, 500));
+  ASSERT_TRUE(client.transport.Deliver(server.transport.sent()[0].bytes));
+
+  (void)caller.get();
+  servant.Join();
+
+  ASSERT_TRUE(replied) << "服务端那次 Send 应成功入队";
+  ASSERT_TRUE(outcome) << outcome.error().message();
+  EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
+  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0xC0, 0xDE}));
+
+  ASSERT_EQ(client.transport.sent().size(), kWarmupFrames + 1)
+      << "一发即中,不该有重发";
+  ASSERT_EQ(server.transport.sent().size(), 1u);
+  const Message command = DecodeSent(client.transport, kWarmupFrames);
+  const Message reply = DecodeSent(server.transport, 0);
+  EXPECT_NE(command.session_id, 0)
+      << "预热后会话号须非 0,本用例才不会被'两边都从 0 起'的巧合蒙混";
+  EXPECT_EQ(reply.session_id, command.session_id)
+      << "Send 原样透传调用方填的 session_id——回帧因此才与请求匹配";
+  EXPECT_EQ(reply.message_id, command.message_id);
+  EXPECT_EQ(reply.frm_type, FrameType::kResponse) << "调用方给出的帧类型优先";
+  EXPECT_EQ(reply.protocol_id, kProtocolId) << "protocol_id 仍由节点盖(D3)";
 }

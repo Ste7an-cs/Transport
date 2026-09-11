@@ -12,7 +12,8 @@
 #include "transport/core/Error.hpp"
 
 // ProtocolNode.cpp — 见 .hpp。协议特有语义内联于此(D9/D10 红线):key 派生、frm_type
-// 盖章、session_id 分配、Dispatch 分类、终结判别、寻址。生命周期(幂等 Start / 关闭仲裁 /
+// 盖章、session_id 分配(仅三个 `RequestFor*`,ADR-0019 D2)、Dispatch 分类、终结判别、
+// 寻址。生命周期(幂等 Start / 关闭仲裁 /
 // join)由基类 NodeBase 承载,本类只填三个钩子。
 //
 // 入站只有一条通路——`Dispatcher` 按键投递(ADR-0009 D1)。本类不持有业务队列:入站
@@ -215,10 +216,14 @@ Coro::Result<Message> ProtocolNode::RequestForResult(
 
   // D8:回应结果是本模型**固有的最后一步**,不是可选项。该帧完全由收到的 kResult 派生——
   // payload 原样回显(整块拷贝,框架不解读)、session_id 与 message_id 沿用,**仅**改帧类型;
-  // CRC 由 ICodec::Encode 重算。不走 Send():它会强制盖新 session_id 与 kCommand。
+  // CRC 由 ICodec::Encode 重算。
+  //
+  // **走公开的 Send()**(ADR-0019 D4):它不再盖 session_id(D1),而 frm_type 已在此显式
+  // 设为 kResponse、Send 只在 kUnknown 时才补 kCommand,故原先那两条绕行理由都已消失。
+  // 框架自己的应答路径能走公开面,即证明宿主也能。
   Message reply = result_msg.value();
   reply.frm_type = FrameType::kResponse;
-  if (auto sent = EncodeAndWrite(reply); !sent) {
+  if (auto sent = Send(reply); !sent) {
     return sent.error();  // 回应结果发送失败 ⇒ 整次交互返错。
   }
   return result_msg;
@@ -266,13 +271,16 @@ Coro::Result<void> ProtocolNode::Send(Message msg) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
-  // 盖章:调用方给出的业务类型优先,否则取命令帧;默认协议 id;下一个 session_id。
-  // 本调用不期待应答,不登记订阅。
+  // 盖章只剩两项(ADR-0019 D1):frm_type(调用方给出的业务类型优先,否则补 kCommand)
+  // 与 protocol_id(D3,恒取节点配置)。**session_id 一律原样透传**——本调用不登记订阅、
+  // 不参与关联,没有理由替调用方决定关联键;调用方不填即为 `Message` 的默认值 0。
+  //
+  // 由此 `Send` 可发出合法的应答帧(回带请求的 session_id),外部协议的服务端只用公开面
+  // 即可写出。
   if (msg.frm_type == FrameType::kUnknown) {
     msg.frm_type = FrameType::kCommand;
   }
   msg.protocol_id = config_.protocol_id;
-  msg.session_id = NextSession();
   return EncodeAndWrite(msg);
 }
 
