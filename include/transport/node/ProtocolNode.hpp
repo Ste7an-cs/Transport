@@ -46,6 +46,8 @@
  *
  * session_id 由一个 `std::uint8_t` 计数器**循环递增**给出:每次取用后自增,越过 255 自然
  * 回绕到 0。它只用于区分近期的并发交互,不构成并发上限,故取用不会失败。
+ * **只有三个 `RequestFor*` 取用它**(ADR-0019 D2);`Send` 不分配、原样透传调用方填的值
+ * (D1),不填即为默认值 0。
  *
  * @warning 在途交互数超过 256 时 session_id 会重复。重复的键意味着两个订阅登记在同一桶
  *          中,一条响应将同时投递给二者。若协议存在此量级的并发,应在键中引入更宽的
@@ -198,8 +200,9 @@ class ProtocolNode : public NodeBase {
    *
    * **末尾的回应结果是本模型固有的最后一步、不是可选项**(D8 / RT_NODE_002_f):该帧完全由
    * 收到的 `kResult` 派生——payload 原样回显、session_id 与 message_id 沿用,**仅**把帧类型
-   * 改为 kResponse,CRC 由 `ICodec::Encode` 重算。它不走 `Send()`(那会强制盖新 session_id
-   * 与 kCommand)。该帧交给传输失败则整次交互返错(只在节点关闭时可能发生)。
+   * 改为 kResponse,CRC 由 `ICodec::Encode` 重算。该帧**经公开的 `Send()` 发出**
+   * (ADR-0019 D4):`Send` 不再盖 session_id,frm_type 又已显式给出,故原先绕开它的两条
+   * 理由都已消失。该帧交给传输失败则整次交互返错(只在节点关闭时可能发生)。
    *
    * @param req               请求 Message;盖章同 `RequestForResponse`。
    * @param retry             **受理阶段**的重发策略。
@@ -257,10 +260,24 @@ class ProtocolNode : public NodeBase {
   /**
    * @brief noresponse fire-and-forget 出站:盖章 + 编码 + 交给传输,不期待应答。
    *
-   * 本节点盖 frm_type(调用方给出的业务类型优先,否则取 kCommand)、默认 protocol_id,
-   * 并取用下一个 session_id。不登记任何订阅——本调用不期待应答。
+   * 本节点只盖**两项**(ADR-0019 D1):frm_type(调用方给出的业务类型优先,否则取
+   * kCommand)与 protocol_id(恒取节点配置,D3)。不登记任何订阅——本调用不期待应答。
    *
-   * @param msg 出站 Message(payload + 可选 message_id / frm_type 由调用方填)。
+   * ## `session_id` 由**调用方**填,本方法原样透传
+   *
+   * 本方法不参与关联,故不替调用方决定关联键——填 0、填 255、填任意值都原样上线。
+   * 这使 `Send` 能发出**合法的应答帧**:回带请求的 `session_id` 与 `message_id`、帧类型置
+   * `kResponse`,对端的 `RequestForResponse` 即被终结。**外部协议的服务端由此只用公开面
+   * 即可写出**,不必绕到 codec + transport 层。
+   *
+   * @warning **不填即为 `Message::session_id` 的默认值 0**,而 0 是合法值,框架不校验、
+   *          也无从校验(ADR-0019 代价 2)。对端若按 `session_id` 区分帧(如订阅键用
+   *          `FrameOf(session, ...)`,或协议要求会话号递增),宿主**必须自己填**。
+   *
+   * @note 与三个 `RequestFor*` 不同:它们**必须**自己分配 `session_id`(要用它登记订阅、
+   *       作唯一关联键),调用方填的会被覆盖(D2)。盖章规则按方法分两档。
+   *
+   * @param msg 出站 Message(payload + session_id + 可选 message_id / frm_type 由调用方填)。
    * @return 已入队,或机器可判别错误(kClosed / 编码错误)。
    *         **返回成功不表示已发出**——实际写出与其失败归因都在传输的写泵里。
    */
@@ -353,7 +370,7 @@ class ProtocolNode : public NodeBase {
   /// 取 const 引用:投递只读源消息,命中的订阅者各拷一份副本。
   void Dispatch(const Message& msg);
   /// @brief 编码 + 交给传输(`Send` 与各 `RequestFor*` 共用的出站尾段)。
-  ///        **不盖任何章**——这正是 D8 的回应结果帧走本函数而非 `Send()` 的原因。
+  ///        **不盖任何章**——盖章一律在各出站方法内完成,本函数只管编码与入队。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
 
   /// @brief 受理阶段(等 kResponse,超时重发),`RequestForResponse` 与 `RequestForResult`
@@ -377,6 +394,9 @@ class ProtocolNode : public NodeBase {
 
   /// @brief 取用下一个 session_id:自增计数器,`std::uint8_t` 自然回绕即 0..255 循环。
   ///        取用不会失败,故不返回错误。
+  ///
+  /// **仅三个 `RequestFor*` 调用它**(ADR-0019 D2):它们要用 session_id 登记订阅、作唯一
+  /// 关联键。`Send` 不再调用(D1)。
   [[nodiscard]] std::uint8_t NextSession();
 
   ITransport& transport_;  ///< **借用**:宿主拥有并启停,寿命须长于本节点。
