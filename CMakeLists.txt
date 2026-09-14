@@ -132,6 +132,10 @@ if(TRANSPORT_BUILD_TESTS)
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp
+    # dds_codec_test 此前不在任一构建的源清单里(既无停摆依据、也无注释说明)。
+    # ADR-0020 D2 要求【五个 codec 全部必填 frame】,DdsCodec 的那一条得有直接用例守住,
+    # 故随 #247 补进编译面。
+    tests/codec/dds_codec_test.cpp
     tests/dds/fake_dds_provider_test.cpp
     tests/dds/dds_registry_test.cpp
     tests/dds/dds_transport_test.cpp

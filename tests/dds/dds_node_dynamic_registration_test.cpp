@@ -41,6 +41,7 @@
 
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/DdsCodec.hpp"
 #include "transport/core/Endpoint.hpp"
@@ -277,14 +278,30 @@ DdsNode::Ticket MustSubscribe(DdsNode& node, DdsNode::TopicKey topic,
   return std::move(ticket).value();
 }
 
+std::string Text(const Message& msg) {
+  return testutil::ToText(msg.payload);
+}
+
 Message Payload(std::string text) {
   Message msg;
-  msg.payload.assign(text.begin(), text.end());
+  msg.payload = testutil::Pay(text);
   return msg;
 }
 
-std::string Text(const Message& msg) {
-  return std::string(msg.payload.begin(), msg.payload.end());
+/// 出站发布用:目的地 topic 填进 `endpoint`——`Publish` 不再收 topic 参数,目的地取自
+/// `msg.endpoint` 且**须是 `kTopic`**(ADR-0020 **D6**)。
+Message Payload(std::string topic, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Topic(std::move(topic));
+  return msg;
+}
+
+/// 出站请求用:**服务名**填进 `endpoint`,**须是 `kService`**——服务名不是 topic
+/// (ADR-0020 **D5/D6**)。
+Message Ask(std::string service_name, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Service(std::move(service_name));
+  return msg;
 }
 
 constexpr auto kCaseTimeout = 300ms;
@@ -323,7 +340,7 @@ TEST(DdsNodeDynamicRegistration, RegisteringWhileRunningDeliversImmediately) {
 
   // Fake 总线没有发现窗口,故这条是确定的(真实 DDS 上首帧会丢——ADR-0015
   // 「明确接受的代价」①,风险由宿主自行评估处置)。
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("late", Payload("hi"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("late", "hi"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
   ASSERT_EQ(seen->size(), 1u);
   EXPECT_EQ(seen->front(), "hi");
@@ -341,7 +358,7 @@ TEST(DdsNodeDynamicRegistration, RequestResponseWorksAfterRunningRegistration) {
 
   // 补注册之前:服务名查不到 ⇒ kConfiguration(不猜、不回落)。
   EXPECT_EQ(
-      client.node().RequestForResultDirect("get", Payload("ping"), {kCaseTimeout, 1})
+      client.node().RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 1})
           .error(),
       make_error_code(TransportErrc::kConfiguration));
   EXPECT_EQ(server.node().ServeRequests("get").error(),
@@ -356,12 +373,11 @@ TEST(DdsNodeDynamicRegistration, RequestResponseWorksAfterRunningRegistration) {
     (void)server.node().Reply(request, Payload("pong"));
   });
 
-  auto reply = client.node().RequestForResultDirect("get", Payload("ping"),
-                                                    {kCaseTimeout, 3});
+  auto reply = client.node().RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 3});
   ASSERT_TRUE(static_cast<bool>(reply)) << reply.error().message();
   EXPECT_EQ(Text(reply.value()), "pong");
   // 应答确实走的是派生出来的那条(字面量写死,不复用被测的派生函数)。
-  EXPECT_EQ(reply.value().topic, "cfg.get.response");
+  EXPECT_EQ(reply.value().endpoint.topic, "cfg.get.response");
 }
 
 // ── 2. ⭐ 注销:该 topic 确实不再收发;重新注册后恢复正常(D2)─────────────
@@ -387,12 +403,12 @@ TEST(DdsNodeDynamicRegistration, UnregisterStopsReceivingAndReRegisterRestoresIt
       MustSubscribe(subscriber.node(), std::string("news"), MessageKind::kNotify),
       [seen](const Message& msg) { seen->push_back(Text(msg)); });
 
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("one"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("news", "one"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
 
   // ── 注销:reader 当场拆掉 ──
   ASSERT_TRUE(static_cast<bool>(subscriber.node().UnregisterSubscribers({"news"})));
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("two"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("news", "two"))));
   PumpAWhile();
   EXPECT_EQ(seen->size(), 1u) << "注销之后这条不该再到达";
   // 订阅面也随之收紧:`Subscribe` 查不到该 topic 的读侧角色了。
@@ -402,7 +418,7 @@ TEST(DdsNodeDynamicRegistration, UnregisterStopsReceivingAndReRegisterRestoresIt
 
   // ── 重新注册:reader 再建出来,收发恢复正常 ──
   ASSERT_TRUE(static_cast<bool>(subscriber.node().RegisterSubscribers({"news"})));
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("three"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("news", "three"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2; }));
   ASSERT_EQ(seen->size(), 2u);
   EXPECT_EQ((*seen)[0], "one");
@@ -422,12 +438,12 @@ TEST(DdsNodeDynamicRegistration, UnregisterTearsDownTheWriterNotJustTheRegistryE
   ASSERT_TRUE(static_cast<bool>(node.Start()));
 
   WireTap tap(fixture, "telemetry");
-  ASSERT_TRUE(static_cast<bool>(node.Publish("telemetry", Payload("x"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("telemetry", "x"))));
   EXPECT_TRUE(pumpFiberUntil([&tap] { return tap.Count() == 1; }));
 
   ASSERT_TRUE(static_cast<bool>(node.UnregisterPublishers({"telemetry"})));
   // ① 注册面:与"从没注册过"完全一样。
-  EXPECT_EQ(node.Publish("telemetry", Payload("y")).error(),
+  EXPECT_EQ(node.Publish(Payload("telemetry", "y")).error(),
             make_error_code(TransportErrc::kConfiguration));
   // ② 端点面:绕过节点直接写,写线程上得到"未声明"的 kConfiguration。
   ASSERT_TRUE(static_cast<bool>(host.transport().AsyncWrite(
@@ -440,7 +456,7 @@ TEST(DdsNodeDynamicRegistration, UnregisterTearsDownTheWriterNotJustTheRegistryE
 
   // 重新注册即恢复。
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"telemetry"})));
-  ASSERT_TRUE(static_cast<bool>(node.Publish("telemetry", Payload("z"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("telemetry", "z"))));
   EXPECT_TRUE(pumpFiberUntil([&tap] { return tap.Count() == 2; }));
 }
 
@@ -468,13 +484,13 @@ TEST(DdsNodeDynamicRegistration, UnregisteringOneDirectionLeavesTheOtherWorking)
                  [seen](const Message& msg) { seen->push_back(Text(msg)); });
 
   WireTap tap(fixture, "loop");
-  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("a"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "a"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
 
   // ── 只注销读侧:写侧照常发得出去 ──
   ASSERT_TRUE(static_cast<bool>(node.UnregisterSubscribers({"loop"})));
   const std::size_t before = tap.Count();
-  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("b"))))
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "b"))))
       << "写侧不该被读侧的注销牵连";
   EXPECT_TRUE(pumpFiberUntil([&tap, before] { return tap.Count() == before + 1; }));
   PumpAWhile();
@@ -483,10 +499,10 @@ TEST(DdsNodeDynamicRegistration, UnregisteringOneDirectionLeavesTheOtherWorking)
   // ── 换个方向:恢复读侧、只注销写侧 ──
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
   ASSERT_TRUE(static_cast<bool>(node.UnregisterPublishers({"loop"})));
-  EXPECT_EQ(node.Publish("loop", Payload("c")).error(),
+  EXPECT_EQ(node.Publish(Payload("loop", "c")).error(),
             make_error_code(TransportErrc::kConfiguration));
   // 读侧仍好好的:别人发的照收。
-  ASSERT_TRUE(static_cast<bool>(peer.node().Publish("loop", Payload("d"))));
+  ASSERT_TRUE(static_cast<bool>(peer.node().Publish(Payload("loop", "d"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2; }));
   ASSERT_EQ(seen->size(), 2u);
   EXPECT_EQ((*seen)[1], "d");
@@ -511,19 +527,17 @@ TEST(DdsNodeDynamicRegistration, UnregisteringClientDoesNotDisturbTheServer) {
     (void)server.node().Reply(request, Payload("pong"));
   });
 
-  ASSERT_TRUE(static_cast<bool>(client.node().RequestForResultDirect(
-      "get", Payload("ping"), {kCaseTimeout, 3})));
+  ASSERT_TRUE(static_cast<bool>(client.node().RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 3})));
 
   // 客户端注销:它自己那两条端点没了,服务端一无所感。
   ASSERT_TRUE(static_cast<bool>(client.node().UnregisterClients({"get"})));
   EXPECT_EQ(client.node()
-                .RequestForResultDirect("get", Payload("ping"), {kCaseTimeout, 1})
+                .RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 1})
                 .error(),
             make_error_code(TransportErrc::kConfiguration));
   // 服务端照旧能服务——重新注册的客户端立刻又通了。
   ASSERT_TRUE(static_cast<bool>(client.node().RegisterClients({"get"})));
-  auto again = client.node().RequestForResultDirect("get", Payload("ping"),
-                                                    {kCaseTimeout, 3});
+  auto again = client.node().RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 3});
   EXPECT_TRUE(static_cast<bool>(again)) << again.error().message();
 }
 
@@ -549,8 +563,7 @@ TEST(DdsNodeDynamicRegistration, UnregisteringAServedServiceKeepsTheTicketButFai
 
   // 客户端只发一次(不等结果:没人应答,等下去只会超时)。
   auto request_task = std::make_shared<Coro::FiberTask<void>>(Coro::makeTask([&client] {
-    (void)client.node().RequestForResultDirect("get", Payload("ping"),
-                                               {kCaseTimeout, 1});
+    (void)client.node().RequestForResultDirect(Ask("get", "ping"), {kCaseTimeout, 1});
   }));
   EXPECT_TRUE(pumpFiberUntil([inbox] { return inbox->size() == 1; }));
   ASSERT_EQ(inbox->size(), 1u);
@@ -569,8 +582,7 @@ TEST(DdsNodeDynamicRegistration, UnregisteringAServedServiceKeepsTheTicketButFai
   //    收到了新请求(全程没有再调过一次 `ServeRequests`)。
   ASSERT_TRUE(static_cast<bool>(server.node().RegisterServices({"get"})));
   auto second = std::make_shared<Coro::FiberTask<void>>(Coro::makeTask([&client, &server, inbox] {
-    (void)client.node().RequestForResultDirect("get", Payload("ping2"),
-                                               {kCaseTimeout, 1});
+    (void)client.node().RequestForResultDirect(Ask("get", "ping2"), {kCaseTimeout, 1});
     (void)server;
     (void)inbox;
   }));
@@ -604,15 +616,15 @@ TEST(DdsNodeDynamicRegistration, RunningBatchRollsBackEndpointsBuiltSoFar) {
             make_error_code(TransportErrc::kIo));
 
   // ① 注册表一项不落——连**失败之前**那项也没落。
-  EXPECT_EQ(node.Publish("first", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("first", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
-  EXPECT_EQ(node.Publish("third", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("third", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
   // ② 本批已建的端点已被拆掉(不是"留在那儿反正没人用")。
   EXPECT_TRUE(fixture.trace->WasUndeclared("first"));
   // ③ **先前批次的端点毫发无伤**:回滚清单只记本批真正新建的项。
   EXPECT_FALSE(fixture.trace->WasUndeclared("kept"));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("kept", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("kept", "x"))));
 
   // 去掉故障源再来一次,整批照常落地。
   {
@@ -620,9 +632,9 @@ TEST(DdsNodeDynamicRegistration, RunningBatchRollsBackEndpointsBuiltSoFar) {
     fixture.trace->fail_writers.clear();
   }
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"first", "boom", "third"})));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("first", Payload("x"))));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("boom", Payload("x"))));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("third", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("first", "x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("boom", "x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("third", "x"))));
 }
 
 // 成对派生的那两组回滚要连**半边**一起拆:`Clients` 的一项是 request 的 W + response 的 R,
@@ -644,9 +656,9 @@ TEST(DdsNodeDynamicRegistration, RollbackAlsoTearsDownTheHalfBuiltPairedItem) {
             make_error_code(TransportErrc::kIo));
 
   // 注册表一项不落。
-  EXPECT_EQ(node.RequestForResultDirect("a", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("a", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kConfiguration));
-  EXPECT_EQ(node.RequestForResultDirect("b", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("b", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kConfiguration));
   // 已建成的整项 `a` 两条端点都拆了;失败项 `b` 建了一半的那条 writer 也拆了。
   EXPECT_TRUE(fixture.trace->WasUndeclared("cfg.a.request"));
@@ -671,9 +683,9 @@ TEST(DdsNodeDynamicRegistration, UnregisterInCreatedOnlyRemovesFromTheRegistry) 
   EXPECT_FALSE(fixture.trace->WasUndeclared("cfg.svc.request"));
 
   ASSERT_TRUE(static_cast<bool>(node.Start()));
-  EXPECT_EQ(node.Publish("a", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("a", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("b", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("b", "x"))));
   EXPECT_EQ(node.ServeRequests("svc").error(),
             make_error_code(TransportErrc::kConfiguration));
 }
@@ -696,6 +708,6 @@ TEST(DdsNodeDynamicRegistration, UnregisteringSomethingNeverRegisteredIsANoOp) {
   // 重复注销同一项也一样。
   EXPECT_TRUE(static_cast<bool>(node.UnregisterPublishers({"a"})));
   EXPECT_TRUE(static_cast<bool>(node.UnregisterPublishers({"a"})));
-  EXPECT_EQ(node.Publish("a", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("a", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
 }

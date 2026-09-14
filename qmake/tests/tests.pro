@@ -73,6 +73,7 @@ SOURCES += \
     $$TRANSPORT_ROOT/tests/codec/system_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/codec/datagram_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/codec/system_datagram_codec_test.cpp \
+    $$TRANSPORT_ROOT/tests/codec/dds_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/dds/fake_dds_provider_test.cpp \
     $$TRANSPORT_ROOT/tests/dds/dds_registry_test.cpp \
     $$TRANSPORT_ROOT/tests/dds/dds_transport_test.cpp \

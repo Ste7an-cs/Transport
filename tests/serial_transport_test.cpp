@@ -65,6 +65,7 @@
 
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/SystemCodec.hpp"
 #include "transport/core/Endpoint.hpp"
@@ -75,6 +76,8 @@
 #include "transport/node/ProtocolNode.hpp"
 
 using namespace std::chrono_literals;
+using testutil::Pay;
+using testutil::ToVec;
 using testutil::AwaitRead;
 using testutil::pumpFiberUntil;
 using transport::Datagram;
@@ -842,7 +845,7 @@ TEST(CoroSerialTransport, NodeRequestResponseEndToEndOverSerial) {
 
   Message request;
   request.message_id = 0x0002;
-  request.payload = {0x11, 0x22, 0x33};
+  request.payload = Pay({0x11, 0x22, 0x33});
   Coro::Result<Message> outcome{make_error_code(TransportErrc::kInternal)};
   bool done = false;
   auto caller = Coro::makeTask([&] {
@@ -865,7 +868,7 @@ TEST(CoroSerialTransport, NodeRequestResponseEndToEndOverSerial) {
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
   EXPECT_EQ(outcome.value().protocol_id, 0x2A);
   EXPECT_EQ(outcome.value().message_id, 0x0002);
-  EXPECT_EQ(outcome.value().payload,
+  EXPECT_EQ(ToVec(outcome.value().payload),
             (std::vector<std::uint8_t>{0x11, 0x22, 0x33}));
   EXPECT_EQ(served, 1) << "对端收到的命令帧不是恰好一条";
 

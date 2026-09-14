@@ -38,6 +38,7 @@
 #include "await/awaitable.hpp"
 #include "await/corosocket.hpp"
 #include "coro_test_util.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/SystemCodec.hpp"
 #include "transport/core/Error.hpp"
@@ -47,6 +48,8 @@
 #include "transport/node/ProtocolNode.hpp"
 
 using namespace std::chrono_literals;
+using testutil::Pay;
+using testutil::ToVec;
 using testutil::pumpFiberUntil;
 using transport::AnyOfType;
 using transport::FrameType;
@@ -108,7 +111,7 @@ bool WaitLinkUp(const TcpTransport& t, int budget_ms = 4000) {
 Message Command(std::uint16_t message_id, std::vector<std::uint8_t> payload) {
   Message msg;
   msg.message_id = message_id;
-  msg.payload = std::move(payload);
+  msg.payload = Pay(payload);
   return msg;
 }
 
@@ -236,7 +239,7 @@ TEST(ProtocolNodeTcpE2E, InFlightInteractionSurvivesDisconnectAndNodeKeepsRunnin
   ASSERT_TRUE(first_reply) << first_reply.error().message();
   EXPECT_EQ(first_reply.value().frm_type, FrameType::kResponse);
   EXPECT_EQ(first_reply.value().message_id, 0x0001);
-  EXPECT_EQ(first_reply.value().payload, (std::vector<std::uint8_t>{0x11}));
+  EXPECT_EQ(ToVec(first_reply.value().payload), (std::vector<std::uint8_t>{0x11}));
 
   // —— 在途交互 + 物理断连 ——
   silent = true;
@@ -274,7 +277,7 @@ TEST(ProtocolNodeTcpE2E, InFlightInteractionSurvivesDisconnectAndNodeKeepsRunnin
   auto after = node.RequestForResponse(Command(0x0004, {0xAB}), {3000ms, 3});
   ASSERT_TRUE(after) << after.error().message();
   EXPECT_EQ(after.value().message_id, 0x0004);
-  EXPECT_EQ(after.value().payload, (std::vector<std::uint8_t>{0xAB}));
+  EXPECT_EQ(ToVec(after.value().payload), (std::vector<std::uint8_t>{0xAB}));
 
   echo1->Stop();
   echo2->Stop();
@@ -314,7 +317,7 @@ TEST(ProtocolNodeTcpE2E, InboundBusinessFrameReachesSubscriberAndReplyGoesOut) {
   business.protocol_id = kProtocolId;
   business.session_id = 42;
   business.message_id = 0x0007;
-  business.payload = {0xC0, 0xDE};
+  business.payload = Pay({0xC0, 0xDE});
   peer->Send(business);
 
   auto inbound = Coro::await_for(mailbox, 3000ms);
@@ -322,7 +325,7 @@ TEST(ProtocolNodeTcpE2E, InboundBusinessFrameReachesSubscriberAndReplyGoesOut) {
   EXPECT_EQ(inbound.value().frm_type, FrameType::kState);
   EXPECT_EQ(inbound.value().session_id, 42);
   EXPECT_EQ(inbound.value().message_id, 0x0007);
-  EXPECT_EQ(inbound.value().payload, (std::vector<std::uint8_t>{0xC0, 0xDE}));
+  EXPECT_EQ(ToVec(inbound.value().payload), (std::vector<std::uint8_t>{0xC0, 0xDE}));
 
   // 宿主回一帧(noresponse 出站):原路出去,对端收到。
   Message reply;
@@ -336,7 +339,7 @@ TEST(ProtocolNodeTcpE2E, InboundBusinessFrameReachesSubscriberAndReplyGoesOut) {
   ASSERT_EQ(peer->received().size(), 1u);
   EXPECT_EQ(peer->received().front().frm_type, FrameType::kState);
   EXPECT_EQ(peer->received().front().message_id, 0x00BB);
-  EXPECT_EQ(peer->received().front().payload,
+  EXPECT_EQ(ToVec(peer->received().front().payload),
             (std::vector<std::uint8_t>{0xC0, 0xDE}));
 
   peer->Stop();
@@ -434,7 +437,7 @@ Message ResultFor(const Message& command, std::uint16_t result_message_id,
   result.protocol_id = command.protocol_id;
   result.session_id = command.session_id;
   result.message_id = result_message_id;
-  result.payload = std::move(payload);
+  result.payload = Pay(payload);
   return result;
 }
 
@@ -475,7 +478,7 @@ TEST(ProtocolNodeTcpE2E, RequestForResultCompletesAndRepliesWithDerivedResponse)
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResult) << "返回的是结果那一帧";
   EXPECT_EQ(outcome.value().message_id, kResultId);
-  EXPECT_EQ(outcome.value().payload, kResultPayload);
+  EXPECT_EQ(ToVec(outcome.value().payload), kResultPayload);
 
   // 派生回应帧原路出去,对端收到:命令 + 回应,恰两帧。
   ASSERT_TRUE(
@@ -489,7 +492,7 @@ TEST(ProtocolNodeTcpE2E, RequestForResultCompletesAndRepliesWithDerivedResponse)
   EXPECT_EQ(derived.frm_type, FrameType::kResponse) << "仅此一处相对 kResult 有改动";
   EXPECT_EQ(derived.session_id, command.session_id) << "session_id 沿用";
   EXPECT_EQ(derived.message_id, kResultId) << "message_id 沿用结果帧的";
-  EXPECT_EQ(derived.payload, kResultPayload) << "payload 原样回显";
+  EXPECT_EQ(ToVec(derived.payload), kResultPayload) << "payload 原样回显";
   EXPECT_EQ(derived.protocol_id, kProtocolId);
 }
 
@@ -518,7 +521,7 @@ TEST(ProtocolNodeTcpE2E, RequestForResultAcceptsResultArrivingBeforeAckOverTcp) 
   (void)caller.get();
 
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0x08}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{0x08}));
   ASSERT_TRUE(
       pumpFiberUntil([&] { return link.peer().received().size() >= 2u; }, 4000));
   ASSERT_EQ(link.peer().received().size(), 2u);
@@ -551,7 +554,7 @@ TEST(ProtocolNodeTcpE2E, RequestForResultDirectSucceedsAndSendsNoReplyOverTcp) {
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResult);
   EXPECT_EQ(outcome.value().message_id, kResultId);
-  EXPECT_EQ(outcome.value().payload, kResultPayload);
+  EXPECT_EQ(ToVec(outcome.value().payload), kResultPayload);
 
   // sleep_for 只用于**构造前提**:给任何(本不该存在的)回帧留出穿过 socket 的时间,
   // 使随后的"只收到一帧"成为一条有分量的否定断言,而不是抢跑。
@@ -593,7 +596,7 @@ TEST(ProtocolNodeTcpE2E,
   (void)caller.get();
 
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0x33}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{0x33}));
   ASSERT_EQ(link.peer().command_count(), static_cast<std::size_t>(kAttempts))
       << "总发送次数应恰为 max_attempts——等结果阶段确实重发了";
   ASSERT_EQ(link.peer().received().size(), static_cast<std::size_t>(kAttempts))
@@ -673,7 +676,7 @@ TEST(ProtocolNodeTcpE2E, RequestForResponseRetransmitsUntilAcceptedOverTcp) {
 
   ASSERT_TRUE(reply) << reply.error().message();
   EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{0xAB}));
+  EXPECT_EQ(ToVec(reply.value().payload), (std::vector<std::uint8_t>{0xAB}));
   ASSERT_EQ(link.peer().command_count(), static_cast<std::size_t>(kAttempts))
       << "总发送次数应恰为 max_attempts";
   ASSERT_FALSE(link.peer().received().empty());
@@ -744,7 +747,7 @@ void RunSplitResponseCase(std::size_t split_at) {
   EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
   EXPECT_EQ(reply.value().session_id, captured.session_id);
   EXPECT_EQ(reply.value().message_id, 0x0021);
-  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{0x5A, 0x5B}));
+  EXPECT_EQ(ToVec(reply.value().payload), (std::vector<std::uint8_t>{0x5A, 0x5B}));
 }
 
 }  // namespace

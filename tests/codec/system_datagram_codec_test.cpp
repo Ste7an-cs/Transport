@@ -5,6 +5,11 @@
 #include <vector>
 #include <gtest/gtest.h>
 
+#include "message_test_util.hpp"
+
+using testutil::Pay;
+using testutil::PayloadIsViewOfFrame;
+using testutil::ToVec;
 using transport::FrameType;
 using transport::Message;
 using transport::SystemCodec;
@@ -19,7 +24,7 @@ uint16_t SumCrc(const uint8_t* b, std::size_t n) {
 }
 Message Cmd(uint8_t proto, uint8_t sess, uint16_t mid, std::vector<uint8_t> p) {
   Message m; m.frm_type = FrameType::kCommand; m.protocol_id = proto;
-  m.session_id = sess; m.message_id = mid; m.payload = std::move(p); return m;
+  m.session_id = sess; m.message_id = mid; m.payload = Pay(p); return m;
 }
 std::vector<Message> Decode(SystemDatagramCodec& c, const std::vector<uint8_t>& b) {
   auto r = c.Decode(b.data(), b.size());
@@ -45,7 +50,7 @@ TEST(SystemDatagramCodec, DecodesSingleWholeFrame) {
   EXPECT_EQ(out[0].frm_type, FrameType::kCommand);
   EXPECT_EQ(out[0].session_id, 9);
   EXPECT_EQ(out[0].message_id, 0x0033);
-  EXPECT_EQ(out[0].payload, (std::vector<uint8_t>{1, 2, 3}));
+  EXPECT_EQ(ToVec(out[0].payload), (std::vector<uint8_t>{1, 2, 3}));
 }
 
 TEST(SystemDatagramCodec, DecodesMultipleFramesInOneDatagram) {
@@ -81,4 +86,32 @@ TEST(SystemDatagramCodec, CrcMismatchDropped) {
 TEST(SystemDatagramCodec, EmptyYieldsNone) {
   SystemDatagramCodec c(SumCrc);
   EXPECT_EQ(Decode(c, {}).size(), 0u);
+}
+
+// ADR-0020 **D2**:报文版与流式版**共用** `ScanSystemFrames`,故 `frame` 与 payload 视图的
+// 形状逐字相同——这一条守住"五个 codec 一个都不能漏"里的这一个。
+TEST(SystemDatagramCodec, FillsFrameAndPayloadIsAViewIntoIt) {
+  SystemDatagramCodec c(SumCrc);
+  auto wire = SystemCodec(SumCrc).Encode(Cmd(2, 9, 0x0033, {1, 2, 3})).value();
+  auto out = Decode(c, wire);
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(ToVec(out[0].frame), wire);        // 整帧原样落进 frame。
+  EXPECT_TRUE(PayloadIsViewOfFrame(out[0]));   // payload 是它的视图,不是拷贝。
+  EXPECT_EQ(out[0].payload.constData() - out[0].frame.constData(), 17);
+}
+
+// 一个报文里两帧:**各自**的 frame 互不相干,且各自的 payload 指进自己那一帧。
+TEST(SystemDatagramCodec, EachFrameOwnsItsOwnBlock) {
+  SystemCodec enc(SumCrc);
+  auto f1 = enc.Encode(Cmd(1, 1, 0x0001, {0xA, 0xA})).value();
+  auto f2 = enc.Encode(Cmd(1, 2, 0x0002, {0xB, 0xB})).value();
+  std::vector<uint8_t> both = f1; both.insert(both.end(), f2.begin(), f2.end());
+  SystemDatagramCodec c(SumCrc);
+  auto out = Decode(c, both);
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_EQ(ToVec(out[0].frame), f1);
+  EXPECT_EQ(ToVec(out[1].frame), f2);
+  EXPECT_TRUE(PayloadIsViewOfFrame(out[0]));
+  EXPECT_TRUE(PayloadIsViewOfFrame(out[1]));
+  EXPECT_NE(out[0].frame.constData(), out[1].frame.constData());
 }
