@@ -3,6 +3,8 @@
 // SystemDatagramCodec.hpp — 外部协议帧的【无状态报文版】codec(header-only)。
 // 与流式 SystemCodec 共用 EncodeSystemFrame/ScanSystemFrames;每次 Decode 只解这一个
 // datagram、吐出其中整帧,残留直接丢弃、零跨报文保留 → 适配 UDP(多对端安全)。
+// frame 的填充与 payload 视图的建立在共用的 ScanSystemFrames 里(ADR-0020 D2),故两个
+// codec 的帧边界逐字相同:frame = [帧头 15][frm_body],payload 偏移 = 15 + 2。
 
 #include <cstddef>
 #include <cstdint>

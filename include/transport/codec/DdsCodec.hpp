@@ -3,12 +3,14 @@
 // DdsCodec.hpp — DDS 无状态 codec(header-only)。DDS 每 sample 即一条完整消息,
 // 无需滚动缓冲;携带交互元数据(kind/correlation_id/reply_to)+ payload。
 // 线缆:[kind:1][corr_len:2 BE][corr][reply_len:2 BE][reply_to][payload]
-// 无成员状态 → 多 topic 并发 Decode 安全。topic/source 由上层按来源 topic 填。
+// 无成员状态 → 多 topic 并发 Decode 安全。endpoint 由上层按来源 topic 填。
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include <QByteArray>
 
 #include "transport/codec/ICodec.hpp"
 #include "transport/core/Message.hpp"
@@ -21,13 +23,16 @@ class DdsCodec : public ICodec {
     // 字段超 uint16 长度前缀上限:codec 格式无法承载 → kCodec。
     if (msg.correlation_id.size() > 0xFFFF || msg.reply_to.size() > 0xFFFF)
       return make_error_code(TransportErrc::kCodec);
+    // **完全忽略 msg.frame**(ADR-0020 D7):出站样本只由当前各字段生成。
+    const std::size_t payload_len = static_cast<std::size_t>(msg.payload.size());
+    const auto* payload = reinterpret_cast<const uint8_t*>(msg.payload.constData());
     std::vector<uint8_t> out;
     out.reserve(1 + 2 + msg.correlation_id.size() + 2 + msg.reply_to.size() +
-                msg.payload.size());
+                payload_len);
     out.push_back(static_cast<uint8_t>(msg.kind));
     PutLenPrefixed(out, msg.correlation_id);
     PutLenPrefixed(out, msg.reply_to);
-    out.insert(out.end(), msg.payload.begin(), msg.payload.end());
+    out.insert(out.end(), payload, payload + payload_len);
     return out;
   }
 
@@ -45,7 +50,11 @@ class DdsCodec : public ICodec {
       return make_error_code(TransportErrc::kCodec);
     if (!GetLenPrefixed(data, len, pos, m.reply_to))
       return make_error_code(TransportErrc::kCodec);
-    m.payload.assign(data + pos, data + len);  // 余下即 payload
+    // 整帧 = 整个 sample(DDS 每 sample 即一条完整消息),payload 偏移即解析停下的 pos。
+    // ★ 顺序:先落 frame,再在【它】上面建视图(ADR-0020 D2)。
+    m.frame = QByteArray(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    m.payload = QByteArray::fromRawData(m.frame.constData() + pos,
+                                        static_cast<int>(len - pos));  // 余下即 payload
     out.push_back(std::move(m));
     return out;
   }

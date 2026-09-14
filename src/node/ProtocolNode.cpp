@@ -293,7 +293,13 @@ void ProtocolNode::DecodeAndDispatch(Datagram datagram) {
     // 坏帧 / codec 错误:**丢弃**(codec 内部 resync),不归因、不记录(ADR-0014 D1/D4)。
     return;
   }
-  for (const auto& msg : decoded.value()) {
+  for (auto& msg : decoded.value()) {
+    // **入站来源地址**(ADR-0020 D3):`Message::endpoint` 与 `Datagram::peer` 逐字同义
+    // ——读时是来源、写时是目的地。UDP 路径由此首次把发送方 `ip:port` 交到业务层手里;
+    // 默认对端的传输(TCP / 串口)带出的是 `Endpoint::Default()`,同样原样透出。
+    //
+    // **codec 不填这一项**:来源是传输层事实,codec 看不到,只能由本节点在此补上。
+    msg.endpoint = datagram.peer;
     Dispatch(msg);
   }
 }

@@ -279,9 +279,13 @@ DdsNode::DdsNode(DdsTransport& transport, std::unique_ptr<ICodec> codec,
       // 全部根据,故不能每次请求重取。
       uuid_(MakeUuid(config_.uuid_override)),
       // 键提取函数:给出一条消息在三个匹配字段上的具体值。部分匹配(kAny)由 Dispatcher
-      // 实现,本类不需要提供通配逻辑。`topic` 由读循环按来源填(D5:topic 不上线缆)。
+      // 实现,本类不需要提供通配逻辑。`endpoint` 由读循环按来源填(D5:topic 不上线缆)。
+      //
+      // ★ 键的第一位取 **`endpoint.topic`**(ADR-0020 **D4**),而不是整个 `endpoint`:
+      //   键只需要那个字符串,为此给 `Endpoint` 加 `operator==` / `std::hash` 是多余负担,
+      //   还会诱使将来把 `host` / `port` 也塞进键。
       dispatcher_([](const Message& msg) {
-        return std::make_tuple(msg.topic, msg.correlation_id, msg.kind);
+        return std::make_tuple(msg.endpoint.topic, msg.correlation_id, msg.kind);
       }) {}
 
 // 析构即关闭并汇合:必须在**本类**析构体内做——基类析构时虚钩子已退回纯虚。
@@ -517,9 +521,9 @@ void DdsNode::DecodeAndDispatch(const Datagram& datagram) {
   }
   for (auto& msg : decoded.value()) {
     // **topic 不上线缆**(D5):它是 DDS 的寻址维度,入站只能由 `Datagram.peer` 带出。
-    // 这两个字段同时也是 `Dispatcher` 键的第一位,故这一行是分发能成立的前提。
-    msg.source = datagram.peer.topic;
-    msg.topic = datagram.peer.topic;
+    // `endpoint` 同时也是 `Dispatcher` 键第一位的来源(ADR-0020 **D4**),故这一行是分发
+    // 能成立的前提。**接收时 `endpoint` 是来源**(**D3**)——此处即来源 topic。
+    msg.endpoint = Endpoint::Topic(datagram.peer.topic);
     Dispatch(msg);
   }
 }
@@ -571,16 +575,22 @@ Coro::Result<DdsNode::Ticket> DdsNode::Subscribe(TopicKey topic, KindKey kind) {
       dispatcher_.Subscribe({std::move(topic), kAny, std::move(kind)})};
 }
 
-Coro::Result<void> DdsNode::Publish(const std::string& topic, Message msg) {
+Coro::Result<void> DdsNode::Publish(Message msg) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
-  // **调用序错误先于配置错误**:上面先判了生命周期,这里才判注册。
+  // **目的地取自 `msg.endpoint`**(ADR-0020 **D6**):本方法收 `Message`,寻址参数是多余的
+  // 第二处真相。**须是 `kTopic`**——`kService` 是另一个概念(D5),`kDefault` / `kNet` 在
+  // DDS 上无从解释,一律 `kInvalidArgument`。
+  if (msg.endpoint.kind != Endpoint::Kind::kTopic) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  const std::string topic = msg.endpoint.topic;
+  // **调用序错误先于配置错误**:上面先判了生命周期与参数,这里才判注册。
   if (publishers_.count(topic) == 0) {
     return make_error_code(TransportErrc::kConfiguration);  // 不猜、不回落、不懒补。
   }
   msg.kind = MessageKind::kNotify;
-  msg.topic = topic;
   // `correlation_id` **只有框架生成的关联符一个来源**(D6),发布路径上不使用它;
   // `reply_to` 同理——本调用不期待应答。
   msg.correlation_id.clear();
@@ -588,8 +598,8 @@ Coro::Result<void> DdsNode::Publish(const std::string& topic, Message msg) {
   return EncodeAndWrite(msg, topic);
 }
 
-Coro::Result<Message> DdsNode::RequestForResultDirect(
-    const std::string& service_name, Message req, RetryPolicy retry) {
+Coro::Result<Message> DdsNode::RequestForResultDirect(Message req,
+                                                       RetryPolicy retry) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
@@ -599,8 +609,14 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(
       retry.timeout <= std::chrono::milliseconds::zero()) {
     return make_error_code(TransportErrc::kInvalidArgument);
   }
-  // **第一参是服务名**(D8):查它有没有注册为 `Clients`,**查不到即 kConfiguration,不猜、
-  // 不回落**(D6)。这让"忘了注册"从一个静默无效变成一个显式错误。
+  // **服务名取自 `req.endpoint`**(ADR-0020 **D6**),**须是 `kService`**:请求-响应的服务名
+  // 不是 topic(**D5** / ADR-0013 D6),传 `kTopic` 会把两个刻意分开的概念混回去。
+  if (req.endpoint.kind != Endpoint::Kind::kService) {
+    return make_error_code(TransportErrc::kInvalidArgument);
+  }
+  const std::string service_name = req.endpoint.topic;  // kService:名字存在 topic 字段里。
+  // 查它有没有注册为 `Clients`,**查不到即 kConfiguration,不猜、不回落**(D6)。这让
+  // "忘了注册"从一个静默无效变成一个显式错误。
   if (clients_.count(service_name) == 0) {
     return make_error_code(TransportErrc::kConfiguration);
   }
@@ -614,7 +630,8 @@ Coro::Result<Message> DdsNode::RequestForResultDirect(
   req.correlation_id = correlation_id;
   // `reply_to` 上线缆,供服务端做**一致性交叉校验**(D15)。
   req.reply_to = reply_topic;
-  req.topic = request_topic;
+  // 出站 `endpoint` 是**真正的目的地**:服务名派生出来的请求 topic(不再是 `kService`)。
+  req.endpoint = Endpoint::Topic(request_topic);
 
   // **编码一次**,重发复用同一份字节(ADR-0010 D3:重发的是字节完全相同的原帧,
   // `correlation_id` 不变,故订阅横跨全部重发继续有效)。
@@ -665,9 +682,11 @@ Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
   if (!IsRunning()) {
     return make_error_code(TransportErrc::kClosed);
   }
-  // **应答目的地由自己注册的服务反查,不取信于线缆、不建端点**(D15):`request.topic` 是
-  // 派生出来的 `cfg.<名>.request`,反查同样走 `DeriveServiceTopics`(不另写解析器)。
-  const auto service = FindServiceByRequestTopic(services_, request.topic);
+  // **应答目的地由自己注册的服务反查,不取信于线缆、不建端点**(D15):`request.endpoint`
+  // 是收到该请求的来源 topic(ADR-0020 **D3**),即派生出来的 `cfg.<名>.request`;反查同样
+  // 走 `DeriveServiceTopics`(不另写解析器)。
+  const auto service =
+      FindServiceByRequestTopic(services_, request.endpoint.topic);
   if (!service.has_value()) {
     return make_error_code(TransportErrc::kConfiguration);  // 我根本不服务这个 topic。
   }
@@ -680,7 +699,7 @@ Coro::Result<void> DdsNode::Reply(const Message& request, Message result) {
   result.kind = MessageKind::kReply;
   result.correlation_id = request.correlation_id;  // 关联符沿用请求那一份。
   result.reply_to.clear();                         // 应答不再期待应答。
-  result.topic = reply_topic;
+  result.endpoint = Endpoint::Topic(reply_topic);  // 出站 endpoint = 目的地(D3)。
   return EncodeAndWrite(result, reply_topic);
 }
 

@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include <QByteArray>
+
 #include "transport/core/Error.hpp"
 
 // LengthFieldCodec.cpp — 见 LengthFieldCodec.hpp。
@@ -28,7 +30,9 @@ LengthFieldCodec::LengthFieldCodec(LengthFieldCodecConfig config)
     : config_(config) {}
 
 Coro::Result<std::vector<uint8_t>> LengthFieldCodec::Encode(const Message& msg) {
-  return msg.payload;  // 透传
+  // 透传 payload;**完全忽略 msg.frame**(ADR-0020 D7)。
+  const auto* p = reinterpret_cast<const uint8_t*>(msg.payload.constData());
+  return std::vector<uint8_t>(p, p + msg.payload.size());
 }
 
 Coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
@@ -58,8 +62,14 @@ Coro::Result<std::vector<Message>> LengthFieldCodec::Decode(const uint8_t* data,
     if (buffer_.size() - offset < frame_size) break;
 
     Message m;
-    m.payload.assign(buffer_.begin() + offset,
-                     buffer_.begin() + offset + static_cast<std::size_t>(frame_size));
+    // 本 codec **不剥帧头**:payload 历来就是整帧(header + body),故 payload 偏移为 0、
+    // 长度与 frame 相同——两者内容一致,但 payload 仍是 frame 的视图(ADR-0020 D2)。
+    // ★ 顺序:先落 frame,再在【它】上面建视图。
+    m.frame = QByteArray(
+        reinterpret_cast<const char*>(buffer_.data() + offset),
+        static_cast<int>(frame_size));
+    m.payload = QByteArray::fromRawData(m.frame.constData(),
+                                        static_cast<int>(frame_size));
     out.push_back(std::move(m));
     offset += static_cast<std::size_t>(frame_size);
   }

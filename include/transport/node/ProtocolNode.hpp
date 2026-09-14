@@ -362,7 +362,11 @@ class ProtocolNode : public NodeBase {
    */
   void SpawnReadLoop();
 
-  /// @brief 读循环体内的协议特有处理:Decode 一帧 → 逐条 Dispatch。
+  /// @brief 读循环体内的协议特有处理:Decode 一帧 → **填入站来源 `endpoint`** → 逐条
+  ///        Dispatch。
+  ///
+  /// `msg.endpoint = datagram.peer`(ADR-0020 **D3**):来源是传输层事实、codec 看不到,
+  /// 只能在此补上。UDP 路径由此首次把**发送方 `ip:port`** 交到业务层手里。
   void DecodeAndDispatch(Datagram datagram);
   /// 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时一律
   /// 静默丢弃,终结帧与业务帧无别(ADR-0009 D1/D5、ADR-0014 D1)。
