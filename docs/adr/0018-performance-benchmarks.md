@@ -80,6 +80,13 @@ Fast DDS 3.6.1 自带两套成熟的性能测试，方法学可直接借鉴：
   >
   > 事实上，正是本 ADR 的服务端设计暴露了那个接口缺口，才有了 ADR-0019。
 
+  > **再更正（2026-09-11，ADR-0020/0021 落地后）**：对端应答除 `session_id`（ADR-0019）外还须回带两项——
+  >
+  > - **`endpoint`**（ADR-0021）：出站目的地取自 `msg.endpoint`。UDP 上不回带请求方地址，应答会发往配置的默认对端、请求方收不到。**双机 UDP 正是本 ADR 的测试形态，故这一条不可省。**
+  > - **`payload` 现在是 `QByteArray`**（ADR-0020），且**接收时是指进 `frame` 的视图**。回显 payload 若要活过当前 `Message`，须取 `OwnedPayload()`；在回显语句里直接用则安全（`Message` 尚在作用域内）。
+  >
+  > `DdsNode` 两个方法的签名亦已变化（ADR-0020 D6）：`Publish(msg)`（topic 取自 `msg.endpoint`）、`RequestForResultDirect(req, retry)`（服务名取自 `req.endpoint`，须 `Endpoint::Service(名)`）。
+
 - **D6（只报数，不做 pass/fail）：** 与 Fast DDS 一致——性能数字进断言必然抖。`transport_perf` 输出表格即完成使命。
 
   **由此它是 SRS §3.6.2 的证据来源，而不是验收判据本身**：判据成立与否由人读数后裁定。
