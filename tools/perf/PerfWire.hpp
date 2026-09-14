@@ -66,7 +66,7 @@ enum class CtrlCommand : std::uint8_t {
   kBye = 4,    ///< 全部跑完:对端收工退出。
 };
 
-/// 控制请求的 payload(小端定长,共 16 字节)。
+/// 控制请求的 payload(小端定长,共 20 字节)。
 struct CtrlRequest {
   CtrlCommand command = CtrlCommand::kHello;
   std::uint8_t suite = 0;          ///< 0 = latency,1 = throughput。
@@ -75,6 +75,14 @@ struct CtrlRequest {
   std::uint32_t payload_bytes = 0; ///< 该行矩阵的 payload 档位。
   std::uint32_t expected = 0;      ///< 预期条数(仅供对端预留,统计不依赖它)。
   std::uint32_t run_index = 0;     ///< 第几行矩阵,便于排障时对齐两侧日志。
+  /**
+   * @brief 本次测量窗口的**起始序号**——把预热样本挡在窗口之外(**D9**)。
+   *
+   * 预热必须先于测量、且必须被对端照常应答(否则预热付不掉首帧路径的惰性开销),
+   * 于是对端也会数到那 100 条。客户端因此在预热之后再发一次 `kBegin`,把
+   * `start_seq` 抬到预热之后:序号小于它的一律不计——**迟到的预热样本**也不计。
+   */
+  std::uint32_t start_seq = 0;
 };
 
 /// 控制应答的 payload(小端定长,共 32 字节)。
@@ -88,7 +96,7 @@ struct CtrlReply {
   std::uint64_t rec_time_us = 0;   ///< 接收侧首末样本间隔(微秒)。
 };
 
-constexpr int kCtrlRequestBytes = 16;
+constexpr int kCtrlRequestBytes = 20;
 constexpr int kCtrlReplyBytes = 32;
 
 // ── 小端读写(不依赖任何库内部件)──────────────────────────────────────────
@@ -148,6 +156,7 @@ inline void PutU64(char* p, std::uint64_t v) {
   PutU32(p + 4, req.payload_bytes);
   PutU32(p + 8, req.expected);
   PutU32(p + 12, req.run_index);
+  PutU32(p + 16, req.start_seq);
   return out;
 }
 
@@ -164,6 +173,7 @@ inline void PutU64(char* p, std::uint64_t v) {
   req->payload_bytes = GetU32(p + 4);
   req->expected = GetU32(p + 8);
   req->run_index = GetU32(p + 12);
+  req->start_seq = GetU32(p + 16);
   return true;
 }
 
