@@ -118,12 +118,17 @@ Coro::Result<void> ProtocolNode::EncodeAndWrite(const Message& msg) {
     return encoded.error();
   }
   std::vector<std::uint8_t> bytes = std::move(encoded).value();
-  // 目的地恒填 `Endpoint::Default()`,交给传输解析成它自己配置的默认对端:本类传输无关,
-  // 不知道也不该知道对端是 ip:port 还是 topic。
+  // **目的地取 `msg.endpoint`,原样转交**(ADR-0021 D1):`Endpoint` 正是"传输无关地表达
+  // 对端"的那个类型——本类依旧**不解释**它(不知道也不该知道对端是 ip:port 还是 topic),
+  // 只是不再把它丢掉。解释在传输侧:UDP 写泵按 `kDefault` / `kNet` 解析(ADR-0003 D12),
+  // TCP / 串口写泵一律忽略 `peer`(ADR-0011 D8 / ADR-0012 D9),故本条只在 UDP 上兑现。
+  //
+  // **向后兼容**(D2):`Message::endpoint` 的默认值就是 `Endpoint::Default()`,不填的调用方
+  // 行为与此前逐字相同——发往传输自己配置的默认对端。四个出站方法一视同仁(D3)。
   //
   // fire-and-forget:返回成功只表示"已入队",不表示已发出;写出的一切结果不回传,只落
   // 传输的 `LastError()`。这里能拿到的错误只有生命周期非法一种。
-  if (auto written = transport_.AsyncWrite({std::move(bytes), Endpoint::Default()});
+  if (auto written = transport_.AsyncWrite({std::move(bytes), msg.endpoint});
       !written) {
     return written;
   }

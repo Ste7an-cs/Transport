@@ -277,7 +277,15 @@ class ProtocolNode : public NodeBase {
    * @note 与三个 `RequestFor*` 不同:它们**必须**自己分配 `session_id`(要用它登记订阅、
    *       作唯一关联键),调用方填的会被覆盖(D2)。盖章规则按方法分两档。
    *
-   * @param msg 出站 Message(payload + session_id + 可选 message_id / frm_type 由调用方填)。
+   * ## 目的地由**调用方**填 `msg.endpoint`(ADR-0021 D1)
+   *
+   * 不填即 `Endpoint::Default()`——发往传输配置的默认对端,与本 ADR 之前逐字相同(D2)。
+   * UDP 上填 `Endpoint::Net(ip, port)` 即发往该对端,这正是服务端回应答的那一行:
+   * `rsp.endpoint = req.endpoint;`(D4,与本方法透传 `session_id` 合起来才闭环)。
+   * TCP / 串口的写泵一律忽略它(ADR-0011 D8 / ADR-0012 D9),填了也照旧发往固定对端。
+   *
+   * @param msg 出站 Message(payload + session_id + 可选 message_id / frm_type / endpoint
+   *            由调用方填)。
    * @return 已入队,或机器可判别错误(kClosed / 编码错误)。
    *         **返回成功不表示已发出**——实际写出与其失败归因都在传输的写泵里。
    */
@@ -375,6 +383,9 @@ class ProtocolNode : public NodeBase {
   void Dispatch(const Message& msg);
   /// @brief 编码 + 交给传输(`Send` 与各 `RequestFor*` 共用的出站尾段)。
   ///        **不盖任何章**——盖章一律在各出站方法内完成,本函数只管编码与入队。
+  ///
+  /// 目的地取 `msg.endpoint` **原样转交**(ADR-0021 D1):本类不解释它,解释在传输侧。
+  /// 不填即 `Endpoint::Default()`,行为与本 ADR 之前逐字相同(D2);四个出站方法一视同仁(D3)。
   [[nodiscard]] Coro::Result<void> EncodeAndWrite(const Message& msg);
 
   /// @brief 受理阶段(等 kResponse,超时重发),`RequestForResponse` 与 `RequestForResult`
