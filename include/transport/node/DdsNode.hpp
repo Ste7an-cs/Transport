@@ -10,8 +10,8 @@
  *
  * | 模式 | 客户端/发布侧 | 服务端/订阅侧 |
  * |---|---|---|
- * | 发布-订阅 | `Publish(topic, msg)` | `Subscribe(topic, kNotify)` |
- * | 请求-响应(**单阶段** `Direct`,**D7**) | `RequestForResultDirect(服务名, req, retry)` | `ServeRequests(服务名)` + `Reply(request, result)` |
+ * | 发布-订阅 | `Publish(msg)`(topic 取自 `msg.endpoint`) | `Subscribe(topic, kNotify)` |
+ * | 请求-响应(**单阶段** `Direct`,**D7**) | `RequestForResultDirect(req, retry)`(服务名取自 `req.endpoint`) | `ServeRequests(服务名)` + `Reply(request, result)` |
  *
  * **公开面只有这五个交互方法**(**D8**):服务端**没有** `Accept()`(本模型无受理阶段);
  * `MessageKind::kFeedback` **在本设计中不使用**;**不提供旁路监听**——机制上
@@ -78,12 +78,19 @@
  * 四者可任意并存(一个节点常常兼任)。请求-响应两侧**传一模一样的服务名**,各自按角色建
  * 各自那一侧,不会填错方向、也不必协调。
  *
- * ## 参数含义按模式分家(**D8**)
+ * ## 寻址按模式分家(**D8** + ADR-0020 **D6**)
  *
- * | 方法 | 第一参 |
- * |---|---|
- * | `Publish` / `Subscribe` | **topic**(永远) |
- * | `RequestForResultDirect` / `ServeRequests` | **服务名**(永远) |
+ * | 方法 | 寻址从哪来 | 要求 |
+ * |---|---|---|
+ * | `Publish(msg)` | `msg.endpoint` | **`kTopic`**,否则 `kInvalidArgument` |
+ * | `RequestForResultDirect(req, retry)` | `req.endpoint` | **`kService`**,否则 `kInvalidArgument` |
+ * | `Subscribe(topic, kind)` | **第一参**(订阅键,可为 `kAny`) | 参数不变 |
+ * | `ServeRequests(服务名)` | **第一参**(服务名) | 参数不变 |
+ *
+ * **只有"收 `Message` 的方法"去掉了寻址参数**(ADR-0020 **D6**):那两个方法拿得到
+ * `endpoint`,再单传一个寻址参数就是同一事实的第二处真相。**后两者保留参数是有理由的**
+ * ——它们**不接收 `Message`**,没有 `endpoint` 可取;`ServeRequests` 返回的是 `Ticket`,
+ * `Subscribe` 的第一参是**订阅键**(可为 `kAny`)而非寻址目的地。
  *
  * **`Subscribe` 保持通用**——它的第一参**永远是 topic**,`ServeRequests(名)` 是它在服务名
  * 一侧的封装(内部即 `Subscribe(cfg.<名>.request, kRequest)`)。
@@ -162,11 +169,15 @@
 
 namespace transport {
 
-/// 参与 DDS 分发的字段:**topic + correlation_id + kind**(ADR-0013 **D6**)。
+/// 参与 DDS 分发的字段:**endpoint.topic + correlation_id + kind**(ADR-0013 **D6**、
+/// ADR-0020 **D4**)。
 ///
 /// 三者分别是 **DDS 的寻址维度**、**其关联符**、**消息类别**;部分匹配由 `Dispatcher`
 /// 实现,本类只需在键提取函数里给出各字段的具体值。
-using DdsDispatcher = Dispatcher<Message, std::string /*topic*/,
+///
+/// 键的第一位是 `endpoint` 里的那个**字符串**,不是整个 `Endpoint`——**不给 `Endpoint` 加
+/// `operator==` / `std::hash`**(**D4**)。
+using DdsDispatcher = Dispatcher<Message, std::string /*endpoint.topic*/,
                                           std::string /*correlation_id*/,
                                           MessageKind /*kind*/>;
 
@@ -281,7 +292,7 @@ class DdsNode : public NodeBase {
    * **直接拆端点,不做任何"是否仍被需要"的重算**(**D3**):普通 topic 禁用 `cfg.` 前缀之后
    * 「一条端点恰有一个注册项负责」是可证的结构性质,该项负责的端点只有该项要。
    *
-   * 注销之后 `Publish(topic, …)` 返 `kConfiguration`——与"从没注册过"完全一样。
+   * 注销之后向该 topic `Publish` 返 `kConfiguration`——与"从没注册过"完全一样。
    *
    * @param topics 待注销的 topic 集合。
    * @return 成功;`Closing` / `Closed` 相位返 `kClosed`。
@@ -375,13 +386,24 @@ class DdsNode : public NodeBase {
    *
    * 本节点盖 `kind = kNotify` 并**清空** `correlation_id` / `reply_to`(**D6**)。
    *
-   * @param topic 目标 topic,**须已注册为 `Publishers`**。
-   * @param msg   出站 Message(`payload` 由调用方填)。
-   * @return 已入队;`kClosed`(未启动 / 关闭中 / 已关闭)、`kConfiguration`(topic 未注册为
-   *         发布者)、编码错误。**返回成功不表示已发出**——写出与其失败归因都在传输的
-   *         专属写线程里,只落 `LastError()`。
+   * **目的地取自 `msg.endpoint`,不再有 topic 参数**(ADR-0020 **D6**):本方法收 `Message`,
+   * 单独再传一个寻址参数就是同一事实的第二处真相。
+   *
+   * ```cpp
+   * Message msg;
+   * msg.payload  = QByteArray("hello");
+   * msg.endpoint = Endpoint::Topic("telemetry");
+   * (void)node.Publish(std::move(msg));
+   * ```
+   *
+   * @param msg 出站 Message(`payload` 与 `endpoint` 由调用方填)。`endpoint` **须是
+   *            `kTopic`**,其 topic **须已注册为 `Publishers`**;`frame` 被完全忽略(**D7**)。
+   * @return 已入队;`kClosed`(未启动 / 关闭中 / 已关闭)、`kInvalidArgument`
+   *         (`endpoint.kind` 不是 `kTopic`)、`kConfiguration`(topic 未注册为发布者)、
+   *         编码错误。**返回成功不表示已发出**——写出与其失败归因都在传输的专属写线程里,
+   *         只落 `LastError()`。
    */
-  [[nodiscard]] Coro::Result<void> Publish(const std::string& topic, Message msg);
+  [[nodiscard]] Coro::Result<void> Publish(Message msg);
 
   /**
    * @brief 交付一次请求-响应(**单阶段**,等结果时重发,不回应;**D7**)。
@@ -392,11 +414,19 @@ class DdsNode : public NodeBase {
    * ← kReply                                ⇒ 成功(返回该帧,【不回应】)
    * ```
    *
-   * 步骤:查 `service_name` 是否已注册为 `Clients`(**查不到即 `kConfiguration`,不猜、
-   * 不回落**)→ 派生出 `cfg.<名>.request` / `cfg.<名>.response` → 盖 `kind` / `corr` /
-   * `reply_to` → **先登记订阅再发出** → 编码**一次**、重发复用同一份字节 → 首个到达即成功。
+   * 步骤:查服务名是否已注册为 `Clients`(**查不到即 `kConfiguration`,不猜、不回落**)→
+   * 派生出 `cfg.<名>.request` / `cfg.<名>.response` → 盖 `kind` / `corr` / `reply_to` /
+   * `endpoint` → **先登记订阅再发出** → 编码**一次**、重发复用同一份字节 → 首个到达即成功。
    *
-   * **第一参是【服务名】,不是 topic**(**D8**):派生规则不外泄到调用方。
+   * **服务名取自 `req.endpoint`,不再有服务名参数**(ADR-0020 **D6**);**须是 `kService`**
+   * ——服务名不是 topic(**D5**),派生规则仍不外泄到调用方:
+   *
+   * ```cpp
+   * Message req;
+   * req.payload  = QByteArray("q");
+   * req.endpoint = Endpoint::Service("get");   // 【不是】Endpoint::Topic
+   * auto reply = client.RequestForResultDirect(std::move(req), retry);
+   * ```
    *
    * **签名里没有 `result_timeout`**:本交互只有**一个**等待阶段,其时限即 `retry.timeout`;
    * 耗尽返 `kTimeout`(本模型没有受理阶段,故不用 `kNotAccepted`)。
@@ -404,16 +434,17 @@ class DdsNode : public NodeBase {
    * **`RELIABLE` 的 DDS 上仍要重发**:丢的不是网络,是**队列**——读队列有界 1024、满时
    * 静默丢最旧(**D11**)。代价是**要求对端能容忍重复请求**,框架不校验。
    *
-   * @param service_name 服务名,**须已注册为 `Clients`**。
-   * @param req   请求 Message(`payload` 由调用方填;`kind` / `correlation_id` /
-   *              `reply_to` / `topic` 由本节点盖)。
+   * @param req   请求 Message(`payload` 与 `endpoint` 由调用方填,`endpoint` **须是
+   *              `Endpoint::Service(服务名)`** 且该服务名**已注册为 `Clients`**;`kind` /
+   *              `correlation_id` / `reply_to` 由本节点盖,`endpoint` 被本节点改写为派生出
+   *              的请求 topic;`frame` 被完全忽略,**D7**)。
    * @param retry 重发策略,见 `RetryPolicy`。
-   * @return 收到的 `kReply`(其 `topic` 是 `cfg.<名>.response`);或 `kTimeout`(重发次数
-   *         耗尽)、`kInvalidArgument`(策略非法)、`kConfiguration`(服务名未注册为客户端)、
-   *         `kClosed`、编码错误。
+   * @return 收到的 `kReply`(其 `endpoint.topic` 是 `cfg.<名>.response`);或 `kTimeout`
+   *         (重发次数耗尽)、`kInvalidArgument`(策略非法,**或 `endpoint.kind` 不是
+   *         `kService`**)、`kConfiguration`(服务名未注册为客户端)、`kClosed`、编码错误。
    */
-  [[nodiscard]] Coro::Result<Message> RequestForResultDirect(
-      const std::string& service_name, Message req, RetryPolicy retry);
+  [[nodiscard]] Coro::Result<Message> RequestForResultDirect(Message req,
+                                                             RetryPolicy retry);
 
   /**
    * @brief 服务端收请求——`Subscribe(cfg.<名>.request, kRequest)` 的**服务名封装**(**D8**)。
@@ -434,7 +465,8 @@ class DdsNode : public NodeBase {
   /**
    * @brief 服务端回一条终结应答 `kReply`——请求-响应服务端**唯一**的方法(无受理阶段)。
    *
-   * 它由 `request.topic`(即派生出的 `cfg.<名>.request`)**反查自己注册的服务**,再派生出
+   * 它由 `request.endpoint.topic`(收到该请求的**来源** topic,即派生出的
+   * `cfg.<名>.request`)**反查自己注册的服务**,再派生出
    * 该服务的 `cfg.<名>.response`(走的是**同一个派生函数**,不另写解析器)。**不取信于
    * 线缆、不建端点**(**D15**):该应答 topic 的 writer 在注册那一刻就建好了。启动前注册的
    * 服务,其**第一次应答不会丢**;**运行期动态注册的服务则会丢一次**(ADR-0015「明确接受
@@ -446,10 +478,10 @@ class DdsNode : public NodeBase {
    * 线缆上的 `reply_to` 降为**一致性交叉校验**:非空且与派生出的应答 topic 不等即返
    * `kInvalidArgument`——对**版本不一致的对端**,它是唯一能当场发现偏差的手段。
    *
-   * @param request 收到的请求(其 `topic` 与 `correlation_id` 是本方法的全部输入)。
-   * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` / `topic`
-   *                由本节点盖)。
-   * @return 已入队;`kClosed`、`kConfiguration`(`request.topic` 不是本节点任何一个已注册
+   * @param request 收到的请求(其 `endpoint.topic` 与 `correlation_id` 是本方法的全部输入)。
+   * @param result  应答 Message(`payload` 由调用方填;`kind` / `correlation_id` /
+   *                `endpoint` 由本节点盖)。
+   * @return 已入队;`kClosed`、`kConfiguration`(`request.endpoint.topic` 不是本节点任何一个已注册
    *         服务的请求 topic)、`kInvalidArgument`(`reply_to` 交叉校验不过)、编码错误。
    */
   [[nodiscard]] Coro::Result<void> Reply(const Message& request, Message result);
@@ -485,8 +517,9 @@ class DdsNode : public NodeBase {
   [[nodiscard]] Coro::Result<bool> RegistrationPhase() const;
   /// @brief spawn 读-分发循环 fiber:`await(rx_) → 成功 → DecodeAndDispatch;错误 → Close()`。
   void SpawnReadLoop();
-  /// @brief 读循环体内的 DDS 特有处理:Decode 一条样本 → 按来源 topic 填 `topic`/`source`
-  ///        → 逐条 Dispatch。**topic 不上线缆**(**D5**),入站只能由 `Datagram.peer` 带出。
+  /// @brief 读循环体内的 DDS 特有处理:Decode 一条样本 → 按来源 topic 填 `endpoint`
+  ///        (`Endpoint::Topic(datagram.peer.topic)`,ADR-0020 **D3**)→ 逐条 Dispatch。
+  ///        **topic 不上线缆**(**D5**),入站只能由 `Datagram.peer` 带出。
   void DecodeAndDispatch(const Datagram& datagram);
   /// @brief 单条 Message 的分发:交 `Dispatcher` 按键投递(**唯一投递路径**);无人认领时
   ///        一律静默丢弃,`kReply` 与业务消息无别(ADR-0009 D5、ADR-0014 D1)。

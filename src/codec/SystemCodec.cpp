@@ -3,6 +3,8 @@
 #include <array>
 #include <utility>
 
+#include <QByteArray>
+
 #include "transport/core/Error.hpp"
 
 // SystemCodec.cpp — 见 .hpp。小端;坏帧 resync;CRC 注入。
@@ -41,14 +43,17 @@ uint16_t DefaultCrc16(const uint8_t* body, std::size_t len) {
 SystemCodec::SystemCodec(CrcFn crc) : crc_(std::move(crc)) {}
 
 Coro::Result<std::vector<uint8_t>> EncodeSystemFrame(const Message& msg, const CrcFn& crc) {
+  // **完全忽略 msg.frame**(ADR-0020 D7):出站帧只由当前各字段生成。
+  const std::size_t payload_len = static_cast<std::size_t>(msg.payload.size());
   // 整帧 body 超 16 位长度字段可表达上限 → 分帧上限,kFrame。
-  if (msg.payload.size() + 2 > kMaxBody)
+  if (payload_len + 2 > kMaxBody)
     return make_error_code(TransportErrc::kFrame);
 
+  const auto* payload = reinterpret_cast<const uint8_t*>(msg.payload.constData());
   std::vector<uint8_t> body;
-  body.reserve(2 + msg.payload.size());
+  body.reserve(2 + payload_len);
   PutU16LE(body, msg.message_id);
-  body.insert(body.end(), msg.payload.begin(), msg.payload.end());
+  body.insert(body.end(), payload, payload + payload_len);
   const uint16_t crc_v = crc(body.data(), body.size());
 
   std::vector<uint8_t> out;
@@ -99,9 +104,16 @@ std::size_t ScanSystemFrames(const uint8_t* data, std::size_t len, const CrcFn& 
     }
     m.protocol_id = h[5];
     m.session_id = h[6];
+    // 整帧 = [帧头 kHeaderLen] + [frm_body frm_len],帧头起点即 h(ADR-0020 D2:必填)。
+    m.frame = QByteArray(reinterpret_cast<const char*>(h),
+                         static_cast<int>(kHeaderLen + frm_len));
     if (frm_len >= 2) {
       m.message_id = GetU16LE(bd);
-      m.payload.assign(bd + 2, bd + frm_len);
+      // ★ **顺序是硬要求**:视图必须建在 `m.frame` 这个【最终的】QByteArray 上,不能先在
+      //   局部变量上建再把 frame 拷进来——那样视图会指向局部变量的数据块。
+      //   payload 在帧内的偏移 = 帧头 + message_id(2 字节)。
+      m.payload = QByteArray::fromRawData(m.frame.constData() + kHeaderLen + 2,
+                                          static_cast<int>(frm_len - 2));
     }
     out.push_back(std::move(m));
     off += kHeaderLen + frm_len;

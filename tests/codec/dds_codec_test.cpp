@@ -7,8 +7,12 @@
 
 #include <gtest/gtest.h>
 
+#include "message_test_util.hpp"
 #include "transport/core/Error.hpp"
 
+using testutil::Pay;
+using testutil::PayloadIsViewOfFrame;
+using testutil::ToVec;
 using transport::DdsCodec;
 using transport::Message;
 using transport::MessageKind;
@@ -18,7 +22,7 @@ using transport::make_error_code;
 namespace {
 Message Make(MessageKind k, std::string corr, std::string reply, std::vector<uint8_t> p) {
   Message m; m.kind = k; m.correlation_id = std::move(corr);
-  m.reply_to = std::move(reply); m.payload = std::move(p); return m;
+  m.reply_to = std::move(reply); m.payload = Pay(p); return m;
 }
 }  // namespace
 
@@ -33,7 +37,7 @@ TEST(DdsCodec, EncodeDecodeRoundtripCarriesMetadata) {
   EXPECT_EQ(m.kind, MessageKind::kRequest);
   EXPECT_EQ(m.correlation_id, "corr-7");
   EXPECT_EQ(m.reply_to, "inbox-A");
-  EXPECT_EQ(m.payload, (std::vector<uint8_t>{1, 2, 3}));
+  EXPECT_EQ(ToVec(m.payload), (std::vector<uint8_t>{1, 2, 3}));
 }
 
 TEST(DdsCodec, EmptyAndNoMetadata) {
@@ -51,7 +55,7 @@ TEST(DdsCodec, EmptyAndNoMetadata) {
   EXPECT_EQ(dec.value()[0].kind, MessageKind::kOneway);
   EXPECT_TRUE(dec.value()[0].correlation_id.empty());
   EXPECT_TRUE(dec.value()[0].reply_to.empty());
-  EXPECT_TRUE(dec.value()[0].payload.empty());
+  EXPECT_TRUE(dec.value()[0].payload.isEmpty());
 }
 
 TEST(DdsCodec, TruncatedFailsWithCodecError) {
@@ -103,10 +107,46 @@ TEST(DdsCodec, StatelessConcurrentDecodeSafe) {
       auto dec = c.Decode(frames[i].data(), frames[i].size());
       if (dec && dec.value().size() == 1u &&
           dec.value()[0].correlation_id == "c" + std::to_string(i) &&
-          dec.value()[0].payload == std::vector<uint8_t>{static_cast<uint8_t>(i)})
+          ToVec(dec.value()[0].payload) ==
+              std::vector<uint8_t>{static_cast<uint8_t>(i)})
         ok.fetch_add(1);
     });
   }
   for (auto& t : ts) t.join();
   EXPECT_EQ(ok.load(), N);  // 无共享状态 → 全部正确
+}
+
+// ADR-0020 **D2**:DDS 每 sample 即一条完整消息,故 `frame` 是整个 sample、payload 的偏移
+// 恰是元数据解析停下的位置(`[kind:1][corr_len:2][corr][reply_len:2][reply_to]` 之后)。
+TEST(DdsCodec, FillsFrameAndPayloadIsAViewIntoIt) {
+  DdsCodec c;
+  auto enc = c.Encode(Make(MessageKind::kRequest, "corr-7", "inbox-A", {1, 2, 3}));
+  ASSERT_TRUE(static_cast<bool>(enc));
+  auto dec = c.Decode(enc.value().data(), enc.value().size());
+  ASSERT_TRUE(static_cast<bool>(dec));
+  ASSERT_EQ(dec.value().size(), 1u);
+  const Message& m = dec.value()[0];
+
+  EXPECT_EQ(ToVec(m.frame), enc.value());     // 整个 sample 原样落进 frame。
+  EXPECT_TRUE(PayloadIsViewOfFrame(m));       // payload 是它的视图,不是拷贝。
+  // 1(kind) + 2 + len("corr-7") + 2 + len("inbox-A") = 1 + 2 + 6 + 2 + 7 = 18
+  EXPECT_EQ(m.payload.constData() - m.frame.constData(), 18);
+  EXPECT_EQ(m.payload.size(), 3);
+}
+
+// `Encode` 完全忽略 `frame`(**D7**):改了字段就该按新字段重新编码。
+TEST(DdsCodec, EncodeIgnoresTheFrame) {
+  DdsCodec c;
+  auto enc = c.Encode(Make(MessageKind::kRequest, "corr-7", "inbox-A", {1, 2, 3}));
+  ASSERT_TRUE(static_cast<bool>(enc));
+  auto dec = c.Decode(enc.value().data(), enc.value().size());
+  ASSERT_TRUE(static_cast<bool>(dec));
+  Message m = dec.value()[0];
+  ASSERT_FALSE(m.frame.isEmpty());
+
+  m.kind = MessageKind::kNotify;              // 若"frame 非空就原样重发",这一改不会生效。
+  auto again = c.Encode(m);
+  ASSERT_TRUE(static_cast<bool>(again));
+  EXPECT_EQ(again.value()[0], static_cast<uint8_t>(MessageKind::kNotify));
+  EXPECT_NE(again.value(), enc.value());
 }

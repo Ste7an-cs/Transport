@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include "coro_test_util.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"  // Coro::makeTask —— 服务端那条消费 fiber。
 #include "transport/codec/DdsCodec.hpp"
 #include "transport/core/Error.hpp"
@@ -40,6 +41,7 @@ using transport::DdsConfig;
 using transport::DdsNode;
 using transport::DdsTransport;
 using transport::LinkState;
+using transport::Endpoint;
 using transport::Message;
 using transport::MessageKind;
 using transport::RetryPolicy;
@@ -89,12 +91,28 @@ class Host {
 };
 
 std::string Text(const Message& msg) {
-  return std::string(msg.payload.begin(), msg.payload.end());
+  return testutil::ToText(msg.payload);
 }
 
-Message Payload(const std::string& text) {
+Message Payload(std::string text) {
   Message msg;
-  msg.payload.assign(text.begin(), text.end());
+  msg.payload = testutil::Pay(text);
+  return msg;
+}
+
+/// 出站发布用:目的地 topic 填进 `endpoint`——`Publish` 不再收 topic 参数,目的地取自
+/// `msg.endpoint` 且**须是 `kTopic`**(ADR-0020 **D6**)。
+Message Payload(std::string topic, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Topic(std::move(topic));
+  return msg;
+}
+
+/// 出站请求用:**服务名**填进 `endpoint`,**须是 `kService`**——服务名不是 topic
+/// (ADR-0020 **D5/D6**)。
+Message Ask(std::string service_name, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Service(std::move(service_name));
   return msg;
 }
 
@@ -134,14 +152,14 @@ TEST(DdsNodeFastDds, PublishSubscribeRoundTripOverRealDds) {
   ASSERT_TRUE(WaitLinkUp(subscriber.transport())) << "订阅侧一直没匹配上对端";
 
   ASSERT_TRUE(static_cast<bool>(
-      publisher.node().Publish("e2e.news", Payload("over-the-wire"))));
+      publisher.node().Publish(Payload("e2e.news", "over-the-wire"))));
 
   auto got = mailbox.Wait(std::chrono::milliseconds(kDiscoveryBudgetMs));
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "over-the-wire");
   EXPECT_EQ(got.value().kind, MessageKind::kNotify);
   // topic **不上线缆**(**D5**):它由入站 `Datagram.peer` 带出、在读循环里填回。
-  EXPECT_EQ(got.value().topic, "e2e.news");
+  EXPECT_EQ(got.value().endpoint.topic, "e2e.news");
   EXPECT_FALSE(publisher.transport().LastError())
       << publisher.transport().LastError().message();
 }
@@ -195,8 +213,7 @@ TEST(DdsNodeFastDds, RequestResponseRoundTripOverRealDds) {
     }
   });
 
-  auto got = client.node().RequestForResultDirect(
-      "e2e.svc", Payload("ping"), RetryPolicy{1000ms, 8});
+  auto got = client.node().RequestForResultDirect(Ask("e2e.svc", "ping"), RetryPolicy{1000ms, 8});
   stop = true;
   (void)service.get();  // 让出式 join:返回即服务端 fiber 已退出。
 
@@ -204,7 +221,7 @@ TEST(DdsNodeFastDds, RequestResponseRoundTripOverRealDds) {
   EXPECT_EQ(Text(got.value()), "echo:ping");
   EXPECT_EQ(got.value().kind, MessageKind::kReply);
   // ⭐ 应答落在**派生出的**应答 topic 上——服务名 `e2e.svc` → `cfg.e2e.svc.response`。
-  EXPECT_EQ(got.value().topic, "cfg.e2e.svc.response");
+  EXPECT_EQ(got.value().endpoint.topic, "cfg.e2e.svc.response");
   // corr 两段式(**D6**):应答沿用请求那一份,故它必是本节点的 `<uuid>#0`。
   EXPECT_EQ(got.value().correlation_id, client.node().uuid() + "#0");
   EXPECT_GE(served, 1);

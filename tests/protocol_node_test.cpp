@@ -30,6 +30,7 @@
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
 #include "fake_transport.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/SystemDatagramCodec.hpp"
 #include "transport/core/Error.hpp"
@@ -38,6 +39,8 @@
 
 using namespace std::chrono_literals;
 using testutil::FakeTransport;
+using testutil::Pay;
+using testutil::ToVec;
 using transport::FrameType;
 using transport::kAny;
 using transport::Message;
@@ -69,7 +72,7 @@ std::unique_ptr<transport::ICodec> MakeCodec() {
 Message Command(std::uint16_t message_id, std::vector<std::uint8_t> payload = {1}) {
   Message msg;
   msg.message_id = message_id;
-  msg.payload = std::move(payload);
+  msg.payload = Pay(payload);
   return msg;
 }
 
@@ -82,7 +85,7 @@ std::vector<std::uint8_t> EncodeFrame(std::uint8_t session_id,
   msg.session_id = session_id;
   msg.message_id = message_id;
   msg.frm_type = type;
-  msg.payload = std::move(payload);
+  msg.payload = Pay(payload);
   SystemDatagramCodec codec;
   auto bytes = codec.Encode(msg);
   EXPECT_TRUE(bytes);
@@ -315,7 +318,7 @@ TEST(ProtocolNode, RequestIsTerminatedByMatchingResponse) {
 
   ASSERT_TRUE(reply) << reply.error().message();
   EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{7, 7}));
+  EXPECT_EQ(ToVec(reply.value().payload), (std::vector<std::uint8_t>{7, 7}));
 }
 
 // 无回应 → 单次尝试耗尽。终结原因是 kNotAccepted 而非 kTimeout(ADR-0010 D12:
@@ -405,15 +408,16 @@ TEST(ProtocolNode, ConcurrentRequestsAreCorrelatedIndependently) {
   // 故意逆序回应:关联只看键,与到达次序无关。
   for (const Message* sent : {&sent_second, &sent_first}) {
     ASSERT_TRUE(fx.transport.Deliver(EncodeFrame(
-        sent->session_id, sent->message_id, FrameType::kResponse, sent->payload)));
+        sent->session_id, sent->message_id, FrameType::kResponse,
+        ToVec(sent->payload))));
   }
   (void)a.get();
   (void)b.get();
 
   ASSERT_TRUE(first) << first.error().message();
   ASSERT_TRUE(second) << second.error().message();
-  EXPECT_EQ(first.value().payload, (std::vector<std::uint8_t>{0xAA}));
-  EXPECT_EQ(second.value().payload, (std::vector<std::uint8_t>{0xBB}));
+  EXPECT_EQ(ToVec(first.value().payload), (std::vector<std::uint8_t>{0xAA}));
+  EXPECT_EQ(ToVec(second.value().payload), (std::vector<std::uint8_t>{0xBB}));
 }
 
 // —— 3. 分发去向(ADR-0009:入站只有订阅一条通路)——————————————————————————
@@ -749,14 +753,14 @@ TEST(ProtocolNode, SubscribeSupportsMultiPhaseInteraction) {
       EncodeFrame(sent.session_id, sent.message_id, FrameType::kResponse, {1})));
   (void)caller.get();
   ASSERT_TRUE(ack) << ack.error().message();
-  EXPECT_EQ(ack.value().payload, (std::vector<std::uint8_t>{1}));
+  EXPECT_EQ(ToVec(ack.value().payload), (std::vector<std::uint8_t>{1}));
 
   // 第二段:另一命令码的结果,由此前登记的订阅接住。
   ASSERT_TRUE(fx.transport.Deliver(
       EncodeFrame(sent.session_id, 0x03F2, FrameType::kResult, {2})));
   auto got = result.Wait(500ms);
   ASSERT_TRUE(got) << got.error().message();
-  EXPECT_EQ(got.value().payload, (std::vector<std::uint8_t>{2}));
+  EXPECT_EQ(ToVec(got.value().payload), (std::vector<std::uint8_t>{2}));
 }
 
 // 旁路监听与精确等待同时命中同一条消息,各得一份。
@@ -778,7 +782,7 @@ TEST(ProtocolNode, SideChannelSubscriberAlsoReceivesMatchedResponse) {
   ASSERT_TRUE(reply);
   auto observed = audit.Wait(200ms);
   ASSERT_TRUE(observed) << "旁路订阅者应另得一份副本";
-  EXPECT_EQ(observed.value().payload, (std::vector<std::uint8_t>{5}));
+  EXPECT_EQ(ToVec(observed.value().payload), (std::vector<std::uint8_t>{5}));
 }
 
 // —— 6. 交互模式:RequestForResponse / RequestForResult(ADR-0010)————————————
@@ -804,7 +808,7 @@ TEST(ProtocolNode, RequestForResponseSucceedsOnFirstAttempt) {
 
   ASSERT_TRUE(reply) << reply.error().message();
   EXPECT_EQ(reply.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{7, 7}));
+  EXPECT_EQ(ToVec(reply.value().payload), (std::vector<std::uint8_t>{7, 7}));
   EXPECT_EQ(fx.transport.sent().size(), 1u) << "首次即受理,不应有重发";
 }
 
@@ -825,7 +829,7 @@ TEST(ProtocolNode, RequestForResponseRetransmitsSameFrameUntilAccepted) {
   (void)caller.get();
 
   ASSERT_TRUE(reply) << reply.error().message();
-  EXPECT_EQ(reply.value().payload, (std::vector<std::uint8_t>{3}));
+  EXPECT_EQ(ToVec(reply.value().payload), (std::vector<std::uint8_t>{3}));
   ASSERT_EQ(fx.transport.sent().size(), 3u) << "总发送次数应恰为 max_attempts";
   for (std::size_t i = 0; i < 3u; ++i) {
     const Message attempt = DecodeSent(fx.transport, i);
@@ -911,14 +915,14 @@ TEST(ProtocolNode, RequestForResultRepliesWithDerivedResponseFrame) {
 
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResult) << "返回的是结果那一帧";
-  EXPECT_EQ(outcome.value().payload, kResultPayload);
+  EXPECT_EQ(ToVec(outcome.value().payload), kResultPayload);
 
   ASSERT_EQ(fx.transport.sent().size(), 2u) << "命令 + 回应结果,各一帧";
   const Message reply = DecodeSent(fx.transport, 1);
   EXPECT_EQ(reply.frm_type, FrameType::kResponse) << "仅此一处相对 kResult 有改动";
   EXPECT_EQ(reply.session_id, sent.session_id) << "session_id 沿用";
   EXPECT_EQ(reply.message_id, kResultId) << "message_id 沿用结果帧的";
-  EXPECT_EQ(reply.payload, kResultPayload) << "payload 原样回显";
+  EXPECT_EQ(ToVec(reply.payload), kResultPayload) << "payload 原样回显";
   EXPECT_EQ(reply.protocol_id, kProtocolId);
 }
 
@@ -945,7 +949,7 @@ TEST(ProtocolNode, RequestForResultAcceptsResultArrivingBeforeAck) {
   (void)caller.get();
 
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{8}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{8}));
   ASSERT_EQ(fx.transport.sent().size(), 2u);
   EXPECT_EQ(DecodeSent(fx.transport, 1).frm_type, FrameType::kResponse);
 }
@@ -1007,7 +1011,7 @@ TEST(ProtocolNode, DuplicateAckAfterAcceptPhaseIsDropped) {
       EncodeFrame(sent.session_id, kResultId, FrameType::kResult, {9})));
   (void)caller.get();
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{9}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{9}));
 }
 
 // —— 7. 另一种协议的直取结果交互:RequestForResultDirect(ADR-0010 D13 / RT_NODE_002_g)——
@@ -1042,7 +1046,7 @@ TEST(ProtocolNode, RequestForResultDirectSucceedsAndSendsNoReply) {
 
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResult) << "返回的是结果那一帧";
-  EXPECT_EQ(outcome.value().payload, kResultPayload);
+  EXPECT_EQ(ToVec(outcome.value().payload), kResultPayload);
   EXPECT_EQ(outcome.value().session_id, sent.session_id);
   EXPECT_EQ(fx.transport.sent().size(), 1u)
       << "只有那一条命令帧:收到 kResult 后**不回应任何帧**(与 RequestForResult 相反)";
@@ -1071,7 +1075,7 @@ TEST(ProtocolNode, RequestForResultDirectRetransmitsWhileAwaitingResult) {
   (void)caller.get();
 
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{3}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{3}));
   ASSERT_EQ(fx.transport.sent().size(), 3u)
       << "总发送次数应恰为 max_attempts——等结果阶段重发了,且收到结果后不回应";
   for (std::size_t i = 0; i < 3u; ++i) {
@@ -1128,7 +1132,7 @@ TEST(ProtocolNode, RequestForResultDirectIgnoresInterveningResponseFrame) {
       EncodeFrame(sent.session_id, kResultId, FrameType::kResult, {9})));
   (void)caller.get();
   ASSERT_TRUE(outcome) << outcome.error().message();
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{9}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{9}));
   EXPECT_EQ(fx.transport.sent().size(), 1u) << "成功后仍不回应任何帧";
 }
 
@@ -1202,7 +1206,7 @@ TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
                        reply.frm_type = FrameType::kResponse;
                        reply.session_id = request.session_id;  // ★ 回带请求的会话号
                        reply.message_id = request.message_id;
-                       reply.payload = {0xC0, 0xDE};
+                       reply.payload = Pay({0xC0, 0xDE});
                        replied = server.node->Send(std::move(reply));
                      });
 
@@ -1237,7 +1241,7 @@ TEST(ProtocolNode, PublicApiServerRepliesWithSendAndTerminatesClientRequest) {
   ASSERT_TRUE(replied) << "服务端那次 Send 应成功入队";
   ASSERT_TRUE(outcome) << outcome.error().message();
   EXPECT_EQ(outcome.value().frm_type, FrameType::kResponse);
-  EXPECT_EQ(outcome.value().payload, (std::vector<std::uint8_t>{0xC0, 0xDE}));
+  EXPECT_EQ(ToVec(outcome.value().payload), (std::vector<std::uint8_t>{0xC0, 0xDE}));
 
   ASSERT_EQ(client.transport.sent().size(), kWarmupFrames + 1)
       << "一发即中,不该有重发";

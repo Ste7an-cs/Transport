@@ -1,12 +1,18 @@
 #include "transport/codec/SystemCodec.hpp"
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
+#include <QByteArray>
 #include <gtest/gtest.h>
 
+#include "message_test_util.hpp"
 #include "transport/core/Error.hpp"
 
+using testutil::Pay;
+using testutil::PayloadIsViewOfFrame;
+using testutil::ToVec;
 using transport::FrameType;
 using transport::Message;
 using transport::SystemCodec;
@@ -22,7 +28,7 @@ uint16_t SumCrc(const uint8_t* b, std::size_t n) {
 }
 Message Cmd(uint8_t proto, uint8_t sess, uint16_t mid, std::vector<uint8_t> p) {
   Message m; m.frm_type = FrameType::kCommand; m.protocol_id = proto;
-  m.session_id = sess; m.message_id = mid; m.payload = std::move(p); return m;
+  m.session_id = sess; m.message_id = mid; m.payload = Pay(p); return m;
 }
 }  // namespace
 
@@ -59,7 +65,7 @@ TEST(SystemCodec, EncodeDecodeRoundtrip) {
   EXPECT_EQ(m.protocol_id, 3);
   EXPECT_EQ(m.session_id, 5);
   EXPECT_EQ(m.message_id, 0x1234);
-  EXPECT_EQ(m.payload, (std::vector<uint8_t>{1, 2, 3, 4}));
+  EXPECT_EQ(ToVec(m.payload), (std::vector<uint8_t>{1, 2, 3, 4}));
 }
 
 TEST(SystemCodec, DecodeSplitAcrossReads) {
@@ -71,7 +77,7 @@ TEST(SystemCodec, DecodeSplitAcrossReads) {
   ASSERT_TRUE(static_cast<bool>(d1)); EXPECT_TRUE(d1.value().empty());
   auto d2 = c.Decode(f.data() + 6, f.size() - 6);     // 补齐
   ASSERT_TRUE(static_cast<bool>(d2)); ASSERT_EQ(d2.value().size(), 1u);
-  EXPECT_EQ(d2.value()[0].payload, (std::vector<uint8_t>{9, 9, 9}));
+  EXPECT_EQ(ToVec(d2.value()[0].payload), (std::vector<uint8_t>{9, 9, 9}));
 }
 
 TEST(SystemCodec, DecodeMultipleFramesOneRead) {
@@ -90,7 +96,7 @@ TEST(SystemCodec, ResyncOnBadHeadFlag) {
   junk.insert(junk.end(), enc.value().begin(), enc.value().end());
   auto dec = c.Decode(junk.data(), junk.size());
   ASSERT_TRUE(static_cast<bool>(dec)); ASSERT_EQ(dec.value().size(), 1u);
-  EXPECT_EQ(dec.value()[0].payload, (std::vector<uint8_t>{7, 7}));
+  EXPECT_EQ(ToVec(dec.value()[0].payload), (std::vector<uint8_t>{7, 7}));
 }
 
 TEST(SystemCodec, ResyncOnCrcMismatch) {
@@ -109,4 +115,140 @@ TEST(SystemCodec, EncodeRejectsOversizePayload) {
   auto enc = c.Encode(m);
   ASSERT_FALSE(static_cast<bool>(enc));
   EXPECT_EQ(enc.error(), make_error_code(TransportErrc::kFrame));
+}
+
+// ── ADR-0020:frame / payload 视图的四条承重断言 ──────────────────────────────
+//
+// 本组是这次重构**是否真的成立**的证据。前三条断言的都是**地址**,不是内容——内容相等的
+// 拷贝实现也能让"内容"断言变绿,证不了零拷贝。
+
+/// 解码一条帧,返回 `{整帧字节, 解出的 Message}`。
+namespace {
+std::pair<std::vector<uint8_t>, Message> DecodeOne(const Message& src) {
+  SystemCodec codec(SumCrc);
+  auto enc = codec.Encode(src);
+  EXPECT_TRUE(static_cast<bool>(enc));
+  std::vector<uint8_t> wire = enc.value();
+  auto dec = codec.Decode(wire.data(), wire.size());
+  EXPECT_TRUE(static_cast<bool>(dec));
+  EXPECT_EQ(dec.value().size(), 1u);
+  return {std::move(wire), dec.value().front()};
+}
+}  // namespace
+
+// ⭐ ① **零拷贝确实成立**(D2):`payload.constData()` 落在 `frame` 的数据块区间内 ⇒
+//    它是**视图**而非拷贝。
+TEST(SystemCodec, DecodedPayloadIsAZeroCopyViewIntoTheFrame) {
+  auto [wire, msg] = DecodeOne(Cmd(3, 5, 0x1234, {1, 2, 3, 4}));
+
+  ASSERT_FALSE(msg.frame.isEmpty());
+  EXPECT_TRUE(PayloadIsViewOfFrame(msg))
+      << "payload 必须指进 frame 的数据块——不在区间内即说明它被拷了一份";
+  // 偏移恰是"帧头 15 + message_id 2":线缆布局说什么,视图就从哪儿起。
+  EXPECT_EQ(msg.payload.constData() - msg.frame.constData(), 17);
+  EXPECT_EQ(msg.payload.size(), 4);
+}
+
+// ⭐ ④ **frame 就是线缆上那一整帧**(帧头 → payload 末),对本 codec 可逐字节核对。
+TEST(SystemCodec, DecodedFrameIsTheWholeWireFrameByteForByte) {
+  auto [wire, msg] = DecodeOne(Cmd(0x07, 0x09, 0x0201, {0xAA, 0xBB}));
+
+  EXPECT_EQ(ToVec(msg.frame), wire) << "frame 应与 Encode 出来的整帧逐字节相同";
+  EXPECT_EQ(msg.frame.size(), 19);  // 头 15 + body(2 + 2)
+
+  // 帧头里的字节在 payload 里看不到,但在 frame 里能看到——这正是本 ADR 买到的东西。
+  EXPECT_EQ(static_cast<uint8_t>(msg.frame[0]), 0xAA);   // head_flag
+  EXPECT_EQ(static_cast<uint8_t>(msg.frame[11]), 0x68);  // crc LE 低字节
+  EXPECT_EQ(static_cast<uint8_t>(msg.frame[12]), 0x01);
+}
+
+// 前导垃圾(resync)之后,frame 仍**恰好**是那一帧:不含被跳过的垃圾字节。
+TEST(SystemCodec, FrameExcludesResyncGarbage) {
+  SystemCodec c(SumCrc);
+  auto enc = SystemCodec(SumCrc).Encode(Cmd(1, 2, 3, {7, 7}));
+  ASSERT_TRUE(static_cast<bool>(enc));
+  std::vector<uint8_t> junk = {0x00, 0x11, 0xAA, 0xBB, 0x22};
+  junk.insert(junk.end(), enc.value().begin(), enc.value().end());
+
+  auto dec = c.Decode(junk.data(), junk.size());
+  ASSERT_TRUE(static_cast<bool>(dec));
+  ASSERT_EQ(dec.value().size(), 1u);
+  EXPECT_EQ(ToVec(dec.value()[0].frame), enc.value());
+  EXPECT_TRUE(PayloadIsViewOfFrame(dec.value()[0]));
+}
+
+// ⭐ ② **拷贝之后视图仍然有效**(D2 的拷贝安全性论证):`Dispatcher` 给每个订阅者各发一份
+//    副本走的正是这条路。`QByteArray` 拷贝只是引用计数加一,**数据块地址不变**。
+TEST(SystemCodec, PayloadViewSurvivesMessageCopy) {
+  auto [wire, msg] = DecodeOne(Cmd(3, 5, 0x1234, {1, 2, 3, 4}));
+  const char* original_block = msg.frame.constData();
+
+  Message copy = msg;  // ← Dispatcher 投递给订阅者时做的就是这一步。
+
+  EXPECT_EQ(copy.frame.constData(), original_block) << "拷贝不该换块";
+  EXPECT_TRUE(PayloadIsViewOfFrame(copy));
+  EXPECT_EQ(ToVec(copy.payload), (std::vector<uint8_t>{1, 2, 3, 4}));
+
+  // 原件析构之后副本照样可读——块被副本继续引用着。
+  msg = Message{};
+  EXPECT_EQ(ToVec(copy.payload), (std::vector<uint8_t>{1, 2, 3, 4}));
+  EXPECT_TRUE(PayloadIsViewOfFrame(copy));
+}
+
+// ⭐ ③ **移动之后同样有效**:`std::vector<Message>` 扩容、入队出队都只是移动,d 指针转手、
+//    块地址不变。
+TEST(SystemCodec, PayloadViewSurvivesMoveAndVectorReallocation) {
+  auto [wire, msg] = DecodeOne(Cmd(3, 5, 0x1234, {1, 2, 3, 4}));
+  const char* original_block = msg.frame.constData();
+
+  std::vector<Message> queue;
+  queue.reserve(1);
+  queue.push_back(std::move(msg));
+  // 反复 push 强制扩容,每次扩容把已有元素**移动**到新缓冲。
+  for (int i = 0; i < 64; ++i) {
+    queue.push_back(DecodeOne(Cmd(1, 1, 1, {0xEE})).second);
+  }
+
+  EXPECT_EQ(queue.front().frame.constData(), original_block) << "移动不该换块";
+  EXPECT_TRUE(PayloadIsViewOfFrame(queue.front()));
+  EXPECT_EQ(ToVec(queue.front().payload), (std::vector<uint8_t>{1, 2, 3, 4}));
+
+  // 出队(再一次移动)之后仍然成立。
+  Message popped = std::move(queue.front());
+  queue.clear();
+  EXPECT_EQ(popped.frame.constData(), original_block);
+  EXPECT_EQ(ToVec(popped.payload), (std::vector<uint8_t>{1, 2, 3, 4}));
+}
+
+// ⭐ ⑤ **`OwnedPayload()` 确为深拷贝**:内容相同,但地址**不在** frame 区间内(D8)。
+TEST(SystemCodec, OwnedPayloadEscapesTheFrame) {
+  auto [wire, msg] = DecodeOne(Cmd(3, 5, 0x1234, {1, 2, 3, 4}));
+  ASSERT_TRUE(PayloadIsViewOfFrame(msg));
+
+  const QByteArray owned = msg.OwnedPayload();
+  const char* begin = msg.frame.constData();
+  const char* end = begin + msg.frame.size();
+  EXPECT_TRUE(owned.constData() < begin || owned.constData() >= end)
+      << "OwnedPayload() 必须落在 frame 之外";
+  EXPECT_EQ(ToVec(owned), ToVec(msg.payload));
+
+  // 让整条 Message 消失——`owned` 是能活得比它久的那一个,这就是它唯一的用途。
+  msg = Message{};
+  EXPECT_EQ(ToVec(owned), (std::vector<uint8_t>{1, 2, 3, 4}));
+}
+
+// **`Encode` 完全忽略 `frame`**(D7):把一条收到的 Message 改几个字段再发出,出站帧由
+// **当前字段**生成,不是把 `frame` 原样吐回去。
+TEST(SystemCodec, EncodeIgnoresTheFrameAndRebuildsFromFields) {
+  auto [wire, msg] = DecodeOne(Cmd(3, 5, 0x1234, {1, 2, 3, 4}));
+  ASSERT_FALSE(msg.frame.isEmpty());
+
+  msg.message_id = 0x4321;  // 改一个字段:若"frame 非空就原样重发",这一改就不生效。
+  SystemCodec codec(SumCrc);
+  auto again = codec.Encode(msg);
+  ASSERT_TRUE(static_cast<bool>(again));
+
+  EXPECT_NE(again.value(), wire);
+  EXPECT_EQ(again.value()[15], 0x21);  // message_id LE —— 新值生效了。
+  EXPECT_EQ(again.value()[16], 0x43);
 }

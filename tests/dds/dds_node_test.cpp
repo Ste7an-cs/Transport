@@ -50,6 +50,7 @@
 
 #include "await/awaitable.hpp"
 #include "coro_test_util.hpp"
+#include "message_test_util.hpp"
 #include "task/fibertask.h"
 #include "transport/codec/DdsCodec.hpp"
 #include "transport/core/Error.hpp"
@@ -69,6 +70,7 @@ using transport::DdsNodeConfig;
 using transport::DdsProviderRegistry;
 using transport::DdsTransport;
 using transport::FakeDdsProvider;
+using transport::Endpoint;
 using transport::ICodec;
 using transport::IDdsProvider;
 using transport::kAny;
@@ -224,14 +226,30 @@ DdsNode::Ticket MustSubscribe(DdsNode& node, DdsNode::TopicKey topic,
   return std::move(ticket).value();
 }
 
+std::string Text(const Message& msg) {
+  return testutil::ToText(msg.payload);
+}
+
 Message Payload(std::string text) {
   Message msg;
-  msg.payload.assign(text.begin(), text.end());
+  msg.payload = testutil::Pay(text);
   return msg;
 }
 
-std::string Text(const Message& msg) {
-  return std::string(msg.payload.begin(), msg.payload.end());
+/// 出站发布用:目的地 topic 填进 `endpoint`——`Publish` 不再收 topic 参数,目的地取自
+/// `msg.endpoint` 且**须是 `kTopic`**(ADR-0020 **D6**)。
+Message Payload(std::string topic, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Topic(std::move(topic));
+  return msg;
+}
+
+/// 出站请求用:**服务名**填进 `endpoint`,**须是 `kService`**——服务名不是 topic
+/// (ADR-0020 **D5/D6**)。
+Message Ask(std::string service_name, std::string text) {
+  Message msg = Payload(std::move(text));
+  msg.endpoint = Endpoint::Service(std::move(service_name));
+  return msg;
 }
 
 constexpr auto kCaseTimeout = 300ms;
@@ -306,9 +324,9 @@ TEST(DdsNode, RegistrationAccumulatesAcrossCallsAndDeduplicates) {
 
   // 三个都注册上了才发得出去(未注册为 Publishers 返 kConfiguration)。
   for (const char* topic : {"a", "b", "c"}) {
-    EXPECT_TRUE(static_cast<bool>(node.Publish(topic, Payload("x"))));
+    EXPECT_TRUE(static_cast<bool>(node.Publish(Payload(topic, "x"))));
   }
-  EXPECT_EQ(node.Publish("d", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("d", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
 }
 
@@ -330,11 +348,11 @@ TEST(DdsNode, InvalidItemRollsBackTheWholeBatch) {
   // 故"一项都没落"改由启动之后的调用面反推:合法项若落下了,`Publish` 就不该报
   // kConfiguration。
   ASSERT_TRUE(static_cast<bool>(node.Start()));
-  EXPECT_EQ(node.Publish("good", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("good", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
   EXPECT_EQ(node.Subscribe(std::string("good"), MessageKind::kNotify).error(),
             make_error_code(TransportErrc::kConfiguration));
-  EXPECT_EQ(node.RequestForResultDirect("ok", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("ok", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kConfiguration));
 }
 
@@ -371,7 +389,7 @@ TEST(DdsNode, PlainTopicsMayNotStartWithTheCfgPrefixButServiceNamesMay) {
   ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"cfg.x"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterServices({"cfg.y"})));
   ASSERT_TRUE(static_cast<bool>(node.Start()));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("cfg", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("cfg", "x"))));
   // 派生结果写死字面量,不复用被测的派生函数。
   EXPECT_TRUE(static_cast<bool>(
       node.Subscribe(std::string("cfg.cfg.x.response"), kAny)));
@@ -420,7 +438,7 @@ TEST(DdsNode, RollbackLeavesEarlierBatchesIntact) {
   ASSERT_TRUE(static_cast<bool>(node.Start()));
 
   // 先前那三批**原样还在**。
-  EXPECT_TRUE(static_cast<bool>(node.Publish("p1", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("p1", "x"))));
   EXPECT_TRUE(static_cast<bool>(
       node.Subscribe(std::string("s1"), MessageKind::kNotify)));
   EXPECT_TRUE(static_cast<bool>(
@@ -430,13 +448,13 @@ TEST(DdsNode, RollbackLeavesEarlierBatchesIntact) {
       static_cast<bool>(node.Subscribe(std::string("cfg.cli.response"), kAny)));
 
   // 非法批里的**合法项**一个都没落下。
-  EXPECT_EQ(node.Publish("p2", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("p2", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
   EXPECT_EQ(node.Subscribe(std::string("s3"), MessageKind::kNotify).error(),
             make_error_code(TransportErrc::kConfiguration));
   EXPECT_EQ(node.ServeRequests("svc2").error(),
             make_error_code(TransportErrc::kConfiguration));
-  EXPECT_EQ(node.RequestForResultDirect("cli2", Payload("x"), {kCaseTimeout, 1})
+  EXPECT_EQ(node.RequestForResultDirect(Ask("cli2", "x"), {kCaseTimeout, 1})
                 .error(),
             make_error_code(TransportErrc::kConfiguration));
 }
@@ -520,7 +538,7 @@ TEST(DdsNode, OtherWriterReaderOverlapsAreNotRejected) {
   auto seen = std::make_shared<std::vector<std::string>>();
   Subscriber sub(MustSubscribe(node, std::string("loop"), MessageKind::kNotify),
                  [seen](const Message& msg) { seen->push_back(Text(msg)); });
-  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("echo"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "echo"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
   ASSERT_EQ(seen->size(), 1u);
   EXPECT_EQ(seen->front(), "echo");
@@ -543,13 +561,13 @@ TEST(DdsNode, StartWithNoRegistrationSucceedsAndRegistrationCanFollow) {
   EXPECT_TRUE(node.IsRunning());
 
   // 此刻确实什么都收发不了——注册面是空的。
-  EXPECT_EQ(node.Publish("a", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("a", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
 
   // 启动之后补注册,端点当场建出,随即就能收发。
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a"})));
   ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"b"})));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("a", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("a", "x"))));
   EXPECT_TRUE(static_cast<bool>(
       node.Subscribe(std::string("b"), MessageKind::kNotify)));
 }
@@ -568,7 +586,7 @@ TEST(DdsNode, StartBeforeTransportIsRunningFailsThenSucceedsAfterRetry) {
   host.StartTransport();
   ASSERT_TRUE(static_cast<bool>(node.Start()));  // 注册表没被清掉,一次就成。
   EXPECT_TRUE(node.IsRunning());
-  EXPECT_TRUE(static_cast<bool>(node.Publish("a", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("a", "x"))));
 }
 
 // ── 3. 发布-订阅 + 调用与注册的对应校验(D16)──────────────────────────
@@ -590,8 +608,8 @@ TEST(DdsNode, PublishAndSubscribeDeliverAcrossNodes) {
       MustSubscribe(subscriber.node(), std::string("news"), MessageKind::kNotify),
       [seen](const Message& msg) { seen->push_back(Text(msg)); });
 
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("one"))));
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("news", Payload("two"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("news", "one"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("news", "two"))));
 
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2; }));
   ASSERT_EQ(seen->size(), 2u);
@@ -607,19 +625,19 @@ TEST(DdsNode, PublishRequiresPublisherRegistrationAndRunning) {
   ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"ok"})));
 
   // 未启动:**调用序错误先于配置错误**——即便 topic 没注册也先报 kClosed。
-  EXPECT_EQ(node.Publish("ok", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("ok", "x")).error(),
             make_error_code(TransportErrc::kClosed));
-  EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("nope", "x")).error(),
             make_error_code(TransportErrc::kClosed));
 
   ASSERT_TRUE(static_cast<bool>(node.Start()));
-  EXPECT_TRUE(static_cast<bool>(node.Publish("ok", Payload("x"))));
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("ok", "x"))));
   // **不猜、不回落、不懒补**:忘了注册是显式错误,不是静默无效。
-  EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("nope", "x")).error(),
             make_error_code(TransportErrc::kConfiguration));
 
   ASSERT_TRUE(static_cast<bool>(node.Close()));
-  EXPECT_EQ(node.Publish("ok", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("ok", "x")).error(),
             make_error_code(TransportErrc::kClosed));
   node.WaitClosed();
 }
@@ -713,12 +731,11 @@ TEST(DdsNode, DerivedTopicsAreCfgNameRequestAndResponse) {
                    (void)server.node().Reply(request, Payload("pong"));
                  });
 
-  auto got = client.node().RequestForResultDirect("get", Payload("ping"),
-                                                  RetryPolicy{1000ms, 1});
+  auto got = client.node().RequestForResultDirect(Ask("get", "ping"), RetryPolicy{1000ms, 1});
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "pong");
   // ③ 应答落在派生出的应答 topic 上。
-  EXPECT_EQ(got.value().topic, "cfg.get.response");
+  EXPECT_EQ(got.value().endpoint.topic, "cfg.get.response");
 
   // ① 线缆上两条 topic 各自都真的过了帧。
   EXPECT_GE(requests.Count(), 1u) << "请求没走 cfg.get.request";
@@ -726,7 +743,7 @@ TEST(DdsNode, DerivedTopicsAreCfgNameRequestAndResponse) {
 
   // 服务端看到的请求 topic 同样是派生出来的那条(它是 `Reply` 反查服务的唯一输入)。
   ASSERT_EQ(pending->size(), 1u);
-  EXPECT_EQ(pending->front().topic, "cfg.get.request");
+  EXPECT_EQ(pending->front().endpoint.topic, "cfg.get.request");
   EXPECT_EQ(pending->front().reply_to, "cfg.get.response");
   svc.Join();
 }
@@ -775,10 +792,10 @@ TEST(DdsNode, SubscribeAnyTopicCoversOnlyRegisteredReaderTopics) {
 
   auto seen = std::make_shared<std::vector<std::string>>();
   Subscriber sub(MustSubscribe(subscriber.node(), kAny, MessageKind::kNotify),
-                 [seen](const Message& msg) { seen->push_back(msg.topic); });
+                 [seen](const Message& msg) { seen->push_back(msg.endpoint.topic); });
 
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("out", Payload("x"))));
-  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish("in", Payload("y"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("out", "x"))));
+  ASSERT_TRUE(static_cast<bool>(publisher.node().Publish(Payload("in", "y"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return !seen->empty(); }));
   // 只收得到 "in"——"out" 上本节点没建 reader,那条样本压根不进本进程。
   EXPECT_EQ(seen->size(), 1u);
@@ -852,16 +869,14 @@ TEST(DdsNode, RequestForResultDirectRoundTripsAndStampsTwoPartCorrelationId) {
 
   EXPECT_EQ(client.node().uuid(), "node-a");
 
-  auto first = client.node().RequestForResultDirect("svc", Payload("ping"),
-                                                    RetryPolicy{kCaseTimeout, 3});
+  auto first = client.node().RequestForResultDirect(Ask("svc", "ping"), RetryPolicy{kCaseTimeout, 3});
   ASSERT_TRUE(static_cast<bool>(first)) << first.error().message();
   EXPECT_EQ(Text(first.value()), "ping");
   EXPECT_EQ(first.value().kind, MessageKind::kReply);
   // 应答落在**派生出的**应答 topic 上——两侧从头到尾只说过 "svc" 这个服务名。
-  EXPECT_EQ(first.value().topic, "cfg.svc.response");
+  EXPECT_EQ(first.value().endpoint.topic, "cfg.svc.response");
 
-  auto second = client.node().RequestForResultDirect("svc", Payload("pong"),
-                                                     RetryPolicy{kCaseTimeout, 3});
+  auto second = client.node().RequestForResultDirect(Ask("svc", "pong"), RetryPolicy{kCaseTimeout, 3});
   ASSERT_TRUE(static_cast<bool>(second));
   EXPECT_EQ(Text(second.value()), "pong");
 
@@ -887,8 +902,7 @@ TEST(DdsNode, RetriesInTheResultPhaseReusingTheSameCorrelationId) {
   ASSERT_TRUE(static_cast<bool>(server.node().Start()));
   Service service(server.node(), "svc", /*skip=*/2);  // 前两条吞掉。
 
-  auto got = client.node().RequestForResultDirect("svc", Payload("retry"),
-                                                  RetryPolicy{100ms, 5});
+  auto got = client.node().RequestForResultDirect(Ask("svc", "retry"), RetryPolicy{100ms, 5});
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "retry");
 
@@ -919,8 +933,7 @@ TEST(DdsNode, ResentFramesAreByteIdenticalOnTheWire) {
   // 客户端往**派生出的**请求 topic 上发的每一帧原样收下。
   WireTap requests(fixture, "cfg.svc.request");
 
-  auto got = client.node().RequestForResultDirect("svc", Payload("same-bytes"),
-                                                  RetryPolicy{100ms, 5});
+  auto got = client.node().RequestForResultDirect(Ask("svc", "same-bytes"), RetryPolicy{100ms, 5});
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
 
   const auto frames = requests.Frames();
@@ -956,8 +969,7 @@ TEST(DdsNode, SuccessfulRequestSendsNothingBackAndTheLateDuplicateReplyIsDropped
     (void)server.node().Reply(request, Payload("done"));
   });
 
-  auto got = client.node().RequestForResultDirect("svc", Payload("once"),
-                                                  RetryPolicy{1000ms, 3});
+  auto got = client.node().RequestForResultDirect(Ask("svc", "once"), RetryPolicy{1000ms, 3});
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "done");
   ASSERT_EQ(seen->size(), 1u);
@@ -988,8 +1000,7 @@ TEST(DdsNode, RetryExhaustionReturnsTimeoutNotNotAccepted) {
   ASSERT_TRUE(static_cast<bool>(server.node().Start()));
   Service service(server.node(), "svc", /*skip=*/100);  // 永不回应。
 
-  auto got = client.node().RequestForResultDirect("svc", Payload("void"),
-                                                  RetryPolicy{60ms, 3});
+  auto got = client.node().RequestForResultDirect(Ask("svc", "void"), RetryPolicy{60ms, 3});
   ASSERT_FALSE(static_cast<bool>(got));
   // **kTimeout,不是 kNotAccepted**:后者的语义是"对端没有受理",而本模型根本不存在
   // 受理这一步。
@@ -1007,29 +1018,28 @@ TEST(DdsNode, RequestValidatesLifecycleRetryPolicyAndClientRegistration) {
   ASSERT_TRUE(static_cast<bool>(node.RegisterServices({"own"})));
 
   // 未启动:kClosed(先于一切)。
-  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("svc", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kClosed));
 
   ASSERT_TRUE(static_cast<bool>(node.Start()));
   // 策略非法:零时限(不接受"零即永不超时")与零次数(一帧都不发)。
-  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {0ms, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("svc", "x"), {0ms, 1}).error(),
             make_error_code(TransportErrc::kInvalidArgument));
-  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {kCaseTimeout, 0}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("svc", "x"), {kCaseTimeout, 0}).error(),
             make_error_code(TransportErrc::kInvalidArgument));
   // 负值同判:`timeout <= 0` 与 `max_attempts < 1`(两个字段都是有符号类型,负值进得来)。
-  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {-1ms, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("svc", "x"), {-1ms, 1}).error(),
             make_error_code(TransportErrc::kInvalidArgument));
-  EXPECT_EQ(node.RequestForResultDirect("svc", Payload("x"), {kCaseTimeout, -1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("svc", "x"), {kCaseTimeout, -1}).error(),
             make_error_code(TransportErrc::kInvalidArgument));
   // **服务名未注册为 Clients:查不到即 kConfiguration,不猜、不回落**。
-  EXPECT_EQ(node.RequestForResultDirect("other", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("other", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kConfiguration));
   // 只注册为服务端的服务名同样不行——那一侧没有发请求的 writer。
-  EXPECT_EQ(node.RequestForResultDirect("own", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("own", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kConfiguration));
   // 派生出的 topic **不是**服务名:拿它当第一参一样查不到(第一参永远是服务名,D8)。
-  EXPECT_EQ(node.RequestForResultDirect("cfg.svc.request", Payload("x"),
-                                        {kCaseTimeout, 1})
+  EXPECT_EQ(node.RequestForResultDirect(Ask("cfg.svc.request", "x"), {kCaseTimeout, 1})
                 .error(),
             make_error_code(TransportErrc::kConfiguration));
 }
@@ -1065,11 +1075,9 @@ TEST(DdsNode, CorrelationIdsOfDistinctNodesNeverCollide) {
   EXPECT_EQ(uuid_b.find('#'), std::string::npos);
 
   // 两条请求依次发(调用是阻塞的,故服务端看到的顺序确定)。
-  auto from_a = client_a.node().RequestForResultDirect("svc", Payload("a"),
-                                                       RetryPolicy{kCaseTimeout, 3});
+  auto from_a = client_a.node().RequestForResultDirect(Ask("svc", "a"), RetryPolicy{kCaseTimeout, 3});
   ASSERT_TRUE(static_cast<bool>(from_a)) << from_a.error().message();
-  auto from_b = client_b.node().RequestForResultDirect("svc", Payload("b"),
-                                                       RetryPolicy{kCaseTimeout, 3});
+  auto from_b = client_b.node().RequestForResultDirect(Ask("svc", "b"), RetryPolicy{kCaseTimeout, 3});
   ASSERT_TRUE(static_cast<bool>(from_b)) << from_b.error().message();
   EXPECT_EQ(Text(from_a.value()), "a");
   EXPECT_EQ(Text(from_b.value()), "b");
@@ -1126,14 +1134,12 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   Coro::Result<Message> reply_a = make_error_code(TransportErrc::kInternal);
   Coro::Result<Message> reply_b = make_error_code(TransportErrc::kInternal);
   auto task_a = Coro::makeTask([&] {
-    reply_a = client_a.node().RequestForResultDirect("svc", Payload("from-a"),
-                                                     RetryPolicy{2000ms, 1});
+    reply_a = client_a.node().RequestForResultDirect(Ask("svc", "from-a"), RetryPolicy{2000ms, 1});
   });
   // 等 A 的请求确实到了服务端,再让 B 发——这样"后到的先回"才是确定的,不靠调度巧合。
   ASSERT_TRUE(pumpFiberUntil([pending] { return pending->size() == 1; }));
   auto task_b = Coro::makeTask([&] {
-    reply_b = client_b.node().RequestForResultDirect("svc", Payload("from-b"),
-                                                     RetryPolicy{2000ms, 1});
+    reply_b = client_b.node().RequestForResultDirect(Ask("svc", "from-b"), RetryPolicy{2000ms, 1});
   });
   (void)task_a.get();
   (void)task_b.get();
@@ -1151,7 +1157,7 @@ TEST(DdsNode, SharedReplyTopicDiscriminatesClientsByConcreteCorrelationId) {
   svc.Join();
 }
 
-// ── 8. Reply:由 request.topic 反查自己注册的服务 + reply_to 交叉校验(D15)──
+// ── 8. Reply:由 request.endpoint.topic 反查自己注册的服务 + reply_to 交叉校验(D15)──
 
 TEST(DdsNode, ReplyResolvesTheServiceFromRequestTopicAndCrossChecksReplyTo) {
   Fixture fixture;
@@ -1160,10 +1166,10 @@ TEST(DdsNode, ReplyResolvesTheServiceFromRequestTopicAndCrossChecksReplyTo) {
   DdsNode& node = server.node();
   ASSERT_TRUE(static_cast<bool>(node.RegisterServices({"svc"})));
 
-  // 一条"收到的请求"。它的 `topic` 是**派生出的请求 topic**——`Reply` 的全部输入就是它,
-  // 反查走的是同一个派生规则。
+  // 一条"收到的请求"。**接收时 `endpoint` 是来源**(ADR-0020 D3),这里即**派生出的请求
+  // topic**——`Reply` 的全部输入就是它,反查走的是同一个派生规则。
   Message request;
-  request.topic = "cfg.svc.request";
+  request.endpoint = Endpoint::Topic("cfg.svc.request");
   request.kind = MessageKind::kRequest;
   request.correlation_id = "node-a#0";
 
@@ -1174,17 +1180,17 @@ TEST(DdsNode, ReplyResolvesTheServiceFromRequestTopicAndCrossChecksReplyTo) {
 
   // 本节点根本不服务这个 topic ⇒ kConfiguration。
   Message foreign = request;
-  foreign.topic = "other";
+  foreign.endpoint = Endpoint::Topic("other");
   EXPECT_EQ(node.Reply(foreign, Payload("r")).error(),
             make_error_code(TransportErrc::kConfiguration));
   // **服务名本身不是请求 topic**:反查同样落空。
   Message bare_name = request;
-  bare_name.topic = "svc";
+  bare_name.endpoint = Endpoint::Topic("svc");
   EXPECT_EQ(node.Reply(bare_name, Payload("r")).error(),
             make_error_code(TransportErrc::kConfiguration));
   // 应答 topic 也不是请求 topic——两个后缀不同,反查不会张冠李戴。
   Message reply_side = request;
-  reply_side.topic = "cfg.svc.response";
+  reply_side.endpoint = Endpoint::Topic("cfg.svc.response");
   EXPECT_EQ(node.Reply(reply_side, Payload("r")).error(),
             make_error_code(TransportErrc::kConfiguration));
 
@@ -1221,8 +1227,7 @@ TEST(DdsNode, FirstReplyIsNotLostBecauseWritersAreDeclaredAtStart) {
   Service service(server.node(), "svc");
 
   // 只发**一次**(max_attempts = 1):首答一旦丢,这条就直接 kTimeout。
-  auto got = client.node().RequestForResultDirect("svc", Payload("first"),
-                                                  RetryPolicy{1000ms, 1});
+  auto got = client.node().RequestForResultDirect(Ask("svc", "first"), RetryPolicy{1000ms, 1});
   ASSERT_TRUE(static_cast<bool>(got)) << got.error().message();
   EXPECT_EQ(Text(got.value()), "first");
   EXPECT_FALSE(server.transport().LastError())
@@ -1246,8 +1251,7 @@ TEST(DdsNode, CloseTerminatesInFlightRequestExactlyOnce) {
 
   Coro::Result<Message> outcome = make_error_code(TransportErrc::kInternal);
   auto caller = Coro::makeTask([&] {
-    outcome = client.node().RequestForResultDirect("svc", Payload("x"),
-                                                   RetryPolicy{5000ms, 1});
+    outcome = client.node().RequestForResultDirect(Ask("svc", "x"), RetryPolicy{5000ms, 1});
   });
   EXPECT_TRUE(pumpFiberUntil([&service] { return service.received() >= 1; }));
 
@@ -1278,16 +1282,16 @@ TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
   ASSERT_TRUE(static_cast<bool>(node.Start()));
 
   Message request;  // 一条"关闭之前收到的"请求,用来试 Reply。
-  request.topic = "cfg.svc.request";
+  request.endpoint = Endpoint::Topic("cfg.svc.request");
   request.kind = MessageKind::kRequest;
   request.correlation_id = "peer#0";
 
   ASSERT_TRUE(static_cast<bool>(node.Close()));
   node.WaitClosed();
 
-  EXPECT_EQ(node.Publish("pub", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("pub", "x")).error(),
             make_error_code(TransportErrc::kClosed));
-  EXPECT_EQ(node.RequestForResultDirect("cli", Payload("x"), {kCaseTimeout, 1}).error(),
+  EXPECT_EQ(node.RequestForResultDirect(Ask("cli", "x"), {kCaseTimeout, 1}).error(),
             make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Reply(request, Payload("r")).error(),
             make_error_code(TransportErrc::kClosed));
@@ -1297,13 +1301,13 @@ TEST(DdsNode, EveryInteractionAfterCloseEndsInClosed) {
   EXPECT_EQ(node.ServeRequests("svc").error(),
             make_error_code(TransportErrc::kClosed));
   // 未注册的 topic / 服务名也一样报 kClosed,不报 kConfiguration。
-  EXPECT_EQ(node.Publish("nope", Payload("x")).error(),
+  EXPECT_EQ(node.Publish(Payload("nope", "x")).error(),
             make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.Subscribe(std::string("nope"), MessageKind::kNotify).error(),
             make_error_code(TransportErrc::kClosed));
   EXPECT_EQ(node.ServeRequests("nope").error(),
             make_error_code(TransportErrc::kClosed));
-  EXPECT_EQ(node.RequestForResultDirect("nope", Payload("x"), {kCaseTimeout, 1})
+  EXPECT_EQ(node.RequestForResultDirect(Ask("nope", "x"), {kCaseTimeout, 1})
                 .error(),
             make_error_code(TransportErrc::kClosed));
   // `kAny` 也不例外:相位判定在 `kAny` 的跳过校验**之前**。
@@ -1367,7 +1371,7 @@ TEST(DdsNode, SubscribeRightAfterStartReceivesTheFirstMessage) {
   auto seen = std::make_shared<std::vector<std::string>>();
   Subscriber sub(std::move(ticket).value(),
                  [seen](const Message& msg) { seen->push_back(Text(msg)); });
-  ASSERT_TRUE(static_cast<bool>(node.Publish("loop", Payload("first"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "first"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
   ASSERT_EQ(seen->size(), 1u);
   EXPECT_EQ(seen->front(), "first");
@@ -1417,10 +1421,135 @@ TEST(DdsNode, UndecodableSampleIsDroppedAndDoesNotStopTheReadLoop) {
   ASSERT_TRUE(static_cast<bool>(peer.Publish("t", Bytes{0xFF, 0, 0, 0, 0})));
 
   // 坏样本之后的正常样本仍被解出并投递 ⇒ 前者只是被丢弃,没有带停读循环。
-  ASSERT_TRUE(static_cast<bool>(node.Publish("t", Payload("after"))));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("t", "after"))));
   EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1; }));
   ASSERT_EQ(seen->size(), 1u);
   EXPECT_EQ(seen->front(), "after") << "坏样本不得进入信箱";
   EXPECT_TRUE(node.IsRunning());
   peer.Shutdown();
+}
+
+// ── 9. ADR-0020:endpoint 的两向语义 + 两个新签名的负例 ───────────────────────
+
+// ⭐ **接收时 `endpoint` 是【来源】**(**D3**):DDS 路径上即**来源 topic**。
+//
+// topic **不上线缆**(D5),入站只能由 `Datagram.peer` 带出——`DecodeAndDispatch` 填的那
+// 一行同时也是 `Dispatcher` 键第一位的来源(**D4**),故这一条既是语义断言,也是分发能
+// 成立的前提。
+TEST(DdsNode, InboundEndpointCarriesTheSourceTopic) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a", "b"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"a", "b"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // `kAny` 订阅:两条 topic 的通知都落进同一个信箱,来源只能从 `endpoint` 分辨。
+  auto seen = std::make_shared<std::vector<Endpoint>>();
+  Subscriber sub(MustSubscribe(node, kAny, MessageKind::kNotify),
+                 [seen](const Message& msg) { seen->push_back(msg.endpoint); });
+
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("a", "x"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1u; }));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("b", "y"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2u; }));
+  ASSERT_EQ(seen->size(), 2u);
+
+  EXPECT_EQ((*seen)[0].kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ((*seen)[0].topic, "a");
+  EXPECT_EQ((*seen)[1].kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ((*seen)[1].topic, "b");
+  // DDS 没有 ip:port 这一维,来源只有 topic。
+  EXPECT_TRUE((*seen)[0].host.empty());
+  EXPECT_EQ((*seen)[0].port, 0);
+}
+
+// ⭐ **D6 的负例**:`Publish` 的目的地取自 `msg.endpoint` 且**须是 `kTopic`**。
+//
+// 三种非 `kTopic` 各返 `kInvalidArgument`,且**先于**注册校验——`kService("pub")` 即便
+// "pub" 已注册为 Publishers 也照拒:服务名不是 topic(**D5**),不做任何回落解释。
+TEST(DdsNode, PublishRejectsANonTopicEndpoint) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"pub"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  Message def = Payload("x");                       // kDefault(缺省)。
+  EXPECT_EQ(node.Publish(std::move(def)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message net = Payload("x");
+  net.endpoint = Endpoint::Net("127.0.0.1", 9000);  // kNet:DDS 上无从解释。
+  EXPECT_EQ(node.Publish(std::move(net)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message svc = Payload("x");
+  svc.endpoint = Endpoint::Service("pub");          // ★ 名字对得上,kind 不对 ⇒ 照拒。
+  EXPECT_EQ(node.Publish(std::move(svc)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  // 同一个名字换成 kTopic 就通——证明上面拒的确实是 `kind`,不是名字。
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("pub", "x"))));
+}
+
+// ⭐ **D6 的负例**:`RequestForResultDirect` 的服务名取自 `req.endpoint` 且**须是
+// `kService`**。传 `kTopic` 是最容易犯的错(服务名看着就像个 topic),故单列。
+TEST(DdsNode, RequestForResultDirectRejectsANonServiceEndpoint) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"cli"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  const RetryPolicy retry{kCaseTimeout, 1};
+
+  Message def = Payload("x");                      // kDefault(缺省)。
+  EXPECT_EQ(node.RequestForResultDirect(std::move(def), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message topic = Payload("x");
+  topic.endpoint = Endpoint::Topic("cli");         // ★ 名字对得上,kind 不对 ⇒ 照拒。
+  EXPECT_EQ(node.RequestForResultDirect(std::move(topic), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message net = Payload("x");
+  net.endpoint = Endpoint::Net("127.0.0.1", 9000);
+  EXPECT_EQ(node.RequestForResultDirect(std::move(net), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  // 换成 kService 就过了参数这一关——没有服务端应答,故收敛在 kTimeout 而不是
+  // kInvalidArgument,正说明它走到了交互本身。
+  EXPECT_EQ(node.RequestForResultDirect(Ask("cli", "x"), retry).error(),
+            make_error_code(TransportErrc::kTimeout));
+}
+
+// `Publish` 出站之后,收到的那一条其 `payload` 是**指进 `frame` 的视图**(ADR-0020 D2)
+// ——本条把"零拷贝"从 codec 单测一路验到节点的投递出口:`Dispatcher` 给订阅者发的是
+// **副本**,视图跨这次拷贝仍然成立(D2 的拷贝安全性论证)。
+TEST(DdsNode, DispatchedCopyKeepsAValidPayloadView) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  auto got = std::make_shared<std::vector<Message>>();
+  Subscriber sub(MustSubscribe(node, std::string("loop"), MessageKind::kNotify),
+                 [got](const Message& msg) { got->push_back(msg); });
+
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "zero-copy"))));
+  EXPECT_TRUE(pumpFiberUntil([got] { return got->size() == 1u; }));
+  ASSERT_EQ(got->size(), 1u);
+
+  const Message& msg = got->front();
+  EXPECT_FALSE(msg.frame.isEmpty()) << "DdsCodec 必填 frame(D2)";
+  EXPECT_TRUE(testutil::PayloadIsViewOfFrame(msg))
+      << "订阅者拿到的是副本,视图必须仍指进【同一块】frame";
+  EXPECT_EQ(Text(msg), "zero-copy");
 }
