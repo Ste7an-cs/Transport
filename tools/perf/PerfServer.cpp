@@ -95,20 +95,33 @@ class InboundCounter {
 
   /// @brief 结算:实收 / 丢失 / 首末样本间隔。
   ///
-  /// 丢失 = (最大序号 − 起始序号 + 1) − 实收。重发导致的重复会让它变负,**夹到 0**
-  /// ——重复不是丢失,报负数只会让读表的人困惑。
-  [[nodiscard]] CtrlReply Settle(CtrlCommand command) const {
+  /// 丢失 = **窗口条数** − 实收。窗口条数取两者的较大值:
+  /// ① 本侧观测到的序号跨度 `最大序号 − 起始序号 + 1`;
+  /// ② 发起端在 `kEnd` 里报的入队条数(`expected`)。
+  ///
+  /// 只用 ① 会漏掉**窗口末尾那一段根本没上线的条目**(它们连序号都没到过接收侧,
+  /// 看起来就像窗口本来就那么短);加上 ② 之后,那一段才落进 `Lost Samples` 而不是
+  /// 只体现为 `Sent` 与 `Rec` 两列的差。两者都出自序号,只是窗口右端由控制信道给出
+  /// ——控制信道本就是 **D4** 指定的协调与结果回传通道。
+  ///
+  /// 重发导致的重复会让差值变负,**夹到 0**——重复不是丢失,报负数只会让读表的人困惑。
+  [[nodiscard]] CtrlReply Settle(CtrlCommand command,
+                                 std::uint32_t expected) const {
     CtrlReply reply;
     reply.command = command;
     reply.received = received_;
+    std::uint64_t span = expected;
     if (seen_) {
-      const std::uint64_t span =
+      const std::uint64_t observed =
           static_cast<std::uint64_t>(max_seq_ - start_seq_) + 1;
-      reply.lost = span > received_ ? span - received_ : 0;
+      if (observed > span) {
+        span = observed;
+      }
       reply.rec_time_us = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(last_ - first_)
               .count());
     }
+    reply.lost = span > received_ ? span - received_ : 0;
     return reply;
   }
 
@@ -154,7 +167,7 @@ CtrlReply HandleControl(const CtrlRequest& request, RunSetup* setup,
       break;
     }
     case CtrlCommand::kEnd:
-      return counter->Settle(request.command);
+      return counter->Settle(request.command, request.expected);
     case CtrlCommand::kBye:
       *stop = true;
       break;
