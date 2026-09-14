@@ -56,7 +56,8 @@ SOURCES += \
     $$TRANSPORT_ROOT/tests/serial_transport_test.cpp \
     $$TRANSPORT_ROOT/tests/node_base_lifecycle_test.cpp \
     $$TRANSPORT_ROOT/tests/protocol_node_test.cpp \
-    $$TRANSPORT_ROOT/tests/protocol_node_tcp_e2e_test.cpp
+    $$TRANSPORT_ROOT/tests/protocol_node_tcp_e2e_test.cpp \
+    $$TRANSPORT_ROOT/tests/protocol_node_endpoint_test.cpp
 
 # —— 以下两个 TCP 用例继续停摆，各有明确的待决依据（#181 的判定）——
 #   tcp_client_reconfig_test（`ApplyConfig` 热更新的去留待 ADR-0011 D11 裁决）

@@ -118,6 +118,9 @@ if(TRANSPORT_BUILD_TESTS)
     tests/node_base_lifecycle_test.cpp
     tests/protocol_node_test.cpp
     tests/protocol_node_tcp_e2e_test.cpp
+    # ADR-0020 D3:入站 `endpoint` = 发送方。"发送方地址"只有真 socket 给得出来,
+    # 故本组用例建在真实 UDP 回环上(#247)。
+    tests/protocol_node_endpoint_test.cpp
     # —— 以下两个 TCP 用例继续停摆，各有明确的待决依据（#181 的判定）——
     #   tcp_client_reconfig_test（`ApplyConfig` 热更新的去留待 ADR-0011 D11 裁决）
     #   tcp_server_accept_test（`TcpServer` 本轮不做，ADR-0011 D10）

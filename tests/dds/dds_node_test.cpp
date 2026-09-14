@@ -1428,3 +1428,128 @@ TEST(DdsNode, UndecodableSampleIsDroppedAndDoesNotStopTheReadLoop) {
   EXPECT_TRUE(node.IsRunning());
   peer.Shutdown();
 }
+
+// ── 9. ADR-0020:endpoint 的两向语义 + 两个新签名的负例 ───────────────────────
+
+// ⭐ **接收时 `endpoint` 是【来源】**(**D3**):DDS 路径上即**来源 topic**。
+//
+// topic **不上线缆**(D5),入站只能由 `Datagram.peer` 带出——`DecodeAndDispatch` 填的那
+// 一行同时也是 `Dispatcher` 键第一位的来源(**D4**),故这一条既是语义断言,也是分发能
+// 成立的前提。
+TEST(DdsNode, InboundEndpointCarriesTheSourceTopic) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"a", "b"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"a", "b"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  // `kAny` 订阅:两条 topic 的通知都落进同一个信箱,来源只能从 `endpoint` 分辨。
+  auto seen = std::make_shared<std::vector<Endpoint>>();
+  Subscriber sub(MustSubscribe(node, kAny, MessageKind::kNotify),
+                 [seen](const Message& msg) { seen->push_back(msg.endpoint); });
+
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("a", "x"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 1u; }));
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("b", "y"))));
+  EXPECT_TRUE(pumpFiberUntil([seen] { return seen->size() == 2u; }));
+  ASSERT_EQ(seen->size(), 2u);
+
+  EXPECT_EQ((*seen)[0].kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ((*seen)[0].topic, "a");
+  EXPECT_EQ((*seen)[1].kind, Endpoint::Kind::kTopic);
+  EXPECT_EQ((*seen)[1].topic, "b");
+  // DDS 没有 ip:port 这一维,来源只有 topic。
+  EXPECT_TRUE((*seen)[0].host.empty());
+  EXPECT_EQ((*seen)[0].port, 0);
+}
+
+// ⭐ **D6 的负例**:`Publish` 的目的地取自 `msg.endpoint` 且**须是 `kTopic`**。
+//
+// 三种非 `kTopic` 各返 `kInvalidArgument`,且**先于**注册校验——`kService("pub")` 即便
+// "pub" 已注册为 Publishers 也照拒:服务名不是 topic(**D5**),不做任何回落解释。
+TEST(DdsNode, PublishRejectsANonTopicEndpoint) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"pub"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  Message def = Payload("x");                       // kDefault(缺省)。
+  EXPECT_EQ(node.Publish(std::move(def)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message net = Payload("x");
+  net.endpoint = Endpoint::Net("127.0.0.1", 9000);  // kNet:DDS 上无从解释。
+  EXPECT_EQ(node.Publish(std::move(net)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message svc = Payload("x");
+  svc.endpoint = Endpoint::Service("pub");          // ★ 名字对得上,kind 不对 ⇒ 照拒。
+  EXPECT_EQ(node.Publish(std::move(svc)).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  // 同一个名字换成 kTopic 就通——证明上面拒的确实是 `kind`,不是名字。
+  EXPECT_TRUE(static_cast<bool>(node.Publish(Payload("pub", "x"))));
+}
+
+// ⭐ **D6 的负例**:`RequestForResultDirect` 的服务名取自 `req.endpoint` 且**须是
+// `kService`**。传 `kTopic` 是最容易犯的错(服务名看着就像个 topic),故单列。
+TEST(DdsNode, RequestForResultDirectRejectsANonServiceEndpoint) {
+  Fixture fixture;
+  Host host(fixture, "node-a");
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterClients({"cli"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  const RetryPolicy retry{kCaseTimeout, 1};
+
+  Message def = Payload("x");                      // kDefault(缺省)。
+  EXPECT_EQ(node.RequestForResultDirect(std::move(def), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message topic = Payload("x");
+  topic.endpoint = Endpoint::Topic("cli");         // ★ 名字对得上,kind 不对 ⇒ 照拒。
+  EXPECT_EQ(node.RequestForResultDirect(std::move(topic), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  Message net = Payload("x");
+  net.endpoint = Endpoint::Net("127.0.0.1", 9000);
+  EXPECT_EQ(node.RequestForResultDirect(std::move(net), retry).error(),
+            make_error_code(TransportErrc::kInvalidArgument));
+
+  // 换成 kService 就过了参数这一关——没有服务端应答,故收敛在 kTimeout 而不是
+  // kInvalidArgument,正说明它走到了交互本身。
+  EXPECT_EQ(node.RequestForResultDirect(Ask("cli", "x"), retry).error(),
+            make_error_code(TransportErrc::kTimeout));
+}
+
+// `Publish` 出站之后,收到的那一条其 `payload` 是**指进 `frame` 的视图**(ADR-0020 D2)
+// ——本条把"零拷贝"从 codec 单测一路验到节点的投递出口:`Dispatcher` 给订阅者发的是
+// **副本**,视图跨这次拷贝仍然成立(D2 的拷贝安全性论证)。
+TEST(DdsNode, DispatchedCopyKeepsAValidPayloadView) {
+  Fixture fixture;
+  Host host(fixture);
+  host.StartTransport();
+  DdsNode& node = host.node();
+  ASSERT_TRUE(static_cast<bool>(node.RegisterPublishers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.RegisterSubscribers({"loop"})));
+  ASSERT_TRUE(static_cast<bool>(node.Start()));
+
+  auto got = std::make_shared<std::vector<Message>>();
+  Subscriber sub(MustSubscribe(node, std::string("loop"), MessageKind::kNotify),
+                 [got](const Message& msg) { got->push_back(msg); });
+
+  ASSERT_TRUE(static_cast<bool>(node.Publish(Payload("loop", "zero-copy"))));
+  EXPECT_TRUE(pumpFiberUntil([got] { return got->size() == 1u; }));
+  ASSERT_EQ(got->size(), 1u);
+
+  const Message& msg = got->front();
+  EXPECT_FALSE(msg.frame.isEmpty()) << "DdsCodec 必填 frame(D2)";
+  EXPECT_TRUE(testutil::PayloadIsViewOfFrame(msg))
+      << "订阅者拿到的是副本,视图必须仍指进【同一块】frame";
+  EXPECT_EQ(Text(msg), "zero-copy");
+}
