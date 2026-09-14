@@ -52,6 +52,8 @@
 
   **`ProtocolNode` 收包时开始填它**（`msg.endpoint = datagram.peer`）——这是白拿的改进：UDP 的发送方地址首次对业务层可见。
 
+  > **⚠ 本条只规定了入站，出站半边是本 ADR 的缺口（由 ADR-0021 补齐，2026-09-11）。** D3 定义了"发送时是目的地"，却没规定 `ProtocolNode::EncodeAndWrite` 必须把它交给传输——该方法当时仍把目的地写死成 `Endpoint::Default()`。**于是字段有了、`UdpTransport` 的按报文寻址能力也早就有（ADR-0003 D12），中间这一段却断着**，UDP 一对多在 node 层无从表达。**ADR-0021 补上出站半边。**
+
 - **D4（`Dispatcher` 的键取 `endpoint.topic`）：** `DdsNode` 的键提取由 `msg.topic` 改为 `msg.endpoint.topic`，其余两位不变。**不给 `Endpoint` 加 `operator==` 与 `std::hash`**——键只需要那个字符串，为此让整个 `Endpoint` 可哈希是多余的负担。
 
 - **D5（`Endpoint` 增加 `kService`）：** 请求-响应的**服务名不是 topic**——它派生出 `cfg.<名>.request` 与 `cfg.<名>.response` 两个 topic（ADR-0013 **D6**）。塞进 `kTopic` 会把 D6 刻意分开的两个概念混回去。
