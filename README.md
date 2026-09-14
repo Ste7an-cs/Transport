@@ -96,8 +96,8 @@ void RunApplication() {                // ← 身处 fiber 内（见上一节）
   if (!node.Start()) return;
 
   Message req;
-  req.payload    = {0x01, 0x02};
-  req.message_id = 0x10;               // 命令码由调用方给
+  req.payload    = QByteArray::fromHex("0102");   // payload 是 QByteArray（ADR-0020）
+  req.message_id = 0x10;                          // 命令码由调用方给
   auto rsp = node.RequestForResponse(std::move(req), RetryPolicy{2000ms, 3});
   if (rsp) { /* 用 rsp.value().payload */ }
 
@@ -202,7 +202,6 @@ DdsTransport transport(cfg);
 |---|---|---|---|
 | `SystemCodec` | **有状态·流式** | TCP / 串口 | 外部协议完整帧：头标志 + 帧类型 + CRC + 长度。跨切片拼帧，坏帧逐字节重同步。 |
 | `SystemDatagramCodec` | 无状态·报文 | UDP | 同一套帧格式的**报文版**：只解本报文内的整帧，残留直接丢弃，**零跨报文状态**（多对端安全）。 |
-| `LengthFieldCodec` | 有状态·流式 | TCP / 串口 | 通用「固定 header + 长度字段」分帧，`payload` 透传。不解释帧内语义。 |
 | `DatagramCodec` | 无状态·报文 | UDP | 直通：整段字节即一条 `kOneway` 消息。 |
 | `DdsCodec` | 无状态 | DDS | 每 sample 一条完整消息，携带 `kind` / `correlation_id` / `reply_to`。 |
 
@@ -253,7 +252,7 @@ ProtocolNode node(transport, std::make_unique<SystemCodec>(), ncfg);
 
 ```cpp
 Message msg;
-msg.payload = {0x01, 0x02};
+msg.payload = QByteArray::fromHex("0102");
 auto ok = node.Send(std::move(msg));      // 不登记任何订阅
 ```
 
@@ -445,7 +444,8 @@ DdsNode node(transport, std::make_unique<DdsCodec>(), DdsNodeConfig{});
 
 ```cpp
 // —— 客户端 ——
-auto result = node.RequestForResultDirect("get", req, RetryPolicy{2000ms, 3});
+req.endpoint = Endpoint::Service("get");        // ★ 服务名放进 endpoint（ADR-0020）
+auto result = node.RequestForResultDirect(req, RetryPolicy{2000ms, 3});
 if (result) { /* 用 result.value().payload */ }
 
 // —— 服务端 ——
@@ -464,7 +464,8 @@ auto worker = Coro::makeTask([&] {
 (void)worker.get();                       // 宿主自己 join
 
 // —— 发布-订阅 ——
-(void)node.Publish("telemetry", msg);
+msg.endpoint = Endpoint::Topic("telemetry");    // ★ 目的 topic 放进 endpoint
+(void)node.Publish(msg);
 
 auto sub = node.Subscribe(DdsNode::TopicKey{"telemetry"},   // 两个键都是 DdsNode 的嵌套别名
                           DdsNode::KindKey{MessageKind::kNotify});
@@ -533,10 +534,10 @@ cfg.provider = "mine";
 
 ```cpp
 struct Message {
-  std::vector<uint8_t> payload;   // 应用字节，框架不解读其语义
-  std::string topic;              // 操作/通道名（DDS = topic）
-  std::string source;             // 来源标识，【由框架填】：UDP = "ip:port"、DDS = topic
-  int64_t     timestamp = 0;      // 预留，本库未用
+  QByteArray frame;               // 【接收】完整一帧（帧头 → payload 末）；【发送】空，Encode 忽略
+  QByteArray payload;             // 【发送】用户数据（拥有）；【接收】指进 frame 的视图（不拥有）
+  Endpoint   endpoint;            // 【发送】目的地；【接收】来源。语义与 Datagram::peer 逐字相同
+  int64_t    timestamp = 0;       // 预留，本库未用
 
   // ── DDS 路径（DdsCodec 上线缆）──
   MessageKind kind = MessageKind::kOneway;
@@ -552,6 +553,39 @@ struct Message {
 ```
 
 **调用方只需要填 `payload` 与 `message_id`**（DDS 路径则是 `payload`）；标了【框架盖】的字段由节点填，手填会被覆盖。**唯一的例外是 `Send` 的 `session_id`**——它原样透传（ADR-0019），这正是服务端能回应答帧的依据。
+
+### ⚠ 接收时 `payload` 是视图，有生命周期
+
+接收路径上 `payload` **不拥有内存**——它是 `frame` 里那段字节的视图（ADR-0020）。由此换来两件事：**你能拿到原始整帧**（透传转发、按原字节重发、排障），且 **payload 不产生第二次拷贝**。
+
+代价是 **payload 只在其所属 `Message` 存活、且 `frame` 未被改写期间有效**。下列动作会让它失效，**而且不会报错**：
+
+| 动作 | 后果 |
+|---|---|
+| `msg.frame.clear()`，或对 `frame` 写入（触发 COW 分离） | payload 悬垂 |
+| 把 `payload` 拷出来单独保存，让 `Message` 析构 | 同上 |
+| 跨线程 / 跨 fiber 传 `payload` 而不带 `Message` | 同上 |
+
+需要让 payload 活得更久，用 **`OwnedPayload()`** 取一份拥有型深拷贝：
+
+```cpp
+// 在 Message 存活的作用域内用完 —— 直接用，零拷贝
+for (;;) {
+  auto m = Coro::await(ticket.mailbox());
+  if (!m) break;
+  Handle(m.value().payload);                 // ✔ m 还活着
+}
+
+// 要存起来 / 跨线程 / 从函数返回 —— 必须拷
+backlog.push_back(m.value().OwnedPayload()); // ✔
+return m.value().payload;                    // ✘ m 在此析构，返回的是悬垂视图
+```
+
+> **判据是「需要活得比 `Message` 久才调」，不是「不确定就调」。** 处处防御性地调 `OwnedPayload()`，零拷贝收益会全部消失，而帧头与 CRC 的额外拷贝还在——**那比不做这套还差**。
+
+对 `payload` **写入**反而是安全的：`QByteArray` 在非 const 访问时自行深拷贝转为拥有型。危险只在读侧。
+
+> **空 payload 是个边界**：Qt 的 `fromRawData(p, 0)` 返回的块不在 `frame` 内，故「payload 是 frame 的视图」这句话只对**非空** payload 成立。不影响正确性。
 
 `MessageKind`（DDS）：`kOneway` / `kRequest` / `kReply` / `kFeedback` / `kNotify`。
 `FrameType`（外部协议）：`kCommand` / `kResponse` / `kResult` / `kState` / `kHeartbeat`——**枚举值是占位的**，真实对接时改成协议规定的字节值。
@@ -650,7 +684,18 @@ class MyCodec : public transport::ICodec {
 };
 ```
 
-三条纪律：
+**`Decode` 还必须填 `frame` 并建立 payload 视图**（ADR-0020，**必填**）：
+
+```cpp
+msg.frame   = QByteArray(reinterpret_cast<const char*>(frame_begin), frame_len);
+msg.payload = QByteArray::fromRawData(msg.frame.constData() + payload_offset, payload_len);
+```
+
+> ⚠ **顺序是硬要求**：视图必须建在 `msg.frame` 这个**最终的** `QByteArray` 上。若先在局部变量上建视图、再把 frame 拷进 `Message`，视图会指向局部变量的数据块——**这是静默的内存错误，功能测试可能照样全绿**。
+
+**注意两层用不同的字节容器**：`Message`（node / codec 层）用 `QByteArray`，而 `Datagram`（传输层）仍用 `std::vector<uint8_t>`——故 `Encode` 的返回类型是 `std::vector<uint8_t>`，与 `Datagram::bytes` 对齐。转换只发生在 codec 这一层。
+
+四条纪律：
 
 1. **`Decode` 扫不出完整帧时返回空成功，不是错误**——字节流本来就会切在半帧处。
 2. **返回错误意味着"这段字节坏了"**，节点会静默丢弃并继续读；坏帧的重同步（前移重扫）由 codec 自己负责。

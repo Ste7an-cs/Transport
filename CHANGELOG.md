@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+### 💥 破坏性：`Message` 重构——增加 `frame`、`payload` 接收时为其视图、`topic`+`source` 合并为 `endpoint`（ADR-0020，#247）
+
+- **新增 `frame`**（`QByteArray`）：接收时存**完整一帧**（帧头 → payload 末），发送时为空、`Encode` 忽略。宿主由此首次能拿到原始整帧——**透传转发、按原字节重发、排障**（框架无可观测面之后，这是拿到第一手现场的唯一途径）。
+- **`payload` 改为 `QByteArray`**：发送时拥有用户数据；**接收时是指进 `frame` 的视图**（`fromRawData`），不产生第二次拷贝。
+  - **为什么只能用 `QByteArray`**：`std::vector` 拥有内存、无法指向别处，而 C++17 没有 `std::span`；`Message` 又是**按值**在队列里搬运、且 `Dispatcher` 给每个订阅者各发一份副本。`QByteArray` 的隐式共享 + `fromRawData` 是这三条约束下唯一可行的载体。
+  - **拷贝/移动是安全的**：`QByteArray` 的数据块在堆上，拷贝只是引用计数加一、移动只转移 d 指针，**块地址都不变**。
+- **⚠ 接收时 `payload` 有生命周期**：只在**所属 `Message` 存活、且 `frame` 未被改写**期间有效。`frame.clear()`、对 `frame` 写入（COW 分离）、把 `payload` 单独拷走让 `Message` 析构——都会让它悬垂，**而且不会报错**。需要活得更久用 **`OwnedPayload()`** 取深拷贝。
+  - **判据是「需要活得比 `Message` 久才调」，不是「不确定就调」**——处处防御性拷贝会让零拷贝收益全部消失，而帧头与 CRC 的额外拷贝还在，**那比不做这套还差**。
+  - **空 payload 是例外**：Qt 的 `fromRawData(p, 0)` 返回的块不在 `frame` 内，故"payload 是 frame 的视图"只对非空 payload 成立。
+- **诚实记一笔：本次改动不省内存，反而多拷。** 现状是把 payload 拷出来一次；改后是把整帧（含帧头与 CRC）拷进 `frame` 一次、payload 做视图零次。买到的是"拿到原始帧"与"payload 无第二次拷贝"，不是内存总量的节省。
+- **`topic` + `source` 合并为 `endpoint`**（`Endpoint`）：语义与 `Datagram::peer` **逐字相同**——发送时是目的地，接收时是来源。
+  - **`ProtocolNode` 开始填它**：UDP 收到的报文，**发送方地址首次对业务层可见**（此前两个字段它一个都不填）。
+- **`Endpoint` 增 `kService` 与 `Endpoint::Service(name)`**：请求-响应的服务名**不是 topic**（它派生出两个 topic，ADR-0013 D6），由类型系统守住这条区分。
+- **💥 `DdsNode` 两个签名变化**：`Publish(topic, msg)` → `Publish(msg)`；`RequestForResultDirect(服务名, req, retry)` → `RequestForResultDirect(req, retry)`。寻址一律取自 `msg.endpoint`，类型不符返 `kInvalidArgument`。
+  - **`ServeRequests(服务名)` 与 `Subscribe(TopicKey, KindKey)` 签名不变**——它们不接收 `Message`、没有 `endpoint` 可取，且 `Subscribe` 的第一参是**订阅键**（可为 `kAny`）而非目的地。
+- **`ICodec::Decode` 契约扩大**：五个 codec **必须**填 `frame` 并建立 payload 视图。**视图必须建在 `msg.frame` 这个最终的 `QByteArray` 上**——先在局部变量上建再拷进 `Message`，视图会指向局部变量的块，**这是静默的内存错误**。
+  - 变异验证：把该顺序改错后 **11 条用例变红**，其中三条是**既有功能用例**（`ConcurrentRequestsAreCorrelatedIndependently` 等）——悬垂会真的破坏交互行为。
+- **两层用不同的字节容器**：`Message`（node / codec 层）用 `QByteArray`，`Datagram`（传输层）仍用 `std::vector<uint8_t>`，故 `Encode` 的返回类型不变。转换只发生在 codec 这一层。
+- 用例 258 → 287。
+
+### 💥 破坏性：删除 `LengthFieldCodec`
+
+- 产品代码**零消费者**，仅存其自身、其测试与两套构建清单。删除 `include/transport/codec/LengthFieldCodec.hpp`、`src/codec/LengthFieldCodec.cpp`、`tests/codec/length_field_codec_test.cpp`（7 条用例），两套构建清单同步。
+- 通用「固定 header + 长度字段」分帧的需求，由宿主按 `ICodec` 自行实现即可——README 的「扩展：自定义 codec」一节给了骨架。
+
+### 修正
+
+- `tests/codec/dds_codec_test.cpp` **此前两套构建都未登记**（文件存在，也不在"停摆用例"注释清单里，属漏登记）。ADR-0020 要求五个 codec 全部必填 `frame`，`DdsCodec` 需有直接用例守住，故补进两套构建。
+
 ### 💥 破坏性：`ProtocolNode::Send` 不再盖 `session_id`，改由调用方填（ADR-0019，#244）
 
 - **`Send` 保留的盖章只剩两项**：`protocol_id`（取自节点配置）与 `frm_type`（仅当调用方留 `kUnknown` 时补 `kCommand`）。`session_id` **原样透传**。

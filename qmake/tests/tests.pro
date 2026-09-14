@@ -70,7 +70,6 @@ SOURCES += \
 #   handler_loop_test（HandlerLoop 已随 ADR-0009 废止内建 handler 通道而删除）
 SOURCES += \
     $$TRANSPORT_ROOT/tests/codec/message_test.cpp \
-    $$TRANSPORT_ROOT/tests/codec/length_field_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/codec/system_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/codec/datagram_codec_test.cpp \
     $$TRANSPORT_ROOT/tests/codec/system_datagram_codec_test.cpp \

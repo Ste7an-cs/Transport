@@ -112,7 +112,7 @@
 |---|---|---|---|
 | **CSC_CORE** | `core/` | `TransportErrc`、`Message`、`Endpoint`、**`Dispatcher`**、`Datagram`、`LifecycleState` / `LinkState` | RT_ERROR、RT_DATA_MESSAGE、RT_DESIGN_005 |
 | **CSC_IO** | `io/`（`tcp/`·`udp/`·`serial/`·`dds/`） | `ITransport`（含链路可用性）、`Tcp/Udp/Serial/DdsTransport`、`IDdsProvider`；`TcpServer`（本轮不做，ADR-0011 D10） | RT_TRANSPORT、RT_TCP_RECONNECT/RECONFIG、RT_IF_*、RT_IN_INTERFACE_002/003 |
-| **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`DatagramCodec`、`DdsCodec`、`LengthFieldCodec` | RT_CODEC、RT_IF_SYSFRAME |
+| **CSC_CODEC** | `codec/` | `ICodec`、`SystemCodec`、`SystemDatagramCodec`、`DatagramCodec`、`DdsCodec` | RT_CODEC、RT_IF_SYSFRAME |
 | **CSC_NODE** | `node/` | `NodeBase`、`ProtocolNode`、**`DdsNode`**（三者**均在编译面内**）（`Dispatcher` 实际位于 `core/`，归 **CSC_CORE**，此处不再重复登记） | RT_NODE、RT_REQUEST、RT_INBOUND、RT_LIFECYCLE、RT_DESIGN_003/008 |
 
 #### 4.1.1 核心原语部件（CSC_CORE）
@@ -139,7 +139,7 @@
 #### 4.1.3 编解码层部件（CSC_CODEC）
 
 - **用途**：逻辑 `Message` ↔ 线缆字节的分帧、序列化、校验、重同步；应用可提供并装配的公共扩展点。响应 RT_CODEC_*、RT_IF_SYSFRAME。
-- **主要内容**：接口 `ICodec`（`Encode` 一对一 / `Decode` 0..N）；实现 `SystemCodec`（外部协议流式，占位帧常量）、`DatagramCodec`（报文式保边界）、`DdsCodec`（DDS 元数据，无状态并发）、`LengthFieldCodec`（长度字段分帧基元）。
+- **主要内容**：接口 `ICodec`（`Encode` 一对一 / `Decode` 0..N）；实现 `SystemCodec`（外部协议流式，占位帧常量）、`SystemDatagramCodec`（同帧格式的无状态报文版）、`DatagramCodec`（报文式保边界）、`DdsCodec`（DDS 元数据，无状态并发）。**`Decode` 必须填 `frame` 并建立 payload 视图**（ADR-0020 D2）。
 - **关系与结构**：依赖 CSC_CORE（`Message`/`Coro::Result`）；被 CSC_NODE 组合（node 持 `unique_ptr<ICodec>`）。结构简单，无独立类图，详见 §5.5。
 
 #### 4.1.4 交互层部件（CSC_NODE）
@@ -971,7 +971,7 @@ LinkState TcpTransport::CurrentLinkState() const {
 
 **设计约束**：`Encode` 一对一；`Decode` 半包返回空、粘包返回多条；分帧错误 `kFrame`、语义错误 `kCodec`。**不设重置操作**（ADR-0004 D4 撤销）——透明重连后残尾与新链路首字节拼成的错帧，由既有校验与重同步处置（报坏帧、计入坏帧计数后恢复）。
 
-**软件逻辑**：`SystemCodec`（外部协议流式，占位帧常量 TBD-003，跨切片拼帧 + 重同步）；`DatagramCodec`（报文式保边界）；`DdsCodec`（kind/correlation_id/reply_to 元数据，无状态）；`LengthFieldCodec`（长度字段分帧基元）。
+**软件逻辑**：`SystemCodec`（外部协议流式，占位帧常量 TBD-003，跨切片拼帧 + 重同步）；`DatagramCodec`（报文式保边界）；`DdsCodec`（kind/correlation_id/reply_to 元数据，无状态）。
 
 **执行时序/数据流**：见 §4.2.3（Decode 在读循环、Encode 在出站）。
 

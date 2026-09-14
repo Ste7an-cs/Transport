@@ -71,7 +71,6 @@ classDiagram
     }
     class SystemCodec
     class DatagramCodec
-    class LengthFieldCodec
     class DdsCodec
 
     ITransport <|.. TcpTransport
@@ -80,7 +79,6 @@ classDiagram
     ITransport <|.. DdsTransport
     ICodec <|.. SystemCodec
     ICodec <|.. DatagramCodec
-    ICodec <|.. LengthFieldCodec
     ICodec <|.. DdsCodec
 
     ProtocolNode ..> ITransport : 借用（宿主启停）

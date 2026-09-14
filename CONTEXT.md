@@ -15,8 +15,9 @@
 
 ## 数据
 
-- **逻辑消息** —— 编解码边界上的消息语义：`payload` + 当前协议所需的类别、关联、来源和目的信息；不要求 TCP/UDP/串口/DDS 共用一个包含所有字段的 C++ 结构。
-- **Endpoint** —— 中立寻址值类型:`Default` / `Net(ip,port)` / `Topic(name)`。
+- **逻辑消息** —— 编解码边界上的消息语义:`payload` + **原始整帧**(`frame`)+ **寻址端点**(`endpoint`,发送时是目的地、接收时是来源,与 `Datagram::peer` 同形)+ 当前协议所需的类别与关联信息;不要求 TCP/UDP/串口/DDS 共用一个包含所有字段的 C++ 结构。
+- **payload 视图** —— **[target]** 接收路径上 `payload` **不拥有内存**,它是 `frame` 里那段字节的视图(ADR-0020)。换来"能拿到原始整帧"与"payload 不产生第二次拷贝";代价是**其有效期绑在所属 `Message` 上**——`Message` 析构、或 `frame` 被改写,视图即失效,且**是静默的内存错误**。需要活得更久者取 `OwnedPayload()` 的深拷贝。判据是「**需要活得更久才调**」,不是「不确定就调」——处处防御性拷贝会让零拷贝收益全部消失。**空 payload 是例外**:其视图不指进 `frame`。
+- **Endpoint** —— 中立寻址值类型:`Default` / `Net(ip,port)` / `Topic(name)` / `Service(name)`。**`Service` 与 `Topic` 刻意分开**(ADR-0020 D5):请求-响应的服务名不是 topic,它派生出 `cfg.<名>.request` 与 `cfg.<名>.response` **两个** topic(ADR-0013 D6),由类型系统守住这条区分。
 - **Datagram** —— **[target]** 传输层数据面的**唯一**载荷类型 `{bytes, peer}`,读写共用:`AsyncRead()` 交出的队列里 `peer` 是**发送方**,`AsyncWrite()` 送入的 `peer` 是**目的地**——方向由使用它的接口决定,不需要两个结构相同的类型来编码(原 `SendUnit` 已于 ADR-0008 D8 合并进本类型)。UDP/DDS 一次一完整报文(`peer` 可变);TCP/串口一次一任意字节切片(`peer` 恒为对端)。
 - **错误类别** —— 用户可机器判别的稳定失败语义：`InvalidArgument`、`InvalidState`、`Configuration`、`Connection`、`Closed`、`Timeout`、`Cancelled`、`Io`、`Frame`、`Codec`、`ResourceExhausted`、`Unsupported`、`Internal`；可附带诊断文本。具体错误码、枚举和结果载体属于 API/设计说明，调用方不得依靠解析文本前缀分类。
 - **匹配键（Key）** —— 请求↔应答配对键。**[target]** 不再是压成单值的机器键,而是 `Dispatcher` 的**订阅模式**:逐字段给出约束或 `kAny`(外部协议 = `(session_id, message_id, frm_type)`;DDS = `correlation_id`)。见「按键分配」。

@@ -61,7 +61,6 @@ add_library(transport STATIC
   src/io/udp/UdpTransport.cpp
   src/io/tcp/TcpTransport.cpp
   src/io/serial/SerialTransport.cpp
-  src/codec/LengthFieldCodec.cpp
   src/codec/SystemCodec.cpp
   # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内。DdsTransport 与 provider 注册表随
   # #203 的双队列重写回到编译面;DdsNode 随 #204 的整体重写(注册接口 / Dispatcher 键 /
@@ -131,7 +130,6 @@ if(TRANSPORT_BUILD_TESTS)
     #   shared_completion_test（SharedCompletion 已随手搓同步件一并删除）
     #   handler_loop_test（HandlerLoop 已随 ADR-0009 废止内建 handler 通道而删除）
     tests/codec/message_test.cpp
-    tests/codec/length_field_codec_test.cpp
     tests/codec/system_codec_test.cpp
     tests/codec/datagram_codec_test.cpp
     tests/codec/system_datagram_codec_test.cpp

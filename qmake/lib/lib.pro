@@ -31,7 +31,6 @@ SOURCES += \
     $$TRANSPORT_ROOT/src/io/udp/UdpTransport.cpp \
     $$TRANSPORT_ROOT/src/io/tcp/TcpTransport.cpp \
     $$TRANSPORT_ROOT/src/io/serial/SerialTransport.cpp \
-    $$TRANSPORT_ROOT/src/codec/LengthFieldCodec.cpp \
     $$TRANSPORT_ROOT/src/codec/SystemCodec.cpp
 
 # FakeDdsProvider 零 FastDDS 依赖,恒在编译面内。DdsTransport 与 provider 注册表随
