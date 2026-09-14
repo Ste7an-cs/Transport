@@ -78,6 +78,28 @@
 
   > **不做"`frame` 非空则原样重发"**：那会让同一个 `Send` 有两种行为，且与"改了字段却不生效"的直觉冲突。按原字节重发是另一件事，若要做应另设显式接口。
 
+- **D8（`Message::OwnedPayload()`——唯一的逃生口，非侵入式）：**
+
+  ```cpp
+  /// @brief 返回 payload 的【拥有型】深拷贝，供需要活得比本 `Message` 久的消费者使用。
+  [[nodiscard]] QByteArray OwnedPayload() const {
+    return QByteArray(payload.constData(), payload.size());
+  }
+  ```
+
+  **恒为深拷贝，不做"已是拥有型就直接返回"的优化。** 那种优化要判别"这个 `QByteArray` 是不是 `fromRawData` 出来的"，而 Qt5 **没有公开 API 可判**；退而用 `frame.isEmpty()` 作判据则依赖一条可被违反的不变量（调用方自行构造的 `Message` 可以两者都填）。**正确性优先**——本方法只在调用方显式索要所有权时才被调用，那一次拷贝是它自己要的。
+
+  **判据只有一句：只在需要让 payload 活得比 `Message` 久时才调。**
+
+  | 场景 | 用法 |
+  |---|---|
+  | 在 `Message` 存活的作用域内用完 | **直接用 `msg.payload`**，零拷贝 |
+  | 存进容器 / 成员变量、待会儿再处理 | `OwnedPayload()` |
+  | 交给别的线程或 fiber | `OwnedPayload()` |
+  | 从函数里把 payload 返回出去 | `OwnedPayload()` |
+
+  > **⚠ 这条判据必须写进文档并强调。** 若调用方"保险起见"处处调 `OwnedPayload()`，零拷贝收益**全部消失**，而帧头与 CRC 的额外拷贝还在——**那就比不做本 ADR 更差**。判据是"需要活得更久才调"，**不是"不确定就调"**。
+
 ## 明确接受的代价
 
 1. **⚠ `payload` 悬垂是静默的内存错误。** 视图只在**其所属 `Message` 存活、且 `frame` 未被改写**期间有效。以下都会让它失效，且**不会报错**：
@@ -88,7 +110,7 @@
    | 把 `payload` 拷出来单独保存，让 `Message` 析构 | 同上 |
    | 跨线程/跨 fiber 传 `payload` 而不带 `Message` | 同上 |
 
-   **缓解**：提供 `Message::OwnedPayload()` 返回一份**拥有型**深拷贝，供需要活得比 `Message` 久的消费者使用；`payload` 的 Doxygen 加 `@warning`。**框架不校验、也无从校验。**
+   **缓解见 D8**；`payload` 的 Doxygen 加 `@warning`。**框架不校验、也无从校验。**
 
    > 对 `payload` **写入**是安全的——`fromRawData` 的 `QByteArray` 在非 const 访问时会自行深拷贝转为拥有型。危险只在读侧。
 
@@ -108,7 +130,7 @@
 - **负面（明确接受）：** 见上六条，其中 **代价 1 是本 ADR 唯一的内存安全风险**。
 - **对 SRS：** `RT_DATA_MESSAGE` 的字段构成与所有权语义改写；新增"payload 视图的有效期"约束。
 - **对 SDD：** `Message` 的数据设计、`ICodec` 契约、`DdsNode` 的键提取与三个方法签名、`ProtocolNode` 的入站填充。
-- **对 README：** `Message` 字段归属表整体改写；自定义 codec 一节补 `frame` 填充纪律与视图建立顺序；DDS 一节的调用示例去掉 topic 参数。
+- **对 README：** `Message` 字段归属表整体改写；**新增 `payload` 有效期与 `OwnedPayload()` 的判据表（D8）**——这是宿主最容易用错的一处；自定义 codec 一节补 `frame` 填充纪律与视图建立顺序；DDS 一节的调用示例去掉 topic 参数。
 - **对 CONTEXT.md：** 「逻辑消息」词条补 `frame`/`endpoint`；新增「payload 视图」词条。
 
 ## 备选方案（Alternatives considered）
@@ -117,5 +139,6 @@
 - **`payload` 恒为拥有型，接收时 `frame.mid(off, len)`。** 简单、安全。**否决理由：** Qt5 的 `mid()` 对子区间是**深拷贝**——那就只剩"拿到原始帧"，"省掉第二次拷贝"落空。裁决为**两者都要**。
 - **`payload` 保持 `std::vector<std::uint8_t>`。** 不动 99 处使用点。**否决理由：** vector 拥有内存、无法指向 `frame`，与 D2 的目标直接冲突。C++17 无 `std::span` 可替代。
 - **`frame` 设为选填（codec 可不填）。** 迁移更平缓。**否决理由：** 见代价 6——承诺时有时无比不做更坏，调用方无法依赖它。
+- **同时提供侵入式的 `Message::Detach()`**（就地把 payload 转为拥有型、`frame` 可一并丢弃，此后整条 `Message` 可安全保存）。转发、排队、重投这类要保存**整条消息**（还要带 `endpoint` / `session_id` 等元数据）的场景，用它比用 `OwnedPayload()` 再手工重建一条 `Message` 顺手。**否决理由（2026-09-11 裁决）：** 只保留 `OwnedPayload()` 一个逃生口。两个接口会带来"该用哪个"的选择负担，而 `Detach()` 的场景可由调用方自行拼出（取 `OwnedPayload()` 后赋回 `msg.payload` 并清空 `frame`）。**此条已关闭，不是悬着的备选。**
 - **服务名直接塞进 `Endpoint::kTopic`。** 最省事。**否决理由：** 把 ADR-0013 **D6** 刻意分开的"服务名"与"topic"混为一谈；`kService` 让类型系统替我们守住这条区分。
 - **给 `Endpoint` 加 `operator==` / `std::hash` 以整体入键。** **否决理由：** 键只需要那个字符串（**D4**），为此让整个结构体可哈希是多余负担，且会诱使将来把 `host`/`port` 也塞进键。
