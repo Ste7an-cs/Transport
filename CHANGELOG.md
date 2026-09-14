@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 新增：UDP 一对多——`ProtocolNode` 出站目的地取自 `Message::endpoint`（ADR-0021，#250）
+
+- `EncodeAndWrite` 由 `AsyncWrite({bytes, Endpoint::Default()})` 改为 `AsyncWrite({bytes, msg.endpoint})`。**产品代码就这一行。**
+- **`UdpTransport` 的按报文寻址能力早就有**（`kDefault` → 配置默认对端、`kNet` → ip:port，ADR-0003 D12），**`ProtocolNode` 是唯一的堵点**。
+  - 原注释"本类传输无关，不知道也不该知道对端是 ip:port 还是 topic"**在 ADR-0020 之前是成立的**——那时 `Message` 发送侧没有目的地字段可传。而 `Endpoint` 恰恰就是"传输无关地表达对端"的类型：节点**不必知道**却仍能**原样转交**。
+  - **这是 ADR-0020 D3 的缺口**：它定义了 `endpoint`"发送时是目的地"，却只规定了入站填充。已在 ADR-0020 D3 就地加补正。
+- **向后兼容，不设开关**：`Message::endpoint` 默认就是 `Endpoint::Default()`，**不填的调用方行为逐字不变**；TCP 与串口的写泵本就忽略 `peer`（ADR-0011 D8 / ADR-0012 D9），对它们是空操作。**收益只在 UDP 上兑现。**
+- **与 ADR-0019 合起来，外部协议服务端在 UDP 上才真正闭环**：`rsp.session_id = req.session_id`（透传）+ `rsp.endpoint = req.endpoint`（发回请求方）+ `Send`。缺任一条都不通——README 的服务端示例此前缺后者，已补。
+- **⚠ 行为变更**：转发一条收到的 `Message` 时，目的地会变成**原发送方**（`endpoint` 还带着来源），此前发往配置的默认对端。要发往别处须显式改写该字段。
+- **⚠ 明确接受**：**请求-响应的关联键不含对端**（`session_id` + `message_id` + `frm_type`，ADR-0009 D1）。`session_id` 是节点全局自增，故并发发往不同对端天然不撞；但**行为异常或恶意的对端**若用了别人的 `session_id` 作答，框架无从分辨。不可信网络上跑一对多请求-响应，须自行校验 `rsp.endpoint` 的来源。**若一对多的请求-响应日后成为主力用法，应重开"把对端纳入关联键"之议。**
+- 新增四条用例（280 → 284）。**关键设计**：每条都配一个**诱饵默认对端**并断言它一帧都收不到——否则"收到了就算过"的写法在目的地被丢弃时照样会绿。变异验证（还原成 `Endpoint::Default()`）：一对多与服务端闭环两条变红，向后兼容与 TCP 忽略两条**保持绿**（它们断言的正是本次**没有**改变的行为）。
+
 ### 💥 破坏性：`Message` 重构——增加 `frame`、`payload` 接收时为其视图、`topic`+`source` 合并为 `endpoint`（ADR-0020，#247）
 
 - **新增 `frame`**（`QByteArray`）：接收时存**完整一帧**（帧头 → payload 末），发送时为空、`Encode` 忽略。宿主由此首次能拿到原始整帧——**透传转发、按原字节重发、排障**（框架无可观测面之后，这是拿到第一手现场的唯一途径）。

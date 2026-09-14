@@ -153,6 +153,20 @@ UdpTransport transport(cfg);
 
 **保报文边界**，`Datagram::peer` 是**可变**的：读到的是发送方地址，写出的是目的地——故一条 UDP 传输可对多个对端收发。
 
+**一对多**（ADR-0021）：在 `Message::endpoint` 里填目的地即可，一个节点一条 socket 就够：
+
+```cpp
+Message a; a.payload = Pay(...); a.endpoint = Endpoint::Net("192.168.1.10", 9000);
+Message b; b.payload = Pay(...); b.endpoint = Endpoint::Net("192.168.1.11", 9000);
+(void)node.Send(std::move(a));        // 发往 .10
+(void)node.Send(std::move(b));        // 发往 .11
+(void)node.Send(std::move(c));        // 不填 endpoint → 发往 cfg 的默认对端
+```
+
+入站的 `msg.endpoint` 即**发送方**地址，回给谁一目了然。
+
+> ⚠ **请求-响应的关联键不含对端**（`session_id` + `message_id` + `frm_type`）。`session_id` 是**节点全局**自增，故并发发往不同对端的请求天然不撞；但**行为异常或恶意的对端**若用了别人的 `session_id` 作答，框架无从分辨。不可信网络上跑一对多请求-响应，须自行校验 `rsp.endpoint` 的来源。
+
 > ⚠ **UDP 是唯一不校验配置的传输**：它没有 `kConfiguration` 这条路径，`silence_timeout` 非正时**静默兜底为 5s**。TCP 与串口则在 `Start()` 直接拒绝并停在 `Created`。
 
 #### `SerialTransport` —— 流式，单设备，自动重开
@@ -347,8 +361,9 @@ auto serving = Coro::makeTask([&] {
 
     Message rsp;
     rsp.frm_type   = FrameType::kResponse;
-    rsp.session_id = req.value().session_id;   // ★ 必须回带
+    rsp.session_id = req.value().session_id;   // ★ 必须回带（ADR-0019）
     rsp.message_id = req.value().message_id;   // ★ 必须回带
+    rsp.endpoint   = req.value().endpoint;     // ★ UDP 上必须回带：发回请求方（ADR-0021）
     rsp.payload    = Handle(req.value());
     (void)node.Send(std::move(rsp));
   }
@@ -356,6 +371,8 @@ auto serving = Coro::makeTask([&] {
 ...
 (void)serving.get();                       // 宿主自己 join
 ```
+
+> ⚠ **`rsp.endpoint` 在 UDP 上不可省。** 出站目的地取自 `msg.endpoint`（ADR-0021）；不回带请求方地址，应答会发往 `UdpConfig` 配置的**默认对端**，请求方收不到、只会一路超时。TCP 与串口忽略该字段（点对点 / 单设备），填不填都一样——**但照着写总是对的**。
 
 三种请求-响应模式的应答形态不同，对端须按客户端所用的模式回：
 
@@ -884,7 +901,7 @@ class ITransport {
 
 **写为彻底的 fire-and-forget**：`AsyncWrite` 只判生命周期与入队，返回成功仅表示已受理；目的地能否解析、socket 是否写成一律不回传，只落 `LastError()`。链路不可用时数据留在内部队列等待恢复，不拒绝、不丢弃。**由此不提供背压。**
 
-`Datagram{bytes, peer}` 读写共用：读到的 `peer` 是发送方，写出的 `peer` 是目的地（`Endpoint::Default()` 表示"发往本传输配置的默认对端"，故传输无关的调用方恒可传它）。
+`Datagram{bytes, peer}` 读写共用：读到的 `peer` 是发送方，写出的 `peer` 是目的地（`Endpoint::Default()` 表示"发往本传输配置的默认对端"，传输无关的调用方不填即得此值）。
 
 `Datagram` 的读写不对称与 fire-and-forget 语义见上；生命周期三段式见[生命周期与相位规则](#生命周期与相位规则)。
 

@@ -593,6 +593,7 @@ reader 侧 = Subscribers ∪ Clients 的值 ∪ Services 的键
 - **Dispatch**（ADR-0009 D1/D5）：投递给全部键匹配的订阅者，各得一份副本。未命中时**一律静默丢弃、不作记录**——响应帧（`kResponse`/`kResult`）的迟到·无匹配与业务帧的无人认领**处置相同**（ADR-0009 D5 + ADR-0014 D1/D4，见 SRS §3.6）。
 - **交互模式（ADR-0010，RT_NODE_002_a..g）**：四个方法，其中三个属**外部系统协议**（`Send` / `RequestForResponse` / `RequestForResult`——后者对应协议里的 `withfeedback` 与 `needfeedback`，二者经核实为**同一个通信模型**），一个属**另一种协议**（`RequestForResultDirect`）。**模式不作参数、不入节点状态**——状态机的阶段、已发送次数与原始命令帧全是该方法的局部变量，活在**调用方 fiber 的栈**上，故节点无"在途交互表"、`Dispatcher` 不认识模式。各方法的公共骨架：
   1. 取 `session_id` → 盖章（**仅三个 `RequestFor*`**；`Send` 原样透传调用方所填，ADR-0019 **D1/D2**）；
+     **出站目的地取 `msg.endpoint`**（ADR-0021 **D1/D3**，四个出站方法一视同仁）：节点**不解释**该值、只原样转交给传输，解释在传输侧（UDP 按 `kDefault`/`kNet` 解析；TCP 与串口一律忽略）。默认值即 `Endpoint::Default()`，故不填的调用方行为与此前逐字相同。**UDP 一对多由此在 node 层成为可能。**
   2. **发命令之前**同时登记两个订阅 `{sid, mid, kResponse}` 与（③④）`{sid, result_mid, kResult}`——`kResult` 可能先于 `kResponse` 到达，等收到受理再登记会丢帧（**D4**）；
   3. 第一阶段：发帧 → 等 `kResponse`，超时则**重发字节完全相同的原帧**（`session_id` 不变，**D3**），至多 `max_attempts` 次；耗尽返 **`kNotAccepted`**（**D12**）；
   4. 收到首个 `kResponse` 后**立即 `Reset()` 该凭据**（**D5**）——否则重发引出的重复受理帧会继续落入信箱；注销后它们成为无匹配终结帧，被静默丢弃；
