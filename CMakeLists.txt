@@ -93,6 +93,27 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# transport_perf —— 性能基准测试工具(ADR-0018 D7:独立可执行,不进 transport_tests)。
+# 双机双进程、同一可执行两个角色;只报数、不做 pass/fail(D6),故不 add_test。
+# ---------------------------------------------------------------------------
+option(TRANSPORT_BUILD_PERF "Build transport_perf benchmark tool" ON)
+if(TRANSPORT_BUILD_PERF)
+  add_executable(transport_perf
+    tools/perf/main.cpp
+    tools/perf/PerfOptions.cpp
+    tools/perf/PerfStats.cpp
+    tools/perf/PerfLink.cpp
+    tools/perf/AcceptedTcpTransport.cpp
+    tools/perf/PerfRun.cpp
+    tools/perf/PerfServer.cpp
+    tools/perf/PerfClient.cpp
+  )
+  target_include_directories(transport_perf PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/perf)
+  target_link_libraries(transport_perf PRIVATE transport asynctask Qt5::Core Qt5::Network)
+endif()
+
+# ---------------------------------------------------------------------------
 # 单一测试目标:全部 tests/* 纳入一个可执行文件,在 AsyncTask fiber 调度器内跑。
 # ---------------------------------------------------------------------------
 if(TRANSPORT_BUILD_TESTS)

@@ -17,10 +17,13 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
-SUBDIRS = lib gtest tests
+SUBDIRS = lib gtest tests perf
 
 lib.subdir   = qmake/lib
 gtest.subdir = qmake/gtest
 tests.subdir = qmake/tests
+# transport_perf —— 性能基准测试工具(ADR-0018 D7:独立可执行,不进 transport_tests)。
+perf.subdir  = qmake/perf
 
 tests.depends = lib gtest
+perf.depends  = lib
