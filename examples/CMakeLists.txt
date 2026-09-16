@@ -43,3 +43,6 @@ transport_add_example(udp_fanout udp_fanout/main.cpp)
 
 # ④ DdsNode 发布-订阅。
 transport_add_example(dds_pubsub dds_pubsub/main.cpp)
+
+# ⑤ DdsNode 请求-响应(单阶段 Direct)。
+transport_add_example(dds_service dds_service/main.cpp)
