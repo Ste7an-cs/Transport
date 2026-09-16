@@ -114,6 +114,20 @@ if(TRANSPORT_BUILD_PERF)
 endif()
 
 # ---------------------------------------------------------------------------
+# examples —— 六个完整可运行的示例程序(#255)。
+#
+# **默认 OFF**:示例不拖慢日常构建,也不进 libtransport.a / transport_tests。
+# 开启:`cmake -S . -B build -DTRANSPORT_BUILD_EXAMPLES=ON`
+# qmake 侧的等价开关:`qmake CONFIG+=examples ../transport.pro`(双清单义务)。
+#
+# 代价是**示例会默默腐烂**——API 变了不会有任何信号,故每个示例都须真的跑通一次。
+# ---------------------------------------------------------------------------
+option(TRANSPORT_BUILD_EXAMPLES "Build examples" OFF)
+if(TRANSPORT_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+
+# ---------------------------------------------------------------------------
 # 单一测试目标:全部 tests/* 纳入一个可执行文件,在 AsyncTask fiber 调度器内跑。
 # ---------------------------------------------------------------------------
 if(TRANSPORT_BUILD_TESTS)
