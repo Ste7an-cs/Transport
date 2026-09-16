@@ -84,6 +84,29 @@ inline std::string Text(const QByteArray& bytes) {
   return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
 }
 
+/// @brief **打印用**的 payload 形式:可见 ASCII 原样,其余一律escape 成 `\xNN`。
+///
+/// 为什么不直接 `Text()` 去打:`Log()` 走 `printf("%s")`,**遇 `\0` 就截断**,后面的内容
+/// 会凭空消失、看起来像程序出了别的毛病。而 payload **确实可能含 `\0`** —— 真实
+/// Fast DDS **跨进程**收到的样本里就有(见 examples/dds_pubsub 的说明)。
+/// 打印一律用本函数,取数据一律用 `Text()`。
+inline std::string Printable(const QByteArray& bytes) {
+  static const char kDigits[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(static_cast<std::size_t>(bytes.size()));
+  for (int i = 0; i < bytes.size(); ++i) {
+    const auto byte = static_cast<unsigned char>(bytes.at(i));
+    if (byte >= 0x20 && byte != 0x7F) {  // 可见 ASCII 与 UTF-8 续字节原样留着
+      out.push_back(static_cast<char>(byte));
+      continue;
+    }
+    out += "\\x";
+    out.push_back(kDigits[byte >> 4]);
+    out.push_back(kDigits[byte & 0x0F]);
+  }
+  return out;
+}
+
 /// @brief 把字节打成 `AA BB CC` 形式,供看帧用。
 inline std::string Hex(const QByteArray& bytes) {
   static const char kDigits[] = "0123456789ABCDEF";

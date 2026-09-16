@@ -42,6 +42,7 @@ using example::Err;
 using example::Hex16;
 using example::Log;
 using example::Pay;
+using example::Printable;
 using example::Text;
 using transport::AnyOfType;
 using transport::Endpoint;
@@ -130,7 +131,7 @@ void RunPeer(const std::string& bind_addr, std::uint16_t port, int requests) {
       //   ip:port 交到业务层手里,"回给谁"一目了然。
       Log("[收到] 来自 " + Show(req.endpoint) + " message_id=" + Hex16(req.message_id) +
           " session_id=" + std::to_string(req.session_id) +
-          " payload=\"" + Text(req.payload) + "\"");  // 作用域内直接用视图,零拷贝
+          " payload=\"" + Printable(req.payload) + "\"");  // 作用域内直接用视图,零拷贝
 
       if (req.message_id == kMidPing) {
         Message rsp;
@@ -229,7 +230,7 @@ void RunFanout(const std::vector<Endpoint>& peers) {
       continue;
     }
     // ★ 入站 `endpoint` 是**来源**:这就是"谁答的"。上面那条警告要校验的正是它。
-    Log("   ← 来自 " + Show(rsp.value().endpoint) + ":\"" + Text(rsp.value().payload) +
+    Log("   ← 来自 " + Show(rsp.value().endpoint) + ":\"" + Printable(rsp.value().payload) +
         "\" session_id=" + std::to_string(rsp.value().session_id));
     const bool from_the_one_we_asked =
         rsp.value().endpoint.port == peer.port;

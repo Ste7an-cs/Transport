@@ -101,7 +101,8 @@ void Handle(ProtocolNode& node, const Message& req,
   // ★ `req` 还活着,`payload` 这个指进 `frame` 的视图此刻有效 —— 直接用,零拷贝。
   const std::string body = Text(req.payload);
   Log("[收到] frm_type=kCommand message_id=" + Hex16(req.message_id) +
-      " session_id=" + std::to_string(req.session_id) + " payload=\"" + body + "\"");
+      " session_id=" + std::to_string(req.session_id) + " payload=\"" +
+      example::Printable(req.payload) + "\"");
 
   switch (req.message_id) {
     case kMidNotify:

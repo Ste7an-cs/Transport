@@ -16,6 +16,11 @@
  *    **队列**(读队列有界 1024、满时静默丢最旧),而首帧还可能掉进约 240ms 的发现窗口。
  *    本例**不等 `kUp`**,直接让 `RetryPolicy` 去吸收这段窗口。
  *  - **接收 `payload` 是指进 `frame` 的视图**(ADR-0020):作用域内直接用,要存才 `OwnedPayload()`。
+ *
+ * ⚠ **跑真实 Fast DDS 且两端在不同进程时,收到的 `payload` 末尾可能多出 1..3 个零字节。**
+ *   实测事实,成因见 `examples/dds_pubsub/main.cpp` 文件头的同名说明(RTPS 的 4 字节对齐
+ *   填充被当成了 payload)。本例把 payload 的字节数与整帧字节数都打出来,方便对照
+ *   ——`整帧 % 4 == 0` 时就没有填充。示例不兜这个底。
  */
 
 #include <chrono>
@@ -45,6 +50,7 @@ using namespace std::chrono_literals;
 using example::Err;
 using example::Log;
 using example::Pay;
+using example::Printable;
 using example::Text;
 using transport::DdsCodec;
 using transport::DdsConfig;
@@ -140,7 +146,9 @@ void RunService(const DdsConfig& cfg, const std::string& service_name, int secon
       const Message& req = request.value();
       // ★ 作用域内直接用视图,零拷贝。
       Log("[请求] corr=" + req.correlation_id + " 来源 topic=\"" + req.endpoint.topic +
-          "\" payload=\"" + Text(req.payload) + "\"");
+          "\" payload=\"" + Printable(req.payload) + "\"(" +
+          std::to_string(req.payload.size()) + " 字节,整帧 " +
+          std::to_string(req.frame.size()) + " 字节)");
       journal.push_back(req.OwnedPayload());  // ★ 要留到循环之外 ⇒ 深拷贝
 
       // ★ 服务端**唯一**的方法:`Reply`。本模型没有受理阶段,故没有 Accept()。
@@ -247,7 +255,9 @@ void RunClient(const DdsConfig& cfg, const std::string& service_name,
   auto reply = node.RequestForResultDirect(std::move(req), RetryPolicy{1000ms, 8});
   if (reply) {
     // ★ 作用域内直接用 payload 视图,零拷贝。
-    Log("[应答] payload=\"" + Text(reply.value().payload) + "\"");
+    Log("[应答] payload=\"" + Printable(reply.value().payload) + "\"(" +
+        std::to_string(reply.value().payload.size()) + " 字节,整帧 " +
+        std::to_string(reply.value().frame.size()) + " 字节)");
     Log("       kind=kReply corr=" + reply.value().correlation_id +
         "(两段式:<uuid>#<自增序号>)");
     // ★ 应答落在**派生出的**应答 topic 上——服务名 → cfg.<名>.response。

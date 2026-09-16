@@ -40,6 +40,7 @@ using namespace std::chrono_literals;
 using example::Err;
 using example::Log;
 using example::Pay;
+using example::Printable;
 using example::Text;
 using transport::LinkState;
 using transport::Message;
@@ -136,7 +137,7 @@ void RunClient(const std::string& host, std::uint16_t port) {
     if (rsp) {
       // ★ 用法 A(零拷贝):`rsp` 还活着,`payload` 这个**指进 frame 的视图**此刻有效,
       //   直接用即可,**不要**多此一举地 OwnedPayload()。
-      Log("   收到 kResponse:payload=\"" + Text(rsp.value().payload) + "\"" +
+      Log("   收到 kResponse:payload=\"" + Printable(rsp.value().payload) + "\"" +
           " session_id=" + std::to_string(rsp.value().session_id) +
           " message_id=" + example::Hex16(rsp.value().message_id));
       // 接收路径还白送一件事:**完整的原始帧**(ADR-0020 D2 必填),排障/透传都靠它。
@@ -188,7 +189,7 @@ void RunClient(const std::string& host, std::uint16_t port) {
                                               RetryPolicy{2000ms, 3},  // 唯一等待阶段
                                               kMidQueryResult);
     if (result) {
-      Log("   收到 kResult:payload=\"" + Text(result.value().payload) + "\"");
+      Log("   收到 kResult:payload=\"" + Printable(result.value().payload) + "\"");
     } else {
       Log("   失败:" + Err(result.error()) + "(本交互耗尽返 kTimeout,非 kNotAccepted)");
     }
@@ -196,7 +197,7 @@ void RunClient(const std::string& host, std::uint16_t port) {
 
   // `Message` 早已析构,但 backlog 里那份是**拥有型**的,照样可用。
   for (const QByteArray& owned : backlog) {
-    Log("\n[backlog] Message 已析构,OwnedPayload() 的那份仍然有效:\"" + Text(owned) + "\"");
+    Log("\n[backlog] Message 已析构,OwnedPayload() 的那份仍然有效:\"" + Printable(owned) + "\"");
   }
 
   // ── 正常收尾:先节点、后传输,顺序不能反 ──────────────────────────────

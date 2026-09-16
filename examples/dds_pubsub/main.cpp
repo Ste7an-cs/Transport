@@ -20,6 +20,13 @@
  *   **240ms 的发现窗口**,窗口内写出的帧直接丢失而 `Publish` 照样返回成功。框架**不提供**
  *   "何时可安全发送"的判据。本例的处置是:**先等链路 `kUp` 再发**(轮询
  *   `CurrentLinkState()`),这只是宿主自选的一种处置,不是框架承诺。
+ *
+ * ⚠ **跑真实 Fast DDS 且两端在不同进程时,收到的 `payload` 末尾可能多出 1..3 个零字节。**
+ *   这是本示例跑出来的**实测事实**,记在这里以免读者以为自己写错了:RTPS 把序列化载荷按
+ *   4 字节对齐,而 `DdsCodec` 的 payload 长度取"整条 sample 减去头部",于是对齐填充被
+ *   一并当成 payload。**同进程**(Fast DDS 默认 `INTRAPROCESS_FULL`)与 `fake` provider
+ *   都不经这条路径,故看不到。示例只如实打印(见 `example::Printable`),**不在示例里
+ *   兜这个底**——该由库侧裁决。
  */
 
 #include <chrono>
@@ -48,6 +55,7 @@ using namespace std::chrono_literals;
 using example::Err;
 using example::Log;
 using example::Pay;
+using example::Printable;
 using example::Text;
 using transport::DdsCodec;
 using transport::DdsConfig;
@@ -224,7 +232,7 @@ void RunSubscriber(const DdsConfig& cfg, const std::string& topic, int count) {
       const Message& msg = got.value();
       // ★ 用法 A:`msg` 还活着,payload 这个指进 frame 的视图此刻有效 —— 直接用。
       Log("[收到] topic=\"" + msg.endpoint.topic + "\" kind=kNotify payload=\"" +
-          Text(msg.payload) + "\" 整帧 " + std::to_string(msg.frame.size()) + " 字节");
+          Printable(msg.payload) + "\" 整帧 " + std::to_string(msg.frame.size()) + " 字节");
       // ★ 用法 B:要留到循环之外 ⇒ 必须深拷贝(判据:要活得比 Message 久)。
       archive.push_back(msg.OwnedPayload());
       ++received;
@@ -235,7 +243,7 @@ void RunSubscriber(const DdsConfig& cfg, const std::string& topic, int count) {
   Log("\n[归档] " + std::to_string(archive.size()) +
       " 条 OwnedPayload(),在各自的 Message 析构之后仍然有效:");
   for (const QByteArray& owned : archive) {
-    Log("   \"" + Text(owned) + "\"");
+    Log("   \"" + Printable(owned) + "\"");
   }
 
   Log("\n[收尾] node.Close() → node.WaitClosed() → transport.Close() → transport.WaitClosed()");
