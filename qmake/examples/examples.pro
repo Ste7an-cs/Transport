@@ -13,7 +13,8 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
-SUBDIRS = tcp_client tcp_server
+SUBDIRS = tcp_client tcp_server udp_fanout
 
 tcp_client.subdir = tcp_client
 tcp_server.subdir = tcp_server
+udp_fanout.subdir = udp_fanout

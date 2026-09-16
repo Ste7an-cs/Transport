@@ -37,3 +37,6 @@ transport_add_example(tcp_server tcp_server/main.cpp
   ${CMAKE_SOURCE_DIR}/tools/perf/AcceptedTcpTransport.cpp)
 target_include_directories(transport_example_tcp_server PRIVATE
   ${CMAKE_SOURCE_DIR}/tools/perf)
+
+# ③ UDP 一对多 + 入站 endpoint 即发送方。
+transport_add_example(udp_fanout udp_fanout/main.cpp)
