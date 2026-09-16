@@ -26,11 +26,10 @@
  * (ADR-0011 **D10**,其 `.cpp` 不在任一构建的源清单里)。而 `ProtocolNode` 只接
  * `ITransport&`,于是服务端角色缺一个"监听 + 接受 + 收发字节"的实现。
  *
- * 这件事 `tools/perf` 早就遇到过并写了一个(`perf::AcceptedTcpTransport`),本示例**直接
- * 复用它**而不再抄一份——同一个事实存两份必然漂移。**它是工具/示例代码,不是库代码**:
- * 不进 `libtransport.a`、不进公共头。
+ * 示例自带一个:`examples/common/ListeningTcpTransport.{hpp,cpp}`。**它是示例的脚手架,
+ * 不是库代码**——不进 `libtransport.a`、不进公共头、不改任何既有 API。
  *
- * **除这一个构造语句外,本文件全程只用公开面**:`Subscribe` / `Ticket::Wait` / `Send`。
+ * **除"构造它"这一句之外,本文件全程只用公开面**:`Subscribe` / `Ticket::Wait` / `Send`。
  */
 
 #include <chrono>
@@ -50,8 +49,8 @@
 #include "transport/core/Message.hpp"
 #include "transport/node/ProtocolNode.hpp"
 
-#include "AcceptedTcpTransport.hpp"  // 见文件头:监听侧传输,复用 tools/perf 的那一个。
 #include "ExampleCommon.hpp"
+#include "ListeningTcpTransport.hpp"  // 见文件头:示例自带的监听侧传输(脚手架)。
 
 using namespace std::chrono_literals;
 using example::Err;
@@ -59,6 +58,7 @@ using example::Hex16;
 using example::Log;
 using example::Pay;
 using example::Text;
+using example::ListeningTcpTransport;
 using transport::AnyOfType;
 using transport::FrameType;
 using transport::Message;
@@ -145,8 +145,8 @@ void Handle(ProtocolNode& node, const Message& req,
 /// ★★ 全部业务代码都在**这一个函数**里,而它**身处 fiber 内**(见 main 的 ③)。
 void RunServer(const std::string& bind_addr, std::uint16_t port, int requests) {
   // —— 装配三件套 ————————————————————————————————————————————————————
-  // 见文件头:监听侧传输不在库里,这里复用 tools/perf 的那一个。
-  perf::AcceptedTcpTransport transport(bind_addr, port);
+  // 见文件头:监听侧传输不在库里,这是示例自带的那一个(examples/common/)。
+  ListeningTcpTransport transport(bind_addr, port);
   if (auto started = transport.Start(); !started) {
     Log("监听失败(" + bind_addr + ":" + std::to_string(port) + "):" +
         Err(started.error()));
