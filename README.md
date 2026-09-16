@@ -26,7 +26,7 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 - [扩展：自定义 codec](#扩展自定义-codec)
 - [扩展：新建一个 node](#扩展新建一个-node) —— 交互方式变了的时候
 - [内部传输契约（`ITransport`）](#内部传输契约itransport)
-- [构建](#构建)
+- [构建](#构建) · [性能基准测试](#性能基准测试-transport_perf)
 - [关键约束](#关键约束)
 
 ---
@@ -946,6 +946,41 @@ qmake CONFIG+=debug ../transport.pro               # Debug（qmake 默认 releas
 工程文件收在 `qmake/` 下，根 `transport.pro` 是 Qt Creator 的入口。
 
 > ⚠ **源文件清单有两份**（`CMakeLists.txt` 与 `qmake/*/*.pro`），增删 `.cpp` 须同时改。两边的清单顺序与注释逐字一致，便于肉眼 diff 发现漂移。
+
+### 性能基准测试 `transport_perf`
+
+与 `transport_tests` 并列的**独立可执行**（ADR-0018），方法学照 Fast DDS 3.6.1 的 LatencyTest / ThroughputTest。**只报数，不做 pass/fail** —— 它是 SRS §3.6.2 的**证据来源**，不是验收判据。
+
+**目标形态是两台机器**：一台跑客户端/pub，另一台跑服务端/sub。
+
+```bash
+# —— 机器 A（服务端）——
+./transport_perf --role server --medium tcp --suite latency --bind 0.0.0.0 --port 45678
+
+# —— 机器 B（客户端，打印最终表格）——
+./transport_perf --role client --medium tcp --suite latency --host 192.168.1.10 --port 45678
+```
+
+同机自测（验证端到端可用）把 `--host` 换成 `127.0.0.1` 即可。
+
+| 选项 | 含义 |
+|---|---|
+| `--role client\|server` | 角色。**client 是发起端，打印最终表格** |
+| `--medium tcp\|udp\|dds` | 介质。**`serial` 不实现**，传入即报错退出（需实机，ADR-0018 D5） |
+| `--suite latency\|throughput` | 测哪一套 |
+| `--mode <m[,m...]>` | 被测面。`tcp`/`udp`：`send,response,result,resultdirect`；`dds`：`pubsub,reqresp`。缺省全部 |
+| `--payloads <n[,n...]>` | payload 档位（字节）。缺省 `16,256,1024,16384,63488` |
+| `--samples` / `--demand` `--recovery` `--time` | 时延 / 吞吐各自的样本量与节奏 |
+| `--host` `--bind` `--port` `--local-port` `--domain` | 各介质的寻址 |
+
+**两套口径与 Fast DDS 逐列同名**，可直接横向比对：
+
+- **时延** = `RTT / 2 − 时钟开销`（开销由 1001 次时钟读取标定），报 `stdev / mean / min / 50% / 90% / 99% / 99.99% / max`（µs）
+- **吞吐**：burst × recovery × 测试时长，**两侧分列** —— 发送侧、接收侧各自的条数与速率，接收侧另报**丢失条数**
+
+> ⚠ **发送侧的数字只是"入队条数"，不代表上线量。** 写侧是 fire-and-forget、队列满时静默丢最旧且返回成功，**过载时发送侧速率会虚高**。解读**以接收侧为准** —— 丢失由工具在 payload 内嵌的自增序号算出（框架无观测面，见[关键约束](#关键约束)）。
+
+> **已知的首轮发现**：TCP/UDP 的时延被 **AsyncTask 事件泵的 1 ms 间隔**支配（`pump_interval_ms_`，私有且不可配），同机往返约 3.5 ms；而 DDS 走 Fast DDS 自己的线程、绕开该泵，同机往返约 300 µs。**payload 大小几乎不影响**——这是固定的每跳延迟地板，不是带宽问题。详见 ADR-0018。
 
 ### 前置依赖
 

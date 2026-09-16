@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+### 新增：`transport_perf` 性能基准测试工具（ADR-0018，#252）
+
+- 与 `transport_tests` **并列的独立可执行**，不进单元测试、**不设阈值断言**（性能数字抖动，混进 CI 会长期误报、最终被无视）。方法学与报表列照 **Fast DDS 3.6.1** 的 LatencyTest / ThroughputTest，可直接横向比对。
+- **双机双进程**：`--role client|server --medium tcp|udp|dds --suite latency|throughput`。**`--medium serial` 不实现**，传入即报错退出（需实机，D5）。
+- **时延** = `RTT / 2 − 时钟开销`（开销由 1001 次时钟读取标定）；**吞吐**两侧分列，接收侧另报**丢失条数**——由工具在 payload 内嵌的自增序号算出（框架无观测面）。
+  - ⚠ **发送侧只能报"入队条数"**，不代表上线量。写侧 fire-and-forget、队列满静默丢最旧且返回成功，**过载时发送侧速率虚高**。本机实测的一行（TCP throughput，1024 B）：发送侧 33000 条 / 131 MBits/sec，接收侧只有 22699 条 / 54 MBits/sec，**丢 10301 条**。
+- **控制信道走被测传输本身**，并复用框架自带的重发（`RequestForResponse` 而非 `Send`——UDP 会丢包）；控制往返落在测量窗口之外。
+- 库**一个字没动**（D10：不为测量给库加计数或钩子）。`transport_tests` 仍 284 全绿。
+
+### ⚠ 首轮实测的两处发现（已记入 ADR-0018 与 SRS §3.6.2）
+
+1. **TCP / UDP 的时延被 AsyncTask 事件泵的 1 ms 间隔支配。** `QtFiberScheduler` 的事件泵是 `processEvents()` + `Coro::msleep(pump_interval_ms_)`，而 `pump_interval_ms_` 是**私有成员、默认 1、全仓无 setter——不可配**。
+
+   | 介质 | 事件分发路径 | 同机往返 mean | 16 B vs 1024 B |
+   |---|---|---|---|
+   | **DDS** | 走 Fast DDS 自己的线程，**绕开该泵** | **300 µs** | 300 / 306 |
+   | **TCP** | 走 AsyncTask 的 Qt 事件泵 | **3488 µs** | 3488 / 3823 |
+
+   **payload 大小几乎不影响**——这是**固定的每跳延迟地板**，不是带宽问题。TCP 比 DDS 慢 **11.6 倍**，差额基本全部来自这 1 ms。**这是 AsyncTask 上游的设计，本仓库改不了**；若将来要压 TCP/UDP 时延，第一件该做的是让该间隔可配或改用真正的 Qt/fiber 集成，而不是在本仓库找优化点。
+
+2. **库里没有 TCP 服务端字节管道。** `TcpTransport` 只有客户端形态，`TcpServer` 本轮不做（ADR-0011 D10）。工具内部自备了 `AcceptedTcpTransport`（不进库、不进公共头、不改既有 API）。**代价：性能测试的 TCP 服务端走的不是产品代码路径**，其数字的服务端半边不代表未来 `TcpServer`。
+
 ### 新增：UDP 一对多——`ProtocolNode` 出站目的地取自 `Message::endpoint`（ADR-0021，#250）
 
 - `EncodeAndWrite` 由 `AsyncWrite({bytes, Endpoint::Default()})` 改为 `AsyncWrite({bytes, msg.endpoint})`。**产品代码就这一行。**

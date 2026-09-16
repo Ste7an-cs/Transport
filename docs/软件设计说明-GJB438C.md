@@ -976,6 +976,26 @@ LinkState TcpTransport::CurrentLinkState() const {
 
 **执行时序/数据流**：见 §4.2.3（Decode 在读循环、Encode 在出站）。
 
+### 5.8 性能基准工具详细设计（`transport_perf`）
+
+**定位**：与 `transport_tests` 并列的**独立可执行**（ADR-0018 **D7**），**不是 CSCI 的一部分**——它不进 `libtransport.a`、不提供任何公共头，只是产出 SRS §3.6.2 证据的工具。方法学与报表列照 **Fast DDS 3.6.1** 的 LatencyTest / ThroughputTest，便于横向比对「用了本框架比裸 DDS 多花多少」。
+
+**形态**：双机双进程，同一可执行两个角色（`--role client|server`），介质 `tcp|udp|dds`（**`serial` 不实现**，传入即报错退出，**D5**）。控制（握手、开始/结束、结果回传）**走被测传输本身**，并**复用框架自带的重发**（`RequestForResponse` / `RequestForResultDirect` 而非 `Send`——UDP 会丢包，控制流不能丢，**D4**）；控制往返**落在测量窗口之外**。
+
+**两套统计口径**：
+
+| suite | 口径 |
+|---|---|
+| latency | `RTT / 2 − 时钟开销`（开销由 **1001 次时钟读取**标定，照 Fast DDS）；报 `stdev / mean / min / 50% / 90% / 99% / 99.99% / max`（µs） |
+| throughput | burst × recovery × 测试时长；**两侧分列**——发送侧条数与速率、接收侧条数与速率、**接收侧另报丢失条数** |
+
+> **发送侧只能报「入队条数」**：写侧 fire-and-forget、队列满静默丢最旧且返回成功（ADR-0007 **D3**）；而框架**无观测面**（ADR-0014），故**实收与丢失由工具在 payload 内嵌的自增序号算出**（**D3**）。**报表两侧并列，解读以接收侧为准。**
+
+**两处须记的实现事实**：
+
+1. **TCP 服务端走的不是产品代码路径。** 库里**没有 TCP 服务端字节管道**——`TcpTransport` 只有客户端形态，`TcpServer` 本轮不做（ADR-0011 **D10**，其 `.cpp` 不在任一构建清单里）。工具内部自备了 `AcceptedTcpTransport`（`tools/perf/`，不进库、不进公共头、不改既有 API，与 **D10** 不冲突）。**故 TCP 数字的服务端半边不代表未来 `TcpServer` 的性能**；`TcpServer` 日后进库应替换此处。
+2. **`RequestForResult` 的「到受理」只能取上界。** 该方法只返回最终 `kResult`，中间那帧 `kResponse` 的到达时刻**调用方观察不到**，须另开一路旁路订阅（`AnyOfType(kResponse)`）按 `message_id` 关联。单线程 fiber 协作下探针 fiber 的盖时刻必然略晚，**小 payload 下该量贴近甚至略大于「到结果」**；大 payload 下两阶段才真正拉开。
+
 ## 6. 需求可追踪性
 
 与 REF-1（SRS）构成追溯关系。§6.1 为本文档每个设计单元到 SRS 需求的对应；§6.2 为每个 SRS 需求到设计单元的对应。
