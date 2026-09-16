@@ -46,3 +46,6 @@ transport_add_example(dds_pubsub dds_pubsub/main.cpp)
 
 # ⑤ DdsNode 请求-响应(单阶段 Direct)。
 transport_add_example(dds_service dds_service/main.cpp)
+
+# ⑥ 自定义 ICodec(LineCodec.hpp,header-only)+ 端到端跑通。
+transport_add_example(custom_codec custom_codec/main.cpp)

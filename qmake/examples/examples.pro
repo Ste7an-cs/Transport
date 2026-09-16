@@ -13,10 +13,11 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
-SUBDIRS = tcp_client tcp_server udp_fanout dds_pubsub dds_service
+SUBDIRS = tcp_client tcp_server udp_fanout dds_pubsub dds_service custom_codec
 
-tcp_client.subdir = tcp_client
-tcp_server.subdir = tcp_server
-udp_fanout.subdir = udp_fanout
-dds_pubsub.subdir = dds_pubsub
-dds_service.subdir = dds_service
+tcp_client.subdir   = tcp_client
+tcp_server.subdir   = tcp_server
+udp_fanout.subdir   = udp_fanout
+dds_pubsub.subdir   = dds_pubsub
+dds_service.subdir  = dds_service
+custom_codec.subdir = custom_codec
