@@ -40,3 +40,6 @@ target_include_directories(transport_example_tcp_server PRIVATE
 
 # ③ UDP 一对多 + 入站 endpoint 即发送方。
 transport_add_example(udp_fanout udp_fanout/main.cpp)
+
+# ④ DdsNode 发布-订阅。
+transport_add_example(dds_pubsub dds_pubsub/main.cpp)
