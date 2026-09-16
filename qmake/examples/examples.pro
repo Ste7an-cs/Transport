@@ -13,6 +13,7 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
-SUBDIRS = tcp_client
+SUBDIRS = tcp_client tcp_server
 
 tcp_client.subdir = tcp_client
+tcp_server.subdir = tcp_server

@@ -25,3 +25,15 @@ endfunction()
 
 # ① ProtocolNode + TcpTransport:四种交互模式。
 transport_add_example(tcp_client tcp_client/main.cpp)
+
+# ② 只用公开面写的外部协议服务端。
+#
+# 多编一个 `tools/perf/AcceptedTcpTransport.cpp`:库里的 `TcpTransport` 是**客户端**
+# 传输,`TcpServer` 本轮不做(ADR-0011 **D10**,其 .cpp 不在任一构建的源清单里),
+# 而 `ProtocolNode` 只接 `ITransport&` —— 服务端角色缺一个"监听 + 接受"的实现。
+# `tools/perf` 早已为同一原因写了一个,**直接复用而不再抄一份**(同一事实存两份必然漂移)。
+# 它是工具/示例代码,不进 libtransport.a、不进公共头。
+transport_add_example(tcp_server tcp_server/main.cpp
+  ${CMAKE_SOURCE_DIR}/tools/perf/AcceptedTcpTransport.cpp)
+target_include_directories(transport_example_tcp_server PRIVATE
+  ${CMAKE_SOURCE_DIR}/tools/perf)
