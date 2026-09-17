@@ -6,7 +6,24 @@
 
 ---
 
-## [Unreleased]
+## [0.6.0] - 2026-09-17
+
+> **升级提示：本版含 7 项破坏性变更，其中 DDS 的线缆格式不兼容——使用 DDS 的部署必须两端同时升级。** 逐项见下方 💥 小节。
+
+### 新增：`Transport.pri`——qmake 下游一行接入（ADR-0022，#262 / #263）
+
+- **#232 只解决了"我们自己怎么构建"，没解决"下游怎么用"。** 此前一个 qmake 工程想用本库，得自己摸清 `INCLUDEPATH` 加哪两个目录、要不要 include AsyncTask 的 `.pri`、boost 四个库的链接顺序、Fast DDS 在不在、`TRANSPORT_HAS_FASTDDS` 该不该定义。现在：
+
+  ```pro
+  include($$PWD/path/to/transport/Transport.pri)
+  ```
+
+  形态照我们自己就在用的 `third_party/AsyncTask/AsyncTask.pri`：**源码级并入消费者 target**，不建中间库、无构建顺序、无 `PRE_TARGETDEPS`。`FASTDDS_ROOT=` 与 `CONFIG+=no_fastdds` 对下游照常可用。
+- **一个文件两种模式**（D6）：默认并入源码（下游）；include 前置 `TRANSPORT_LINK_STATIC = 1` 则改链 `libtransport.a`（仓库内部的 tests / perf / examples 走这条）。两种模式**共用同一份** `QT` / `INCLUDEPATH` / `DEFINES` / Fast DDS 探测 / boost，由此消掉 `tests.pro`、`perf.pro`、`example.pri` 里**逐字重复三遍**的十行依赖声明。
+- **`.pri` 由 3 个收敛为 2 个**：`qmake/fastdds.pri` 整体内联进 `Transport.pri`；`qmake/common.pri` 更名 **`qmake/build_layout.pri`**（原名没说清它装的全是仓库内部构建布局）。
+  - ⚠ **`QMAKE_CXXFLAGS_WARN_ON =`（关告警）刻意留在 `build_layout.pri`，未进 `Transport.pri`。** 它是我们压第三方头文件噪音的内部手段，一旦进了对外的 `.pri`，**下游只要 include 就会被无声关掉全部编译告警**。"内部设置"与"对外契约"必须分家——这也是没把三个 `.pri` 合成一个的原因。
+- **`examples/downstream_qmake/` 是一个纯 qmake 的最小下游样例**（D5），随 `CONFIG+=examples` 一起构建。理由：`Transport.pri` 是给别人用的，**本仓库自己的构建不经过它**，没有这个样例它写错了**不会有任何信号**。实测其链接行**不含 `-ltransport`**、26 个 `.o` 全是现编的库源码——与同一次构建里六个既有示例（仍带 `-ltransport`）形成对照。
+- CMake 侧与 C++ 源码**一个字节未改**；qmake 默认构建产物与此前逐字相同。
 
 ### 💥 修复（破坏性）：跨进程 DDS 的 payload 末尾多出对齐填充零字节（ADR-0023，#258 / #260）
 
@@ -810,7 +827,13 @@
 
 ---
 
-[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Ste7an-cs/Transport/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.6.0
+[0.5.1]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.5.1
+[0.5.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.5.0
+[0.4.5]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.4.5
+[0.4.4]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.4.4
+[0.4.3]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.4.3
 [0.4.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.3.0
 [0.2.1]: https://github.com/Ste7an-cs/Transport/releases/tag/v0.2.1

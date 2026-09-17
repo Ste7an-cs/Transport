@@ -943,9 +943,9 @@ qmake CONFIG+=no_fastdds ../transport.pro          # 强制不编 FastDdsProvide
 qmake CONFIG+=debug ../transport.pro               # Debug（qmake 默认 release）
 ```
 
-工程文件收在 `qmake/` 下，根 `transport.pro` 是 Qt Creator 的入口。
+工程文件收在 `qmake/` 下，根 `transport.pro` 是 Qt Creator 的入口；库的源清单与全部依赖声明在根 **`Transport.pri`**，`qmake/build_layout.pri` 只管本仓库自己的输出目录布局。
 
-> ⚠ **源文件清单有两份**（`CMakeLists.txt` 与 `qmake/*/*.pro`），增删 `.cpp` 须同时改。两边的清单顺序与注释逐字一致，便于肉眼 diff 发现漂移。
+> ⚠ **源文件清单有两份**（`CMakeLists.txt` 与 `Transport.pri`），增删 `.cpp` 须同时改。两边的清单顺序与注释逐字一致，便于肉眼 diff 发现漂移。qmake 这一侧**只有 `Transport.pri` 一份**（ADR-0022 D2）。
 
 ### 示例 `examples/`
 
@@ -1023,12 +1023,32 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTRANSPORT_BUILD_EXAMPLES=ON
 
 ### 链接到你的工程
 
+**CMake**：
+
 ```cmake
 add_subdirectory(path/to/transport)
 target_link_libraries(your_app PRIVATE transport)
 ```
 
 `transport` 已 PUBLIC 传递 AsyncTask、Qt5 与 boost 的用法要求，无需重复声明。
+
+**qmake**（ADR-0022）：
+
+```pro
+include($$PWD/path/to/transport/Transport.pri)
+```
+
+一行即可——`Transport.pri` 把库的 `SOURCES`、`INCLUDEPATH`、`QT`、`DEFINES`、AsyncTask、boost 与 Fast DDS 的可选探测全部并进**你的 target**。`FASTDDS_ROOT=` 与 `CONFIG+=no_fastdds` 同样生效。可运行的最小样例见 `examples/downstream_qmake/`。
+
+> 两条路径的形态不同，各有代价：
+>
+> | | CMake | qmake |
+> |---|---|---|
+> | 形态 | 链接 `libtransport.a` | **源码并入你的 target** |
+> | 多个可执行 | 库只编一次 | **每个 target 各编一遍库** |
+> | 私有头 | `src/` 是 `PRIVATE`，你看不到 | **`src/` 进你的 `INCLUDEPATH`**，公私边界只剩约定 |
+>
+> 源码并入是 qmake 生态的常规做法（我们依赖的 `AsyncTask.pri` 即如此）——qmake 没有 CMake 那套 target 依赖传递，改走静态库会把构建顺序、产物路径、`PRE_TARGETDEPS` 与传递性链接原样推给你。若你的工程有多个可执行且在意编译时间，可自行把它包成一个 staticlib 子工程——我们的 `qmake/lib/lib.pro` 就是范例。
 
 ---
 
