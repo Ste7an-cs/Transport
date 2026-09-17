@@ -12,6 +12,7 @@
 # 可选开关:
 #   qmake CONFIG+=no_fastdds ../transport.pro   # 强制不编 FastDdsProvider
 #   qmake FASTDDS_ROOT=/opt/fastdds ../transport.pro
+#   qmake CONFIG+=examples ../transport.pro     # 连六个示例程序一起编(默认不编)
 # ---------------------------------------------------------------------------
 
 TEMPLATE = subdirs
@@ -27,3 +28,16 @@ perf.subdir  = qmake/perf
 
 tests.depends = lib gtest
 perf.depends  = lib
+
+# ---------------------------------------------------------------------------
+# examples —— 六个完整可运行的示例程序(#255)。
+#
+# **默认不构建**,对应 CMake 的 `option(TRANSPORT_BUILD_EXAMPLES "Build examples" OFF)`;
+# 这里的等价开关是 `qmake CONFIG+=examples ../transport.pro`。
+# 不加开关时本段整段不生效,构建与从前逐字相同。
+# ---------------------------------------------------------------------------
+contains(CONFIG, examples) {
+    SUBDIRS += examples
+    examples.subdir  = qmake/examples
+    examples.depends = lib
+}
