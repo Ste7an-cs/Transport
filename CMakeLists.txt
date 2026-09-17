@@ -185,7 +185,8 @@ if(TRANSPORT_BUILD_TESTS)
   if(TRANSPORT_HAS_FASTDDS)
     target_sources(transport_tests PRIVATE
       tests/dds/fast_dds_provider_test.cpp
-      tests/dds/dds_node_fastdds_e2e_test.cpp)
+      tests/dds/dds_node_fastdds_e2e_test.cpp
+      tests/dds/fast_dds_payload_length_test.cpp)
     # FastDdsProvider.hpp 不是公共头(在 src/ 下),用例须直接见到它。
     target_include_directories(transport_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   endif()
