@@ -26,7 +26,7 @@ C++17 通信中间件库，把**传输**、**编解码**、**交互**三层彻�
 - [扩展：自定义 codec](#扩展自定义-codec)
 - [扩展：新建一个 node](#扩展新建一个-node) —— 交互方式变了的时候
 - [内部传输契约（`ITransport`）](#内部传输契约itransport)
-- [构建](#构建) · [性能基准测试](#性能基准测试-transport_perf)
+- [构建](#构建) · [示例](#示例-examples) · [性能基准测试](#性能基准测试-transport_perf)
 - [关键约束](#关键约束)
 
 ---
@@ -946,6 +946,38 @@ qmake CONFIG+=debug ../transport.pro               # Debug（qmake 默认 releas
 工程文件收在 `qmake/` 下，根 `transport.pro` 是 Qt Creator 的入口。
 
 > ⚠ **源文件清单有两份**（`CMakeLists.txt` 与 `qmake/*/*.pro`），增删 `.cpp` 须同时改。两边的清单顺序与注释逐字一致，便于肉眼 diff 发现漂移。
+
+### 示例 `examples/`
+
+**六个完整可运行的程序**,每个都能直接跑、成对对接。**默认不构建**:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTRANSPORT_BUILD_EXAMPLES=ON
+# qmake: qmake CONFIG+=examples ../transport.pro
+```
+
+| 示例 | 演示什么 | 怎么跑 |
+|---|---|---|
+| `tcp_client` / `tcp_server` | **四种交互模式**;服务端**只用公开面**写 | 两个终端,先起服务端 |
+| `udp_fanout` | **UDP 一对多**;入站 `endpoint` 即发送方 | 单进程,自带两个回声端 |
+| `dds_pubsub` | `DdsNode` 发布-订阅 | `--role pub` / `--role sub` |
+| `dds_service` | `DdsNode` 请求-响应 | `--role service` / `--role client` |
+| `custom_codec` | 自实现 `ICodec`,含 **`frame` 填充与视图建立顺序** | 单进程 |
+
+**它们不是片段,是把几个最容易用错的点变成可见事实**：
+
+```
+[收到] frm_type=kCommand message_id=0x0001 session_id=255 …   ← Send 原样透传（ADR-0019）
+[收到] frm_type=kCommand message_id=0x0010 session_id=0   …   ← RequestFor* 自分配
+   整帧 frame(29 字节)：AA BB CC DD 02 01 00 00 …             ← frame 字段的价值
+[backlog] Message 已析构，OwnedPayload() 的那份仍然有效       ← payload 视图的生命周期
+```
+
+两个 DDS 示例还**故意各犯一次错**并打印错误码:`Start()` 前调交互方法 → `kClosed`;`Publish` 传 `Endpoint::Service` / 请求传 `Endpoint::Topic` → `kInvalidArgument`;未注册的服务名 → `kConfiguration`。
+
+> ⚠ **示例默认不构建,意味着 API 变了不会有任何信号。** 改动公共接口后请顺手开着开关编一遍——本仓库已有过文档与代码漂移的先例。
+
+> DDS 两例默认 `--provider fastdds`(而非 `DdsConfig` 的默认 `"fake"`):`fake` 是**进程内**总线,跨不了两个终端。
 
 ### 性能基准测试 `transport_perf`
 

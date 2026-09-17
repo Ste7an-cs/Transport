@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+### 新增：`examples/` 六个完整可运行的示例程序（#255）
+
+- `tcp_client` / `tcp_server`（四种交互模式 + **只用公开面**写的服务端）、`udp_fanout`（UDP 一对多）、`dds_pubsub`、`dds_service`、`custom_codec`（自实现 `ICodec`）。
+- **默认不构建**：`-DTRANSPORT_BUILD_EXAMPLES=ON`（qmake：`CONFIG+=examples`）。不加开关时构建与此前逐字相同，`transport_tests` 仍 284 全绿。
+- **示例把几个最容易用错的点变成了可见事实**：`Send` 透传的 `session_id=255` 与 `RequestFor*` 自分配的 0/1/2 并排打印（ADR-0019 的两档盖章规则）；整帧 `frame` 的十六进制（ADR-0020 的 `frame` 字段价值）；`Message` 析构后 `OwnedPayload()` 那份仍有效（payload 视图的生命周期）。两个 DDS 示例还**故意各犯一次相位与寻址错误**并打印错误码。
+- 示例**自包含**，不依赖 `tools/`：监听侧传输是 `examples/common/ListeningTcpTransport`（库里没有 TCP 服务端字节管道，见 ADR-0011 D10）。
+- ⚠ **默认不构建意味着 API 变了不会有任何信号**，改动公共接口后需顺手开着开关编一遍。
+
+### ⚠ 示例编写过程中发现的库缺陷（见 #258，修复设计 ADR-0023）
+
+**跨进程 DDS 收到的 `payload` 末尾多出 RTPS 对齐填充零字节 —— 数据损坏。** 实测真实 payload `"echo:ping"`（9 字节）收到 13 字节。机理：RTPS 把 DATA 子消息载荷按 4 字节对齐，接收侧 `SerializedPayload_t::length` 含填充而 `FastDdsRawType::deserialize` 照单全收；而 `DdsCodec` 的 payload 是"剩下的全部"、无长度字段，无从分辨。
+
+**既有测试对它完全盲**：`dds_node_fastdds_e2e_test` 两端同进程，Fast DDS 默认 `INTRAPROCESS_FULL` 根本不走序列化，且那两条用例的样本长度恰好是 4 的倍数。
+
 ### 新增：`transport_perf` 性能基准测试工具（ADR-0018，#252）
 
 - 与 `transport_tests` **并列的独立可执行**，不进单元测试、**不设阈值断言**（性能数字抖动，混进 CI 会长期误报、最终被无视）。方法学与报表列照 **Fast DDS 3.6.1** 的 LatencyTest / ThroughputTest，可直接横向比对。
