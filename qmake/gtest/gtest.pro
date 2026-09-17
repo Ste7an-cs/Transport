@@ -9,7 +9,7 @@
 # gtest 不需要 Qt,故 QT 全清空。第三方代码不参与本项目的告警策略。
 # ---------------------------------------------------------------------------
 
-include(../common.pri)
+include(../build_layout.pri)
 
 TEMPLATE = lib
 CONFIG += staticlib
