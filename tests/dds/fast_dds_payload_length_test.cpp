@@ -240,7 +240,7 @@ TEST(FastDdsRawTypePrefix, DeserializeRejectsSampleShorterThanPrefix) {
     for (std::uint32_t i = 0; i < len; ++i) payload.data[i] = 0xFF;
     payload.length = len;
     RawBytes got;
-    got.payload = {0xAA};  // 失败路径**不得**改动出参之外的东西,这里只求返 false。
+    got.payload = {0xAA};  // 预置一个可辨的值:断言只看返回值,不指望出参被写。
     EXPECT_FALSE(type.deserialize(payload, &got));
   }
 }
@@ -266,7 +266,7 @@ TEST(FastDdsRawTypePrefix, DeserializeRejectsLengthPrefixBeyondPayload) {
 
 // ======================= 二、线缆层:真的走一遍序列化 =======================
 
-// ⚠ **进程级设置的看门用例**:`transport_tests` 是单一二进制,291 条用例跑在同一个进程里,
+// ⚠ **进程级设置的看门用例**:`transport_tests` 是单一二进制,全部用例跑在同一个进程里,
 // 而 `set_library_settings` 改的是**整个进程**的库设置。这条用例钉死 `IntraprocessOff`
 // 出作用域必**原样还原**——否则后面每一条 DDS 用例都会在一个**被本文件悄悄改过**的
 // 交付模式下跑,那是最坏的处理方式(既有用例的行为一个字都不该被本票改动)。
