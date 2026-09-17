@@ -134,6 +134,10 @@
 
 **图例说明**：各介质传输实现**唯一**的 `ITransport`（七个方法，含链路可用性）。**读写刻意不对称**：`AsyncRead()` 交出读队列的等待器句柄，超时/取消/扇出由调用方自理；`AsyncWrite(Datagram)` 入队即返，写出结果只落 `LastError()`。**四个介质均已按同一形态落地、且都在编译面内**（2026-09-01）：`UdpTransport`（ADR-0007，socket 管理泵 + 读写双队列，`silence_timeout` 兼作读超时与 bind 重试间隔）、`TcpTransport`（ADR-0011，连接管理内建、固定间隔重连、不自终）、`SerialTransport`（ADR-0012，静默超时为唯一判活依据）、`DdsTransport`（ADR-0013）。
 **唯 `DdsTransport` 有两处形态差异**：读侧由 provider 的 listener 在外来线程上直推读队列（**无泵 fiber**），写侧由**一条专属 OS 线程**消费写队列（`Publish` 的阻塞是线程级）；另在七方法之外有 `DeclareWriter` / `DeclareReader` 两个 DDS 专有的端点声明方法，**但不改动 `ITransport` 本身**。仍排除于编译面的只剩 `TcpServer`。
+
+> **`FastDdsRawType` 的线缆布局是 `[len:4 BE][payload]`**（ADR-0023）。那 4 字节长度前缀**不是消息格式的一部分**，而是 provider 层的私事：RTPS 把 DATA 子消息载荷按 4 字节对齐，接收侧 `SerializedPayload_t::length` **含填充**，故 `deserialize` 若照单全收就会把填充当成 payload（#258，跨进程数据损坏）。前缀让长度自描述；`deserialize` 另须校验 `declared > payload.length - 4` 即返 `false`（**明确失败，不读越界**；该写法同时规避 `4 + declared` 的 `uint32` 回绕）。
+>
+> **`FakeDdsProvider` 不加前缀**——它是进程内总线、不序列化，本就没有填充问题。**由此"用 `fake` 测过了"不能推出"`fastdds` 上也对"**，这正是 #258 的由来：既有的 `dds_node_fastdds_e2e_test` 两端同进程（默认 `INTRAPROCESS_FULL` **根本不走序列化**），且样本长度恰好是 4 的倍数，对该缺陷**完全盲**。守它的用例须强制走序列化（`INTRAPROCESS_OFF`，以 RAII 还原进程级设置）且 payload 长度**非 4 的倍数**。
 > 注：本图 SVG 尚未随 ADR-0004 重渲染（渲染工具在当前环境不可用），`.mmd` 源以本节文字为准。
 
 #### 4.1.3 编解码层部件（CSC_CODEC）

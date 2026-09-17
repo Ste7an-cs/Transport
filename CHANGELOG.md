@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+### 💥 修复（破坏性）：跨进程 DDS 的 payload 末尾多出对齐填充零字节（ADR-0023，#258 / #260）
+
+- **这是数据损坏，不是显示问题。** 实测真实 payload `"echo:ping"`（9 字节）跨进程收到 **13 字节**。
+- **机理**：RTPS 把 DATA 子消息载荷按 4 字节对齐，接收侧 `SerializedPayload_t::length` **含填充**，而 `FastDdsRawType::deserialize` 照单全收；`DdsCodec` 的 payload 又是"剩下的全部"、无长度字段，**无从分辨**。发送侧写的 `payload.length` 是精确值——**信息是在 RTPS 这一层丢的**。
+- **修法**：`FastDdsRawType` 的线缆布局改为 **`[len:4 BE][payload]`**，`deserialize` 按前缀取、不信 `payload.length`，并校验 `declared > payload.length - 4` 即返 `false`（明确失败、不读越界；该写法同时规避 `uint32` 回绕）。
+  - **修在 provider 层而非 codec 层**：填充是 RTPS 引入的，那是信息丢失的源头；修在这里对**任何** codec 生效。`DdsCodec` 的线缆格式**一个字节没改**。
+- **💥 线缆不兼容，新旧版本节点不能互通，必须两端一起升级。** 旧版本发的样本无前缀会被拒；反之旧版本会把前缀当 payload 的头 4 字节。理由：本库尚未有外部部署，且**该缺陷本身就让跨进程收发不可靠**——「兼容一个本来就在损坏数据的旧版本」没有意义。
+- `FakeDdsProvider` **不加前缀**（进程内、不序列化）。**由此"用 `fake` 测过了"不能推出"`fastdds` 上也对"。**
+
+#### ⚠ 为什么这个缺陷能活到今天：既有测试形态对它完全盲
+
+`dds_node_fastdds_e2e_test` 的两端在**同一进程**，Fast DDS 默认 `INTRAPROCESS_FULL` **根本不走序列化**；且那两条用例的样本长度**恰好是 4 的倍数**。
+
+新增 **8 条**用例（284 → 292），须**同时**满足：强制走序列化（`INTRAPROCESS_OFF`，以 RAII 进出还原**进程级**设置，另有看门用例直接读回比对、杜绝"其实没关掉"的假绿）、payload 长度**非 4 的倍数**（1/2/3/5/9/63 覆盖四种余数）、断言**逐字节且长度相等**。样本一律以 `0x00` 结尾，顺带钉死"剥掉尾部零字节"那条被否决的路。
+
+**变异验证**：把产品代码整体还原到修复前——**旧用例全绿、新用例全红**，这是"测试形态对缺陷全盲"的直接证据。
+
 ### 新增：`examples/` 六个完整可运行的示例程序（#255）
 
 - `tcp_client` / `tcp_server`（四种交互模式 + **只用公开面**写的服务端）、`udp_fanout`（UDP 一对多）、`dds_pubsub`、`dds_service`、`custom_codec`（自实现 `ICodec`）。
