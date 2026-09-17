@@ -266,6 +266,32 @@ TEST(FastDdsRawTypePrefix, DeserializeRejectsLengthPrefixBeyondPayload) {
 
 // ======================= 二、线缆层:真的走一遍序列化 =======================
 
+// ⚠ **进程级设置的看门用例**:`transport_tests` 是单一二进制,291 条用例跑在同一个进程里,
+// 而 `set_library_settings` 改的是**整个进程**的库设置。这条用例钉死 `IntraprocessOff`
+// 出作用域必**原样还原**——否则后面每一条 DDS 用例都会在一个**被本文件悄悄改过**的
+// 交付模式下跑,那是最坏的处理方式(既有用例的行为一个字都不该被本票改动)。
+//
+// 与用例执行顺序无关:它直接读回库设置比对,不依赖"谁先谁后"。
+TEST(FastDdsSerializedWire, IntraprocessGuardRestoresProcessWideSetting) {
+  auto* factory = fdds::DomainParticipantFactory::get_instance();
+  eprosima::fastdds::LibrarySettings before{};
+  ASSERT_EQ(factory->get_library_settings(before), fdds::RETCODE_OK);
+
+  {
+    IntraprocessOff guard;
+    ASSERT_TRUE(guard.ok());
+    eprosima::fastdds::LibrarySettings during{};
+    ASSERT_EQ(factory->get_library_settings(during), fdds::RETCODE_OK);
+    EXPECT_EQ(during.intraprocess_delivery, eprosima::fastdds::INTRAPROCESS_OFF)
+        << "守卫在作用域内没把交付模式压成 OFF —— 线缆用例会假绿";
+  }
+
+  eprosima::fastdds::LibrarySettings after{};
+  ASSERT_EQ(factory->get_library_settings(after), fdds::RETCODE_OK);
+  EXPECT_EQ(after.intraprocess_delivery, before.intraprocess_delivery)
+      << "守卫把进程级设置漏了出去 —— 同进程内其它 DDS 用例会跟着换交付模式";
+}
+
 // ⭐ provider 层跨越真实 RTPS 线缆:`INTRAPROCESS_OFF` ⇒ 样本必经 serialize /
 // deserialize,4 字节对齐填充**真的会发生**。六档非 4 倍数长度各跑一遍。
 //
