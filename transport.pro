@@ -40,4 +40,13 @@ contains(CONFIG, examples) {
     SUBDIRS += examples
     examples.subdir  = qmake/examples
     examples.depends = lib
+
+    # ADR-0022 D5 —— 最小的 qmake **下游**样例,与上面六个分开列:
+    #   * 六个示例链 libtransport.a(故 examples.depends = lib);
+    #   * 本例**不链**,它 include 根上的 Transport.pri 走源码级并入 —— 那正是
+    #     下游的接入路径,也是本例存在的唯一理由(Transport.pri 写错了要有信号)。
+    # 因此它**不依赖 lib**,.pro 也留在 examples/downstream_qmake/ 与 main.cpp 同级,
+    # 形如一个真实的外部工程。
+    SUBDIRS += downstream_qmake
+    downstream_qmake.subdir = examples/downstream_qmake
 }
