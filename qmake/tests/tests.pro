@@ -89,7 +89,8 @@ include(../fastdds.pri)
 !isEmpty(TRANSPORT_HAS_FASTDDS) {
     SOURCES += \
         $$TRANSPORT_ROOT/tests/dds/fast_dds_provider_test.cpp \
-        $$TRANSPORT_ROOT/tests/dds/dds_node_fastdds_e2e_test.cpp
+        $$TRANSPORT_ROOT/tests/dds/dds_node_fastdds_e2e_test.cpp \
+        $$TRANSPORT_ROOT/tests/dds/fast_dds_payload_length_test.cpp
     # FastDdsProvider.hpp 不是公共头(在 src/ 下),用例须直接见到它。
     INCLUDEPATH += $$TRANSPORT_ROOT/src
 }
